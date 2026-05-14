@@ -232,28 +232,31 @@
         padding: 32px 48px 80px;
       }
       .review-layout {
-        display: grid;
-        grid-template-columns: 400px 1fr;
-        grid-template-rows: auto auto;
+        display: flex;
         gap: 24px;
-        align-items: start;
+        align-items: flex-start;
       }
-      .review-sidebar {
-        grid-column: 1;
-        grid-row: 1;
+      .review-left {
+        flex: 0 0 400px;
+        width: 400px;
         position: sticky;
         top: 20px;
         max-height: calc(100vh - 40px);
         overflow-y: auto;
         scrollbar-width: thin;
+        display: flex;
+        flex-direction: column;
+        gap: 24px;
+      }
+      .review-sidebar {
+        /* content inside review-left, no separate sticky needed */
       }
       .review-main {
-        grid-column: 2;
-        grid-row: 1 / 3;
+        flex: 1;
+        min-width: 0;
       }
       .review-variants {
-        grid-column: 1;
-        grid-row: 2;
+        /* inside review-left */
       }
       /* In sidebar, stack product info + content vertically */
       .review-sidebar .two-col {
@@ -742,6 +745,15 @@
   Loading connection status…
 </div>
 
+<!-- UPDATE BANNER (hidden by default) -->
+<div id="updateBanner" style="display:none;background:#1a1a2e;color:#fff;padding:10px 32px;font-size:13px;display:none;align-items:center;gap:12px;justify-content:space-between">
+  <span>🆕 <strong>Update available</strong> — a new version of the dashboard is ready. <span id="updateVersionLabel" style="opacity:0.7"></span></span>
+  <div style="display:flex;gap:8px;align-items:center">
+    <span id="updateStatus" style="opacity:0.7"></span>
+    <button onclick="installUpdate()" id="updateBtn" style="background:#4f8ef7;color:#fff;border:none;border-radius:6px;padding:6px 16px;font-size:12px;font-weight:600;cursor:pointer">Install update & restart</button>
+  </div>
+</div>
+
 <!-- MAIN -->
 <main>
 
@@ -807,6 +819,7 @@ luftig kjole</textarea>
     </div>
 
     <div class="review-layout">
+    <div class="review-left">
     <div class="review-sidebar">
 
     <!-- PRODUCT INFO + CONTENT -->
@@ -820,7 +833,7 @@ luftig kjole</textarea>
           <div class="field-group">
             <label>Product name <span style="font-weight:400;text-transform:none;color:#aaa">(female name, unique)</span></label>
             <div class="name-row">
-              <input type="text" id="productName" value="Solène" oninput="updateTitlePreview(); buildVariantCards()">
+              <input type="text" id="productName" value="Solène" oninput="updateTitlePreview(); autoHandle()">
               <button class="refresh-btn" onclick="refreshName()" title="Generate new name">↻</button>
             </div>
           </div>
@@ -848,8 +861,8 @@ luftig kjole</textarea>
           <div class="field-group">
             <label>Price</label>
             <div style="display:flex;gap:8px;align-items:center">
-              <input type="text" id="productPrice" value="349,00 DKK" style="flex:1" oninput="updateComparePrice()">
-              <select id="discountSelect" style="height:38px;border:1px solid #ddd;border-radius:6px;padding:0 8px;font-size:13px;background:#fff;cursor:pointer" onchange="updateComparePrice()">
+              <input type="text" id="productPrice" value="349,00 DKK" style="flex:0 0 140px;width:140px" oninput="updateComparePrice()">
+              <select id="discountSelect" style="flex:1;height:38px;border:1px solid #ddd;border-radius:6px;padding:0 8px;font-size:13px;background:#fff;cursor:pointer" onchange="updateComparePrice()">
                 <option value="0">No discount</option>
                 <option value="25" selected>~25% discount</option>
                 <option value="50">~50% discount</option>
@@ -1047,6 +1060,7 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
       </div>
     </div>
     </div><!-- /review-variants -->
+    </div><!-- /review-left -->
 
     </div><!-- /review-layout -->
 
@@ -1190,7 +1204,47 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
     buildKeywordChips();
     buildVariantCards();
     checkAuthStatus();
+    checkForUpdate();
   });
+
+  async function checkForUpdate() {
+    try {
+      const r = await fetch('/api/version');
+      const d = await r.json();
+      if (!d.update_available) return;
+      const banner = document.getElementById('updateBanner');
+      const label  = document.getElementById('updateVersionLabel');
+      if (banner) {
+        label.textContent = `(v${d.local} → v${d.remote})`;
+        banner.style.display = 'flex';
+      }
+    } catch(e) { /* silently ignore — no GITHUB_RAW configured */ }
+  }
+
+  async function installUpdate() {
+    const btn    = document.getElementById('updateBtn');
+    const status = document.getElementById('updateStatus');
+    btn.disabled = true;
+    btn.textContent = 'Installing…';
+    status.textContent = 'Downloading files…';
+    try {
+      const r = await fetch('/api/update', { method: 'POST' });
+      const d = await r.json();
+      if (d.success) {
+        status.textContent = 'Done! Restarting in 3s…';
+        btn.textContent = 'Restarting…';
+        setTimeout(() => location.reload(), 4000);
+      } else {
+        status.textContent = 'Error: ' + (d.errors || []).join(', ');
+        btn.disabled = false;
+        btn.textContent = 'Retry';
+      }
+    } catch(e) {
+      status.textContent = 'Connection error';
+      btn.disabled = false;
+      btn.textContent = 'Retry';
+    }
+  }
 
   function buildKeywordChips() {
     const input = document.getElementById('keywordsInput').value;

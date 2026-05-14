@@ -600,6 +600,71 @@ def higgsfield_generate():
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+# --- Auto-update ---
+GITHUB_RAW = os.getenv('GITHUB_RAW', '').rstrip('/')
+# e.g. https://raw.githubusercontent.com/yourname/vionna-dashboard/main
+
+VERSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'version.txt')
+
+def _read_local_version():
+    try:
+        return open(VERSION_FILE).read().strip()
+    except Exception:
+        return '0.0.0'
+
+def _version_tuple(v):
+    try:
+        return tuple(int(x) for x in v.strip().split('.'))
+    except Exception:
+        return (0, 0, 0)
+
+@app.route('/api/version')
+def api_version():
+    local = _read_local_version()
+    if not GITHUB_RAW:
+        return jsonify({'local': local, 'remote': None, 'update_available': False})
+    try:
+        r = req.get(f'{GITHUB_RAW}/version.txt', timeout=5)
+        remote = r.text.strip()
+        update_available = _version_tuple(remote) > _version_tuple(local)
+        return jsonify({'local': local, 'remote': remote, 'update_available': update_available})
+    except Exception as e:
+        return jsonify({'local': local, 'remote': None, 'update_available': False, 'error': str(e)})
+
+@app.route('/api/update', methods=['POST'])
+def api_update():
+    if not GITHUB_RAW:
+        return jsonify({'error': 'GITHUB_RAW not configured'}), 400
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    files_to_update = ['index.html', 'server.py', 'version.txt']
+    updated = []
+    errors  = []
+    for fname in files_to_update:
+        try:
+            r = req.get(f'{GITHUB_RAW}/{fname}', timeout=15)
+            r.raise_for_status()
+            dest = os.path.join(base_dir, fname)
+            with open(dest, 'wb') as f:
+                f.write(r.content)
+            updated.append(fname)
+        except Exception as e:
+            errors.append(f'{fname}: {e}')
+
+    if errors:
+        return jsonify({'success': False, 'updated': updated, 'errors': errors}), 500
+
+    # Schedule restart after response is sent
+    def _restart():
+        import time, subprocess
+        time.sleep(1.5)
+        subprocess.Popen([sys.executable] + sys.argv)
+        os._exit(0)
+
+    import threading
+    threading.Thread(target=_restart, daemon=True).start()
+    return jsonify({'success': True, 'updated': updated, 'restarting': True})
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print(f"\nVionna Dashboard running on http://localhost:{port}\n")
