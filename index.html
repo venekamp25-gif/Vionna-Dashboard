@@ -1201,6 +1201,29 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
     fr: { label: 'Vionna FR', lang: '🇫🇷 French', currency: 'EUR' }
   };
 
+  // Tracks the previous product name so we can find/replace in description when user renames
+  let previousProductName = 'Solène';
+
+  // Replace product name everywhere it appears in generated content
+  function syncNameInGeneratedContent(oldName, newName) {
+    if (!oldName || !newName || oldName === newName) return;
+    const fields = ['productDesc', 'metaDesc', 'mTitleSpecs'];
+    // Case-insensitive whole-word replacement
+    const escape = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp('\\b' + escape(oldName) + '\\b', 'gi');
+    fields.forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const newValue = el.value.replace(pattern, newName);
+      if (newValue !== el.value) el.value = newValue;
+    });
+    // Refresh char count for meta description
+    const metaEl = document.getElementById('metaDesc');
+    if (metaEl) updateCharCount(metaEl, 'metaCount');
+    // Refresh M title preview
+    if (typeof updateTitlePreview === 'function') updateTitlePreview();
+  }
+
   function setStore(store, btn) {
     currentStore = store;
     document.querySelectorAll('.store-btn').forEach(b => b.classList.remove('active'));
@@ -1364,7 +1387,10 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
     const allUsed = [...usedNames, ...shopifyNames];
     const available = women_names.filter(n => !allUsed.some(u => u.toLowerCase() === n.toLowerCase()));
     const name = available[Math.floor(Math.random() * available.length)] || 'Nova';
+    const oldName = previousProductName || document.getElementById('productName').value;
     document.getElementById('productName').value = name;
+    syncNameInGeneratedContent(oldName, name);
+    previousProductName = name;
     checkNameUnique(name, allUsed);
     updateTitlePreview();
     autoHandle();
@@ -1378,6 +1404,11 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
     const name = document.getElementById('productName').value.trim();
     clearTimeout(_nameCheckTimer);
     _nameCheckTimer = setTimeout(async () => {
+      // Sync name in description/meta after user stops typing
+      if (previousProductName && previousProductName !== name) {
+        syncNameInGeneratedContent(previousProductName, name);
+        previousProductName = name;
+      }
       let shopifyNames = [];
       try {
         const r = await fetch('/api/names', {
@@ -1439,9 +1470,10 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
       usedFromShopify = (await r.json()).names || [];
     } catch(e) {}
     const allUsed = [...usedNames, ...usedFromShopify];
-    const available = women_names.filter(n => !allUsed.includes(n));
+    const available = women_names.filter(n => !allUsed.some(u => u.toLowerCase() === n.toLowerCase()));
     const chosenName = available[Math.floor(Math.random() * available.length)] || 'Nova';
     document.getElementById('productName').value = chosenName;
+    previousProductName = chosenName;
 
     // 3. Fill product info from scrape
     if (product) {
@@ -1513,6 +1545,8 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
       document.getElementById('metaDesc').value     = gen.meta_description || '';
       document.getElementById('mTitleSpecs').value  = gen.m_title_specs  || '';
       updateCharCount(document.getElementById('metaDesc'), 'metaCount');
+      // Sync the "previous name" with the generated content so manual renames work after generation
+      previousProductName = chosenName;
     } catch(e) {
       document.getElementById('productDesc').value  = `Error: ${e.message}`;
       document.getElementById('metaDesc').value     = '';
