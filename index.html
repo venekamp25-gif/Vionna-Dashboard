@@ -2060,13 +2060,25 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
     const handle  = document.getElementById('siblingsHandle2')?.value || '';
     // Build images per color: shared (steps 1-4) + per color (step 5)
     const imagesByColor = { shared: [] };
+    const allImages = [];
     document.querySelectorAll('#publishImagePool .image-tile.selected').forEach(tile => {
       const url   = tile.querySelector('img')?.src;
       const color = tile.dataset.color || 'shared';
       if (!url || !url.startsWith('http')) return;
       if (!imagesByColor[color]) imagesByColor[color] = [];
       imagesByColor[color].push(url);
+      allImages.push(url);
     });
+    // Deduplicate flat list
+    const imagesFlat = [...new Set(allImages)];
+    console.log('[publish] images_by_color:', imagesByColor, 'flat:', imagesFlat);
+    if (!imagesFlat.length) {
+      if (!confirm('No photos selected in publish pool. Publish anyway (product will have no images)?')) {
+        btn.disabled = false;
+        btn.textContent = 'Publish to Shopify →';
+        return;
+      }
+    }
 
     try {
       const r = await fetch('/api/publish', {
@@ -2086,6 +2098,7 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
           colors,
           siblings_handle: handle,
           images_by_color: imagesByColor,
+          images:          imagesFlat,
         })
       });
       const result = await r.json();

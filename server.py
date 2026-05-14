@@ -273,8 +273,11 @@ def publish():
     sizes            = data.get('sizes', ['XS', 'S', 'M', 'L', 'XL'])
     siblings_handle  = data.get('siblings_handle', '')
     # images_by_color: { 'shared': [...], 'Sort': [...], 'Hvid': [...], ... }
-    images_by_color  = data.get('images_by_color', {})
-    shared_images    = images_by_color.get('shared', data.get('images', []))
+    images_by_color  = data.get('images_by_color', {}) or {}
+    images_flat      = data.get('images', []) or []
+    # Use 'shared' images if any; otherwise fall back to flat images list (legacy or single-color)
+    shared_images    = images_by_color.get('shared') or images_flat
+    print(f"[publish] Received: {len(images_flat)} flat images, color-keys: {list(images_by_color.keys())}, shared: {len(shared_images)}")
 
     # Convert plain-text description to body_html
     def to_html(text):
