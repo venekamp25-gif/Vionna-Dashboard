@@ -232,26 +232,32 @@
         padding: 32px 48px 80px;
       }
       .review-layout {
-        display: flex;
+        display: grid;
+        grid-template-columns: 400px 1fr;
         gap: 24px;
-        align-items: flex-start;
+        align-items: start;
       }
       .review-left {
-        flex: 0 0 400px;
-        width: 400px;
+        grid-column: 1;
+        position: sticky;
+        top: 72px;
+        max-height: calc(100vh - 92px);
+        overflow-y: auto;
+        overflow-x: visible;
+        scrollbar-width: thin;
         display: flex;
         flex-direction: column;
         gap: 24px;
       }
       .review-sidebar {
-        /* content inside review-left, no separate sticky needed */
+        /* sits inside review-left */
       }
       .review-main {
-        flex: 1;
+        grid-column: 2;
         min-width: 0;
       }
       .review-variants {
-        /* inside review-left */
+        /* sits inside review-left, below sidebar */
       }
       /* In sidebar, stack product info + content vertically */
       .review-sidebar .two-col {
