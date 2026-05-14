@@ -1,0 +1,606 @@
+import os, sys, json, re, hashlib, urllib.parse, subprocess, tempfile, shutil, platform
+from flask import Flask, request, redirect, session, jsonify, send_from_directory
+import requests as req
+from dotenv import load_dotenv
+
+# Fix encoding on Windows (prevents UnicodeEncodeError for special chars in print)
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'), override=True)
+
+app = Flask(__name__, static_folder='.')
+app.secret_key = os.environ.get('SECRET_KEY') or os.urandom(24)
+
+@app.errorhandler(Exception)
+def handle_error(e):
+    return jsonify({'error': str(e)}), 500
+
+ANTHROPIC_KEY  = os.getenv('ANTHROPIC_API_KEY')
+
+# Higgsfield EXE — only available on Windows with the CLI installed
+IS_WINDOWS = platform.system() == 'Windows'
+HIGGSFIELD_EXE = os.path.join(
+    os.path.expanduser('~'), 'AppData', 'Roaming', 'npm',
+    'node_modules', '@higgsfield', 'cli', 'vendor', 'hf.exe'
+) if IS_WINDOWS else ''
+print(f'Higgsfield EXE: {HIGGSFIELD_EXE} (exists: {os.path.isfile(HIGGSFIELD_EXE) if HIGGSFIELD_EXE else False})')
+
+APP_CREDENTIALS = {
+    'dk': {
+        'client_id':     os.getenv('SHOPIFY_DK_CLIENT_ID'),
+        'client_secret': os.getenv('SHOPIFY_DK_CLIENT_SECRET'),
+    },
+    'fr': {
+        'client_id':     os.getenv('SHOPIFY_FR_CLIENT_ID'),
+        'client_secret': os.getenv('SHOPIFY_FR_CLIENT_SECRET'),
+    },
+}
+
+STORES = {
+    'dk': os.getenv('SHOPIFY_DK_DOMAIN'),
+    'fr': os.getenv('SHOPIFY_FR_DOMAIN'),
+}
+
+SCOPES      = 'write_products,read_products'
+# APP_URL env var should be set on Railway to https://your-app.up.railway.app
+_APP_URL    = os.getenv('APP_URL', 'http://localhost:5000').rstrip('/')
+REDIRECT_URI = f'{_APP_URL}/callback'
+API_VERSION  = '2024-10'
+
+# --- Token storage ---
+# Tokens are stored in tokens.json locally and can be bootstrapped
+# from env vars on Railway (SHOPIFY_DK_TOKEN / SHOPIFY_FR_TOKEN).
+TOKENS_FILE = 'tokens.json'
+tokens = {}
+if os.path.exists(TOKENS_FILE):
+    try:
+        with open(TOKENS_FILE) as f:
+            tokens = json.load(f)
+    except Exception:
+        pass
+
+# Also load from environment variables (works on Railway where filesystem is ephemeral)
+for _store_key, _env_key in [('dk', 'SHOPIFY_DK_TOKEN'), ('fr', 'SHOPIFY_FR_TOKEN')]:
+    _tok = os.getenv(_env_key)
+    _shop = STORES.get(_store_key)
+    if _tok and _shop and _store_key not in tokens:
+        tokens[_store_key] = {'shop': _shop, 'token': _tok}
+
+def save_tokens():
+    try:
+        with open(TOKENS_FILE, 'w') as f:
+            json.dump(tokens, f)
+    except Exception:
+        pass  # Silently ignore on read-only filesystems (Railway)
+
+def shopify_headers(store_key):
+    t = tokens.get(store_key, {})
+    return {'X-Shopify-Access-Token': t.get('token', ''), 'Content-Type': 'application/json'}
+
+def shopify_url(store_key, path):
+    shop = tokens.get(store_key, {}).get('shop') or STORES.get(store_key)
+    return f"https://{shop}/admin/api/{API_VERSION}/{path}"
+
+
+# --- Static files ---
+@app.route('/')
+def index():
+    return send_from_directory('.', 'index.html')
+
+
+# --- Auth ---
+@app.route('/auth/<store_key>')
+def auth(store_key):
+    shop = STORES.get(store_key)
+    if not shop:
+        return 'Unknown store', 400
+    creds = APP_CREDENTIALS.get(store_key)
+    state = hashlib.sha256(os.urandom(16)).hexdigest()
+    session['oauth_state'] = state
+    session['store_key']   = store_key
+    params = urllib.parse.urlencode({
+        'client_id':    creds['client_id'],
+        'scope':        SCOPES,
+        'redirect_uri': REDIRECT_URI,
+        'state':        state,
+    })
+    return redirect(f"https://{shop}/admin/oauth/authorize?{params}")
+
+@app.route('/callback')
+def callback():
+    code      = request.args.get('code')
+    shop      = request.args.get('shop')
+    state     = request.args.get('state')
+    store_key = session.get('store_key', 'dk')
+
+    if state != session.get('oauth_state'):
+        return 'Invalid state', 403
+
+    creds = APP_CREDENTIALS.get(store_key, {})
+    res = req.post(f"https://{shop}/admin/oauth/access_token", json={
+        'client_id':     creds.get('client_id'),
+        'client_secret': creds.get('client_secret'),
+        'code':          code,
+    })
+    if res.status_code != 200:
+        return f'OAuth error: {res.text}', 400
+
+    tokens[store_key] = {'shop': shop, 'token': res.json()['access_token']}
+    save_tokens()
+    return redirect(f'/?auth=success&store={store_key}')
+
+@app.route('/api/test_hf')
+def test_hf():
+    import os as _os, glob as _glob
+    exists  = _os.path.exists(HIGGSFIELD_EXE)
+    vendor  = r'C:\Users\venek\AppData\Roaming\npm\node_modules\@higgsfield\cli\vendor'
+    files   = _glob.glob(vendor + r'\*')
+    appdata = _os.environ.get('APPDATA', 'NOT SET')
+    try:
+        r = subprocess.run(
+            f'"{HIGGSFIELD_EXE}" --version',
+            capture_output=True, text=True, timeout=10, shell=True
+        )
+        return jsonify({
+            'exe_exists': exists, 'vendor_files': files,
+            'APPDATA': appdata, 'cwd': _os.getcwd(),
+            'version': r.stdout.strip(), 'stderr': r.stderr.strip(), 'rc': r.returncode
+        })
+    except Exception as e:
+        return jsonify({'exe_exists': exists, 'vendor_files': files, 'APPDATA': appdata, 'error': str(e)})
+
+@app.route('/api/status')
+def status():
+    return jsonify({
+        'dk': 'dk' in tokens,
+        'fr': 'fr' in tokens,
+        'anthropic': bool(ANTHROPIC_KEY and ANTHROPIC_KEY != 'VOELINJEYHIER'),
+    })
+
+
+# --- Scrape competitor product (server-side, geen CORS) ---
+@app.route('/api/scrape', methods=['POST'])
+def scrape():
+    url = request.json.get('url', '').rstrip('/') + '.json'
+    try:
+        r = req.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        r.raise_for_status()
+        return jsonify(r.json())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# --- Get existing product names to avoid duplicates ---
+@app.route('/api/names', methods=['POST'])
+def get_names():
+    store = request.json.get('store', 'dk')
+    if store not in tokens:
+        return jsonify({'names': []})
+    try:
+        r = req.get(shopify_url(store, 'products.json?fields=title&limit=250'),
+                    headers=shopify_headers(store))
+        names = [p['title'] for p in r.json().get('products', [])]
+        return jsonify({'names': names})
+    except:
+        return jsonify({'names': []})
+
+
+# --- Generate content via Claude ---
+@app.route('/api/generate', methods=['POST'])
+def generate():
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        return jsonify({'error': 'Anthropic API key missing — set ANTHROPIC_API_KEY in environment variables'}), 400
+
+    import anthropic
+    data          = request.json
+    store         = data.get('store', 'dk')
+    product_name  = data.get('product_name', '')
+    product_title = data.get('product_title', '')
+    keywords      = data.get('keywords', [])
+    language      = 'Deens' if store == 'dk' else 'Frans'
+
+    example = """Komfortabel og nem at bære
+
+Liviah er en bluse med krave og V-udskæring med knapper foran. De korte ærmer giver et afslappet udtryk og gør blusen behagelig til daglig brug. Det ensfarvede design giver et roligt look og er nemt at kombinere med forskellige bukser.
+
+• Bomuldsblanding: behageligt materiale til daglig brug
+• Krave med V-udskæring: enkel og pæn detalje
+• Korte ærmer: dejlige til varmere vejr
+• Knapdetalje foran: subtilt accent
+• Normal pasform: sidder komfortabelt og giver god bevægelighed
+
+Liviah er en bluse, som er nem at tage på, og som føles behagelig hele dagen."""
+
+    prompt = f"""Je bent een productschrijver voor een vrouwenmodezaak. Schrijf productcontent in het {language} voor een product genaamd "{product_name}".
+
+Competitor producttitel: {product_title}
+Keywords (verwerk de relevantste): {', '.join(keywords[:12])}
+
+Schrijf exact in de stijl van dit voorbeeld:
+---
+{example}
+---
+
+Regels:
+- Gebruik productnaam ({product_name}) in eerste én laatste zin
+- Eerste regel: korte pakkende zin over comfort/draagbaarheid (geen uitroepteken)
+- Dan alinea met productnaam + kernkenmerken van het product
+- Dan 5 bulletpoints: **eigenschap**: korte uitleg
+- Slotszin over hoe het voelt om te dragen
+- Rustige toon, geen hype, geen superlatieven
+
+Geef ook:
+- meta_description: max 155 tekens, SEO-geoptimaliseerd voor {language}
+- m_title_specs: één beschrijvende zin voor Google Shopping (wordt gebruikt als: {product_name} | m_title_specs)
+
+Antwoord uitsluitend als geldig JSON zonder extra tekst:
+{{"description": "...", "meta_description": "...", "m_title_specs": "..."}}"""
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    msg = client.messages.create(
+        model='claude-sonnet-4-5',
+        max_tokens=1200,
+        messages=[{'role': 'user', 'content': prompt}]
+    )
+    text = msg.content[0].text.strip()
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        return jsonify(json.loads(match.group()))
+    return jsonify({'error': 'Kon respons niet parsen', 'raw': text}), 500
+
+
+# --- Publish to Shopify ---
+@app.route('/api/publish', methods=['POST'])
+def publish():
+    data      = request.json
+    store     = data.get('store', 'dk')
+
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()} store. Please click Authorize first.'}), 401
+
+    product_name     = data.get('product_name', '')
+    meta_description = data.get('meta_description', '')
+    m_title_specs    = data.get('m_title_specs', '')
+    product_type     = data.get('product_type', '')
+    price            = data.get('price', '0.00').replace(',', '.').replace(' DKK','').replace(' EUR','').strip()
+    compare_at_price = data.get('compare_at_price')   # optional, None = no compare price
+    size_option_name = 'Størrelse' if store == 'dk' else 'Taille'
+    colors           = data.get('colors', [])
+    sizes            = data.get('sizes', ['XS', 'S', 'M', 'L', 'XL'])
+    siblings_handle  = data.get('siblings_handle', '')
+    images           = data.get('images', [])
+
+    # Convert plain-text description to body_html
+    def to_html(text):
+        lines  = text.strip().splitlines()
+        html   = []
+        bullets = []
+        def flush_bullets():
+            if bullets:
+                html.append('<ul>' + ''.join(f'<li>{b}</li>' for b in bullets) + '</ul>')
+                bullets.clear()
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                flush_bullets()
+                continue
+            if stripped.startswith('•') or stripped.startswith('-'):
+                bullets.append(stripped.lstrip('•- ').strip())
+            else:
+                flush_bullets()
+                html.append(f'<p>{stripped}</p>')
+        flush_bullets()
+        return '\n'.join(html)
+
+    description = to_html(data.get('description', ''))
+
+    hdrs    = shopify_headers(store)
+    base    = shopify_url(store, '')
+
+    # 1. Maak siblings collectie aan
+    collection_id = None
+    coll_res = req.post(f"{base}custom_collections.json", headers=hdrs, json={
+        'custom_collection': {
+            'title':     product_name + ' Siblings',
+            'handle':    siblings_handle,
+            'published': False,
+        }
+    })
+    if coll_res.status_code in [200, 201]:
+        collection_id = coll_res.json()['custom_collection']['id']
+
+    created = []
+
+    # 2. Maak per kleur een product aan
+    for color in colors:
+        img_payload = [{'src': img} for img in images[:10] if img.startswith('http')]
+
+        product_payload = {
+            'product': {
+                'title':        product_name,
+                'body_html':    description,
+                'product_type': product_type,
+                'status':       'draft',
+                'variants': [
+                    {
+                        'option1': size,
+                        'price': price,
+                        'compare_at_price': compare_at_price,
+                        'inventory_management': None,
+                    }
+                    for size in sizes
+                ],
+                'options': [
+                    {'name': size_option_name, 'values': sizes},
+                ],
+                'images': img_payload,
+            }
+        }
+
+        prod_res = req.post(f"{base}products.json", headers=hdrs, json=product_payload)
+        if prod_res.status_code in [200, 201]:
+            prod_data  = prod_res.json()['product']
+            prod_id    = prod_data['id']
+            created.append(prod_id)
+
+            # --- Metafields via separate POST ---
+            # Types must match Shopify metafield definitions exactly
+            metafields = [
+                {'namespace': 'custom', 'key': 'cutline',            'value': color,            'type': 'single_line_text_field'},
+                {'namespace': 'custom', 'key': 'siblings_collection', 'value': siblings_handle,  'type': 'single_line_text_field'},
+                {'namespace': 'custom', 'key': 'm_title_specs',       'value': m_title_specs,    'type': 'multi_line_text_field'},
+                {'namespace': 'global', 'key': 'description_tag',     'value': meta_description, 'type': 'single_line_text_field'},
+            ]
+            mf_errors = []
+            for mf in metafields:
+                if not mf['value']:
+                    continue
+                mf_res = req.post(
+                    shopify_url(store, f'products/{prod_id}/metafields.json'),
+                    headers=hdrs,
+                    json={'metafield': mf}
+                )
+                if mf_res.status_code not in [200, 201]:
+                    # Retry with single_line if multi_line failed (type mismatch guard)
+                    if mf['type'] == 'multi_line_text_field':
+                        mf2 = {**mf, 'type': 'single_line_text_field'}
+                        mf_res2 = req.post(
+                            shopify_url(store, f'products/{prod_id}/metafields.json'),
+                            headers=hdrs,
+                            json={'metafield': mf2}
+                        )
+                        if mf_res2.status_code not in [200, 201]:
+                            mf_errors.append(f"{mf['key']}: {mf_res2.text[:120]}")
+                    else:
+                        mf_errors.append(f"{mf['key']}: {mf_res.text[:120]}")
+
+            # --- Assign first product image to all variants ---
+            prod_images  = prod_data.get('images', [])
+            prod_variants = prod_data.get('variants', [])
+            if prod_images and prod_variants:
+                first_image_id = prod_images[0]['id']
+                for variant in prod_variants:
+                    req.put(
+                        shopify_url(store, f'variants/{variant["id"]}.json'),
+                        headers=hdrs,
+                        json={'variant': {'id': variant['id'], 'image_id': first_image_id}}
+                    )
+
+            # --- Voeg toe aan siblings collectie ---
+            if collection_id:
+                req.post(f"{base}collects.json", headers=hdrs, json={
+                    'collect': {'product_id': prod_id, 'collection_id': collection_id}
+                })
+
+    return jsonify({
+        'success':          True,
+        'collection_id':    collection_id,
+        'products_created': len(created),
+        'product_ids':      created,
+        'metafield_errors': mf_errors if 'mf_errors' in dir() else [],
+    })
+
+
+# --- Nano Banana prompt templates (from PDF workflow) ---
+NANO_BANANA_PROMPTS = {
+    1: ("I've added a photo of a woman wearing a dress. I only want to use the background "
+        "from this photo. Then, I want you to place the {product_type} on a realistic woman "
+        "model. It should be completely unnoticeable that it's an AI-generated model — "
+        "it must look fully natural and real."),
+    2: ("I've uploaded a photo of a woman wearing a {product_type}. I want you to use only "
+        "the background from this image. After that, please generate a female model where her "
+        "entire face is clearly visible. Make sure to replicate all details of the {product_type} "
+        "accurately. Pay special attention to the design elements that must be visible in the result."),
+    3: ("I've added a photo of a woman wearing a {product_type}. This is our model, and we do "
+        "not want the background, model, or product to be changed. Now, we want to see the back "
+        "view of the same product, on the same model, with the same background. Please generate "
+        "a realistic back-side image while maintaining the current setup exactly as it is."),
+    4: ("I've added a photo of a woman wearing a {product_type}. This is our model, and we don't "
+        "want any changes to the background, model, or the product. Now, we want a close-up image "
+        "of the material. Please make sure the zoomed-in shot still matches the original style "
+        "and lighting, and focuses clearly on the texture and details."),
+    5: ("I've added a photo of a woman wearing a {product_type}. This is our model, and we don't "
+        "want any changes to the background, the model, or the product styling. We now want the "
+        "exact same product, in {color}. Please keep everything identical — lighting, pose, fit, "
+        "and background — and only change the color of the {product_type} to {color} and use "
+        "another pose of the model."),
+}
+
+
+# --- Higgsfield image generation ---
+@app.route('/api/higgsfield', methods=['POST'])
+def higgsfield_generate():
+    data         = request.json
+    # Support both legacy single URL and new multi-image list
+    image_urls   = data.get('image_urls', [])
+    legacy_url   = data.get('image_url')
+    if legacy_url and not image_urls:
+        image_urls = [legacy_url]
+
+    prompt_type  = data.get('prompt_type', 0)   # 1-5 = Nano Banana template, 0 = custom
+    product_type = data.get('product_type', 'fashion product')
+    color        = data.get('color', '')
+    count        = data.get('count', 4)          # default 4 (Unlimited mode)
+
+    # Build prompt from template or use custom
+    if prompt_type and prompt_type in NANO_BANANA_PROMPTS:
+        prompt = NANO_BANANA_PROMPTS[prompt_type].format(
+            product_type=product_type,
+            color=color,
+        )
+    else:
+        prompt = data.get('prompt', 'fashion product photo, realistic woman model, professional lighting')
+
+    import re as _re, concurrent.futures as _cf
+
+    def _extract_urls_from_text(text):
+        """Find all image URLs in a string (plain text or JSON)."""
+        return _re.findall(
+            r'https?://[^\s\'"<>\]]+\.(?:jpg|jpeg|png|webp)(?:\?[^\s\'"<>\]]*)?',
+            text, _re.IGNORECASE
+        )
+
+    def _extract_urls_from_obj(obj, found=None):
+        """Recursively find image URLs in a parsed JSON object."""
+        if found is None:
+            found = []
+        if isinstance(obj, str):
+            if obj.startswith('http') and any(obj.lower().endswith(e) for e in ['.jpg','.jpeg','.png','.webp']):
+                found.append(obj)
+            elif obj.startswith('http') and any(k in obj for k in ('cdn','storage','higgsfield','output')):
+                found.append(obj)
+        elif isinstance(obj, list):
+            for item in obj:
+                _extract_urls_from_obj(item, found)
+        elif isinstance(obj, dict):
+            # Only look in clearly output-specific keys (avoids picking up input_images / images)
+            for key in ('output_url', 'download_url', 'signed_url', 'result_url'):
+                if key in obj and isinstance(obj[key], str) and obj[key].startswith('http'):
+                    found.append(obj[key])
+            for key in ('output_images', 'output_urls', 'outputs', 'results'):
+                if key in obj:
+                    _extract_urls_from_obj(obj[key], found)
+            # Also check 'url'/'src' only if NOT inside an input-related parent
+            for key in ('url', 'src', 'uri', 'image_url'):
+                if key in obj and isinstance(obj[key], str) and obj[key].startswith('http'):
+                    found.append(obj[key])
+            # Recurse into jobs/items but skip known input keys
+            for key in ('jobs', 'items'):
+                if key in obj:
+                    _extract_urls_from_obj(obj[key], found)
+        return found
+
+    def _urls_from_stdout(text):
+        """Extract image URLs from hf.exe stdout — JSON first (structured), regex as fallback."""
+        # Try JSON parsing from last line backwards (avoids picking up log/progress URLs)
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+                urls = _extract_urls_from_obj(parsed)
+                if urls:
+                    return urls
+            except Exception:
+                continue
+        # Fallback: regex (may catch log messages, but better than nothing)
+        return _extract_urls_from_text(text)
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                return _extract_urls_from_obj(json.loads(line))
+            except Exception:
+                continue
+        return []
+
+    tmp_dir = None
+    try:
+        tmp_dir = tempfile.mkdtemp()
+
+        # Download reference images as local files (hf.exe auto-uploads them)
+        local_paths = []
+        for i, url in enumerate(image_urls[:4]):
+            img_path = os.path.join(tmp_dir, f'ref_{i}.jpg')
+            try:
+                r = req.get(url, timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
+                r.raise_for_status()
+                with open(img_path, 'wb') as f:
+                    f.write(r.content)
+                local_paths.append(img_path)
+            except Exception:
+                pass
+
+        if not IS_WINDOWS:
+            return jsonify({'error': 'Higgsfield image generation requires Windows with the Higgsfield CLI installed. '
+                                     'This feature is not available on the cloud version — run the dashboard locally to generate images.'}), 501
+        if not os.path.isfile(HIGGSFIELD_EXE):
+            return jsonify({'error': f'hf.exe not found at: {HIGGSFIELD_EXE}. Please install the Higgsfield CLI.'}), 500
+
+        safe_prompt = prompt.replace('"', "'")
+        base_cmd = (f'"{HIGGSFIELD_EXE}" generate create nano_banana_2'
+                    f' --prompt "{safe_prompt}" --aspect_ratio 3:4 --wait --json')
+        for path in local_paths:
+            base_cmd += f' --image "{path}"'
+
+        # Each job produces exactly 1 output image → run `count` jobs to get `count` results
+        num_jobs = count
+
+        def _run(_):
+            r = subprocess.run(base_cmd, capture_output=True, text=True, timeout=300, shell=True)
+            return r.stdout.strip(), r.stderr.strip()
+
+        all_urls, errors = [], []
+        with _cf.ThreadPoolExecutor(max_workers=num_jobs) as pool:
+            for stdout_i, stderr_i in pool.map(_run, range(num_jobs)):
+                if stdout_i:
+                    urls_i = _urls_from_stdout(stdout_i)
+                    # Higgsfield output-CDN: d8j0ntlcm91z4.cloudfront.net met hf_ prefix
+                    # Input-CDN: d2ol7oe51mr4n9.cloudfront.net (altijd weggooien)
+                    OUTPUT_CDN = 'd8j0ntlcm91z4.cloudfront.net'
+                    filtered = [u for u in urls_i if OUTPUT_CDN in u]
+                    print(f'[hf] URLs found: {urls_i}')
+                    print(f'[hf] After CDN filter (output only): {filtered}')
+                    if filtered:
+                        all_urls.extend(filtered)
+                    else:
+                        errors.append(f'No output URL in job: {urls_i}')
+                else:
+                    errors.append(stderr_i[:200] or 'Empty output')
+
+        if not all_urls:
+            return jsonify({'error': '; '.join(errors[:2]) or 'No images received from Higgsfield',
+                            'cmd': base_cmd}), 500
+
+        # Filter by original URL set (exact + without query params)
+        def _base_url(u):
+            return u.split('?')[0].split('#')[0].rstrip('/')
+        input_bases = {_base_url(u) for u in image_urls}
+        all_urls = [u for u in all_urls if _base_url(u) not in input_bases]
+        print(f'[hf] na URL-filter: {all_urls}')
+
+        # Deduplicate, then cap at requested count
+        seen = set()
+        all_urls = [u for u in all_urls if not (u in seen or seen.add(u))]
+        all_urls = all_urls[:count]
+        return jsonify({'urls': all_urls, 'prompt_used': prompt})
+
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Higgsfield timeout — please try again'}), 504
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    print(f"\nVionna Dashboard running on http://localhost:{port}\n")
+    app.run(debug=False, host='0.0.0.0', port=port)

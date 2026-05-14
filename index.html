@@ -1,0 +1,1894 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vionna · Product Dashboard</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #f5f4f2;
+      color: #1a1a1a;
+      min-height: 100vh;
+    }
+
+    /* HEADER */
+    header {
+      background: #fff;
+      border-bottom: 1px solid #e8e6e3;
+      padding: 0 32px;
+      height: 60px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    .logo {
+      font-size: 17px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: #1a1a1a;
+    }
+    .logo span { color: #9b8b7a; }
+
+    .store-toggle {
+      display: flex;
+      background: #f5f4f2;
+      border-radius: 8px;
+      padding: 3px;
+      gap: 2px;
+    }
+    .store-btn {
+      padding: 6px 18px;
+      border: none;
+      background: transparent;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      color: #888;
+      transition: all 0.15s;
+    }
+    .store-btn.active {
+      background: #fff;
+      color: #1a1a1a;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+    }
+
+    /* MAIN */
+    main {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 32px 24px 80px;
+    }
+
+    /* STEPS */
+    .steps {
+      display: flex;
+      gap: 0;
+      margin-bottom: 28px;
+      background: #fff;
+      border-radius: 10px;
+      padding: 4px;
+      border: 1px solid #e8e6e3;
+    }
+    .step {
+      flex: 1;
+      text-align: center;
+      padding: 10px 8px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      color: #aaa;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      transition: all 0.2s;
+    }
+    .step.active {
+      background: #1a1a1a;
+      color: #fff;
+    }
+    .step.done {
+      color: #9b8b7a;
+    }
+    .step-num {
+      display: inline-block;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: currentColor;
+      color: #fff;
+      font-size: 10px;
+      line-height: 18px;
+      margin-right: 6px;
+      opacity: 0.4;
+    }
+    .step.active .step-num { opacity: 1; background: #fff; color: #1a1a1a; }
+    .step.done .step-num { opacity: 1; background: #9b8b7a; color: #fff; }
+
+    /* CARDS */
+    .card {
+      background: #fff;
+      border: 1px solid #e8e6e3;
+      border-radius: 12px;
+      padding: 28px;
+      margin-bottom: 16px;
+    }
+    .card-title {
+      font-size: 13px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #888;
+      margin-bottom: 20px;
+    }
+
+    /* INPUT FIELDS */
+    label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      color: #666;
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    input[type="text"], textarea, select {
+      width: 100%;
+      border: 1.5px solid #e8e6e3;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 14px;
+      color: #1a1a1a;
+      background: #fafaf9;
+      transition: border-color 0.15s;
+      outline: none;
+      font-family: inherit;
+    }
+    input[type="text"]:focus, textarea:focus {
+      border-color: #9b8b7a;
+      background: #fff;
+    }
+    textarea { resize: vertical; line-height: 1.6; }
+    .field-group { margin-bottom: 18px; }
+
+    .char-count {
+      text-align: right;
+      font-size: 11px;
+      color: #aaa;
+      margin-top: 4px;
+    }
+    .char-count.warn { color: #e07b4f; }
+
+    /* BUTTONS */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 11px 22px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      transition: all 0.15s;
+    }
+    .btn-primary {
+      background: #1a1a1a;
+      color: #fff;
+    }
+    .btn-primary:hover { background: #333; }
+    .btn-secondary {
+      background: #f5f4f2;
+      color: #1a1a1a;
+      border: 1.5px solid #e8e6e3;
+    }
+    .btn-secondary:hover { background: #ece9e5; }
+    .btn-publish {
+      background: #2d7a4f;
+      color: #fff;
+      padding: 13px 32px;
+      font-size: 15px;
+    }
+    .btn-publish:hover { background: #236040; }
+    .btn-publish:disabled {
+      background: #aaa;
+      cursor: not-allowed;
+    }
+    .btn-sm {
+      padding: 6px 12px;
+      font-size: 12px;
+      border-radius: 6px;
+    }
+    .btn-ghost {
+      background: transparent;
+      color: #9b8b7a;
+      border: 1.5px solid #e8e6e3;
+    }
+    .btn-ghost:hover { background: #f5f4f2; }
+
+    /* TWO COLUMN */
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    /* WIDESCREEN REVIEW LAYOUT */
+    .review-layout {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
+    @media (min-width: 1280px) {
+      main {
+        max-width: 1700px;
+        padding: 32px 48px 80px;
+      }
+      .review-layout {
+        display: grid;
+        grid-template-columns: 400px 1fr;
+        grid-template-rows: auto auto;
+        gap: 24px;
+        align-items: start;
+      }
+      .review-sidebar {
+        grid-column: 1;
+        grid-row: 1;
+        position: sticky;
+        top: 20px;
+        max-height: calc(100vh - 40px);
+        overflow-y: auto;
+        scrollbar-width: thin;
+      }
+      .review-main {
+        grid-column: 2;
+        grid-row: 1 / 3;
+      }
+      .review-variants {
+        grid-column: 1;
+        grid-row: 2;
+      }
+      /* In sidebar, stack product info + content vertically */
+      .review-sidebar .two-col {
+        grid-template-columns: 1fr;
+      }
+      /* More image columns on wide screens */
+      .image-grid {
+        grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+      }
+      .nb-results {
+        grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      }
+    }
+
+    /* TAGS / CHIPS */
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 6px;
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: #f5f4f2;
+      border: 1px solid #e8e6e3;
+      border-radius: 20px;
+      padding: 4px 10px;
+      font-size: 12px;
+      font-weight: 500;
+      color: #444;
+    }
+    .chip.color-chip {
+      padding-left: 8px;
+    }
+    .color-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      border: 1px solid rgba(0,0,0,0.1);
+      flex-shrink: 0;
+    }
+    .chip-remove {
+      cursor: pointer;
+      color: #bbb;
+      font-size: 14px;
+      line-height: 1;
+      margin-left: 2px;
+    }
+    .chip-remove:hover { color: #666; }
+
+    /* PRODUCT NAME WITH REFRESH */
+    .name-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .name-row input { flex: 1; }
+    .refresh-btn {
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      border: 1.5px solid #e8e6e3;
+      background: #f5f4f2;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #9b8b7a;
+      font-size: 16px;
+      flex-shrink: 0;
+      transition: all 0.15s;
+    }
+    .refresh-btn:hover { background: #ece9e5; border-color: #9b8b7a; }
+
+    /* IMAGE GRID */
+    .image-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      margin-top: 8px;
+    }
+    .image-tile {
+      aspect-ratio: 3/4;
+      border-radius: 8px;
+      border: 1.5px solid #e8e6e3;
+      overflow: hidden;
+      position: relative;
+      background: #f5f4f2;
+      cursor: pointer;
+      transition: border-color 0.15s;
+    }
+    .image-tile:hover { border-color: #9b8b7a; }
+    .image-tile.selected { border-color: #1a1a1a; border-width: 2px; }
+    .image-tile img { width: 100%; height: 100%; object-fit: cover; }
+    .image-tile .img-label {
+      position: absolute;
+      bottom: 6px;
+      left: 6px;
+      background: rgba(0,0,0,0.6);
+      color: #fff;
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-weight: 600;
+    }
+    .image-tile .select-check {
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: #1a1a1a;
+      color: #fff;
+      font-size: 11px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0;
+      transition: opacity 0.15s;
+    }
+    .image-tile.selected .select-check { opacity: 1; }
+
+    .image-placeholder {
+      aspect-ratio: 3/4;
+      border-radius: 8px;
+      border: 1.5px dashed #d0ccc7;
+      background: #fafaf9;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      color: #bbb;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .image-placeholder:hover { border-color: #9b8b7a; color: #9b8b7a; background: #f7f4f1; }
+    .image-placeholder .icon { font-size: 24px; }
+
+    /* SECTION DIVIDER */
+    .section-label {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #bbb;
+      margin: 20px 0 12px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .section-label::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: #e8e6e3;
+    }
+
+    /* STATUS BADGE */
+    .badge {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .badge-draft { background: #f0ece8; color: #9b8b7a; }
+    .badge-ready { background: #e8f4ed; color: #2d7a4f; }
+
+    /* LOADING */
+    .loading-overlay {
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 48px;
+      gap: 16px;
+    }
+    .loading-overlay.show { display: flex; }
+    .spinner {
+      width: 36px;
+      height: 36px;
+      border: 3px solid #e8e6e3;
+      border-top-color: #1a1a1a;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .loading-text { font-size: 14px; color: #666; font-weight: 500; }
+    .loading-steps { font-size: 12px; color: #aaa; text-align: center; line-height: 1.8; }
+
+    /* COMPETITOR PREVIEW */
+    .competitor-preview {
+      display: none;
+      align-items: center;
+      gap: 14px;
+      padding: 12px;
+      background: #f5f4f2;
+      border-radius: 8px;
+      margin-bottom: 18px;
+    }
+    .competitor-preview.show { display: flex; }
+    .comp-img {
+      width: 48px;
+      height: 60px;
+      border-radius: 6px;
+      object-fit: cover;
+      background: #ddd;
+      flex-shrink: 0;
+    }
+    .comp-info { flex: 1; }
+    .comp-name { font-size: 13px; font-weight: 600; }
+    .comp-meta { font-size: 11px; color: #888; margin-top: 2px; }
+
+    /* BOTTOM BAR */
+    .bottom-bar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: #fff;
+      border-top: 1px solid #e8e6e3;
+      padding: 16px 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      z-index: 100;
+    }
+    .bottom-bar-status { font-size: 13px; color: #888; }
+    .bottom-bar-status strong { color: #1a1a1a; }
+
+    /* HIDDEN SECTIONS */
+    .section-hidden { display: none !important; }
+
+    /* ALERT */
+    .alert {
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 16px;
+      display: none;
+    }
+    .alert.show { display: block; }
+    .alert-success { background: #e8f4ed; color: #2d7a4f; border: 1px solid #b8ddc8; }
+    .alert-info { background: #eef3ff; color: #3b5fc0; border: 1px solid #c0ceee; }
+
+    /* SIBLINGS FLOW */
+    .variant-cards {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .variant-card {
+      border: 1.5px solid #e8e6e3;
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 12px;
+    }
+    .variant-card-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 8px;
+      font-weight: 600;
+    }
+    .variant-card input {
+      padding: 6px 8px;
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+    .variant-status {
+      font-size: 10px;
+      color: #aaa;
+      margin-top: 4px;
+    }
+
+    /* KEYWORDS DISPLAY */
+    .keyword-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-top: 8px;
+    }
+    .keyword-chip {
+      background: #eef3ff;
+      color: #3b5fc0;
+      border: 1px solid #c0ceee;
+      border-radius: 4px;
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 500;
+    }
+
+    /* SCROLLABLE DESCRIPTIONS */
+    .desc-textarea { min-height: 140px; }
+    .meta-textarea { min-height: 80px; }
+
+    /* NANO BANANA WORKFLOW */
+    .nb-setup {
+      background: #fffbf5;
+      border: 1px solid #f0e8dc;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .nb-workflow-step {
+      border: 1.5px solid #e8e6e3;
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 12px;
+      background: #fafaf9;
+    }
+    .nb-workflow-step.nb-active {
+      border-color: #9b8b7a;
+      background: #fff;
+    }
+    .nb-step-title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+      font-weight: 600;
+      font-size: 13px;
+    }
+    .nb-badge {
+      background: #1a1a1a;
+      color: #fff;
+      border-radius: 4px;
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      flex-shrink: 0;
+    }
+    .nb-badge-done {
+      background: #2d7a4f;
+    }
+    .nb-hint {
+      font-size: 11px;
+      color: #aaa;
+      font-weight: 400;
+    }
+    .nb-results {
+      margin-top: 12px;
+    }
+    .nb-results .image-tile {
+      aspect-ratio: unset;
+    }
+    .nb-results .image-tile img {
+      height: auto;
+      object-fit: contain;
+    }
+    .nb-slot-loading {
+      aspect-ratio: 3/4;
+      background: #f5f5f3;
+      border-radius: 8px;
+      border: 1.5px dashed #ddd;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      color: #aaa;
+      font-size: 12px;
+    }
+    .nb-slot-error {
+      aspect-ratio: 3/4;
+      background: #fff5f5;
+      border-radius: 8px;
+      border: 1.5px dashed #e0b0b0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      color: #c0392b;
+      font-size: 11px;
+      padding: 12px;
+      text-align: center;
+    }
+
+    /* Lightbox */
+    #lightbox {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.85);
+      z-index: 9999;
+      align-items: center;
+      justify-content: center;
+      cursor: zoom-out;
+    }
+    #lightbox.open { display: flex; }
+    #lightbox img {
+      max-width: 92vw;
+      max-height: 92vh;
+      object-fit: contain;
+      border-radius: 4px;
+      box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+    }
+    #lightbox-close {
+      position: fixed;
+      top: 16px;
+      right: 20px;
+      color: #fff;
+      font-size: 28px;
+      cursor: pointer;
+      line-height: 1;
+      opacity: 0.8;
+    }
+    #lightbox-close:hover { opacity: 1; }
+    .zoom-btn {
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      background: rgba(0,0,0,0.45);
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      width: 26px;
+      height: 26px;
+      font-size: 14px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0;
+      transition: opacity 0.15s;
+      z-index: 2;
+    }
+    .image-tile:hover .zoom-btn { opacity: 1; }
+    .nb-selected-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px;
+      background: #e8f4ed;
+      border: 1px solid #b8ddc8;
+      border-radius: 6px;
+      margin-top: 8px;
+      font-size: 12px;
+      color: #2d7a4f;
+    }
+    .nb-selected-row img {
+      width: 36px;
+      height: 36px;
+      object-fit: cover;
+      border-radius: 4px;
+    }
+    .nb-color-section {
+      border: 1.5px dashed #e8e6e3;
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 8px;
+    }
+    .nb-color-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header>
+  <div class="logo">Vionna <span>·</span> Product Dashboard</div>
+  <div class="store-toggle">
+    <button class="store-btn active" onclick="setStore('dk', this)">🇩🇰 DK</button>
+    <button class="store-btn" onclick="setStore('fr', this)">🇫🇷 FR</button>
+  </div>
+</header>
+
+<!-- AUTH BAR -->
+<div style="background:#fffbf5;border-bottom:1px solid #f0e8dc;padding:6px 32px;font-size:12px;font-weight:500" id="authBar">
+  Loading connection status…
+</div>
+
+<!-- MAIN -->
+<main>
+
+  <!-- STEPS -->
+  <div class="steps">
+    <div class="step active" id="step1"><span class="step-num">1</span>Input</div>
+    <div class="step" id="step2"><span class="step-num">2</span>Generate</div>
+    <div class="step" id="step3"><span class="step-num">3</span>Review</div>
+    <div class="step" id="step4"><span class="step-num">4</span>Publish</div>
+  </div>
+
+  <!-- ALERT -->
+  <div class="alert alert-success" id="alertSuccess">
+    ✓ Product successfully created in Shopify — set to <strong>draft</strong> until final review.
+  </div>
+
+  <!-- STEP 1: INPUT CARD -->
+  <div id="inputSection">
+    <div class="card">
+      <div class="card-title">Competitor product</div>
+      <div class="field-group">
+        <label>Competitor URL</label>
+        <input type="text" id="competitorUrl" placeholder="https://noirlndn.com/products/..." value="https://noirlndn.com/products/womens-linen-summer-dress">
+      </div>
+      <div class="field-group">
+        <label>Keywords <span style="font-weight:400;text-transform:none;color:#aaa">(one per line, from Ubersuggest/Trends sheet)</span></label>
+        <textarea id="keywordsInput" rows="6" placeholder="zomerjurk&#10;linnen jurk&#10;casual zomerjurk&#10;strandjurk dames&#10;..."
+>linnen kjole
+sommerkjole
+casual kjole
+strandkjole kvinder
+hvid linnen kjole
+kjole med lommer
+løs sommerkjole
+boheme kjole
+maxi kjole sommer
+luftig kjole</textarea>
+      </div>
+      <button class="btn btn-primary" onclick="startGenerate()">
+        Import &amp; Generate →
+      </button>
+    </div>
+  </div>
+
+  <!-- LOADING -->
+  <div class="loading-overlay" id="loadingSection">
+    <div class="spinner"></div>
+    <div class="loading-text" id="loadingText">Fetching competitor product…</div>
+    <div class="loading-steps" id="loadingSteps"></div>
+  </div>
+
+  <!-- STEP 2: REVIEW SECTION -->
+  <div id="reviewSection" class="section-hidden">
+
+    <!-- Competitor preview -->
+    <div class="competitor-preview show" id="competitorPreview">
+      <div style="width:48px;height:60px;border-radius:6px;background:linear-gradient(135deg,#e8e4df,#d5cfc8);flex-shrink:0;"></div>
+      <div class="comp-info">
+        <div class="comp-name" id="compName">Women's Linen Summer Dress — Noir London</div>
+        <div class="comp-meta" id="compMeta">noirlndn.com · 3 colors · sizes XS–XL · €89.95</div>
+      </div>
+      <span class="badge badge-draft">Imported</span>
+    </div>
+
+    <div class="review-layout">
+    <div class="review-sidebar">
+
+    <!-- PRODUCT INFO + CONTENT -->
+    <div class="two-col">
+
+      <!-- LEFT: Product info -->
+      <div>
+        <div class="card" style="height:100%">
+          <div class="card-title">Product info</div>
+
+          <div class="field-group">
+            <label>Product name <span style="font-weight:400;text-transform:none;color:#aaa">(female name, unique)</span></label>
+            <div class="name-row">
+              <input type="text" id="productName" value="Solène" oninput="updateTitlePreview(); buildVariantCards()">
+              <button class="refresh-btn" onclick="refreshName()" title="Generate new name">↻</button>
+            </div>
+          </div>
+
+          <div class="field-group">
+            <label>Colors (from competitor)</label>
+            <div class="chips" id="colorChips">
+              <div class="chip color-chip"><div class="color-dot" style="background:#f5f0e8"></div> Beige <span class="chip-remove" onclick="removeChip(this)">×</span></div>
+              <div class="chip color-chip"><div class="color-dot" style="background:#2d2d2d"></div> Sort <span class="chip-remove" onclick="removeChip(this)">×</span></div>
+              <div class="chip color-chip"><div class="color-dot" style="background:#f8f8f8;border-color:#ddd"></div> Hvid <span class="chip-remove" onclick="removeChip(this)">×</span></div>
+            </div>
+          </div>
+
+          <div class="field-group">
+            <label>Sizes</label>
+            <div class="chips">
+              <div class="chip">XS</div>
+              <div class="chip">S</div>
+              <div class="chip">M</div>
+              <div class="chip">L</div>
+              <div class="chip">XL</div>
+            </div>
+          </div>
+
+          <div class="field-group">
+            <label>Price</label>
+            <div style="display:flex;gap:8px;align-items:center">
+              <input type="text" id="productPrice" value="349,00 DKK" style="flex:1" oninput="updateComparePrice()">
+              <select id="discountSelect" style="height:38px;border:1px solid #ddd;border-radius:6px;padding:0 8px;font-size:13px;background:#fff;cursor:pointer" onchange="updateComparePrice()">
+                <option value="0">No discount</option>
+                <option value="25" selected>~25% discount</option>
+                <option value="50">~50% discount</option>
+              </select>
+            </div>
+            <div id="comparePriceHint" style="font-size:11px;color:#9b8b7a;margin-top:4px"></div>
+          </div>
+
+          <div class="section-label">Metafields</div>
+
+          <div class="field-group">
+            <label>Cutline <span style="font-weight:400;text-transform:none;color:#aaa">(auto from colors)</span></label>
+            <input type="text" id="cutline" value="Beige, Sort, Hvid">
+          </div>
+
+          <div class="field-group">
+            <label>Siblings collection handle</label>
+            <input type="text" id="siblingsHandle" placeholder="e.g. solene-collection">
+          </div>
+
+          <div class="section-label">Found keywords</div>
+          <div class="keyword-chips" id="keywordChips"></div>
+        </div>
+      </div>
+
+      <!-- RIGHT: Content -->
+      <div>
+        <div class="card" style="height:100%">
+          <div class="card-title">Generated content <span id="storeLangBadge" style="font-size:11px;font-weight:400;color:#9b8b7a;margin-left:4px">🇩🇰 Danish</span></div>
+
+          <div class="field-group">
+            <label>Description</label>
+            <textarea class="desc-textarea" id="productDesc">Komfortabel og let at bære
+
+Solène er en afslappet linnen sommerkjole med et rummeligt snit og brede stropper. Det naturlige linnen-materiale holder dig kølig på varme dage og giver et luftigt, ubesværet look. Det enkle design gør kjolen nem at kombinere med sandaler eller sneakers til hverdagen.
+
+• Linnen-blanding: åndbart og let materiale til varme dage
+• Løst snit: sidder afslappet og giver god bevægelighed
+• Brede stropper: komfortabel pasform hele dagen
+• Lommer i siden: praktisk detalje
+• Enkel søm: roligt look der er nemt at style
+
+Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen til aften.</textarea>
+          </div>
+
+          <div class="field-group">
+            <label>Meta description</label>
+            <textarea class="meta-textarea" id="metaDesc" oninput="updateCharCount(this, 'metaCount')">Køb Solène linnen sommerkjole i beige, sort og hvid. Luftig og komfortabel kjole til varme dage — nem at kombinere og behagelig at bære.</textarea>
+            <div class="char-count" id="metaCount">138 / 160</div>
+          </div>
+
+          <div class="field-group">
+            <label>M title specs <span style="font-weight:400;text-transform:none;color:#aaa">— used as: Solène | M title specs</span></label>
+            <input type="text" id="mTitleSpecs" value="Luftig linnen sommerkjole med lommer og løst snit" oninput="updateTitlePreview()">
+            <div style="font-size:11px;color:#aaa;margin-top:5px">Example in Google: <span id="titlePreview" style="color:#3b5fc0">Solène | Luftig linnen sommerkjole med lommer og løst snit</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    </div><!-- /review-sidebar -->
+    <div class="review-main">
+
+    <!-- IMAGES -->
+    <div class="card">
+      <div class="card-title">Images</div>
+
+      <div class="section-label">From competitor</div>
+      <div class="image-grid" id="competitorImageGrid">
+        <div style="grid-column:1/-1;padding:16px;text-align:center;color:#aaa;font-size:13px" id="imageLoadMsg">Fetching images…</div>
+      </div>
+
+      <div class="section-label">✦ Nano Banana — Model photo workflow</div>
+
+      <!-- Setup: bg reference + product type -->
+      <div class="nb-setup">
+        <div style="display:grid;grid-template-columns:1fr auto;gap:12px;align-items:end">
+          <div class="field-group" style="margin-bottom:0">
+            <label>Background reference URL <span style="font-weight:400;text-transform:none;color:#aaa">— competitor photo with a nice background</span></label>
+            <input type="text" id="bgReferenceUrl" value="https://rosamae.co.uk/cdn/shop/files/rosa-mae-linda-cutout-midi-dress-midi-dresses-cream-9667397.jpg?v=1762948519&width=1000" placeholder="https://rosamae.co.uk/cdn/shop/files/...jpg">
+          </div>
+          <div class="field-group" style="margin-bottom:0;width:160px">
+            <label>Product type</label>
+            <input type="text" id="productType" value="dress" placeholder="dress, jacket...">
+          </div>
+        </div>
+        <div style="font-size:11px;color:#aaa;margin-top:8px">💡 Tip: right-click competitor photo → Inspect → scroll up → hover over link → copy "Current source"</div>
+      </div>
+
+      <!-- STEP 1: First model shot -->
+      <div class="nb-workflow-step nb-active" id="nbStep1">
+        <div class="nb-step-title">
+          <span class="nb-badge" id="nbBadge1">Step 1</span>
+          First model shot
+          <span class="nb-hint">Product on model with reference background (4 variants)</span>
+        </div>
+        <button class="btn btn-secondary btn-sm" onclick="runNanoBanana(1)" id="nbBtn1">✦ Generate 4 variants</button>
+        <div style="font-size:11px;color:#aaa;margin-top:6px">Uses: first selected competitor image + background reference</div>
+        <div class="image-grid nb-results" id="nbGrid1" style="display:none;margin-top:12px"></div>
+        <div id="nbSelected1" style="display:none" class="nb-selected-row">
+          <img id="nbSelectedImg1" src=""> <span>✓ Selected for step 2</span>
+          <button class="btn btn-ghost btn-sm" style="margin-left:auto" onclick="clearNbSelection(1)">Change</button>
+        </div>
+      </div>
+
+      <!-- STEP 2: Detailed model shot -->
+      <div class="nb-workflow-step" id="nbStep2" style="opacity:0.4">
+        <div class="nb-step-title">
+          <span class="nb-badge" id="nbBadge2">Step 2</span>
+          Detailed model shot
+          <span class="nb-hint">Full face + product details visible</span>
+        </div>
+        <button class="btn btn-secondary btn-sm" onclick="runNanoBanana(2)" id="nbBtn2" disabled>✦ Generate 4 variants</button>
+        <div style="font-size:11px;color:#aaa;margin-top:6px">Uses: step 1 selection + product image</div>
+        <div class="image-grid nb-results" id="nbGrid2" style="display:none;margin-top:12px"></div>
+        <div id="nbSelected2" style="display:none" class="nb-selected-row">
+          <img id="nbSelectedImg2" src=""> <span>✓ Selected for step 3</span>
+          <button class="btn btn-ghost btn-sm" style="margin-left:auto" onclick="clearNbSelection(2)">Change</button>
+        </div>
+      </div>
+
+      <!-- STEP 3: Back view -->
+      <div class="nb-workflow-step" id="nbStep3" style="opacity:0.4">
+        <div class="nb-step-title">
+          <span class="nb-badge" id="nbBadge3">Step 3</span>
+          Back view
+          <span class="nb-hint">Same model, same background, back view</span>
+        </div>
+        <button class="btn btn-secondary btn-sm" onclick="runNanoBanana(3)" id="nbBtn3" disabled>✦ Generate 4 variants</button>
+        <div class="image-grid nb-results" id="nbGrid3" style="display:none;margin-top:12px"></div>
+        <div id="nbSelected3" style="display:none" class="nb-selected-row">
+          <img id="nbSelectedImg3" src=""> <span>✓ Selected for step 4</span>
+          <button class="btn btn-ghost btn-sm" style="margin-left:auto" onclick="clearNbSelection(3)">Change</button>
+        </div>
+      </div>
+
+      <!-- STEP 4: Close-up material -->
+      <div class="nb-workflow-step" id="nbStep4" style="opacity:0.4">
+        <div class="nb-step-title">
+          <span class="nb-badge" id="nbBadge4">Step 4</span>
+          Close-up material
+          <span class="nb-hint">Texture and detail shot of the material</span>
+        </div>
+        <button class="btn btn-secondary btn-sm" onclick="runNanoBanana(4)" id="nbBtn4" disabled>✦ Generate 4 variants</button>
+        <div class="image-grid nb-results" id="nbGrid4" style="display:none;margin-top:12px"></div>
+      </div>
+
+      <!-- STEP 5: Color variants -->
+      <div class="nb-workflow-step" id="nbStep5" style="opacity:0.4">
+        <div class="nb-step-title">
+          <span class="nb-badge" id="nbBadge5">Step 5</span>
+          Color variants
+          <span class="nb-hint">Per color: same model + background, different color</span>
+        </div>
+        <div id="nbColorSections">
+          <div style="font-size:12px;color:#aaa;padding:8px">Color variants will appear here after selecting colors in the product info.</div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- PHOTOS FOR PUBLICATION -->
+    <div class="card" id="publishPoolCard">
+      <div class="card-title">Photos for publication</div>
+      <div style="font-size:12px;color:#666;margin-bottom:12px">Generated photos appear here. Click to check/uncheck. Selected photos (✓) will be sent to Shopify.</div>
+      <div class="image-grid" id="publishImagePool" style="min-height:60px">
+        <div style="grid-column:1/-1;padding:16px;text-align:center;color:#aaa;font-size:13px" id="publishPoolMsg">No photos yet — generate via the Nano Banana workflow above.</div>
+      </div>
+    </div>
+
+    </div><!-- /review-main -->
+
+    <!-- COLOR VARIANTS / SIBLINGS — in sidebar on widescreen via CSS order -->
+    <div class="review-variants">
+    <div class="card">
+      <div class="card-title">Color variants &amp; Siblings collection</div>
+      <p style="font-size:13px;color:#666;margin-bottom:16px">On publish, a <strong>Shopify collection is automatically created</strong> and per color a <strong>duplicate product</strong> with the correct metafields — so they appear as swatches in the Pipeline theme.</p>
+
+      <div style="display:flex;gap:10px;align-items:flex-end;margin-bottom:18px">
+        <div class="field-group" style="flex:1;margin-bottom:0">
+          <label>Collection handle <span style="font-weight:400;text-transform:none;color:#aaa">(will be created in Shopify)</span></label>
+          <input type="text" id="siblingsHandle2" placeholder="solene-siblings" oninput="syncHandleAndRebuild(this)">
+          <div style="font-size:11px;color:#aaa;margin-top:4px" id="siblingsHandleHint"></div>
+        </div>
+        <button class="btn btn-secondary btn-sm" style="margin-bottom:0;height:38px" onclick="autoHandle()">Auto ↻</button>
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;padding:10px 14px;background:#eef3ff;border:1px solid #c0ceee;border-radius:8px;font-size:12px;color:#3b5fc0;margin-bottom:16px">
+        <span style="font-size:16px">ℹ</span>
+        <span>Each color variant gets its own product page in Shopify. <strong>Cutline</strong> = the color of that duplicate. <strong>Siblings handle</strong> = the collection that groups them as swatches.</span>
+      </div>
+
+      <div class="variant-cards" id="variantCards">
+        <!-- filled by JS -->
+      </div>
+    </div>
+    </div><!-- /review-variants -->
+
+    </div><!-- /review-layout -->
+
+  </div><!-- /reviewSection -->
+
+</main>
+
+<!-- BOTTOM BAR -->
+<div class="bottom-bar" id="bottomBar" style="display:none">
+  <div class="bottom-bar-status" id="bottomStatus">
+    <strong id="bottomStoreName">Vionna DK</strong> · Ready for review
+  </div>
+  <div style="display:flex;gap:10px;align-items:center">
+    <button class="btn btn-secondary" onclick="resetDashboard()">← New product</button>
+    <button class="btn btn-publish" id="publishBtn" onclick="publishProduct()">
+      Publish to Shopify →
+    </button>
+  </div>
+</div>
+
+<!-- LIGHTBOX -->
+<div id="lightbox" onclick="closeLightbox()">
+  <span id="lightbox-close" onclick="closeLightbox()">✕</span>
+  <img id="lightbox-img" src="" alt="">
+</div>
+
+<script>
+  // --- Lightbox ---
+  function openLightbox(src) {
+    document.getElementById('lightbox-img').src = src;
+    document.getElementById('lightbox').classList.add('open');
+    document.addEventListener('keydown', _lbKey);
+  }
+  function closeLightbox() {
+    document.getElementById('lightbox').classList.remove('open');
+    document.getElementById('lightbox-img').src = '';
+    document.removeEventListener('keydown', _lbKey);
+  }
+  function _lbKey(e) { if (e.key === 'Escape') closeLightbox(); }
+
+  let currentStore = 'dk';
+
+  // Color translations: English → Danish / French
+  const COLOR_TRANSLATIONS = {
+    dk: {
+      'black':'Sort','white':'Hvid','cream':'Creme','ivory':'Elfenben',
+      'beige':'Beige','red':'Rød','blue':'Blå','navy':'Navy','light blue':'Lyseblå',
+      'green':'Grøn','olive':'Oliven','sage':'Salvie','forest green':'Skovgrøn',
+      'pink':'Pink','hot pink':'Hot Pink','blush':'Blush','rose':'Rosa',
+      'purple':'Lilla','lilac':'Lilla','mauve':'Mauve','violet':'Violet',
+      'brown':'Brun','camel':'Kamel','tan':'Tan','chocolate':'Chokolade',
+      'grey':'Grå','gray':'Grå','light grey':'Lysegrå','charcoal':'Koks',
+      'orange':'Orange','rust':'Rust','terracotta':'Terracotta',
+      'yellow':'Gul','mustard':'Sennep','gold':'Guld','silver':'Sølv',
+      'nude':'Nude','sand':'Sand','stone':'Sten','champagne':'Champagne',
+      'mint':'Mint','teal':'Teal','burgundy':'Bordeaux','wine':'Vinrød',
+      'leopard':'Leopard','floral':'Blomstret','stripe':'Stribet',
+    },
+    fr: {
+      'black':'Noir','white':'Blanc','cream':'Crème','ivory':'Ivoire',
+      'beige':'Beige','red':'Rouge','blue':'Bleu','navy':'Marine','light blue':'Bleu clair',
+      'green':'Vert','olive':'Olive','sage':'Sauge','forest green':'Vert forêt',
+      'pink':'Rose','hot pink':'Rose vif','blush':'Blush','rose':'Rose',
+      'purple':'Violet','lilac':'Lilas','mauve':'Mauve','violet':'Violet',
+      'brown':'Marron','camel':'Camel','tan':'Fauve','chocolate':'Chocolat',
+      'grey':'Gris','gray':'Gris','light grey':'Gris clair','charcoal':'Anthracite',
+      'orange':'Orange','rust':'Rouille','terracotta':'Terre cuite',
+      'yellow':'Jaune','mustard':'Moutarde','gold':'Or','silver':'Argent',
+      'nude':'Nude','sand':'Sable','stone':'Pierre','champagne':'Champagne',
+      'mint':'Menthe','teal':'Bleu sarcelle','burgundy':'Bordeaux','wine':'Bordeaux',
+      'leopard':'Léopard','floral':'Fleuri','stripe':'Rayé',
+    }
+  };
+
+  // Guess Shopify product_type from productType field + product name
+  function guessShopifyProductType() {
+    const pt  = (document.getElementById('productType')?.value || '').toLowerCase();
+    const name = (document.getElementById('productName')?.value || '').toLowerCase();
+    const combined = pt + ' ' + name;
+    if (/dress|kjole|robe/.test(combined))   return 'Dress';
+    if (/top|blouse|shirt|blus/.test(combined)) return 'Top';
+    if (/skirt|nederdel|jupe/.test(combined)) return 'Skirt';
+    if (/jacket|jakke|veste|coat|frakke/.test(combined)) return 'Jacket';
+    if (/pant|trouser|bukse|pantalon/.test(combined)) return 'Pants';
+    if (/jumpsuit|overall/.test(combined))   return 'Jumpsuit';
+    if (/shorts/.test(combined))             return 'Shorts';
+    if (/bag|taske|sac/.test(combined))      return 'Bag';
+    return 'Clothing';
+  }
+
+  function calcComparePrice(priceStr, discountPct) {
+    const p = parseFloat(priceStr.replace(',','.').replace(/[^\d.]/g,''));
+    if (!p || !discountPct) return null;
+    const raw = p / (1 - discountPct / 100);
+    // Round up to nearest 10, always .00
+    return (Math.ceil(raw / 10) * 10).toFixed(2);
+  }
+
+  function updateComparePrice() {
+    const priceStr  = document.getElementById('productPrice').value;
+    const discount  = parseInt(document.getElementById('discountSelect').value);
+    const hint      = document.getElementById('comparePriceHint');
+    const currency  = currentStore === 'dk' ? 'DKK' : 'EUR';
+    if (!discount) { hint.textContent = ''; return; }
+    const cp = calcComparePrice(priceStr, discount);
+    hint.textContent = cp ? `Compare price: ${cp} ${currency} (≈${discount}% discount)` : '';
+  }
+
+  function translateColor(color) {
+    const map = COLOR_TRANSLATIONS[currentStore] || {};
+    const key = color.toLowerCase().trim();
+    return map[key] || color;  // keep original if no translation found
+  }
+  const women_names = ['Solène','Amélie','Astrid','Freya','Ingrid','Nora','Sigrid','Elsa','Maja','Fiona','Liora','Celia','Thea','Vera','Iris','Luna','Sofia','Mira','Zara','Lena','Hana','Aria','Nina','Tova','Saga'];
+  const usedNames = ['Liviah', 'Emma', 'Anna', 'Clara', 'Sara', 'Maria'];
+  let nameIndex = 0;
+
+  const storeConfig = {
+    dk: { label: 'Vionna DK', lang: '🇩🇰 Danish', currency: 'DKK' },
+    fr: { label: 'Vionna FR', lang: '🇫🇷 French', currency: 'EUR' }
+  };
+
+  function setStore(store, btn) {
+    currentStore = store;
+    document.querySelectorAll('.store-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('bottomStoreName').textContent = storeConfig[store].label;
+    document.getElementById('storeLangBadge').textContent = storeConfig[store].lang;
+  }
+
+  function updateCharCount(el, countId) {
+    const len = el.value.length;
+    const countEl = document.getElementById(countId);
+    countEl.textContent = len + ' / 160';
+    countEl.classList.toggle('warn', len > 155);
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    const meta = document.getElementById('metaDesc');
+    if (meta) updateCharCount(meta, 'metaCount');
+    buildKeywordChips();
+    buildVariantCards();
+    checkAuthStatus();
+  });
+
+  function buildKeywordChips() {
+    const input = document.getElementById('keywordsInput').value;
+    const keywords = input.split('\n').map(k => k.trim()).filter(k => k.length > 0);
+    const container = document.getElementById('keywordChips');
+    if (!container) return;
+    container.innerHTML = keywords.map(k => `<span class="keyword-chip">${k}</span>`).join('');
+  }
+
+  const colorDots = { 'Beige': '#f5f0e8', 'Sort': '#2d2d2d', 'Hvid': '#f8f8f8', 'Noir': '#1a1a1a', 'Blanc': '#f8f8f8', 'Écru': '#f0ead4', 'Brun': '#8b6347', 'Grøn': '#4a7c5c', 'Blå': '#3b5fc0', 'Rød': '#c0392b' };
+
+  function buildVariantCards() {
+    const colorChips = document.querySelectorAll('#colorChips .chip');
+    const colors = Array.from(colorChips).map(c => c.textContent.replace('×','').trim());
+    updateNbColorSections();
+    const handle = document.getElementById('siblingsHandle2')?.value || '';
+    const productName = document.getElementById('productName')?.value || 'Product';
+    const container = document.getElementById('variantCards');
+    if (!container) return;
+
+    container.innerHTML = colors.map((color, i) => `
+      <div class="variant-card">
+        <div class="variant-card-header">
+          <div class="color-dot" style="background:${colorDots[color] || '#ccc'};border:1px solid rgba(0,0,0,0.15)"></div>
+          Duplicate — ${color}
+        </div>
+        <label style="font-size:10px;margin-bottom:3px">Product title</label>
+        <input type="text" value="${productName}" style="margin-bottom:6px" readonly style="color:#888">
+        <label style="font-size:10px;margin-bottom:3px">Cutline metafield</label>
+        <input type="text" value="${color}" style="margin-bottom:6px">
+        <label style="font-size:10px;margin-bottom:3px">Siblings collection handle</label>
+        <input type="text" value="${handle}" placeholder="e.g. solene-collection" oninput="updateAllHandles(this.value)">
+        <div class="variant-status" style="margin-top:6px;padding:5px 8px;background:#f5f4f2;border-radius:4px">
+          <span style="color:#9b8b7a">⟳</span> Duplicate + collection link on publish
+        </div>
+      </div>
+    `).join('');
+  }
+
+  function syncHandleAndRebuild(el) {
+    document.getElementById('siblingsHandle').value = el.value;
+    buildVariantCards();
+  }
+
+  function updateAllHandles(val) {
+    document.getElementById('siblingsHandle2').value = val;
+    document.getElementById('siblingsHandle').value = val;
+    buildVariantCards();
+  }
+
+  function toHandle(str) {
+    return str.toLowerCase()
+      .normalize('NFD').replace(/[̀-ͯ]/g, '') // é → e, ë → e etc.
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '');
+  }
+
+  function autoHandle() {
+    const name = document.getElementById('productName')?.value || '';
+    const displayName = name + ' Siblings';
+    const handle = toHandle(displayName);
+    document.getElementById('siblingsHandle2').value = handle;
+    document.getElementById('siblingsHandle').value = handle;
+    const hint = document.getElementById('siblingsHandleHint');
+    if (hint) hint.textContent = 'Collection name in Shopify: "' + displayName + '"';
+    buildVariantCards();
+  }
+
+  function updateTitlePreview() {
+    const name = document.getElementById('productName')?.value || '';
+    const specs = document.getElementById('mTitleSpecs')?.value || '';
+    const preview = document.getElementById('titlePreview');
+    if (preview) preview.textContent = (name && specs) ? `${name} | ${specs}` : (name || specs);
+  }
+
+  function removeChip(el) {
+    el.parentElement.remove();
+    const cutlineColors = Array.from(document.querySelectorAll('#colorChips .chip'))
+      .map(c => c.textContent.replace('×','').trim());
+    document.getElementById('cutline').value = cutlineColors.join(', ');
+    buildVariantCards();
+  }
+
+  function toggleImage(el) {
+    el.classList.toggle('selected');
+  }
+
+  function refreshName() {
+    const available = women_names.filter(n => !usedNames.includes(n));
+    const name = available[Math.floor(Math.random() * available.length)];
+    document.getElementById('productName').value = name;
+    updateTitlePreview();
+    buildVariantCards();
+  }
+
+  let loadTimer;
+
+  function setLoading(text, sub = '') {
+    document.getElementById('loadingText').textContent = text;
+    document.getElementById('loadingSteps').textContent = sub;
+  }
+
+  async function startGenerate() {
+    const url      = document.getElementById('competitorUrl').value.trim();
+    const keywords = document.getElementById('keywordsInput').value
+                       .split('\n').map(k => k.trim()).filter(Boolean);
+    if (!url) { alert('Please enter a competitor URL.'); return; }
+
+    document.getElementById('inputSection').classList.add('section-hidden');
+    document.getElementById('loadingSection').classList.add('show');
+    setStep(2);
+    buildKeywordChips();
+
+    // 1. Scrape competitor product via backend
+    setLoading('Fetching competitor product…');
+    let product = null;
+    try {
+      const r = await fetch('/api/scrape', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({url})
+      });
+      const d = await r.json();
+      product = d.product || null;
+    } catch(e) { console.warn('Scrape error:', e); }
+
+    // 2. Pick unique women's name
+    setLoading('Generating product name…', 'Checking uniqueness in catalog');
+    let usedFromShopify = [];
+    try {
+      const r = await fetch('/api/names', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({store: currentStore})
+      });
+      usedFromShopify = (await r.json()).names || [];
+    } catch(e) {}
+    const allUsed = [...usedNames, ...usedFromShopify];
+    const available = women_names.filter(n => !allUsed.includes(n));
+    const chosenName = available[Math.floor(Math.random() * available.length)] || 'Nova';
+    document.getElementById('productName').value = chosenName;
+
+    // 3. Fill product info from scrape
+    if (product) {
+      const hostname = new URL(url).hostname.replace('www.','');
+      document.getElementById('compName').textContent = (product.title||'') + ' — ' + hostname;
+      document.getElementById('compMeta').textContent =
+        hostname + ' · ' + (product.variants?.length||0) + ' variants · ' +
+        (product.variants?.[0]?.price ? '€'+product.variants[0].price : '');
+
+      // Colors
+      const isSizeVal = v => /^(xs|s|m|l|xl|xxl|one size|\d{1,3}(cm)?)$/i.test(v.trim());
+      const colorOpt = product.options?.find(o => /colou?r|kleur|farve|couleur/i.test(o.name))
+                    || product.options?.find(o => o.values && !o.values.every(isSizeVal));
+      let colors = [];
+      if (colorOpt?.values?.length && !colorOpt.values.every(isSizeVal)) {
+        colors = colorOpt.values.slice(0,6);
+      } else {
+        const handle = product.handle || '';
+        const w = handle.split('-').filter(w => w.length>2 && !/dress|top|skirt|blouse|coat|jacket|shirt|pants|jeans|mini|maxi|midi/.test(w)).pop();
+        if (w) colors = [w.charAt(0).toUpperCase()+w.slice(1)];
+      }
+      if (colors.length) {
+        const translated = colors.map(c => translateColor(c));
+        document.getElementById('colorChips').innerHTML = translated.map(c=>`
+          <div class="chip color-chip">
+            <div class="color-dot" style="background:${colorDots[c]||colorDots[c.toLowerCase()]||'#ccc'}"></div>
+            ${c} <span class="chip-remove" onclick="removeChip(this)">×</span>
+          </div>`).join('');
+        document.getElementById('cutline').value = translated.join(', ');
+      }
+
+      // Images
+      const images = (product.images||[]).slice(0,8);
+      const grid = document.getElementById('competitorImageGrid');
+      if (images.length) {
+        grid.innerHTML = images.map((img,i)=>{
+          const src = img.src.startsWith('//') ? 'https:'+img.src : img.src;
+          return `<div class="image-tile ${i<2?'selected':''}" onclick="toggleImage(this)">
+            <img src="${src}" loading="lazy" onerror="this.parentElement.style.background='#eee'">
+            <div class="img-label">Competitor ${i+1}</div>
+            <div class="select-check">✓</div>
+            <button class="zoom-btn" onclick="event.stopPropagation();openLightbox('${src}')" title="Zoom">⤢</button>
+          </div>`;
+        }).join('');
+      } else {
+        grid.innerHTML = `<div style="grid-column:1/-1;padding:12px;color:#aaa;font-size:13px">No images found — upload manually or use Higgsfield.<br><input type="file" multiple accept="image/*" onchange="handleManualImages(this)" style="margin-top:8px;font-size:12px"></div>`;
+      }
+    }
+
+    // 4. Generate content via Claude
+    setLoading('Generating description via Claude…', 'Style: calm, practical, comfort-oriented');
+    document.getElementById('productDesc').value    = 'Generating…';
+    document.getElementById('metaDesc').value       = 'Generating…';
+    document.getElementById('mTitleSpecs').value    = 'Generating…';
+
+    try {
+      const r = await fetch('/api/generate', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          store: currentStore,
+          product_name:  chosenName,
+          product_title: product?.title || '',
+          keywords,
+        })
+      });
+      const gen = await r.json();
+      if (gen.error) throw new Error(gen.error);
+      document.getElementById('productDesc').value  = gen.description    || '';
+      document.getElementById('metaDesc').value     = gen.meta_description || '';
+      document.getElementById('mTitleSpecs').value  = gen.m_title_specs  || '';
+      updateCharCount(document.getElementById('metaDesc'), 'metaCount');
+    } catch(e) {
+      document.getElementById('productDesc').value  = `Error: ${e.message}`;
+      document.getElementById('metaDesc').value     = '';
+      document.getElementById('mTitleSpecs').value  = '';
+    }
+
+    // 5. Auto-detect product type for Nano Banana
+    if (product) {
+      const titleLower = (product.title || '').toLowerCase();
+      const handle = (product.handle || '').toLowerCase();
+      const combined = titleLower + ' ' + handle;
+      const typeMap = [
+        ['jacket', /jacket|jas|veste|jakke/],
+        ['coat', /coat|mantel|manteau/],
+        ['blazer', /blazer/],
+        ['blouse', /blouse|top|shirt/],
+        ['skirt', /skirt|rok|jupe|nederdel/],
+        ['trousers', /trouser|pant|broek|pantalon|bukser/],
+        ['dress', /dress|jurk|robe|kjole/],
+        ['jumpsuit', /jumpsuit|overall/],
+        ['cardigan', /cardigan|vest/],
+        ['sweater', /sweater|sweatshirt|pullover|trui|hoodie/],
+      ];
+      for (const [type, re] of typeMap) {
+        if (re.test(combined)) {
+          const ptEl = document.getElementById('productType');
+          if (ptEl) ptEl.value = type;
+          break;
+        }
+      }
+    }
+
+    // 6. Show review
+    document.getElementById('loadingSection').classList.remove('show');
+    document.getElementById('reviewSection').classList.remove('section-hidden');
+    document.getElementById('bottomBar').style.display = 'flex';
+    setStep(3);
+    autoHandle();
+    updateTitlePreview();
+    buildVariantCards();
+    updateNbColorSections();
+  }
+
+  function setStep(n) {
+    for (let i = 1; i <= 4; i++) {
+      const el = document.getElementById('step' + i);
+      el.classList.remove('active', 'done');
+      if (i < n) el.classList.add('done');
+      else if (i === n) el.classList.add('active');
+    }
+  }
+
+  // Auth status check on load
+  async function checkAuthStatus() {
+    try {
+      const r = await fetch('/api/status');
+      const s = await r.json();
+      updateAuthBar(s);
+    } catch(e) {
+      // Running without backend (preview mode)
+      updateAuthBar({dk: false, fr: false, anthropic: false});
+    }
+  }
+
+  function updateAuthBar(s) {
+    const bar = document.getElementById('authBar');
+    const dk  = s.dk  ? '✓ DK' : '<a href="/auth/dk" style="color:#c0392b;font-weight:700">⚠ Authorize DK</a>';
+    const fr  = s.fr  ? '✓ FR' : '<a href="/auth/fr" style="color:#c0392b;font-weight:700">⚠ Authorize FR</a>';
+    const ai  = s.anthropic ? '✓ Claude' : '⚠ Add Anthropic key in .env';
+    bar.innerHTML = `${dk} &nbsp;·&nbsp; ${fr} &nbsp;·&nbsp; ${ai}`;
+    bar.style.color = (s.dk && s.fr && s.anthropic) ? '#2d7a4f' : '#8a5a1a';
+  }
+
+  function handleManualImages(input) {
+    const grid = document.getElementById('competitorImageGrid');
+    const files = Array.from(input.files);
+    const tiles = files.slice(0, 8).map((file, i) => {
+      const url = URL.createObjectURL(file);
+      return `<div class="image-tile ${i < 2 ? 'selected' : ''}" onclick="toggleImage(this)">
+        <img src="${url}" alt="Upload ${i+1}">
+        <div class="img-label">Upload ${i+1}</div>
+        <div class="select-check">✓</div>
+      </div>`;
+    });
+    grid.innerHTML = tiles.join('');
+  }
+
+  // ---- NANO BANANA WORKFLOW STATE ----
+  const nbState = {
+    selected: { 1: null, 2: null, 3: null, 4: null },  // URL per step
+    generating: {}
+  };
+
+  // Get product image URL (first selected competitor image)
+  function getNbProductImage() {
+    const img = document.querySelector('#competitorImageGrid .image-tile.selected img');
+    return img?.src || null;
+  }
+
+  // Build image URL list for a given step
+  function getNbImageUrls(step) {
+    const productImg = getNbProductImage();
+    const bgUrl      = document.getElementById('bgReferenceUrl')?.value.trim() || '';
+    const urls = [];
+
+    if (step === 1) {
+      // Prompt 1: background reference FIRST (model/styling), then product image
+      // Order matters: first image = background source, second image = product to place
+      if (bgUrl) urls.push(bgUrl);
+      if (productImg) urls.push(productImg);
+    } else if (step === 2) {
+      // Prompt 2: alleen stap 1 selecties (competitor niet meer nodig na stap 1)
+      (nbState.selectedAll?.[1] || (nbState.selected[1] ? [nbState.selected[1]] : [])).forEach(u => urls.push(u));
+    } else if (step === 3 || step === 4) {
+      // Prompts 3 & 4: alleen geselecteerde NB resultaten van vorige stappen
+      for (let s = 1; s < step; s++) {
+        (nbState.selectedAll?.[s] || (nbState.selected[s] ? [nbState.selected[s]] : [])).forEach(u => urls.push(u));
+      }
+    } else if (step === 5) {
+      // Handled separately per color
+    }
+    return urls;
+  }
+
+  async function runNanoBanana(step) {
+    if (nbState.generating[step]) return;
+    nbState.generating[step] = true;
+
+    const TOTAL       = 4;
+    const btn         = document.getElementById(`nbBtn${step}`);
+    const grid        = document.getElementById(`nbGrid${step}`);
+    const productType = document.getElementById('productType')?.value.trim() || 'dress';
+    const imageUrls   = getNbImageUrls(step);
+
+    btn.disabled    = true;
+    btn.textContent = '⟳ Generating…';
+    grid.style.display = 'grid';
+
+    // Show 4 loading placeholders immediately
+    grid.innerHTML = Array.from({length: TOTAL}, (_, i) => `
+      <div class="nb-slot-loading" id="nbSlot_${step}_${i}">
+        <div class="spinner" style="width:22px;height:22px;border-width:2px"></div>
+        <span>Variant ${i+1}</span>
+      </div>`).join('');
+
+    // Fire 4 individual requests in parallel — each shows as soon as it arrives
+    let doneCount = 0;
+    const promises = Array.from({length: TOTAL}, async (_, i) => {
+      try {
+        const r = await fetch('/api/higgsfield', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            prompt_type:  step,
+            product_type: productType,
+            image_urls:   imageUrls,
+            count:        1,
+          })
+        });
+        const data = await r.json();
+        if (data.error) throw new Error(data.error);
+        const url = (data.urls || [])[0];
+        if (!url) throw new Error('No image received');
+
+        // Replace loading slot with actual image
+        const slot = document.getElementById(`nbSlot_${step}_${i}`);
+        if (slot) {
+          const tile = document.createElement('div');
+          tile.className = 'image-tile';
+          tile.onclick = function() { selectNbImage(step, url, this); };
+          tile.innerHTML = `
+            <img src="${url}" loading="lazy" onerror="this.style.background='#eee'">
+            <div class="img-label">Variant ${i+1}</div>
+            <div class="select-check">✓</div>
+            <button class="zoom-btn" onclick="event.stopPropagation();openLightbox('${url}')" title="Zoom">⤢</button>`;
+          slot.replaceWith(tile);
+        }
+        doneCount++;
+        btn.textContent = `⟳ Generating… (${doneCount}/${TOTAL})`;
+        updateNbColorSections();
+        return url;
+      } catch(e) {
+        const slot = document.getElementById(`nbSlot_${step}_${i}`);
+        if (slot) {
+          slot.className = 'nb-slot-error';
+          slot.innerHTML = `<span style="font-size:18px">✕</span><span>${e.message.slice(0,80)}</span>`;
+        }
+        return null;
+      }
+    });
+
+    await Promise.allSettled(promises);
+
+    const successCount = grid.querySelectorAll('.image-tile').length;
+    btn.textContent = successCount
+      ? `✦ Regenerate (${successCount} variants)`
+      : `✦ Try again`;
+    btn.disabled = false;
+    nbState.generating[step] = false;
+    updateNbColorSections();
+  }
+
+  function selectNbImage(step, url, el) {
+    const wasSelected = el.classList.contains('selected');
+
+    if (wasSelected) {
+      // Deselect: remove from publish pool
+      el.classList.remove('selected');
+      removeFromPublishPool(url);
+    } else {
+      // Max 2 per stap — deselect oldest als limiet bereikt
+      const currentSelected = document.querySelectorAll(`#nbGrid${step} .image-tile.selected`);
+      if (currentSelected.length >= 2) {
+        const oldest = currentSelected[0];
+        const oldestUrl = oldest.querySelector('img').src;
+        oldest.classList.remove('selected');
+        removeFromPublishPool(oldestUrl);
+      }
+      // Select: add to publish pool
+      el.classList.add('selected');
+      addToPublishPool(url, `NB Step ${step}`);
+    }
+
+    // Store all selected URLs for this step (max 2) — used as reference for next step
+    const allSelected = Array.from(document.querySelectorAll(`#nbGrid${step} .image-tile.selected img`)).map(i => i.src);
+    nbState.selected[step] = allSelected.length ? allSelected[0] : null;   // first = primary reference
+    nbState.selectedAll = nbState.selectedAll || {};
+    nbState.selectedAll[step] = allSelected;
+
+    // Show/hide "geselecteerd voor stap X" row
+    const selRow = document.getElementById(`nbSelected${step}`);
+    const selImg = document.getElementById(`nbSelectedImg${step}`);
+    if (selRow && selImg) {
+      if (nbState.selected[step]) {
+        selImg.src = nbState.selected[step];
+        selRow.style.display = 'flex';
+      } else {
+        selRow.style.display = 'none';
+      }
+    }
+
+    // Activate next step as soon as at least 1 image is selected
+    const nextStep = step + 1;
+    if (nextStep <= 5 && nbState.selected[step]) {
+      const nextEl  = document.getElementById(`nbStep${nextStep}`);
+      const nextBtn = document.getElementById(`nbBtn${nextStep}`);
+      if (nextEl)  { nextEl.style.opacity  = '1'; nextEl.classList.add('nb-active'); }
+      if (nextBtn) { nextBtn.disabled = false; }
+    }
+
+    // Update badge
+    const badge = document.getElementById(`nbBadge${step}`);
+    if (badge) {
+      if (nbState.selected[step]) badge.classList.add('nb-badge-done');
+      else badge.classList.remove('nb-badge-done');
+    }
+
+    updateNbColorSections();
+  }
+
+  function removeFromPublishPool(url) {
+    const pool = document.getElementById('publishImagePool');
+    if (!pool) return;
+    const img = pool.querySelector(`img[src="${url}"]`);
+    if (img) img.closest('.image-tile').remove();
+    // Show placeholder if pool is now empty
+    if (!pool.querySelector('.image-tile')) {
+      pool.innerHTML = `<div style="grid-column:1/-1;padding:16px;text-align:center;color:#aaa;font-size:13px" id="publishPoolMsg">No photos yet — generate via the Nano Banana workflow above.</div>`;
+    }
+  }
+
+  function clearNbSelection(step) {
+    // Remove all images of this step from publish pool
+    document.querySelectorAll(`#nbGrid${step} .image-tile.selected img`).forEach(img => {
+      removeFromPublishPool(img.src);
+    });
+    nbState.selected[step] = null;
+    if (nbState.selectedAll) nbState.selectedAll[step] = [];
+    const selRow = document.getElementById(`nbSelected${step}`);
+    if (selRow) selRow.style.display = 'none';
+    document.querySelectorAll(`#nbGrid${step} .image-tile`).forEach(t => t.classList.remove('selected'));
+    const badge = document.getElementById(`nbBadge${step}`);
+    if (badge) badge.classList.remove('nb-badge-done');
+  }
+
+  // Add URL to dedicated publish pool section
+  function addToPublishPool(url, label) {
+    const pool = document.getElementById('publishImagePool');
+    if (!pool) return;
+    // Avoid duplicates
+    if (pool.querySelector(`img[src="${url}"]`)) return;
+    // Remove placeholder message
+    const msg = document.getElementById('publishPoolMsg');
+    if (msg) msg.remove();
+    const tile = document.createElement('div');
+    tile.className = 'image-tile selected';  // auto-selected by default
+    tile.onclick = function() { toggleImage(this); };
+    tile.innerHTML = `<img src="${url}" loading="lazy" onerror="this.parentElement.style.background='#eee'">
+      <div class="img-label">${label}</div>
+      <div class="select-check">✓</div>
+      <button class="zoom-btn" onclick="event.stopPropagation();openLightbox('${url}')" title="Zoom">⤢</button>`;
+    pool.appendChild(tile);
+  }
+
+  // Render color variant buttons (step 5) based on current color chips
+  function updateNbColorSections() {
+    const step5 = document.getElementById('nbStep5');
+    const container = document.getElementById('nbColorSections');
+    if (!container) return;
+
+    const colors = Array.from(document.querySelectorAll('#colorChips .chip'))
+                        .map(c => c.textContent.replace('×','').trim())
+                        .filter(Boolean);
+
+    // Need at least one step completed to unlock step 5
+    const anySelected = Object.values(nbState.selected).some(v => v);
+    if (!anySelected) {
+      container.innerHTML = '<div style="font-size:12px;color:#aaa;padding:8px">Select an image in steps 1–4 first to generate color variants.</div>';
+      step5.style.opacity = '0.4';
+      return;
+    }
+    step5.style.opacity = '1';
+    step5.classList.add('nb-active');
+
+    if (!colors.length) {
+      container.innerHTML = '<div style="font-size:12px;color:#aaa;padding:8px">Add colors in the product info to generate color variants.</div>';
+      return;
+    }
+
+    container.innerHTML = colors.map(color => `
+      <div class="nb-color-section" id="nbColorSection_${color.replace(/\s+/g,'_')}">
+        <div class="nb-color-header">
+          <div class="color-dot" style="background:${colorDots[color]||'#ccc'};border:1px solid rgba(0,0,0,0.15)"></div>
+          ${color}
+          <button class="btn btn-secondary btn-sm" style="margin-left:auto" onclick="runNanaBananaColor('${color}')">✦ Generate ${color}</button>
+        </div>
+        <div class="image-grid nb-results" id="nbColorGrid_${color.replace(/\s+/g,'_')}" style="display:none;margin-top:8px"></div>
+      </div>`).join('');
+  }
+
+  async function runNanaBananaColor(color) {
+    const safeColor = color.replace(/\s+/g,'_');
+    const grid = document.getElementById(`nbColorGrid_${safeColor}`);
+    const btn  = document.querySelector(`#nbColorSection_${safeColor} button`);
+    const productType = document.getElementById('productType')?.value.trim() || 'dress';
+
+    // Use best model image: prefer step 2, then step 1, then product
+    const bestModel = nbState.selected[2] || nbState.selected[1] || getNbProductImage();
+    const imageUrls = bestModel ? [bestModel] : [];
+
+    if (!imageUrls.length) { alert('Select a model image in step 1 or 2 first.'); return; }
+
+    btn.disabled = true;
+    btn.textContent = '⟳ Generating…';
+    grid.style.display = 'grid';
+    grid.innerHTML = `<div style="grid-column:1/-1;display:flex;align-items:center;gap:12px;padding:16px;color:#888">
+      <div class="spinner" style="width:24px;height:24px;border-width:2px;flex-shrink:0"></div>
+      <div>Generating color variant <strong>${color}</strong>…</div>
+    </div>`;
+
+    try {
+      const r = await fetch('/api/higgsfield', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          prompt_type:  5,
+          product_type: productType,
+          color:        color,
+          image_urls:   imageUrls,
+          count:        4,
+        })
+      });
+      const data = await r.json();
+      if (data.error) throw new Error(data.error);
+
+      const urls = data.urls || [];
+      if (!urls.length) throw new Error('No images received');
+
+      grid.innerHTML = urls.map((url, i) => `
+        <div class="image-tile" onclick="toggleImage(this);addToPublishPool('${url}','${color} ${i+1}')">
+          <img src="${url}" loading="lazy" onerror="this.style.background='#eee'">
+          <div class="img-label">${color}</div>
+          <div class="select-check">✓</div>
+          <button class="zoom-btn" onclick="event.stopPropagation();openLightbox('${url}')" title="Zoom">⤢</button>
+        </div>`).join('');
+
+      btn.textContent = `✦ Regenerate`;
+      btn.disabled = false;
+
+    } catch(e) {
+      grid.innerHTML = `<div style="grid-column:1/-1;padding:12px;color:#c0392b;font-size:12px">Error: ${e.message}</div>`;
+      btn.textContent = `✦ Try again`;
+      btn.disabled = false;
+    }
+  }
+
+  async function publishProduct() {
+    const name   = document.getElementById('productName').value;
+    const btn    = document.getElementById('publishBtn');
+    btn.disabled = true;
+    btn.textContent = 'Publishing…';
+
+    const colors  = Array.from(document.querySelectorAll('#colorChips .chip'))
+                      .map(c => c.textContent.replace('×','').trim());
+    const handle  = document.getElementById('siblingsHandle2')?.value || '';
+    // Collect selected images: competitor grid first, then publish pool
+    const competitorImgs = Array.from(document.querySelectorAll('#competitorImageGrid .image-tile.selected img'))
+                             .map(img => img.src).filter(s => s.startsWith('http'));
+    const poolImgs       = Array.from(document.querySelectorAll('#publishImagePool .image-tile.selected img'))
+                             .map(img => img.src).filter(s => s.startsWith('http'));
+    // Deduplicate, competitor images first
+    const images = [...new Set([...competitorImgs, ...poolImgs])];
+
+    try {
+      const r = await fetch('/api/publish', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          store:           currentStore,
+          product_name:    name,
+          description:     document.getElementById('productDesc').value,
+          meta_description:document.getElementById('metaDesc').value,
+          m_title_specs:   document.getElementById('mTitleSpecs').value,
+          price:             document.getElementById('productPrice').value,
+          compare_at_price:  calcComparePrice(
+                               document.getElementById('productPrice').value,
+                               parseInt(document.getElementById('discountSelect').value)
+                             ),
+          product_type:    guessShopifyProductType(),
+          colors,
+          siblings_handle: handle,
+          images,
+        })
+      });
+      const result = await r.json();
+
+      if (!r.ok || result.error) throw new Error(result.error || 'Unknown error');
+
+      setStep(4);
+      document.getElementById('reviewSection').classList.add('section-hidden');
+      document.getElementById('alertSuccess').classList.add('show');
+      document.getElementById('alertSuccess').innerHTML =
+        `✓ <strong>${name}</strong> created in <strong>${storeConfig[currentStore].label}</strong> — ${result.products_created} color duplicates · collection <strong>${handle}</strong> created · swatches linked. Product is set to <strong>draft</strong> until final review.`
+        + (result.metafield_errors?.length ? `<br><span style="color:#c0392b;font-size:12px">⚠ Metafield errors: ${result.metafield_errors.join(' | ')}</span>` : '');
+      document.getElementById('bottomStatus').innerHTML = `<strong>${name}</strong> is ready for final review in Shopify`;
+      btn.textContent = 'Published ✓';
+      usedNames.push(name);
+
+    } catch(e) {
+      btn.disabled = false;
+      btn.textContent = 'Publish to Shopify →';
+      alert('Error publishing: ' + e.message);
+    }
+  }
+
+  function resetDashboard() {
+    document.getElementById('inputSection').classList.remove('section-hidden');
+    document.getElementById('reviewSection').classList.add('section-hidden');
+    document.getElementById('alertSuccess').classList.remove('show');
+    document.getElementById('bottomBar').style.display = 'none';
+    document.getElementById('publishBtn').disabled = false;
+    document.getElementById('publishBtn').textContent = 'Publish to Shopify →';
+    setStep(1);
+
+    // Reset Nano Banana state
+    nbState.selected    = { 1: null, 2: null, 3: null, 4: null };
+    nbState.selectedAll = { 1: [],   2: [],   3: [],   4: []   };
+    nbState.generating  = {};
+    [1,2,3,4].forEach(s => {
+      const grid   = document.getElementById(`nbGrid${s}`);
+      const selRow = document.getElementById(`nbSelected${s}`);
+      const btn    = document.getElementById(`nbBtn${s}`);
+      const badge  = document.getElementById(`nbBadge${s}`);
+      const step   = document.getElementById(`nbStep${s}`);
+      if (grid)   { grid.style.display = 'none'; grid.innerHTML = ''; }
+      if (selRow) selRow.style.display = 'none';
+      if (btn)    { btn.disabled = (s > 1); btn.textContent = '✦ Generate 4 variants'; }
+      if (badge)  badge.classList.remove('nb-badge-done');
+      if (step)   { step.style.opacity = s === 1 ? '1' : '0.4'; }
+    });
+    const step5 = document.getElementById('nbStep5');
+    if (step5) step5.style.opacity = '0.4';
+    const bgUrl = document.getElementById('bgReferenceUrl');
+    if (bgUrl) bgUrl.value = '';
+
+    // Reset publish pool
+    const pool = document.getElementById('publishImagePool');
+    if (pool) pool.innerHTML = `<div style="grid-column:1/-1;padding:16px;text-align:center;color:#aaa;font-size:13px" id="publishPoolMsg">No photos yet — generate via the Nano Banana workflow above.</div>`;
+  }
+</script>
+</body>
+</html>
