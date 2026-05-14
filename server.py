@@ -213,6 +213,34 @@ def scrape():
         return jsonify({'error': str(e)}), 500
 
 
+# --- Debug: list metafield definitions for products ---
+@app.route('/api/debug_metafields')
+def debug_metafields():
+    store = request.args.get('store', 'dk')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store}'}), 401
+    try:
+        # Get metafield DEFINITIONS for product owner type
+        url = shopify_url(store, 'metafield_definitions.json?owner_type=PRODUCT')
+        r = req.get(url, headers=shopify_headers(store), timeout=15)
+        if r.status_code != 200:
+            return jsonify({'status': r.status_code, 'response': r.text}), 500
+        defs = r.json().get('metafield_definitions', [])
+        simplified = [
+            {
+                'name': d.get('name'),
+                'namespace': d.get('namespace'),
+                'key': d.get('key'),
+                'type': d.get('type', {}).get('name') if isinstance(d.get('type'), dict) else d.get('type'),
+                'description': d.get('description'),
+            }
+            for d in defs
+        ]
+        return jsonify({'count': len(simplified), 'definitions': simplified})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 # --- Get existing product names to avoid duplicates ---
 @app.route('/api/names', methods=['POST'])
 def get_names():
