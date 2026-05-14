@@ -1895,13 +1895,11 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
     const colors  = Array.from(document.querySelectorAll('#colorChips .chip'))
                       .map(c => c.textContent.replace('×','').trim());
     const handle  = document.getElementById('siblingsHandle2')?.value || '';
-    // Collect selected images: competitor grid first, then publish pool
-    const competitorImgs = Array.from(document.querySelectorAll('#competitorImageGrid .image-tile.selected img'))
-                             .map(img => img.src).filter(s => s.startsWith('http'));
-    const poolImgs       = Array.from(document.querySelectorAll('#publishImagePool .image-tile.selected img'))
-                             .map(img => img.src).filter(s => s.startsWith('http'));
-    // Deduplicate, competitor images first
-    const images = [...new Set([...competitorImgs, ...poolImgs])];
+    // Only use generated images from publish pool — never competitor images
+    const images = [...new Set(
+      Array.from(document.querySelectorAll('#publishImagePool .image-tile.selected img'))
+        .map(img => img.src).filter(s => s.startsWith('http'))
+    )];
 
     try {
       const r = await fetch('/api/publish', {

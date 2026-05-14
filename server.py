@@ -348,9 +348,9 @@ def publish():
             created.append(prod_id)
 
             # --- Metafields via separate POST ---
-            # Types must match Shopify metafield definitions exactly
+            # Try both type variants — Shopify must have matching metafield definition
             metafields = [
-                {'namespace': 'custom', 'key': 'cutline',            'value': color,            'type': 'single_line_text_field'},
+                {'namespace': 'custom', 'key': 'cutline',             'value': color,            'type': 'single_line_text_field'},
                 {'namespace': 'custom', 'key': 'siblings_collection', 'value': siblings_handle,  'type': 'single_line_text_field'},
                 {'namespace': 'custom', 'key': 'm_title_specs',       'value': m_title_specs,    'type': 'multi_line_text_field'},
                 {'namespace': 'global', 'key': 'description_tag',     'value': meta_description, 'type': 'single_line_text_field'},
@@ -358,25 +358,28 @@ def publish():
             mf_errors = []
             for mf in metafields:
                 if not mf['value']:
+                    mf_errors.append(f"{mf['key']}: skipped (empty value)")
                     continue
+                print(f"[mf] Sending {mf['namespace']}.{mf['key']} = {repr(mf['value'][:50])} (type: {mf['type']})")
                 mf_res = req.post(
                     shopify_url(store, f'products/{prod_id}/metafields.json'),
                     headers=hdrs,
                     json={'metafield': mf}
                 )
+                print(f"[mf] Response {mf['key']}: {mf_res.status_code} — {mf_res.text[:200]}")
                 if mf_res.status_code not in [200, 201]:
-                    # Retry with single_line if multi_line failed (type mismatch guard)
-                    if mf['type'] == 'multi_line_text_field':
-                        mf2 = {**mf, 'type': 'single_line_text_field'}
-                        mf_res2 = req.post(
-                            shopify_url(store, f'products/{prod_id}/metafields.json'),
-                            headers=hdrs,
-                            json={'metafield': mf2}
-                        )
-                        if mf_res2.status_code not in [200, 201]:
-                            mf_errors.append(f"{mf['key']}: {mf_res2.text[:120]}")
-                    else:
-                        mf_errors.append(f"{mf['key']}: {mf_res.text[:120]}")
+                    # Retry with the other type
+                    alt_type = 'single_line_text_field' if mf['type'] == 'multi_line_text_field' else 'multi_line_text_field'
+                    mf2 = {**mf, 'type': alt_type}
+                    print(f"[mf] Retrying {mf['key']} with type {alt_type}")
+                    mf_res2 = req.post(
+                        shopify_url(store, f'products/{prod_id}/metafields.json'),
+                        headers=hdrs,
+                        json={'metafield': mf2}
+                    )
+                    print(f"[mf] Retry response {mf['key']}: {mf_res2.status_code} — {mf_res2.text[:200]}")
+                    if mf_res2.status_code not in [200, 201]:
+                        mf_errors.append(f"{mf['key']} ({mf['type']} + {alt_type} both failed): {mf_res2.text[:120]}")
 
             # --- Assign first product image to all variants ---
             prod_images  = prod_data.get('images', [])
