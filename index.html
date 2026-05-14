@@ -827,9 +827,10 @@ luftig kjole</textarea>
           <div class="field-group">
             <label>Product name <span style="font-weight:400;text-transform:none;color:#aaa">(female name, unique)</span></label>
             <div class="name-row">
-              <input type="text" id="productName" value="Solène" oninput="updateTitlePreview(); autoHandle()">
+              <input type="text" id="productName" value="Solène" oninput="onProductNameInput()">
               <button class="refresh-btn" onclick="refreshName()" title="Generate new name">↻</button>
             </div>
+            <div id="nameHint" style="font-size:11px;margin-top:4px;min-height:14px"></div>
           </div>
 
           <div class="field-group">
@@ -1326,12 +1327,52 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
     el.classList.toggle('selected');
   }
 
-  function refreshName() {
-    const available = women_names.filter(n => !usedNames.includes(n));
-    const name = available[Math.floor(Math.random() * available.length)];
+  async function refreshName() {
+    const btn = document.querySelector('.refresh-btn');
+    if (btn) { btn.disabled = true; btn.textContent = '…'; }
+    let shopifyNames = [];
+    try {
+      const r = await fetch('/api/names', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({store: currentStore})
+      });
+      shopifyNames = (await r.json()).names || [];
+    } catch(e) {}
+    const allUsed = [...usedNames, ...shopifyNames];
+    const available = women_names.filter(n => !allUsed.some(u => u.toLowerCase() === n.toLowerCase()));
+    const name = available[Math.floor(Math.random() * available.length)] || 'Nova';
     document.getElementById('productName').value = name;
+    checkNameUnique(name, allUsed);
     updateTitlePreview();
-    buildVariantCards();
+    autoHandle();
+    if (btn) { btn.disabled = false; btn.textContent = '↻'; }
+  }
+
+  let _nameCheckTimer = null;
+  async function onProductNameInput() {
+    updateTitlePreview();
+    autoHandle();
+    const name = document.getElementById('productName').value.trim();
+    clearTimeout(_nameCheckTimer);
+    _nameCheckTimer = setTimeout(async () => {
+      let shopifyNames = [];
+      try {
+        const r = await fetch('/api/names', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({store: currentStore})
+        });
+        shopifyNames = (await r.json()).names || [];
+      } catch(e) {}
+      checkNameUnique(name, [...usedNames, ...shopifyNames]);
+    }, 600);
+  }
+
+  function checkNameUnique(name, allUsed) {
+    const hint = document.getElementById('nameHint');
+    if (!hint) return;
+    const taken = allUsed.some(u => u.toLowerCase() === name.toLowerCase());
+    hint.textContent = taken ? '⚠ This name is already used in your store' : '';
+    hint.style.color = taken ? '#c0392b' : '#4caf50';
   }
 
   let loadTimer;
