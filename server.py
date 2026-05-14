@@ -221,8 +221,9 @@ def get_names():
         return jsonify({'names': []})
     try:
         names = []
-        # status=any includes draft + active + archived (default may exclude drafts)
-        next_url = shopify_url(store, 'products.json?fields=title&status=any&limit=250')
+        # Comma-separated list = all statuses (active + draft + archived).
+        # Without this param Shopify only returns active products by default.
+        next_url = shopify_url(store, 'products.json?fields=title&status=active,draft,archived&limit=250')
         pages = 0
         while next_url and pages < 10:  # max 2500 products = plenty
             r = req.get(next_url, headers=shopify_headers(store), timeout=15)
