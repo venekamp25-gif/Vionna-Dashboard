@@ -386,16 +386,26 @@ def publish():
 
     created = []
 
+    # Primary color = first color in list (matches the original competitor product).
+    # Steps 1-4 ("shared") photos depict that original color, so they ONLY go to
+    # the primary color duplicate. Other color duplicates get only their step 5 photos.
+    primary_color = colors[0] if colors else None
+
     # 2. Maak per kleur een product aan
     for color in colors:
-        # Shared photos (steps 1-4) + color-specific photos (step 5 for this color)
         color_specific = images_by_color.get(color, [])
-        all_imgs = shared_images + color_specific
+        if color == primary_color:
+            # Primary color: shared (step 1-4) photos + its own step 5 photos
+            all_imgs = shared_images + color_specific
+        else:
+            # Other colors: only their own step 5 photos (steps 1-4 don't match)
+            all_imgs = color_specific
         # Deduplicate while preserving order
         seen_imgs = set()
         all_imgs = [u for u in all_imgs if not (u in seen_imgs or seen_imgs.add(u))]
         img_payload = [{'src': img} for img in all_imgs[:10] if img.startswith('http')]
-        print(f"[publish] Color '{color}': {len(shared_images)} shared + {len(color_specific)} color-specific = {len(img_payload)} total images")
+        primary_tag = ' (PRIMARY)' if color == primary_color else ''
+        print(f"[publish] Color '{color}'{primary_tag}: {len(shared_images) if color == primary_color else 0} shared + {len(color_specific)} color-specific = {len(img_payload)} total images")
 
         product_payload = {
             'product': {
