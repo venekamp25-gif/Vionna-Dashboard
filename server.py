@@ -220,12 +220,31 @@ def get_names():
     if store not in tokens:
         return jsonify({'names': []})
     try:
-        r = req.get(shopify_url(store, 'products.json?fields=title&limit=250'),
-                    headers=shopify_headers(store))
-        names = [p['title'] for p in r.json().get('products', [])]
+        names = []
+        # status=any includes draft + active + archived (default may exclude drafts)
+        next_url = shopify_url(store, 'products.json?fields=title&status=any&limit=250')
+        pages = 0
+        while next_url and pages < 10:  # max 2500 products = plenty
+            r = req.get(next_url, headers=shopify_headers(store), timeout=15)
+            data = r.json()
+            for p in data.get('products', []):
+                if p.get('title'):
+                    names.append(p['title'])
+            # Pagination via Link header
+            link = r.headers.get('Link', '')
+            next_url = None
+            for part in link.split(','):
+                if 'rel="next"' in part:
+                    url_part = part.split(';')[0].strip().lstrip('<').rstrip('>')
+                    if url_part.startswith('http'):
+                        next_url = url_part
+                    break
+            pages += 1
+        print(f'[names] {store}: {len(names)} product titles fetched across {pages} pages')
         return jsonify({'names': names})
-    except:
-        return jsonify({'names': []})
+    except Exception as e:
+        print(f'[names] Error: {e}')
+        return jsonify({'names': [], 'error': str(e)})
 
 
 # --- Generate content via Claude ---
