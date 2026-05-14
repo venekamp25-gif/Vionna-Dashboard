@@ -23,11 +23,50 @@ ANTHROPIC_KEY  = os.getenv('ANTHROPIC_API_KEY')
 
 # Higgsfield EXE — only available on Windows with the CLI installed
 IS_WINDOWS = platform.system() == 'Windows'
-HIGGSFIELD_EXE = os.path.join(
-    os.path.expanduser('~'), 'AppData', 'Roaming', 'npm',
-    'node_modules', '@higgsfield', 'cli', 'vendor', 'hf.exe'
-) if IS_WINDOWS else ''
-print(f'Higgsfield EXE: {HIGGSFIELD_EXE} (exists: {os.path.isfile(HIGGSFIELD_EXE) if HIGGSFIELD_EXE else False})')
+
+def _find_higgsfield_exe():
+    """Try multiple known locations + Windows `where` command to find hf.exe."""
+    if not IS_WINDOWS:
+        return ''
+    home    = os.path.expanduser('~')
+    npm_dir = os.path.join(home, 'AppData', 'Roaming', 'npm')
+    candidates = [
+        os.path.join(npm_dir, 'node_modules', '@higgsfield', 'cli', 'vendor', 'hf.exe'),
+        os.path.join(npm_dir, 'node_modules', '@higgsfield', 'cli', 'bin', 'hf.exe'),
+        os.path.join(npm_dir, 'node_modules', '@higgsfield', 'cli', 'hf.exe'),
+        os.path.join(npm_dir, 'node_modules', 'higgsfield-cli', 'vendor', 'hf.exe'),
+        os.path.join(npm_dir, 'hf.exe'),
+        os.path.join(home, 'AppData', 'Local', 'Programs', 'higgsfield', 'hf.exe'),
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    # Try `where hf.exe` via the OS — picks up anything in PATH
+    try:
+        r = subprocess.run('where hf.exe', capture_output=True, text=True, timeout=5, shell=True)
+        if r.returncode == 0:
+            for line in r.stdout.strip().splitlines():
+                line = line.strip()
+                if line and os.path.isfile(line):
+                    return line
+    except Exception:
+        pass
+    # Try `where hf` without extension
+    try:
+        r = subprocess.run('where hf', capture_output=True, text=True, timeout=5, shell=True)
+        if r.returncode == 0:
+            for line in r.stdout.strip().splitlines():
+                line = line.strip()
+                if line and os.path.isfile(line) and line.lower().endswith('.exe'):
+                    return line
+    except Exception:
+        pass
+    return ''
+
+HIGGSFIELD_EXE = _find_higgsfield_exe()
+print(f'Higgsfield EXE: {HIGGSFIELD_EXE or "(not found — searched npm, where hf.exe)"}')
+if not HIGGSFIELD_EXE and IS_WINDOWS:
+    print('  -> Reinstall with: npm install -g @higgsfield/cli')
 
 APP_CREDENTIALS = {
     'dk': {
