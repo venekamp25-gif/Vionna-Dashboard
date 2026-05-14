@@ -1766,7 +1766,7 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
   }
 
   // Add URL to dedicated publish pool section
-  function addToPublishPool(url, label) {
+  function addToPublishPool(url, label, color = 'shared') {
     const pool = document.getElementById('publishImagePool');
     if (!pool) return;
     // Avoid duplicates
@@ -1775,7 +1775,8 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
     const msg = document.getElementById('publishPoolMsg');
     if (msg) msg.remove();
     const tile = document.createElement('div');
-    tile.className = 'image-tile selected';  // auto-selected by default
+    tile.className = 'image-tile selected';
+    tile.dataset.color = color;  // 'shared' for steps 1-4, color name for step 5
     tile.onclick = function() { toggleImage(this); };
     tile.innerHTML = `<img src="${url}" loading="lazy" onerror="this.parentElement.style.background='#eee'">
       <div class="img-label">${label}</div>
@@ -1859,7 +1860,7 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
       if (!urls.length) throw new Error('No images received');
 
       grid.innerHTML = urls.map((url, i) => `
-        <div class="image-tile" onclick="toggleImage(this);addToPublishPool('${url}','${color} ${i+1}')">
+        <div class="image-tile" onclick="toggleImage(this);addToPublishPool('${url}','${color} ${i+1}','${color}')">
           <img src="${url}" loading="lazy" onerror="this.style.background='#eee'">
           <div class="img-label">${color}</div>
           <div class="select-check">✓</div>
@@ -1885,11 +1886,15 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
     const colors  = Array.from(document.querySelectorAll('#colorChips .chip'))
                       .map(c => c.textContent.replace('×','').trim());
     const handle  = document.getElementById('siblingsHandle2')?.value || '';
-    // Only use generated images from publish pool — never competitor images
-    const images = [...new Set(
-      Array.from(document.querySelectorAll('#publishImagePool .image-tile.selected img'))
-        .map(img => img.src).filter(s => s.startsWith('http'))
-    )];
+    // Build images per color: shared (steps 1-4) + per color (step 5)
+    const imagesByColor = { shared: [] };
+    document.querySelectorAll('#publishImagePool .image-tile.selected').forEach(tile => {
+      const url   = tile.querySelector('img')?.src;
+      const color = tile.dataset.color || 'shared';
+      if (!url || !url.startsWith('http')) return;
+      if (!imagesByColor[color]) imagesByColor[color] = [];
+      imagesByColor[color].push(url);
+    });
 
     try {
       const r = await fetch('/api/publish', {
@@ -1908,7 +1913,7 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
           product_type:    guessShopifyProductType(),
           colors,
           siblings_handle: handle,
-          images,
+          images_by_color: imagesByColor,
         })
       });
       const result = await r.json();
