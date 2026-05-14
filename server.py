@@ -465,12 +465,12 @@ def publish():
             created.append(prod_id)
 
             # --- Metafields via separate POST ---
-            # Try both type variants — Shopify must have matching metafield definition
+            # Namespace+key MUST match the metafield definitions configured in the Shopify store.
             metafields = [
-                {'namespace': 'custom', 'key': 'cutline',             'value': color,            'type': 'single_line_text_field'},
-                {'namespace': 'custom', 'key': 'siblings_collection', 'value': siblings_handle,  'type': 'single_line_text_field'},
-                {'namespace': 'custom', 'key': 'm_title_specs',       'value': m_title_specs,    'type': 'multi_line_text_field'},
-                {'namespace': 'global', 'key': 'description_tag',     'value': meta_description, 'type': 'single_line_text_field'},
+                {'namespace': 'theme',  'key': 'cutline',                       'value': color,            'type': 'single_line_text_field'},
+                {'namespace': 'theme',  'key': 'siblings',                      'value': siblings_handle,  'type': 'single_line_text_field'},
+                {'namespace': 'custom', 'key': 'm_title_specs_multi_line_text_','value': m_title_specs,    'type': 'multi_line_text_field'},
+                {'namespace': 'global', 'key': 'description_tag',               'value': meta_description, 'type': 'single_line_text_field'},
             ]
             mf_errors = []
             for mf in metafields:
