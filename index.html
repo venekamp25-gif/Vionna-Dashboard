@@ -261,7 +261,8 @@
         grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
       }
       .nb-results {
-        grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+        grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+        gap: 12px;
       }
     }
 
@@ -688,7 +689,39 @@
       transition: opacity 0.15s;
       z-index: 2;
     }
-    .image-tile:hover .zoom-btn { opacity: 1; }
+    .image-tile:hover .zoom-btn,
+    .image-tile:hover .regen-btn,
+    .image-tile:hover .pin-btn { opacity: 1; }
+    .regen-btn, .pin-btn {
+      position: absolute;
+      top: 6px;
+      background: rgba(0,0,0,0.45);
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      width: 26px;
+      height: 26px;
+      font-size: 14px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0;
+      transition: opacity 0.15s, background 0.15s;
+      z-index: 2;
+    }
+    .regen-btn { right: 38px; }
+    .pin-btn   { right: 70px; }
+    .regen-btn:hover, .pin-btn:hover { background: rgba(0,0,0,0.7); }
+    .pin-btn.pinned {
+      opacity: 1;
+      background: #f0a020;
+      color: #fff;
+    }
+    .image-tile.pinned-tile { border-color: #f0a020 !important; border-width: 3px; }
+    .regen-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    /* Bigger NB tile labels for clarity */
+    .nb-results .image-tile .img-label { font-size: 12px; padding: 4px 8px; }
     .nb-selected-row {
       display: flex;
       align-items: center;
@@ -1570,6 +1603,7 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
   // ---- NANO BANANA WORKFLOW STATE ----
   const nbState = {
     selected: { 1: null, 2: null, 3: null, 4: null },  // URL per step
+    pinned: null,        // URL of the pinned model reference (used across all steps 2-4)
     generating: {}
   };
 
@@ -1587,21 +1621,25 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
 
     if (step === 1) {
       // Prompt 1: background reference FIRST (model/styling), then product image
-      // Order matters: first image = background source, second image = product to place
       if (bgUrl) urls.push(bgUrl);
       if (productImg) urls.push(productImg);
     } else if (step === 2) {
-      // Prompt 2: alleen stap 1 selecties (competitor niet meer nodig na stap 1)
-      (nbState.selectedAll?.[1] || (nbState.selected[1] ? [nbState.selected[1]] : [])).forEach(u => urls.push(u));
+      // Prompt 2: pinned model (priority) or step 1 selections
+      if (nbState.pinned) urls.push(nbState.pinned);
+      else (nbState.selectedAll?.[1] || (nbState.selected[1] ? [nbState.selected[1]] : [])).forEach(u => urls.push(u));
     } else if (step === 3 || step === 4) {
-      // Prompts 3 & 4: alleen geselecteerde NB resultaten van vorige stappen
+      // Prompts 3 & 4: pinned model (priority) + selections from prev steps
+      if (nbState.pinned) urls.push(nbState.pinned);
       for (let s = 1; s < step; s++) {
-        (nbState.selectedAll?.[s] || (nbState.selected[s] ? [nbState.selected[s]] : [])).forEach(u => urls.push(u));
+        (nbState.selectedAll?.[s] || (nbState.selected[s] ? [nbState.selected[s]] : [])).forEach(u => {
+          if (u !== nbState.pinned) urls.push(u);  // avoid duplicate
+        });
       }
     } else if (step === 5) {
       // Handled separately per color
     }
-    return urls;
+    // Deduplicate
+    return [...new Set(urls)];
   }
 
   async function runNanoBanana(step) {
@@ -1645,18 +1683,7 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
         if (!url) throw new Error('No image received');
 
         // Replace loading slot with actual image
-        const slot = document.getElementById(`nbSlot_${step}_${i}`);
-        if (slot) {
-          const tile = document.createElement('div');
-          tile.className = 'image-tile';
-          tile.onclick = function() { selectNbImage(step, url, this); };
-          tile.innerHTML = `
-            <img src="${url}" loading="lazy" onerror="this.style.background='#eee'">
-            <div class="img-label">Variant ${i+1}</div>
-            <div class="select-check">✓</div>
-            <button class="zoom-btn" onclick="event.stopPropagation();openLightbox('${url}')" title="Zoom">⤢</button>`;
-          slot.replaceWith(tile);
-        }
+        renderNbTile(step, i, url);
         doneCount++;
         btn.textContent = `⟳ Generating… (${doneCount}/${TOTAL})`;
         updateNbColorSections();
@@ -1680,6 +1707,117 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
     btn.disabled = false;
     nbState.generating[step] = false;
     updateNbColorSections();
+  }
+
+  // Render one tile in the NB grid (used by both initial generate and slot regenerate)
+  function renderNbTile(step, slotIndex, url) {
+    const slot = document.getElementById(`nbSlot_${step}_${slotIndex}`);
+    if (!slot) return;
+    const isPinned = (nbState.pinned === url);
+    const tile = document.createElement('div');
+    tile.className = 'image-tile' + (isPinned ? ' pinned-tile' : '');
+    tile.id = `nbSlot_${step}_${slotIndex}`;
+    tile.dataset.slotIndex = slotIndex;
+    tile.dataset.step = step;
+    tile.onclick = function(e) { if (e.target === tile || e.target.tagName === 'IMG' || e.target.classList.contains('img-label') || e.target.classList.contains('select-check')) selectNbImage(step, url, this); };
+    tile.innerHTML = `
+      <img src="${url}" loading="lazy" onerror="this.style.background='#eee'">
+      <div class="img-label">Variant ${slotIndex+1}${isPinned ? ' 📌' : ''}</div>
+      <div class="select-check">✓</div>
+      <button class="pin-btn ${isPinned ? 'pinned' : ''}" onclick="event.stopPropagation();togglePinModel('${url}')" title="${isPinned ? 'Unpin model' : 'Pin as model reference for next steps'}">📌</button>
+      <button class="regen-btn" onclick="event.stopPropagation();regenerateNbSlot(${step}, ${slotIndex}, this)" title="Regenerate this image only">↻</button>
+      <button class="zoom-btn" onclick="event.stopPropagation();openLightbox('${url}')" title="Zoom">⤢</button>`;
+    slot.replaceWith(tile);
+  }
+
+  // Regenerate one slot, keeping the other 3 intact
+  async function regenerateNbSlot(step, slotIndex, btnEl) {
+    btnEl.disabled = true;
+    btnEl.textContent = '⟳';
+    const productType = document.getElementById('productType')?.value.trim() || 'dress';
+    const imageUrls   = getNbImageUrls(step);
+    const tile        = document.getElementById(`nbSlot_${step}_${slotIndex}`);
+    if (!tile) return;
+
+    // Replace tile with loading slot
+    const loadingSlot = document.createElement('div');
+    loadingSlot.className = 'nb-slot-loading';
+    loadingSlot.id = `nbSlot_${step}_${slotIndex}`;
+    loadingSlot.innerHTML = `<div class="spinner" style="width:22px;height:22px;border-width:2px"></div><span>Variant ${slotIndex+1}</span>`;
+    // If old tile was selected, remove it from publish pool first
+    const oldImg = tile.querySelector('img');
+    if (oldImg && tile.classList.contains('selected')) removeFromPublishPool(oldImg.src);
+    tile.replaceWith(loadingSlot);
+
+    try {
+      const r = await fetch('/api/higgsfield', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          prompt_type:  step,
+          product_type: productType,
+          image_urls:   imageUrls,
+          count:        1,
+        })
+      });
+      const data = await r.json();
+      if (data.error) throw new Error(data.error);
+      const url = (data.urls || [])[0];
+      if (!url) throw new Error('No image received');
+      renderNbTile(step, slotIndex, url);
+    } catch(e) {
+      const slot = document.getElementById(`nbSlot_${step}_${slotIndex}`);
+      if (slot) {
+        slot.className = 'nb-slot-error';
+        slot.innerHTML = `<span style="font-size:18px">✕</span><span>${e.message.slice(0,80)}</span>`;
+      }
+    }
+  }
+
+  // Pin an image as the model reference for all subsequent NB steps
+  function togglePinModel(url) {
+    if (nbState.pinned === url) {
+      nbState.pinned = null;
+    } else {
+      nbState.pinned = url;
+    }
+    refreshAllPinIndicators();
+    showPinStatus();
+  }
+
+  function refreshAllPinIndicators() {
+    document.querySelectorAll('.image-tile').forEach(tile => {
+      const img = tile.querySelector('img');
+      if (!img) return;
+      const pinBtn  = tile.querySelector('.pin-btn');
+      const label   = tile.querySelector('.img-label');
+      const isPinned = (nbState.pinned === img.src);
+      tile.classList.toggle('pinned-tile', isPinned);
+      if (pinBtn) {
+        pinBtn.classList.toggle('pinned', isPinned);
+        pinBtn.title = isPinned ? 'Unpin model' : 'Pin as model reference for next steps';
+      }
+      if (label && label.textContent) {
+        const baseLabel = label.textContent.replace(/ 📌$/,'');
+        label.textContent = baseLabel + (isPinned ? ' 📌' : '');
+      }
+    });
+  }
+
+  function showPinStatus() {
+    let bar = document.getElementById('pinStatusBar');
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = 'pinStatusBar';
+      bar.style.cssText = 'position:fixed;bottom:80px;right:24px;background:#f0a020;color:#fff;padding:8px 14px;border-radius:8px;font-size:12px;font-weight:600;box-shadow:0 4px 12px rgba(0,0,0,0.2);z-index:50;display:flex;align-items:center;gap:8px';
+      document.body.appendChild(bar);
+    }
+    if (nbState.pinned) {
+      bar.innerHTML = `📌 Model reference pinned — used in all next NB steps <button onclick="togglePinModel('${nbState.pinned}')" style="background:rgba(0,0,0,0.2);color:#fff;border:none;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:11px">Unpin</button>`;
+      bar.style.display = 'flex';
+    } else {
+      bar.style.display = 'none';
+    }
   }
 
   function selectNbImage(step, url, el) {

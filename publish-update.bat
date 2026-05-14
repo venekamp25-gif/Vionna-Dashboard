@@ -23,7 +23,7 @@ echo Updated version: %NEW_VERSION%
 :: Git commit and push
 git add -A
 git commit -m "Update v%NEW_VERSION%"
-git push
+git push origin main
 
 echo.
 echo Done! Version %NEW_VERSION% is live.
