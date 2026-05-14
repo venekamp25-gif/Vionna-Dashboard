@@ -235,27 +235,22 @@
         display: grid;
         grid-template-columns: 400px 1fr;
         grid-template-rows: auto auto;
-        gap: 24px;
+        column-gap: 24px;
+        row-gap: 24px;
         align-items: start;
       }
       .review-left {
         grid-column: 1;
-        grid-row: 1 / 3;
-        display: flex;
-        flex-direction: column;
-        gap: 24px;
-        min-width: 0;
-      }
-      .review-sidebar {
-        /* inside review-left */
+        grid-row: 1;
       }
       .review-main {
         grid-column: 2;
-        grid-row: 1;
+        grid-row: 1 / 3;
         min-width: 0;
       }
       .review-variants {
-        /* inside review-left, stacks below sidebar naturally */
+        grid-column: 1;
+        grid-row: 2;
       }
       /* In sidebar, stack product info + content vertically */
       .review-sidebar .two-col {
@@ -923,6 +918,7 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
     </div>
 
     </div><!-- /review-sidebar -->
+    </div><!-- /review-left -->
     <div class="review-main">
 
     <!-- IMAGES -->
@@ -1059,7 +1055,6 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
       </div>
     </div>
     </div><!-- /review-variants -->
-    </div><!-- /review-left -->
 
     </div><!-- /review-layout -->
 
