@@ -324,7 +324,15 @@ def publish():
     meta_description = data.get('meta_description', '')
     m_title_specs    = data.get('m_title_specs', '')
     product_type     = data.get('product_type', '')
-    price            = data.get('price', '0.00').replace(',', '.').replace(' DKK','').replace(' EUR','').strip()
+    price_raw        = data.get('price', '0.00').replace(',', '.').replace(' DKK','').replace(' EUR','').strip()
+    # Adjust selling price suffix: .95 for DK, .99 for FR
+    try:
+        price_int   = int(float(price_raw))
+        suffix      = '.95' if store == 'dk' else '.99'
+        price       = f'{price_int}{suffix}'
+    except Exception:
+        price       = price_raw
+    print(f"[publish] Price '{price_raw}' -> '{price}' (store: {store})")
     compare_at_price = data.get('compare_at_price')   # optional, None = no compare price
     size_option_name = 'Størrelse' if store == 'dk' else 'Taille'
     colors           = data.get('colors', [])
