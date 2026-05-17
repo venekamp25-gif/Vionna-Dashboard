@@ -516,11 +516,24 @@ def publish():
                     'collect': {'product_id': prod_id, 'collection_id': collection_id}
                 })
 
+    # Build Shopify admin URLs for created products
+    shop_domain = tokens.get(store, {}).get('shop', '')
+    product_urls = [
+        f'https://{shop_domain}/admin/products/{pid}'
+        for pid in created
+    ] if shop_domain else []
+    collection_url = (
+        f'https://{shop_domain}/admin/collections/{collection_id}'
+        if shop_domain and collection_id else None
+    )
+
     return jsonify({
         'success':          True,
         'collection_id':    collection_id,
+        'collection_url':   collection_url,
         'products_created': len(created),
         'product_ids':      created,
+        'product_urls':     product_urls,
         'metafield_errors': mf_errors if 'mf_errors' in dir() else [],
     })
 

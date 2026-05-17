@@ -2108,10 +2108,35 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
       setStep(4);
       document.getElementById('reviewSection').classList.add('section-hidden');
       document.getElementById('alertSuccess').classList.add('show');
+
+      // Build product links per color
+      const productUrls = result.product_urls || [];
+      const colorLinks = colors.map((c, i) => {
+        const url = productUrls[i];
+        return url
+          ? `<a href="${url}" target="_blank" style="color:#3b5fc0;font-weight:600;text-decoration:none;border-bottom:1px solid #3b5fc0">${c}</a>`
+          : `<span>${c}</span>`;
+      }).join(' · ');
+
+      const collectionLink = result.collection_url
+        ? `<a href="${result.collection_url}" target="_blank" style="color:#3b5fc0;font-weight:600;text-decoration:none;border-bottom:1px solid #3b5fc0">${handle}</a>`
+        : `<strong>${handle}</strong>`;
+
+      const firstProductBtn = productUrls[0]
+        ? `<div style="margin-top:12px"><a href="${productUrls[0]}" target="_blank" style="display:inline-block;background:#2d7a4f;color:#fff;padding:8px 18px;border-radius:6px;font-size:13px;font-weight:600;text-decoration:none">→ View imported product in Shopify</a></div>`
+        : '';
+
       document.getElementById('alertSuccess').innerHTML =
-        `✓ <strong>${name}</strong> created in <strong>${storeConfig[currentStore].label}</strong> — ${result.products_created} color duplicates · collection <strong>${handle}</strong> created · swatches linked. Product is set to <strong>draft</strong> until final review.`
+        `✓ <strong>${name}</strong> created in <strong>${storeConfig[currentStore].label}</strong> — ${result.products_created} color duplicates · collection ${collectionLink} created · swatches linked. Product is set to <strong>draft</strong> until final review.`
+        + `<div style="margin-top:8px;font-size:13px"><span style="color:#666">Variants:</span> ${colorLinks}</div>`
+        + firstProductBtn
         + (result.metafield_errors?.length ? `<br><span style="color:#c0392b;font-size:12px">⚠ Metafield errors: ${result.metafield_errors.join(' | ')}</span>` : '');
-      document.getElementById('bottomStatus').innerHTML = `<strong>${name}</strong> is ready for final review in Shopify`;
+
+      // Also put a quick-access button in the bottom bar
+      const firstUrl = productUrls[0];
+      document.getElementById('bottomStatus').innerHTML = firstUrl
+        ? `<strong>${name}</strong> is ready for final review · <a href="${firstUrl}" target="_blank" style="color:#3b5fc0;font-weight:600">View in Shopify →</a>`
+        : `<strong>${name}</strong> is ready for final review in Shopify`;
       btn.textContent = 'Published ✓';
       usedNames.push(name);
 
