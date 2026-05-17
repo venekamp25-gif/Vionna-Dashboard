@@ -1,4 +1,4 @@
-import os, sys, json, re, hashlib, urllib.parse, subprocess, tempfile, shutil, platform
+import os, sys, json, re, hashlib, urllib.parse, subprocess, tempfile, shutil, platform, unicodedata
 from flask import Flask, request, redirect, session, jsonify, send_from_directory
 import requests as req
 from dotenv import load_dotenv
@@ -420,6 +420,24 @@ def publish():
     # the primary color duplicate. Other color duplicates get only their step 5 photos.
     primary_color = colors[0] if colors else None
 
+    # Helpers for slug / SKU generation
+    def _strip_diacritics(text):
+        normalized = unicodedata.normalize('NFKD', text or '')
+        return ''.join(c for c in normalized if not unicodedata.combining(c))
+
+    def _slug(text):
+        ascii_text = _strip_diacritics(text)
+        return re.sub(r'[^a-z0-9]+', '-', ascii_text.lower()).strip('-')
+
+    def make_sku(p_name, color, size):
+        n = _slug(p_name).replace('-', '').upper()
+        c = _slug(color).replace('-', '').upper()[:3]
+        s = (size or '').upper().replace(' ', '')
+        return f'VIONNA-{n}-{c}-{s}'
+
+    def make_handle(p_name, color):
+        return f'{_slug(p_name)}-{_slug(color)}'.strip('-')
+
     # 2. Maak per kleur een product aan
     for color in colors:
         color_specific = images_by_color.get(color, [])
@@ -436,9 +454,11 @@ def publish():
         primary_tag = ' (PRIMARY)' if color == primary_color else ''
         print(f"[publish] Color '{color}'{primary_tag}: {len(shared_images) if color == primary_color else 0} shared + {len(color_specific)} color-specific = {len(img_payload)} total images")
 
+        product_handle = make_handle(product_name, color)
         product_payload = {
             'product': {
                 'title':        product_name,
+                'handle':       product_handle,
                 'body_html':    description,
                 'product_type': product_type,
                 'status':       'draft',
@@ -447,6 +467,7 @@ def publish():
                         'option1': size,
                         'price': price,
                         'compare_at_price': compare_at_price,
+                        'sku': make_sku(product_name, color, size),
                         'inventory_management': None,
                     }
                     for size in sizes
@@ -457,6 +478,7 @@ def publish():
                 'images': img_payload,
             }
         }
+        print(f"[publish] Product handle: '{product_handle}' | Sample SKU: '{make_sku(product_name, color, sizes[0] if sizes else 'M')}'")
 
         prod_res = req.post(f"{base}products.json", headers=hdrs, json=product_payload)
         if prod_res.status_code in [200, 201]:
