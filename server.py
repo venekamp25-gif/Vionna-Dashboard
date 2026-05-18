@@ -430,9 +430,11 @@ def publish():
         return re.sub(r'[^a-z0-9]+', '-', ascii_text.lower()).strip('-')
 
     def make_sku(p_name, color, size):
-        n = _slug(p_name).replace('-', '').upper()
-        c = _slug(color).replace('-', '').upper()[:3]
-        s = (size or '').upper().replace(' ', '')
+        # Match Hextom's format for consistency with bulk-backfilled existing products:
+        # VIONNA-<title>-<cutline>-<option1>  (keeps original case + accents)
+        n = (p_name or '').strip().replace(' ', '')
+        c = (color or '').strip().replace(' ', '')
+        s = (size or '').strip().replace(' ', '')
         return f'VIONNA-{n}-{c}-{s}'
 
     def make_handle(p_name, color):
