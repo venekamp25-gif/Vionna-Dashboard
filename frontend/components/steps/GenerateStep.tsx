@@ -31,6 +31,7 @@ export function GenerateStep() {
     if (idx < FAKE_STEPS.length || finished.current) return;
     finished.current = true;
 
+    const finalName = data.name || "Freya";
     patch({
       competitor: {
         title: "The Dakota Maxi Dress in Cream & Black",
@@ -40,18 +41,17 @@ export function GenerateStep() {
         variants: 7,
         price: "€510.00",
       },
-      name: data.name || "Freya",
+      name: finalName,
       colors: data.colors.length ? data.colors : ["Blå"],
       cutline: "Blå",
-      siblingsHandle: "freya-siblings",
+      siblingsHandle: `${finalName.toLowerCase()}-siblings`,
       description:
-        "Luftig og let at have på\n\nFreya er en let linnen sommerkjole med en afslappet pasform og brede stropper. Det naturlige linnen-materiale holder dig kølig på varme dage og giver et luftigt, ubesværet look.\n\n• Linnen-blanding: åndbart og let materiale til varme dage\n• Løst snit: sidder afslappet og giver god bevægelighed\n• Brede stropper: komfortabel pasform hele dagen\n• Lommer i siden: praktisk detalje\n• Enkel søm: roligt look der er nemt at style\n\nFreya er en kjole, der er nem at tage på, og som føles behagelig fra morgen til aften.",
+        `Luftig og let at have på\n\n${finalName} er en let linnen sommerkjole med en afslappet pasform og brede stropper. Det naturlige linnen-materiale holder dig kølig på varme dage og giver et luftigt, ubesværet look.\n\n• Linnen-blanding: åndbart og let materiale til varme dage\n• Løst snit: sidder afslappet og giver god bevægelighed\n• Brede stropper: komfortabel pasform hele dagen\n• Lommer i siden: praktisk detalje\n• Enkel søm: roligt look der er nemt at style\n\n${finalName} er en kjole, der er nem at tage på, og som føles behagelig fra morgen til aften.`,
       metaDescription:
-        "Køb Freya linnen sommerkjole. Luftig og komfortabel kjole til varme dage — nem at kombinere.",
+        `Køb ${finalName} linnen sommerkjole. Luftig og komfortabel kjole til varme dage — nem at kombinere.`,
       mTitleSpecs: "Luftig linnen sommerkjole med lommer og løst snit",
-      parsedKeywords: data.parsedKeywords.length
-        ? data.parsedKeywords
-        : ["linnen kjole", "sommerkjole", "casual kjole", "strandkjole", "boheme kjole"],
+      // Keep the user's researched keywords as-is. No mock fallback.
+      parsedKeywords: data.parsedKeywords,
     });
 
     const t = setTimeout(() => setStep(3), 600);

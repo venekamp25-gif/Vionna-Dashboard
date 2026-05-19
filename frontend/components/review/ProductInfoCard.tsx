@@ -4,6 +4,7 @@ import { Card } from "@/components/ui/Card";
 import { Chip } from "@/components/ui/Chip";
 import { Field, Label, Input } from "@/components/ui/Field";
 import { useProduct } from "@/lib/product";
+import { randomName } from "@/lib/names";
 
 const COLOR_DOTS: Record<string, string> = {
   "Blå": "#3b5fc0", "Sort": "#2d2d2d", "Hvid": "#f8f8f8", "Beige": "#f5f0e8",
@@ -31,7 +32,8 @@ export function ProductInfoCard() {
           <button
             type="button"
             title="Generate new name"
-            className="w-10 h-10 flex items-center justify-center rounded-[10px] bg-bg-elev-2 border border-border text-text-dim hover:border-accent hover:text-accent transition"
+            onClick={() => patch({ name: randomName([data.name]) })}
+            className="w-10 h-10 flex items-center justify-center rounded-[10px] bg-bg-elev-2 border border-border text-text-dim hover:border-accent hover:text-accent transition active:scale-95"
           >
             ↻
           </button>
