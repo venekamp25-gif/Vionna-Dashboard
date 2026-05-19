@@ -1,5 +1,6 @@
 import os, sys, json, re, hashlib, urllib.parse, subprocess, tempfile, shutil, platform, unicodedata
 from flask import Flask, request, redirect, session, jsonify, send_from_directory
+from flask_cors import CORS
 import requests as req
 from dotenv import load_dotenv
 
@@ -14,6 +15,15 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'), ov
 
 app = Flask(__name__, static_folder='.')
 app.secret_key = os.environ.get('SECRET_KEY') or os.urandom(24)
+
+# CORS: allow Next.js frontend (localhost:3000 in dev, vercel.app domain in prod).
+# Routes under /api/* will accept cross-origin requests from these origins.
+_allowed_origins = [
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    os.environ.get('FRONTEND_URL', ''),
+]
+CORS(app, resources={r'/api/*': {'origins': [o for o in _allowed_origins if o]}}, supports_credentials=True)
 
 @app.errorhandler(Exception)
 def handle_error(e):
