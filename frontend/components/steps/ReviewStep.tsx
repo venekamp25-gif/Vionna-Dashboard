@@ -3,6 +3,7 @@
 import { CompetitorPreview } from "@/components/review/CompetitorPreview";
 import { ProductInfoCard } from "@/components/review/ProductInfoCard";
 import { GeneratedContentCard } from "@/components/review/GeneratedContentCard";
+import { ColorVariantsCard } from "@/components/review/ColorVariantsCard";
 
 export function ReviewStep() {
   return (
@@ -15,6 +16,7 @@ export function ReviewStep() {
         <div className="flex flex-col gap-6 min-w-0">
           <ProductInfoCard />
           <GeneratedContentCard />
+          <ColorVariantsCard />
         </div>
 
         {/* Right column placeholder (Images + NB workflow comes in 3e) */}
