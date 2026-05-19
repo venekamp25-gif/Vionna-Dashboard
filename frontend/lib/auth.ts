@@ -30,7 +30,12 @@ export async function verifySession(token: string | undefined): Promise<SessionP
   if (!token) return null;
   try {
     const { payload } = await jwtVerify(token, SECRET);
-    return payload as SessionPayload;
+    if (typeof payload.email !== "string") return null;
+    return {
+      email: payload.email,
+      iat:   typeof payload.iat === "number" ? payload.iat : undefined,
+      exp:   typeof payload.exp === "number" ? payload.exp : undefined,
+    };
   } catch {
     return null;
   }
