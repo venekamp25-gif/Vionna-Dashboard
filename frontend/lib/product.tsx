@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useContext, useState, ReactNode } from "react";
+import { createContext, useContext, useState, useCallback, ReactNode } from "react";
 
 export interface CompetitorInfo {
   title: string;
@@ -60,8 +60,11 @@ const ProductContext = createContext<ProductContextType>({
 
 export function ProductProvider({ children }: { children: ReactNode }) {
   const [data, setData] = useState<ProductData>(DEFAULT_DATA);
-  const patch = (partial: Partial<ProductData>) =>
-    setData((prev) => ({ ...prev, ...partial }));
+  const patch = useCallback(
+    (partial: Partial<ProductData>) =>
+      setData((prev) => ({ ...prev, ...partial })),
+    []
+  );
   return (
     <ProductContext.Provider value={{ data, setData, patch }}>
       {children}

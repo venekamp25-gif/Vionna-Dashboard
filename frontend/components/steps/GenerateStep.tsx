@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Spinner } from "@/components/ui/Spinner";
 import { Button } from "@/components/ui/Button";
 import { useStep } from "@/lib/step";
@@ -17,36 +17,47 @@ export function GenerateStep() {
   const { setStep } = useStep();
   const { data, patch } = useProduct();
   const [idx, setIdx] = useState(0);
+  const finished = useRef(false);
 
+  // Advance through fake stages
   useEffect(() => {
-    if (idx >= FAKE_STEPS.length) {
-      // Populate mock data so Review step shows something meaningful
-      patch({
-        competitor: {
-          title: "The Dakota Maxi Dress in Cream & Black",
-          hostname: data.competitorUrl ? new URL(data.competitorUrl).hostname.replace(/^www\./, "") : "rosamae.co.uk",
-          variants: 7,
-          price: "€510.00",
-        },
-        name: data.name || "Freya",
-        colors: data.colors.length ? data.colors : ["Blå"],
-        cutline: "Blå",
-        siblingsHandle: "freya-siblings",
-        description:
-          "Luftig og let at have på\n\nFreya er en let linnen sommerkjole med en afslappet pasform og brede stropper. Det naturlige linnen-materiale holder dig kølig på varme dage og giver et luftigt, ubesværet look.\n\n• Linnen-blanding: åndbart og let materiale til varme dage\n• Løst snit: sidder afslappet og giver god bevægelighed\n• Brede stropper: komfortabel pasform hele dagen\n• Lommer i siden: praktisk detalje\n• Enkel søm: roligt look der er nemt at style\n\nFreya er en kjole, der er nem at tage på, og som føles behagelig fra morgen til aften.",
-        metaDescription:
-          "Køb Freya linnen sommerkjole. Luftig og komfortabel kjole til varme dage — nem at kombinere.",
-        mTitleSpecs: "Luftig linnen sommerkjole med lommer og løst snit",
-        parsedKeywords: data.parsedKeywords.length
-          ? data.parsedKeywords
-          : ["linnen kjole", "sommerkjole", "casual kjole", "strandkjole", "boheme kjole"],
-      });
-      const t = setTimeout(() => setStep(3), 600);
-      return () => clearTimeout(t);
-    }
+    if (idx >= FAKE_STEPS.length) return;
     const t = setTimeout(() => setIdx((i) => i + 1), 1500);
     return () => clearTimeout(t);
-  }, [idx, setStep, patch, data]);
+  }, [idx]);
+
+  // When stages done: populate mock data once + advance to step 3
+  useEffect(() => {
+    if (idx < FAKE_STEPS.length || finished.current) return;
+    finished.current = true;
+
+    patch({
+      competitor: {
+        title: "The Dakota Maxi Dress in Cream & Black",
+        hostname: data.competitorUrl
+          ? safeHostname(data.competitorUrl)
+          : "rosamae.co.uk",
+        variants: 7,
+        price: "€510.00",
+      },
+      name: data.name || "Freya",
+      colors: data.colors.length ? data.colors : ["Blå"],
+      cutline: "Blå",
+      siblingsHandle: "freya-siblings",
+      description:
+        "Luftig og let at have på\n\nFreya er en let linnen sommerkjole med en afslappet pasform og brede stropper. Det naturlige linnen-materiale holder dig kølig på varme dage og giver et luftigt, ubesværet look.\n\n• Linnen-blanding: åndbart og let materiale til varme dage\n• Løst snit: sidder afslappet og giver god bevægelighed\n• Brede stropper: komfortabel pasform hele dagen\n• Lommer i siden: praktisk detalje\n• Enkel søm: roligt look der er nemt at style\n\nFreya er en kjole, der er nem at tage på, og som føles behagelig fra morgen til aften.",
+      metaDescription:
+        "Køb Freya linnen sommerkjole. Luftig og komfortabel kjole til varme dage — nem at kombinere.",
+      mTitleSpecs: "Luftig linnen sommerkjole med lommer og løst snit",
+      parsedKeywords: data.parsedKeywords.length
+        ? data.parsedKeywords
+        : ["linnen kjole", "sommerkjole", "casual kjole", "strandkjole", "boheme kjole"],
+    });
+
+    const t = setTimeout(() => setStep(3), 600);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idx]);
 
   const currentLabel = FAKE_STEPS[Math.min(idx, FAKE_STEPS.length - 1)];
 
@@ -75,4 +86,12 @@ export function GenerateStep() {
       </p>
     </div>
   );
+}
+
+function safeHostname(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return "competitor.com";
+  }
 }
