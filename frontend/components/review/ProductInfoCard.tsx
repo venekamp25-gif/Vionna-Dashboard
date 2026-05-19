@@ -1,26 +1,55 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Card } from "@/components/ui/Card";
 import { Chip } from "@/components/ui/Chip";
 import { Field, Label, Input } from "@/components/ui/Field";
 import { useProduct } from "@/lib/product";
+import { useStore } from "@/lib/store";
 import { randomName } from "@/lib/names";
 import { slugify } from "@/lib/slug";
+import { api } from "@/lib/api";
 
 const COLOR_DOTS: Record<string, string> = {
   "Blå": "#3b5fc0", "Sort": "#2d2d2d", "Hvid": "#f8f8f8", "Beige": "#f5f0e8",
   "Rød": "#c0392b", "Grøn": "#4a7c5c", "Brun": "#8b6347", "Grå": "#8e8e8e",
-  "Navy": "#1e2a4a", "Noir": "#1a1a1a", "Blanc": "#f8f8f8",
+  "Navy": "#1e2a4a", "Noir": "#1a1a1a", "Blanc": "#f8f8f8", "Écru": "#f0ead4",
 };
+
+type NameStatus = "idle" | "checking" | "available" | "taken";
 
 export function ProductInfoCard() {
   const { data, patch } = useProduct();
+  const { store } = useStore();
 
-  // ── Name-sync ──
-  // When the product name changes, after a 600ms debounce, replace the OLD name
-  // with the NEW one in description / meta description / mTitleSpecs, and update
-  // the siblings handle if it followed the standard "{slug}-siblings" pattern.
+  // ── Used names cache (fetched once per Review session) ──
+  const [usedNames, setUsedNames] = useState<string[]>([]);
+  const [usedNamesLoading, setUsedNamesLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .names(store)
+      .then((r) => { if (!cancelled) setUsedNames(r.names ?? []); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setUsedNamesLoading(false); });
+    return () => { cancelled = true; };
+  }, [store]);
+
+  // ── Name-availability check (debounced 600ms) ──
+  const [nameStatus, setNameStatus] = useState<NameStatus>("idle");
+  useEffect(() => {
+    if (!data.name.trim()) { setNameStatus("idle"); return; }
+    if (usedNamesLoading) { setNameStatus("checking"); return; }
+    setNameStatus("checking");
+    const t = setTimeout(() => {
+      const taken = usedNames.some((n) => n.toLowerCase() === data.name.toLowerCase());
+      setNameStatus(taken ? "taken" : "available");
+    }, 400);
+    return () => clearTimeout(t);
+  }, [data.name, usedNames, usedNamesLoading]);
+
+  // ── Name-sync (debounced 600ms): replace old name everywhere ──
   const lastSyncedName = useRef<string | null>(null);
   useEffect(() => {
     if (lastSyncedName.current === null) {
@@ -61,6 +90,11 @@ export function ProductInfoCard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data.name]);
 
+  const refreshName = () => {
+    const newName = randomName([...usedNames, data.name]);
+    patch({ name: newName });
+  };
+
   const removeColor = (c: string) =>
     patch({ colors: data.colors.filter((x) => x !== c) });
 
@@ -78,12 +112,13 @@ export function ProductInfoCard() {
           <button
             type="button"
             title="Generate new name"
-            onClick={() => patch({ name: randomName([data.name]) })}
+            onClick={refreshName}
             className="w-10 h-10 flex items-center justify-center rounded-[10px] bg-bg-elev-2 border border-border text-text-dim hover:border-accent hover:text-accent transition active:scale-95"
           >
             ↻
           </button>
         </div>
+        <NameStatusLine status={nameStatus} />
       </Field>
 
       <Field>
@@ -174,5 +209,24 @@ export function ProductInfoCard() {
         )}
       </div>
     </Card>
+  );
+}
+
+function NameStatusLine({ status }: { status: NameStatus }) {
+  if (status === "idle") return <div className="h-[14px]" />;
+  if (status === "checking") {
+    return <div className="text-[11px] text-text-faint mt-1">Checking catalogue…</div>;
+  }
+  if (status === "taken") {
+    return (
+      <div className="text-[11px] text-danger mt-1 flex items-center gap-1">
+        ⚠ This name is already used in your store
+      </div>
+    );
+  }
+  return (
+    <div className="text-[11px] text-accent mt-1 flex items-center gap-1">
+      ✓ Available
+    </div>
   );
 }
