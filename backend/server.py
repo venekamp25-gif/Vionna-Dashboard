@@ -600,11 +600,14 @@ NANO_BANANA_PROMPTS = {
         "want any changes to the background, model, or the product. Now, we want a close-up image "
         "of the material. Please make sure the zoomed-in shot still matches the original style "
         "and lighting, and focuses clearly on the texture and details."),
-    5: ("I've added a photo of a woman wearing a {product_type}. This is our model, and we don't "
-        "want any changes to the background, the model, or the product styling. We now want the "
-        "exact same product, in {color}. Please keep everything identical — lighting, pose, fit, "
-        "and background — and only change the color of the {product_type} to {color} and use "
-        "another pose of the model."),
+    5: ("I've uploaded multiple reference images. The FIRST image is our model wearing a "
+        "{product_type} — keep this model, her face, the background, the lighting, the styling, "
+        "the fit and the silhouette EXACTLY identical. The remaining images are color references "
+        "from the competitor showing the same {product_type} in {color}; use them only to match "
+        "the exact {color} colour, texture and fabric finish. Generate the same model in a slightly "
+        "different pose, wearing the {product_type} in {color}. Do not copy the competitor's model, "
+        "face, body, or background — only mirror the colour from those references onto our model's "
+        "outfit."),
 }
 
 

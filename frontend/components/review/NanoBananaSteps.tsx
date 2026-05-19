@@ -42,7 +42,7 @@ export function NanoBananaSteps() {
         });
       }
     } else if (step === 5) {
-      // For color variants: pinned model OR any selected NB image
+      // For color variants: pinned model first, then competitor refs as color samples
       if (data.pinnedUrl) urls.push(data.pinnedUrl);
       else {
         for (let s = 4; s >= 1; s--) {
@@ -50,6 +50,11 @@ export function NanoBananaSteps() {
           if (sel.length) { urls.push(sel[0].url); break; }
         }
       }
+      // Add selected competitor images as color references (so Higgsfield can match the color).
+      data.competitorImages
+        .filter((img) => img.selected)
+        .slice(0, 3)
+        .forEach((img) => urls.push(img.url));
     }
     return Array.from(new Set(urls));   // dedupe
   };
