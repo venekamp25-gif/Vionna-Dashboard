@@ -2,6 +2,7 @@ import { Logo } from "./Logo";
 import { StoreToggle } from "./StoreToggle";
 import { ThemeToggle } from "./ThemeToggle";
 import { BackendStatusBadge } from "./BackendStatusBadge";
+import { LogoutButton } from "./LogoutButton";
 
 export function Header() {
   return (
@@ -11,6 +12,7 @@ export function Header() {
         <BackendStatusBadge />
         <StoreToggle />
         <ThemeToggle />
+        <LogoutButton />
       </div>
     </header>
   );
