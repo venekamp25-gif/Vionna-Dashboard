@@ -303,6 +303,12 @@ export function NanoBananaSteps() {
         toggleSelect={toggleSelect}
         togglePin={togglePin}
         onZoom={(url) => setZoomUrl(url)}
+        onGenerateAll={async (colors) => {
+          for (const color of colors) {
+            if (data.nbResultsPerColor[color]?.length) continue;  // skip already-generated
+            await runColorVariant(color);
+          }
+        }}
       />
 
       <Lightbox url={zoomUrl} onClose={() => setZoomUrl(null)} />
@@ -312,19 +318,24 @@ export function NanoBananaSteps() {
 
 interface Step5Props {
   onGenerate: (color: string) => void;
+  onGenerateAll: (colors: string[]) => Promise<void>;
   runningColors: Record<string, boolean>;
   toggleSelect: (step: number, slot: number, color: string) => void;
   togglePin: (url: string) => void;
   onZoom: (url: string) => void;
 }
 
-function Step5({ onGenerate, runningColors, toggleSelect, togglePin, onZoom }: Step5Props) {
+function Step5({ onGenerate, onGenerateAll, runningColors, toggleSelect, togglePin, onZoom }: Step5Props) {
   const { data } = useProduct();
   const otherColors = data.colors.slice(1);
 
   const hasModelImage =
     !!data.pinnedUrl ||
     Object.values(data.nbResults).some((arr) => arr.some((r) => r.selected));
+
+  const anyRunning = Object.values(runningColors).some(Boolean);
+  const pendingColors = otherColors.filter((c) => !data.nbResultsPerColor[c]?.length);
+  const canGenerateAll = hasModelImage && pendingColors.length > 0 && !anyRunning;
 
   return (
     <div className="bg-bg-elev-2 border border-border rounded-[14px] p-4">
@@ -336,6 +347,27 @@ function Step5({ onGenerate, runningColors, toggleSelect, togglePin, onZoom }: S
           <div className="text-[14px] font-semibold text-text">Color variants</div>
           <div className="text-[11px] text-text-faint">Per color: same model + background, different color</div>
         </div>
+        {otherColors.length > 0 && hasModelImage && (
+          <Button
+            size="sm"
+            variant="primary"
+            onClick={() => onGenerateAll(pendingColors)}
+            disabled={!canGenerateAll}
+            title={
+              anyRunning
+                ? "Wait for current generation to finish"
+                : pendingColors.length === 0
+                ? "All colors already generated"
+                : `Generate ${pendingColors.length} remaining colors one by one`
+            }
+          >
+            {anyRunning
+              ? "⟳ Running…"
+              : pendingColors.length === 0
+              ? "✓ All done"
+              : `✦ Generate all (${pendingColors.length})`}
+          </Button>
+        )}
       </div>
 
       {!hasModelImage ? (
