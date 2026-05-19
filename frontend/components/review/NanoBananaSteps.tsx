@@ -63,10 +63,8 @@ export function NanoBananaSteps() {
 
     const imageUrls = buildImageUrls(stepNum);
 
-    // Reset slots — show 4 empty loading tiles immediately
-    patch({
-      nbResults: { ...data.nbResults, [stepNum]: [] },
-    });
+    // Reset slots — show 4 empty loading tiles immediately (functional → never overwrites a parallel step)
+    setData((prev) => ({ ...prev, nbResults: { ...prev.nbResults, [stepNum]: [] } }));
 
     const slots: (NbResult | null)[] = Array(TOTAL_VARIANTS).fill(null);
 
@@ -81,20 +79,19 @@ export function NanoBananaSteps() {
         const url = res.urls?.[0];
         if (!url) throw new Error(res.error ?? "No image returned");
         slots[i] = { url, selected: false };
-      } catch (err) {
+      } catch {
         slots[i] = null;
       } finally {
-        // Update progress + reflect filled slots in state
         setProgress((p) => ({ ...p, [stepNum]: (p[stepNum] ?? 0) + 1 }));
         const partial = slots.map((s) => s ?? { url: "", selected: false });
-        patch({ nbResults: { ...data.nbResults, [stepNum]: partial } });
+        setData((prev) => ({ ...prev, nbResults: { ...prev.nbResults, [stepNum]: partial } }));
       }
     });
 
     await Promise.allSettled(calls);
 
     const finalResults = slots.filter((s): s is NbResult => s !== null);
-    patch({ nbResults: { ...data.nbResults, [stepNum]: finalResults } });
+    setData((prev) => ({ ...prev, nbResults: { ...prev.nbResults, [stepNum]: finalResults } }));
 
     if (finalResults.length === 0) {
       setStepErrors((e) => ({ ...e, [stepNum]: "All variants failed. Check Higgsfield + try again." }));
@@ -110,13 +107,16 @@ export function NanoBananaSteps() {
 
     // Remove from publish pool if selected
     if (tile.selected) {
-      patch({ publishPool: data.publishPool.filter((p) => p.url !== tile.url) });
+      setData((prev) => ({ ...prev, publishPool: prev.publishPool.filter((p) => p.url !== tile.url) }));
     }
 
     const imageUrls = buildImageUrls(stepNum);
     const placeholder = { url: "", selected: false };
-    const beforeReplace = current.map((r, i) => (i === slotIndex ? placeholder : r));
-    patch({ nbResults: { ...data.nbResults, [stepNum]: beforeReplace } });
+    setData((prev) => {
+      const cur = prev.nbResults[stepNum] ?? [];
+      const next = cur.map((r, i) => (i === slotIndex ? placeholder : r));
+      return { ...prev, nbResults: { ...prev.nbResults, [stepNum]: next } };
+    });
 
     try {
       const res = await api.higgsfield({
@@ -127,8 +127,11 @@ export function NanoBananaSteps() {
       });
       const url = res.urls?.[0];
       if (!url) throw new Error(res.error ?? "No image returned");
-      const updated = beforeReplace.map((r, i) => (i === slotIndex ? { url, selected: false } : r));
-      patch({ nbResults: { ...data.nbResults, [stepNum]: updated } });
+      setData((prev) => {
+        const cur = prev.nbResults[stepNum] ?? [];
+        const next = cur.map((r, i) => (i === slotIndex ? { url, selected: false } : r));
+        return { ...prev, nbResults: { ...prev.nbResults, [stepNum]: next } };
+      });
     } catch {
       // Leave placeholder empty; user can retry
     }
@@ -157,9 +160,10 @@ export function NanoBananaSteps() {
       if (res.error) throw new Error(res.error);
       const urls = res.urls ?? [];
       const results: NbResult[] = urls.map((u) => ({ url: u, selected: false }));
-      patch({
-        nbResultsPerColor: { ...data.nbResultsPerColor, [color]: results },
-      });
+      setData((prev) => ({
+        ...prev,
+        nbResultsPerColor: { ...prev.nbResultsPerColor, [color]: results },
+      }));
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       alert(`Failed to generate ${color}: ${msg}`);
