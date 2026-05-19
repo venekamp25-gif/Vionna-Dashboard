@@ -103,8 +103,8 @@ export function ReviewStep() {
         </div>
       </div>
 
-      {/* Bottom bar (sticky) */}
-      <div className="sticky bottom-0 mt-8 -mx-8 px-8 py-4 bg-bg-elev border-t border-border backdrop-blur flex items-center justify-between gap-4">
+      {/* Bottom bar (sticky) — bleeds to viewport edges via negative margin matching parent padding */}
+      <div className="sticky bottom-0 mt-8 -mx-8 lg:-mx-12 xl:-mx-16 px-8 lg:px-12 xl:px-16 py-4 bg-bg-elev border-t border-border backdrop-blur flex items-center justify-between gap-4">
         <div className="flex flex-col">
           {error ? (
             <span className="text-[13px] text-danger">{error}</span>

@@ -15,7 +15,7 @@ export default function Home() {
     <>
       <Header />
       <Steps />
-      <main className="flex-1 max-w-[1700px] w-full mx-auto px-8 py-8">
+      <main className="flex-1 w-full mx-auto px-8 lg:px-12 xl:px-16 py-8">
         {step === 1 && <InputStep />}
         {step === 2 && <GenerateStep />}
         {step === 3 && <ReviewStep />}
