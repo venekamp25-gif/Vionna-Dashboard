@@ -1,9 +1,10 @@
 # Netlify build configuration for Vionna Dashboard (Next.js in frontend/)
 [build]
-  base    = "frontend"
-  command = "npm run build"
-  publish = ".next"
+  base      = "frontend"
+  command   = "npm run build"
+  publish   = ".next"
+  functions = ".netlify/functions-internal"
 
-# Use Netlify's official Next.js plugin so middleware, API routes, and SSR all work.
+# Use Netlify's official Next.js plugin so API routes + SSR work.
 [[plugins]]
   package = "@netlify/plugin-nextjs"
