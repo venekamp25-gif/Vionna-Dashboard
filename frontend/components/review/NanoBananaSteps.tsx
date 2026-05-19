@@ -22,7 +22,7 @@ export function NanoBananaSteps() {
   const [progress, setProgress] = useState<Record<number, number>>({});
   const [stepErrors, setStepErrors] = useState<Record<number, string | null>>({});
   const [zoomUrl, setZoomUrl] = useState<string | null>(null);
-  const [runningColor, setRunningColor] = useState<string | null>(null);
+  const [runningColors, setRunningColors] = useState<Record<string, boolean>>({});
 
   /** Build reference image URLs for a given step based on current state. */
   const buildImageUrls = (step: number): string[] => {
@@ -134,15 +134,15 @@ export function NanoBananaSteps() {
     }
   };
 
-  /** Generate 4 variants for a specific color (step 5). */
+  /** Generate 4 variants for a specific color (step 5). Multiple colors can run in parallel. */
   const runColorVariant = async (color: string) => {
-    if (runningColor) return;
-    setRunningColor(color);
+    if (runningColors[color]) return;
+    setRunningColors((m) => ({ ...m, [color]: true }));
 
     const imageUrls = buildImageUrls(5);
     if (!imageUrls.length) {
       alert("Select an image in steps 1–4 first (or pin one as model).");
-      setRunningColor(null);
+      setRunningColors((m) => ({ ...m, [color]: false }));
       return;
     }
 
@@ -164,7 +164,7 @@ export function NanoBananaSteps() {
       const msg = e instanceof Error ? e.message : String(e);
       alert(`Failed to generate ${color}: ${msg}`);
     } finally {
-      setRunningColor(null);
+      setRunningColors((m) => ({ ...m, [color]: false }));
     }
   };
 
@@ -304,10 +304,9 @@ export function NanoBananaSteps() {
       {/* Step 5: Color variants */}
       <Step5
         onGenerate={runColorVariant}
-        runningColor={runningColor}
+        runningColors={runningColors}
         toggleSelect={toggleSelect}
         togglePin={togglePin}
-        regenerateSlot={(color) => runColorVariant(color)}
         onZoom={(url) => setZoomUrl(url)}
       />
 
@@ -318,14 +317,13 @@ export function NanoBananaSteps() {
 
 interface Step5Props {
   onGenerate: (color: string) => void;
-  runningColor: string | null;
+  runningColors: Record<string, boolean>;
   toggleSelect: (step: number, slot: number, color: string) => void;
   togglePin: (url: string) => void;
-  regenerateSlot: (color: string) => void;
   onZoom: (url: string) => void;
 }
 
-function Step5({ onGenerate, runningColor, toggleSelect, togglePin, onZoom }: Step5Props) {
+function Step5({ onGenerate, runningColors, toggleSelect, togglePin, onZoom }: Step5Props) {
   const { data } = useProduct();
   const otherColors = data.colors.slice(1);
 
@@ -357,7 +355,7 @@ function Step5({ onGenerate, runningColor, toggleSelect, togglePin, onZoom }: St
         <div className="space-y-4">
           {otherColors.map((color) => {
             const results = data.nbResultsPerColor[color] ?? [];
-            const isRunning = runningColor === color;
+            const isRunning = !!runningColors[color];
             return (
               <div key={color} className="bg-bg-elev rounded-[10px] p-3">
                 <div className="flex items-center justify-between gap-3 mb-3">
@@ -371,7 +369,7 @@ function Step5({ onGenerate, runningColor, toggleSelect, togglePin, onZoom }: St
                     size="sm"
                     variant="secondary"
                     onClick={() => onGenerate(color)}
-                    disabled={isRunning || !!runningColor}
+                    disabled={isRunning}
                   >
                     {isRunning ? "⟳ Generating…" : results.length ? "✦ Regenerate" : `✦ Generate ${color}`}
                   </Button>
