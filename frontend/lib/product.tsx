@@ -51,6 +51,7 @@ export interface ProductData {
   productType: string;
   nbResults: Record<number, NbResult[]>;   // step number → results array
   nbResultsPerColor: Record<string, NbResult[]>; // color name → results (step 5)
+  pinnedUrl: string | null;                // model reference pinned across NB steps
   publishPool: PoolPhoto[];
 }
 
@@ -75,6 +76,7 @@ const DEFAULT_DATA: ProductData = {
   productType: "dress",
   nbResults: {},
   nbResultsPerColor: {},
+  pinnedUrl: null,
   publishPool: [],
 };
 
