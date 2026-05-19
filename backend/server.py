@@ -31,52 +31,62 @@ def handle_error(e):
 
 ANTHROPIC_KEY  = os.getenv('ANTHROPIC_API_KEY')
 
-# Higgsfield EXE — only available on Windows with the CLI installed
+# Cross-platform Higgsfield CLI lookup (works on Windows + Linux droplet).
 IS_WINDOWS = platform.system() == 'Windows'
 
 def _find_higgsfield_exe():
-    """Try multiple known locations + Windows `where` command to find hf.exe."""
-    if not IS_WINDOWS:
+    """Locate the Higgsfield CLI binary on Windows or Linux."""
+    # Allow override via env var (useful for deployment)
+    override = os.environ.get('HIGGSFIELD_BIN')
+    if override and os.path.isfile(override):
+        return override
+
+    if IS_WINDOWS:
+        home    = os.path.expanduser('~')
+        npm_dir = os.path.join(home, 'AppData', 'Roaming', 'npm')
+        candidates = [
+            os.path.join(npm_dir, 'node_modules', '@higgsfield', 'cli', 'vendor', 'hf.exe'),
+            os.path.join(npm_dir, 'node_modules', '@higgsfield', 'cli', 'bin', 'hf.exe'),
+            os.path.join(npm_dir, 'hf.exe'),
+        ]
+        for p in candidates:
+            if os.path.isfile(p):
+                return p
+        # Fallback: `where hf.exe`
+        try:
+            r = subprocess.run('where hf.exe', capture_output=True, text=True, timeout=5, shell=True)
+            if r.returncode == 0:
+                for line in r.stdout.strip().splitlines():
+                    line = line.strip()
+                    if line and os.path.isfile(line):
+                        return line
+        except Exception:
+            pass
         return ''
-    home    = os.path.expanduser('~')
-    npm_dir = os.path.join(home, 'AppData', 'Roaming', 'npm')
+
+    # Linux / macOS
     candidates = [
-        os.path.join(npm_dir, 'node_modules', '@higgsfield', 'cli', 'vendor', 'hf.exe'),
-        os.path.join(npm_dir, 'node_modules', '@higgsfield', 'cli', 'bin', 'hf.exe'),
-        os.path.join(npm_dir, 'node_modules', '@higgsfield', 'cli', 'hf.exe'),
-        os.path.join(npm_dir, 'node_modules', 'higgsfield-cli', 'vendor', 'hf.exe'),
-        os.path.join(npm_dir, 'hf.exe'),
-        os.path.join(home, 'AppData', 'Local', 'Programs', 'higgsfield', 'hf.exe'),
+        '/usr/local/bin/hf',
+        '/usr/bin/hf',
+        '/usr/lib/node_modules/@higgsfield/cli/vendor/hf',
+        os.path.join(os.path.expanduser('~'), '.npm-global', 'bin', 'hf'),
     ]
     for p in candidates:
         if os.path.isfile(p):
             return p
-    # Try `where hf.exe` via the OS — picks up anything in PATH
+    # Fallback: `which hf`
     try:
-        r = subprocess.run('where hf.exe', capture_output=True, text=True, timeout=5, shell=True)
+        r = subprocess.run(['which', 'hf'], capture_output=True, text=True, timeout=5)
         if r.returncode == 0:
-            for line in r.stdout.strip().splitlines():
-                line = line.strip()
-                if line and os.path.isfile(line):
-                    return line
-    except Exception:
-        pass
-    # Try `where hf` without extension
-    try:
-        r = subprocess.run('where hf', capture_output=True, text=True, timeout=5, shell=True)
-        if r.returncode == 0:
-            for line in r.stdout.strip().splitlines():
-                line = line.strip()
-                if line and os.path.isfile(line) and line.lower().endswith('.exe'):
-                    return line
+            path = r.stdout.strip().splitlines()[0] if r.stdout else ''
+            if path and os.path.isfile(path):
+                return path
     except Exception:
         pass
     return ''
 
 HIGGSFIELD_EXE = _find_higgsfield_exe()
-print(f'Higgsfield EXE: {HIGGSFIELD_EXE or "(not found — searched npm, where hf.exe)"}')
-if not HIGGSFIELD_EXE and IS_WINDOWS:
-    print('  -> Reinstall with: npm install -g @higgsfield/cli')
+print(f'Higgsfield EXE: {HIGGSFIELD_EXE or "(not found — install with: npm install -g @higgsfield/cli)"}')
 
 APP_CREDENTIALS = {
     'dk': {
@@ -704,11 +714,9 @@ def higgsfield_generate():
             except Exception:
                 pass
 
-        if not IS_WINDOWS:
-            return jsonify({'error': 'Higgsfield image generation requires Windows with the Higgsfield CLI installed. '
-                                     'This feature is not available on the cloud version — run the dashboard locally to generate images.'}), 501
-        if not os.path.isfile(HIGGSFIELD_EXE):
-            return jsonify({'error': f'hf.exe not found at: {HIGGSFIELD_EXE}. Please install the Higgsfield CLI.'}), 500
+        if not HIGGSFIELD_EXE or not os.path.isfile(HIGGSFIELD_EXE):
+            return jsonify({'error': 'Higgsfield CLI binary not found on server. '
+                                     'Install with: npm install -g @higgsfield/cli'}), 500
 
         safe_prompt = prompt.replace('"', "'")
         base_cmd = (f'"{HIGGSFIELD_EXE}" generate create nano_banana_2'
