@@ -1,6 +1,19 @@
+# Python
 .env
+backend/.env
 tokens.json
+backend/tokens.json
 __pycache__/
 *.pyc
 *.pyo
+
+# Next.js / Node
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/.env.local
+frontend/.env*.local
+
+# OS
 .DS_Store
+Thumbs.db

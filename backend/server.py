@@ -781,7 +781,8 @@ def api_version():
     if not GITHUB_RAW:
         return jsonify({'local': local, 'remote': None, 'update_available': False})
     try:
-        r = req.get(f'{GITHUB_RAW}/version.txt', timeout=5)
+        # Files moved to backend/ subdirectory after repo restructure
+        r = req.get(f'{GITHUB_RAW}/backend/version.txt', timeout=5)
         remote = r.text.strip()
         update_available = _version_tuple(remote) > _version_tuple(local)
         return jsonify({'local': local, 'remote': remote, 'update_available': update_available})
@@ -793,12 +794,13 @@ def api_update():
     if not GITHUB_RAW:
         return jsonify({'error': 'GITHUB_RAW not configured'}), 400
     base_dir = os.path.dirname(os.path.abspath(__file__))
+    # Pull from backend/ on GitHub, save locally next to the running server.py
     files_to_update = ['index.html', 'server.py', 'version.txt']
     updated = []
     errors  = []
     for fname in files_to_update:
         try:
-            r = req.get(f'{GITHUB_RAW}/{fname}', timeout=15)
+            r = req.get(f'{GITHUB_RAW}/backend/{fname}', timeout=15)
             r.raise_for_status()
             dest = os.path.join(base_dir, fname)
             with open(dest, 'wb') as f:

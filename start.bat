@@ -1,6 +1,6 @@
 @echo off
 echo Vionna Dashboard opstarten...
-cd /d "%~dp0"
+cd /d "%~dp0\backend"
 
 set APPDATA=%APPDATA%
 set PATH=%PATH%;C:\Program Files\nodejs;%APPDATA%\npm
