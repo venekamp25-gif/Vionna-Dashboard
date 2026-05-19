@@ -7,8 +7,17 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script>
+    // Apply saved theme BEFORE render to prevent flash of wrong theme
+    (function() {
+      try {
+        var saved = localStorage.getItem('vionna_theme');
+        if (saved === 'light') document.documentElement.setAttribute('data-theme', 'light');
+      } catch(e) {}
+    })();
+  </script>
   <style>
-    /* ===== DARK THEME TOKENS ===== */
+    /* ===== DARK THEME TOKENS (default) ===== */
     :root {
       --bg:           #0b0f14;   /* page background */
       --bg-elev:      #141a22;   /* cards */
@@ -23,7 +32,8 @@
       --accent-hover: #059669;
       --accent-soft:  rgba(16,185,129,0.13);
       --accent-glow:  rgba(16,185,129,0.35);
-      --secondary:    #c9a55c;   /* warm gold — subtle secondary highlights */
+      --on-accent:    #0b0f14;   /* text color on accent backgrounds */
+      --secondary:    #c9a55c;
       --secondary-soft: rgba(201,165,92,0.12);
       --danger:       #ef4444;
       --warning:      #f59e0b;
@@ -36,6 +46,27 @@
       --radius-lg:    14px;
       --ease:         cubic-bezier(0.4, 0, 0.2, 1);
       --ease-out:     cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    /* ===== LIGHT THEME ===== */
+    :root[data-theme="light"] {
+      --bg:           #f7f8fa;
+      --bg-elev:      #ffffff;
+      --bg-elev-2:    #f1f5f9;
+      --bg-elev-3:    #e2e8f0;
+      --border:       #e2e8f0;
+      --border-hover: #cbd5e1;
+      --text:         #0f172a;
+      --text-dim:     #475569;
+      --text-faint:   #94a3b8;
+      --accent:       #10b981;
+      --accent-hover: #059669;
+      --accent-soft:  rgba(16,185,129,0.10);
+      --accent-glow:  rgba(16,185,129,0.30);
+      --on-accent:    #ffffff;
+      --shadow-sm:    0 1px 2px rgba(15,23,42,0.06), 0 1px 1px rgba(15,23,42,0.04);
+      --shadow-md:    0 4px 12px rgba(15,23,42,0.08), 0 2px 4px rgba(15,23,42,0.04);
+      --shadow-lg:    0 14px 40px rgba(15,23,42,0.12);
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -810,7 +841,7 @@
     .store-btn:hover { color: var(--text) !important; }
     .store-btn.active {
       background: var(--accent) !important;
-      color: #0e1116 !important;
+      color: var(--on-accent) !important;
       box-shadow: var(--shadow-sm);
     }
 
@@ -822,13 +853,13 @@
     }
     .step.active {
       background: var(--accent) !important;
-      color: #0e1116 !important;
+      color: var(--on-accent) !important;
       box-shadow: 0 0 0 1px var(--accent), 0 4px 16px rgba(34,197,94,0.3);
     }
     .step.done { color: var(--text-dim) !important; }
     .step-num { background: var(--bg-elev-2) !important; color: var(--text-dim) !important; }
-    .step.active .step-num { background: #0e1116 !important; color: var(--accent) !important; opacity: 1; }
-    .step.done .step-num { background: var(--accent) !important; color: #0e1116 !important; opacity: 1; }
+    .step.active .step-num { background: var(--on-accent) !important; color: var(--accent) !important; opacity: 1; }
+    .step.done .step-num { background: var(--accent) !important; color: var(--on-accent) !important; opacity: 1; }
 
     /* Cards — more breathing room + dark style */
     .card {
@@ -906,7 +937,7 @@
     }
     .btn-primary {
       background: var(--accent) !important;
-      color: #0e1116 !important;
+      color: var(--on-accent) !important;
       box-shadow: var(--shadow-sm);
     }
     .btn-primary:hover {
@@ -925,7 +956,7 @@
     }
     .btn-publish {
       background: var(--accent) !important;
-      color: #0e1116 !important;
+      color: var(--on-accent) !important;
       box-shadow: 0 4px 14px rgba(34,197,94,0.3);
     }
     .btn-publish:hover { background: var(--accent-hover) !important; box-shadow: 0 6px 20px rgba(34,197,94,0.4); }
@@ -983,7 +1014,7 @@
     }
     .image-tile .select-check {
       background: var(--accent) !important;
-      color: #0e1116 !important;
+      color: var(--on-accent) !important;
     }
     .image-placeholder {
       background: var(--bg-elev-2) !important;
@@ -1051,7 +1082,7 @@
       background: var(--bg-elev) !important;
       color: var(--text-dim) !important;
     }
-    .nb-badge-done { background: var(--accent) !important; color: #0e1116 !important; }
+    .nb-badge-done { background: var(--accent) !important; color: var(--on-accent) !important; }
 
     /* Char count */
     .char-count { color: var(--text-faint) !important; }
@@ -1060,7 +1091,7 @@
     /* Update banner */
     #updateBanner {
       background: linear-gradient(135deg, var(--accent), var(--accent-hover)) !important;
-      color: #0e1116 !important;
+      color: var(--on-accent) !important;
     }
 
     /* Variant cards */
@@ -1093,6 +1124,44 @@
     *::-webkit-scrollbar-track { background: var(--bg); }
     *::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
     *::-webkit-scrollbar-thumb:hover { background: var(--border-hover); }
+
+    /* ============================================================
+       THEME TOGGLE
+       ============================================================ */
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .theme-toggle {
+      background: var(--bg-elev-2);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: all 0.2s var(--ease);
+      position: relative;
+      overflow: hidden;
+    }
+    .theme-toggle:hover {
+      background: var(--bg-elev);
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .theme-toggle svg {
+      position: absolute;
+      transition: transform 0.4s var(--ease-out), opacity 0.25s var(--ease);
+    }
+    /* dark mode shows moon, light mode shows sun */
+    :root .icon-sun  { transform: translateY(20px) rotate(90deg); opacity: 0; }
+    :root .icon-moon { transform: translateY(0) rotate(0); opacity: 1; }
+    :root[data-theme="light"] .icon-sun  { transform: translateY(0) rotate(0); opacity: 1; }
+    :root[data-theme="light"] .icon-moon { transform: translateY(-20px) rotate(-90deg); opacity: 0; }
 
     /* ============================================================
        STORE SELECTOR FLAGS
@@ -1306,20 +1375,26 @@
       <span class="logo-sub">Product Dashboard</span>
     </div>
   </div>
-  <div class="store-toggle">
-    <button class="store-btn active" onclick="setStore('dk', this)" title="Vionna DK">
-      <svg class="flag" viewBox="0 0 28 20" xmlns="http://www.w3.org/2000/svg">
-        <rect width="28" height="20" fill="#C8102E"/>
-        <rect x="9" width="3" height="20" fill="#fff"/>
-        <rect y="8.5" width="28" height="3" fill="#fff"/>
-      </svg>
-    </button>
-    <button class="store-btn" onclick="setStore('fr', this)" title="Vionna FR">
-      <svg class="flag" viewBox="0 0 28 20" xmlns="http://www.w3.org/2000/svg">
-        <rect width="9.33" height="20" fill="#002395"/>
-        <rect x="9.33" width="9.33" height="20" fill="#fff"/>
-        <rect x="18.66" width="9.34" height="20" fill="#ED2939"/>
-      </svg>
+  <div class="header-right">
+    <div class="store-toggle">
+      <button class="store-btn active" onclick="setStore('dk', this)" title="Vionna DK">
+        <svg class="flag" viewBox="0 0 28 20" xmlns="http://www.w3.org/2000/svg">
+          <rect width="28" height="20" fill="#C8102E"/>
+          <rect x="9" width="3" height="20" fill="#fff"/>
+          <rect y="8.5" width="28" height="3" fill="#fff"/>
+        </svg>
+      </button>
+      <button class="store-btn" onclick="setStore('fr', this)" title="Vionna FR">
+        <svg class="flag" viewBox="0 0 28 20" xmlns="http://www.w3.org/2000/svg">
+          <rect width="9.33" height="20" fill="#002395"/>
+          <rect x="9.33" width="9.33" height="20" fill="#fff"/>
+          <rect x="18.66" width="9.34" height="20" fill="#ED2939"/>
+        </svg>
+      </button>
+    </div>
+    <button class="theme-toggle" onclick="toggleTheme()" title="Toggle light / dark theme" aria-label="Toggle theme">
+      <svg class="icon-moon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      <svg class="icon-sun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
     </button>
   </div>
 </header>
@@ -1782,6 +1857,14 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
     if (metaEl) updateCharCount(metaEl, 'metaCount');
     // Refresh M title preview
     if (typeof updateTitlePreview === 'function') updateTitlePreview();
+  }
+
+  function toggleTheme() {
+    const root = document.documentElement;
+    const next = root.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+    if (next === 'light') root.setAttribute('data-theme', 'light');
+    else root.removeAttribute('data-theme');
+    try { localStorage.setItem('vionna_theme', next); } catch(e) {}
   }
 
   function setStore(store, btn) {
