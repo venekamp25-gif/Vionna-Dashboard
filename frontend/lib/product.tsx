@@ -9,6 +9,13 @@ export interface CompetitorInfo {
   price: string;
 }
 
+export interface PublishResult {
+  productsCreated: number;
+  productUrls: string[];
+  collectionUrl: string | null;
+  metafieldErrors: string[];
+}
+
 export interface CompetitorImage {
   url: string;
   selected: boolean;
@@ -53,6 +60,7 @@ export interface ProductData {
   nbResultsPerColor: Record<string, NbResult[]>; // color name → results (step 5)
   pinnedUrl: string | null;                // model reference pinned across NB steps
   publishPool: PoolPhoto[];
+  publishResult: PublishResult | null;     // filled after successful Shopify publish
 }
 
 const DEFAULT_DATA: ProductData = {
@@ -78,6 +86,7 @@ const DEFAULT_DATA: ProductData = {
   nbResultsPerColor: {},
   pinnedUrl: null,
   publishPool: [],
+  publishResult: null,
 };
 
 interface ProductContextType {

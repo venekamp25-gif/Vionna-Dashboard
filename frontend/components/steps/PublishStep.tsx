@@ -11,14 +11,12 @@ export function PublishStep() {
   const { store } = useStore();
   const { setStep } = useStep();
 
-  // Mock product links — Phase 4 will return real Shopify admin URLs
-  const mockBase = store === "dk" ? "https://admin.shopify.com/store/vionna-dk" : "https://admin.shopify.com/store/vionna-fr";
-  const productUrls = data.colors.map((_, i) => `${mockBase}/products/${1000 + i}`);
-  const collectionUrl = `${mockBase}/collections/${data.siblingsHandle}`;
+  const result = data.publishResult;
+  const productUrls = result?.productUrls ?? [];
+  const collectionUrl = result?.collectionUrl ?? null;
   const firstProductUrl = productUrls[0];
 
   const resetForNewProduct = () => {
-    // Reset everything except store/theme
     setData((prev) => ({
       ...prev,
       competitorUrl: "",
@@ -35,7 +33,9 @@ export function PublishStep() {
       competitorImages: [],
       nbResults: {},
       nbResultsPerColor: {},
+      pinnedUrl: null,
       publishPool: [],
+      publishResult: null,
     }));
     setStep(1);
   };
@@ -50,44 +50,68 @@ export function PublishStep() {
               <strong>{data.name}</strong> created in <strong>{STORE_CONFIG[store].label}</strong>
             </h2>
             <p className="text-[13px] text-text-dim leading-relaxed">
-              {data.colors.length} color {data.colors.length === 1 ? "duplicate" : "duplicates"} created · collection{" "}
-              <a href={collectionUrl} target="_blank" rel="noopener noreferrer" className="text-accent font-semibold border-b border-accent hover:text-accent-hover">
-                {data.siblingsHandle}
-              </a>{" "}
+              {result?.productsCreated ?? data.colors.length} color{" "}
+              {(result?.productsCreated ?? data.colors.length) === 1 ? "duplicate" : "duplicates"} created · collection{" "}
+              {collectionUrl ? (
+                <a href={collectionUrl} target="_blank" rel="noopener noreferrer" className="text-accent font-semibold border-b border-accent hover:text-accent-hover">
+                  {data.siblingsHandle}
+                </a>
+              ) : (
+                <strong className="text-text">{data.siblingsHandle}</strong>
+              )}{" "}
               created · swatches linked. Product is set to <strong>draft</strong> until final review.
             </p>
           </div>
         </div>
 
-        {data.colors.length > 0 && (
+        {data.colors.length > 0 && productUrls.length > 0 && (
           <div className="mb-6 pl-[72px]">
             <div className="text-[11px] uppercase tracking-wider text-text-faint mb-2">Variants</div>
             <div className="flex flex-wrap gap-x-3 gap-y-1.5">
-              {data.colors.map((color, i) => (
-                <a
-                  key={color}
-                  href={productUrls[i]}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-[13px] text-accent font-semibold border-b border-accent/60 hover:text-accent-hover hover:border-accent-hover transition-colors"
-                >
-                  {color}
-                </a>
-              ))}
+              {data.colors.map((color, i) =>
+                productUrls[i] ? (
+                  <a
+                    key={color}
+                    href={productUrls[i]}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-[13px] text-accent font-semibold border-b border-accent/60 hover:text-accent-hover hover:border-accent-hover transition-colors"
+                  >
+                    {color}
+                  </a>
+                ) : (
+                  <span key={color} className="text-[13px] text-text-dim">{color}</span>
+                )
+              )}
             </div>
           </div>
         )}
 
-        <div className="pl-[72px]">
-          <a
-            href={firstProductUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-2 bg-accent text-on-accent px-5 py-2.5 rounded-[10px] font-semibold text-[13px] hover:bg-accent-hover transition-colors shadow-[0_4px_14px_var(--accent-glow)]"
-          >
-            → View imported product in Shopify
-          </a>
-        </div>
+        {firstProductUrl && (
+          <div className="pl-[72px]">
+            <a
+              href={firstProductUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-2 bg-accent text-on-accent px-5 py-2.5 rounded-[10px] font-semibold text-[13px] hover:bg-accent-hover transition-colors shadow-[0_4px_14px_var(--accent-glow)]"
+            >
+              → View imported product in Shopify
+            </a>
+          </div>
+        )}
+
+        {result?.metafieldErrors && result.metafieldErrors.length > 0 && (
+          <div className="mt-6 pl-[72px]">
+            <div className="px-3 py-2.5 rounded-md bg-warning/15 border border-warning/40 text-[12px] text-warning">
+              <strong>⚠ Some metafields failed:</strong>
+              <ul className="list-disc list-inside mt-1 space-y-0.5 ml-2">
+                {result.metafieldErrors.map((err, i) => (
+                  <li key={i}>{err}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="mt-6 flex items-center justify-between bg-bg-elev border border-border rounded-2xl px-6 py-4">
@@ -98,10 +122,6 @@ export function PublishStep() {
           ← Create another product
         </Button>
       </div>
-
-      <p className="text-[11px] text-text-faint text-center mt-3">
-        Demo mode — Shopify links are placeholders. Real publish wires up in Phase 4.
-      </p>
     </div>
   );
 }
