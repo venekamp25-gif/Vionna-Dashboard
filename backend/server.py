@@ -233,6 +233,97 @@ def scrape():
         return jsonify({'error': str(e)}), 500
 
 
+# --- Debug: inspect siblings setup for a given product name ---
+@app.route('/api/debug_siblings')
+def debug_siblings():
+    """Diagnose why Pipeline-theme siblings might not be working for a given product."""
+    store = request.args.get('store', 'dk')
+    name  = request.args.get('name', '').strip()
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store}'}), 401
+    if not name:
+        return jsonify({'error': 'Provide ?name=Elsa'}), 400
+
+    hdrs = shopify_headers(store)
+    report = {'store': store, 'name': name, 'products': [], 'collection': None, 'issues': []}
+
+    # 1. Find all products with this title
+    try:
+        r = req.get(shopify_url(store, f'products.json?title={urllib.parse.quote(name)}&status=any&limit=20'),
+                    headers=hdrs, timeout=15)
+        products = r.json().get('products', [])
+    except Exception as e:
+        return jsonify({'error': f'Products lookup failed: {e}'}), 500
+
+    if not products:
+        report['issues'].append(f'No products with title "{name}" found.')
+        return jsonify(report)
+
+    siblings_handles = set()
+    for p in products:
+        pid = p['id']
+        # Fetch metafields for each product
+        try:
+            mr = req.get(shopify_url(store, f'products/{pid}/metafields.json'), headers=hdrs, timeout=15)
+            mfields = mr.json().get('metafields', [])
+        except Exception:
+            mfields = []
+        mf_lookup = {f"{m['namespace']}.{m['key']}": m.get('value') for m in mfields}
+        cutline = mf_lookup.get('theme.cutline')
+        siblings = mf_lookup.get('theme.siblings')
+        if siblings:
+            siblings_handles.add(siblings)
+        report['products'].append({
+            'id': pid,
+            'title': p.get('title'),
+            'handle': p.get('handle'),
+            'status': p.get('status'),
+            'cutline': cutline,
+            'siblings': siblings,
+        })
+
+    if not siblings_handles:
+        report['issues'].append('No products have a theme.siblings metafield set.')
+        return jsonify(report)
+
+    # 2. For each unique siblings handle, look up the collection
+    for handle in siblings_handles:
+        try:
+            cr = req.get(shopify_url(store, f'custom_collections.json?handle={handle}'), headers=hdrs, timeout=15)
+            collections = cr.json().get('custom_collections', [])
+        except Exception as e:
+            report['issues'].append(f'Collection lookup failed for {handle}: {e}')
+            continue
+        if not collections:
+            report['issues'].append(f'Collection with handle "{handle}" does not exist in Shopify.')
+            continue
+        coll = collections[0]
+        # Get products in this collection
+        try:
+            pcr = req.get(shopify_url(store, f"collections/{coll['id']}/products.json?limit=50"),
+                          headers=hdrs, timeout=15)
+            coll_products = pcr.json().get('products', [])
+        except Exception:
+            coll_products = []
+        report['collection'] = {
+            'id': coll['id'],
+            'handle': coll.get('handle'),
+            'title': coll.get('title'),
+            'published_at': coll.get('published_at'),
+            'is_published': coll.get('published_at') is not None,
+            'product_count': len(coll_products),
+            'product_titles': [p.get('title') + ' (' + p.get('status', '?') + ')' for p in coll_products],
+        }
+        if not coll.get('published_at'):
+            report['issues'].append('Collection is NOT published — Pipeline theme can only render published collections.')
+        if all(p.get('status') == 'draft' for p in coll_products):
+            report['issues'].append('All products in the collection are draft — theme may not show drafts.')
+
+    if not report['issues']:
+        report['issues'].append('No obvious issues found. Theme settings may need to be checked manually.')
+    return jsonify(report)
+
+
 # --- Debug: list metafield definitions for products ---
 @app.route('/api/debug_metafields')
 def debug_metafields():
@@ -422,16 +513,20 @@ def publish():
     base    = shopify_url(store, '')
 
     # 1. Maak siblings collectie aan
+    # IMPORTANT: published=True is required for Pipeline theme siblings to work —
+    # the Liquid template queries the storefront context which can't see unpublished collections.
     collection_id = None
     coll_res = req.post(f"{base}custom_collections.json", headers=hdrs, json={
         'custom_collection': {
             'title':     product_name + ' Siblings',
             'handle':    siblings_handle,
-            'published': False,
+            'published': True,
         }
     })
     if coll_res.status_code in [200, 201]:
         collection_id = coll_res.json()['custom_collection']['id']
+    else:
+        print(f"[publish] WARNING: collection creation failed: {coll_res.status_code} — {coll_res.text[:200]}")
 
     created = []
 
