@@ -17,7 +17,7 @@ const STEPS = [
 const TOTAL_VARIANTS = 4;
 
 export function NanoBananaSteps() {
-  const { data, patch } = useProduct();
+  const { data, patch, setData } = useProduct();
   const [running, setRunning] = useState<Record<number, boolean>>({});
   const [progress, setProgress] = useState<Record<number, number>>({});
   const [stepErrors, setStepErrors] = useState<Record<number, string | null>>({});
@@ -168,38 +168,37 @@ export function NanoBananaSteps() {
     }
   };
 
-  /** Toggle selection on a tile (max 2 per step). Updates publish pool. */
+  /** Toggle selection on a tile. Uses functional setData so fast clicks don't lose state. */
   const toggleSelect = (stepNum: number, slotIndex: number, color = "shared") => {
-    const isStep5 = stepNum === 5;
-    const current = isStep5
-      ? data.nbResultsPerColor[color] ?? []
-      : data.nbResults[stepNum] ?? [];
+    setData((prev) => {
+      const isStep5 = stepNum === 5;
+      const current = isStep5
+        ? prev.nbResultsPerColor[color] ?? []
+        : prev.nbResults[stepNum] ?? [];
 
-    const tile = current[slotIndex];
-    if (!tile || !tile.url) return;
-    const willSelect = !tile.selected;
+      const tile = current[slotIndex];
+      if (!tile || !tile.url) return prev;
+      const willSelect = !tile.selected;
 
-    const updated = current.map((r, i) => (i === slotIndex ? { ...r, selected: willSelect } : r));
+      const updated = current.map((r, i) => (i === slotIndex ? { ...r, selected: willSelect } : r));
 
-    // Sync publish pool
-    const tagPrefix = isStep5 ? `NB Step 5 — ${color}` : `NB Step ${stepNum}`;
-    let pool: PoolPhoto[] = data.publishPool.filter((p) => !p.label.startsWith(tagPrefix));
-    updated.forEach((r, i) => {
-      if (r.selected && r.url) {
-        pool.push({
-          url: r.url,
-          label: `${tagPrefix}.${i + 1}`,
-          color: isStep5 ? color : "shared",
-          selected: true,
-        });
-      }
+      const tagPrefix = isStep5 ? `NB Step 5 — ${color}` : `NB Step ${stepNum}`;
+      const pool: PoolPhoto[] = prev.publishPool.filter((p) => !p.label.startsWith(tagPrefix));
+      updated.forEach((r, i) => {
+        if (r.selected && r.url) {
+          pool.push({
+            url: r.url,
+            label: `${tagPrefix}.${i + 1}`,
+            color: isStep5 ? color : "shared",
+            selected: true,
+          });
+        }
+      });
+
+      return isStep5
+        ? { ...prev, nbResultsPerColor: { ...prev.nbResultsPerColor, [color]: updated }, publishPool: pool }
+        : { ...prev, nbResults: { ...prev.nbResults, [stepNum]: updated }, publishPool: pool };
     });
-
-    if (isStep5) {
-      patch({ nbResultsPerColor: { ...data.nbResultsPerColor, [color]: updated }, publishPool: pool });
-    } else {
-      patch({ nbResults: { ...data.nbResults, [stepNum]: updated }, publishPool: pool });
-    }
   };
 
   const togglePin = (url: string) => {
