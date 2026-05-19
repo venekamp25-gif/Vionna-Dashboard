@@ -10,27 +10,32 @@
   <style>
     /* ===== DARK THEME TOKENS ===== */
     :root {
-      --bg:           #0e1116;   /* page background */
-      --bg-elev:      #161b22;   /* cards */
-      --bg-elev-2:    #1c232c;   /* nested elements */
-      --border:       #262e38;
-      --border-hover: #3a4452;
-      --text:         #e6edf3;
-      --text-dim:     #8b949e;
-      --text-faint:   #6b7480;
-      --accent:       #22c55e;   /* primary green */
-      --accent-hover: #16a34a;
-      --accent-soft:  rgba(34,197,94,0.12);
-      --danger:       #f87171;
-      --warning:      #fbbf24;
+      --bg:           #0b0f14;   /* page background */
+      --bg-elev:      #141a22;   /* cards */
+      --bg-elev-2:    #1a2230;   /* nested elements */
+      --bg-elev-3:    #232d3d;   /* hover */
+      --border:       #243044;
+      --border-hover: #3a4860;
+      --text:         #eef2f7;
+      --text-dim:     #94a3b8;
+      --text-faint:   #64748b;
+      --accent:       #10b981;   /* emerald — sophisticated green */
+      --accent-hover: #059669;
+      --accent-soft:  rgba(16,185,129,0.13);
+      --accent-glow:  rgba(16,185,129,0.35);
+      --secondary:    #c9a55c;   /* warm gold — subtle secondary highlights */
+      --secondary-soft: rgba(201,165,92,0.12);
+      --danger:       #ef4444;
+      --warning:      #f59e0b;
       --info:         #60a5fa;
-      --shadow-sm:    0 1px 2px rgba(0,0,0,0.3);
-      --shadow-md:    0 4px 12px rgba(0,0,0,0.35);
-      --shadow-lg:    0 10px 30px rgba(0,0,0,0.45);
+      --shadow-sm:    0 1px 3px rgba(0,0,0,0.4);
+      --shadow-md:    0 4px 16px rgba(0,0,0,0.4);
+      --shadow-lg:    0 14px 40px rgba(0,0,0,0.55);
       --radius-sm:    6px;
       --radius:       10px;
       --radius-lg:    14px;
       --ease:         cubic-bezier(0.4, 0, 0.2, 1);
+      --ease-out:     cubic-bezier(0.16, 1, 0.3, 1);
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1090,11 +1095,158 @@
     *::-webkit-scrollbar-thumb:hover { background: var(--border-hover); }
 
     /* ============================================================
+       LOGO
+       ============================================================ */
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .logo-mark {
+      flex-shrink: 0;
+      filter: drop-shadow(0 0 8px var(--accent-glow));
+      transition: transform 0.3s var(--ease-out);
+    }
+    .logo:hover .logo-mark { transform: rotate(-8deg) scale(1.05); }
+    .logo-text {
+      display: flex;
+      flex-direction: column;
+      line-height: 1;
+    }
+    .logo-name {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: 0.18em;
+      color: var(--text) !important;
+      text-transform: none !important;
+    }
+    .logo-sub {
+      font-size: 10px;
+      font-weight: 500;
+      color: var(--text-faint) !important;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      margin-top: 3px;
+    }
+
+    /* ============================================================
+       STEP PROGRESS BAR — connector lines
+       ============================================================ */
+    .steps {
+      display: flex;
+      align-items: center;
+      gap: 0 !important;
+      position: relative;
+    }
+    .step {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 16px !important;
+      border-radius: 999px !important;
+      z-index: 1;
+    }
+    .step + .step::before {
+      content: '';
+      position: absolute;
+      left: -22px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 22px;
+      height: 2px;
+      background: var(--border);
+      z-index: 0;
+    }
+    .step.done + .step::before,
+    .step.active::before,
+    .step.done + .step.done::before { background: var(--accent); }
+
+    /* ============================================================
+       SKELETON LOADING
+       ============================================================ */
+    .skeleton {
+      background: linear-gradient(
+        90deg,
+        var(--bg-elev-2) 0%,
+        var(--bg-elev-3) 50%,
+        var(--bg-elev-2) 100%
+      );
+      background-size: 200% 100%;
+      animation: shimmer 1.6s infinite linear;
+      border-radius: var(--radius-sm);
+    }
+    @keyframes shimmer {
+      0%   { background-position: 200% 0; }
+      100% { background-position: -200% 0; }
+    }
+    .skeleton-tile {
+      aspect-ratio: 3/4;
+      border-radius: var(--radius);
+    }
+    .skeleton-line { height: 12px; margin-bottom: 8px; }
+    .skeleton-line.short { width: 60%; }
+
+    /* ============================================================
+       SUCCESS CHECKMARK ANIMATION
+       ============================================================ */
+    .checkmark-wrap {
+      width: 48px;
+      height: 48px;
+      border-radius: 50%;
+      background: var(--accent);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      margin-right: 12px;
+      vertical-align: middle;
+      box-shadow: 0 0 0 0 var(--accent-glow);
+      animation: pulse 0.6s var(--ease-out) 0.3s both;
+    }
+    .checkmark-wrap svg {
+      width: 26px; height: 26px;
+      stroke: #0b0f14;
+      stroke-width: 3.5;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .checkmark-wrap svg path {
+      stroke-dasharray: 30;
+      stroke-dashoffset: 30;
+      animation: draw 0.45s var(--ease-out) 0.5s forwards;
+    }
+    @keyframes draw    { to { stroke-dashoffset: 0; } }
+    @keyframes pulse   {
+      0%   { box-shadow: 0 0 0 0 var(--accent-glow); }
+      70%  { box-shadow: 0 0 0 16px transparent; }
+      100% { box-shadow: 0 0 0 0 transparent; }
+    }
+
+    /* ============================================================
+       Button micro-interactions
+       ============================================================ */
+    .btn:active { transform: translateY(0) scale(0.98); }
+    .btn-primary:hover, .btn-publish:hover {
+      box-shadow: 0 6px 24px var(--accent-glow);
+    }
+
+    /* Form field focus glow */
+    input[type="text"]:focus,
+    input[type="url"]:focus,
+    textarea:focus,
+    select:focus {
+      background: var(--bg-elev) !important;
+    }
+
+    /* ============================================================
        RESPONSIVE — mobile / tablet
        ============================================================ */
     @media (max-width: 768px) {
       header { padding: 0 16px; height: auto; min-height: 56px; flex-wrap: wrap; gap: 8px; padding: 10px 16px; }
-      .logo { font-size: 14px; }
+      .logo-name { font-size: 14px; }
+      .logo-sub { display: none; }
+      .logo-mark { width: 24px; height: 24px; }
       .steps { flex-wrap: wrap; gap: 6px; }
       .step { padding: 6px 10px; font-size: 11px; }
       main { padding: 18px 14px 90px !important; }
@@ -1117,7 +1269,22 @@
 
 <!-- HEADER -->
 <header>
-  <div class="logo">Vionna <span>·</span> Product Dashboard</div>
+  <div class="logo">
+    <svg class="logo-mark" width="28" height="28" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <defs>
+        <linearGradient id="logoGrad" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stop-color="#10b981"/>
+          <stop offset="1" stop-color="#059669"/>
+        </linearGradient>
+      </defs>
+      <path d="M4 6 L16 26 L28 6" stroke="url(#logoGrad)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="16" cy="26" r="2.5" fill="url(#logoGrad)"/>
+    </svg>
+    <div class="logo-text">
+      <span class="logo-name">VIONNA</span>
+      <span class="logo-sub">Product Dashboard</span>
+    </div>
+  </div>
   <div class="store-toggle">
     <button class="store-btn active" onclick="setStore('dk', this)">🇩🇰 DK</button>
     <button class="store-btn" onclick="setStore('fr', this)">🇫🇷 FR</button>
@@ -1308,7 +1475,10 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
 
       <div class="section-label">From competitor</div>
       <div class="image-grid" id="competitorImageGrid">
-        <div style="grid-column:1/-1;padding:16px;text-align:center;color:#aaa;font-size:13px" id="imageLoadMsg">Fetching images…</div>
+        <div class="skeleton skeleton-tile"></div>
+        <div class="skeleton skeleton-tile"></div>
+        <div class="skeleton skeleton-tile"></div>
+        <div class="skeleton skeleton-tile"></div>
       </div>
 
       <div class="section-label">✦ Nano Banana — Model photo workflow</div>
@@ -2484,7 +2654,10 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
         : '';
 
       document.getElementById('alertSuccess').innerHTML =
-        `✓ <strong>${name}</strong> created in <strong>${storeConfig[currentStore].label}</strong> — ${result.products_created} color duplicates · collection ${collectionLink} created · swatches linked. Product is set to <strong>draft</strong> until final review.`
+        `<div style="display:flex;align-items:flex-start;gap:14px">
+          <div class="checkmark-wrap"><svg viewBox="0 0 26 26"><path d="M4 13 L11 20 L22 7"/></svg></div>
+          <div style="flex:1"><strong>${name}</strong> created in <strong>${storeConfig[currentStore].label}</strong> — ${result.products_created} color duplicates · collection ${collectionLink} created · swatches linked. Product is set to <strong>draft</strong> until final review.</div>
+        </div>`
         + `<div style="margin-top:8px;font-size:13px"><span style="color:#666">Variants:</span> ${colorLinks}</div>`
         + firstProductBtn
         + (result.metafield_errors?.length ? `<br><span style="color:#c0392b;font-size:12px">⚠ Metafield errors: ${result.metafield_errors.join(' | ')}</span>` : '');
