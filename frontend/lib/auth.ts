@@ -41,15 +41,29 @@ export async function verifySession(token: string | undefined): Promise<SessionP
   }
 }
 
-/** Check credentials against env vars. */
+/**
+ * Check credentials against env vars.
+ * Supports up to 5 user accounts using suffix-based env vars:
+ *   - AUTH_EMAIL   + AUTH_PASSWORD     (user 1)
+ *   - AUTH_EMAIL_2 + AUTH_PASSWORD_2   (user 2)
+ *   - AUTH_EMAIL_3 + AUTH_PASSWORD_3   (user 3)
+ *   - …up to _5
+ * Add a new pair in Netlify env vars to give someone access; remove to revoke.
+ */
 export function checkCredentials(email: string, password: string): boolean {
-  const expectedEmail = process.env.AUTH_EMAIL || "";
-  const expectedPassword = process.env.AUTH_PASSWORD || "";
-  if (!expectedEmail || !expectedPassword) return false;
-  return (
-    email.trim().toLowerCase() === expectedEmail.trim().toLowerCase() &&
-    password === expectedPassword
-  );
+  const normalize = (s: string) => s.trim().toLowerCase();
+  const inputEmail = normalize(email);
+
+  const suffixes = ["", "_2", "_3", "_4", "_5"];
+  for (const suffix of suffixes) {
+    const expectedEmail = process.env[`AUTH_EMAIL${suffix}`] || "";
+    const expectedPassword = process.env[`AUTH_PASSWORD${suffix}`] || "";
+    if (!expectedEmail || !expectedPassword) continue;
+    if (normalize(expectedEmail) === inputEmail && password === expectedPassword) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export const SESSION_MAX_AGE = SESSION_DURATION_SEC;
