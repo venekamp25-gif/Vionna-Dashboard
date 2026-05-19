@@ -9,17 +9,35 @@ export interface CompetitorInfo {
   price: string;
 }
 
+export interface CompetitorImage {
+  url: string;
+  selected: boolean;
+}
+
+export interface NbResult {
+  url: string;
+  selected: boolean;
+  pinned?: boolean;
+}
+
+export interface PoolPhoto {
+  url: string;
+  label: string;
+  color: string;       // "shared" for steps 1-4, color name for step 5
+  selected: boolean;
+}
+
 export interface ProductData {
   // Input
   competitorUrl: string;
-  keywords: string;        // raw textarea content
+  keywords: string;
   // Scraped / derived
   competitor: CompetitorInfo | null;
   // Generated / editable
   name: string;
   colors: string[];
   sizes: string[];
-  price: string;          // e.g. "349,00 DKK"
+  price: string;
   discount: 0 | 25 | 50;
   description: string;
   metaDescription: string;
@@ -27,6 +45,13 @@ export interface ProductData {
   cutline: string;
   siblingsHandle: string;
   parsedKeywords: string[];
+  // Images
+  competitorImages: CompetitorImage[];
+  bgReferenceUrl: string;
+  productType: string;
+  nbResults: Record<number, NbResult[]>;   // step number → results array
+  nbResultsPerColor: Record<string, NbResult[]>; // color name → results (step 5)
+  publishPool: PoolPhoto[];
 }
 
 const DEFAULT_DATA: ProductData = {
@@ -44,6 +69,13 @@ const DEFAULT_DATA: ProductData = {
   cutline: "",
   siblingsHandle: "",
   parsedKeywords: [],
+  competitorImages: [],
+  bgReferenceUrl:
+    "https://rosamae.co.uk/cdn/shop/files/rosa-mae-victoria-backless-maxi-dress-maxi-dresses-black-3057636.jpg?v=1762948520&width=1000",
+  productType: "dress",
+  nbResults: {},
+  nbResultsPerColor: {},
+  publishPool: [],
 };
 
 interface ProductContextType {

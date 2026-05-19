@@ -32,6 +32,13 @@ export function GenerateStep() {
     finished.current = true;
 
     const finalName = data.name || "Freya";
+    // Placeholder competitor images (gradient blocks) — Phase 4 will fetch real ones
+    const placeholderImgs = [
+      "https://placehold.co/600x800/2563eb/eef2f7?text=Competitor+1&font=raleway",
+      "https://placehold.co/600x800/64748b/eef2f7?text=Competitor+2&font=raleway",
+      "https://placehold.co/600x800/0ea5e9/eef2f7?text=Competitor+3&font=raleway",
+      "https://placehold.co/600x800/475569/eef2f7?text=Competitor+4&font=raleway",
+    ];
     patch({
       competitor: {
         title: "The Dakota Maxi Dress in Cream & Black",
@@ -45,6 +52,7 @@ export function GenerateStep() {
       colors: data.colors.length ? data.colors : ["Blå"],
       cutline: "Blå",
       siblingsHandle: `${finalName.toLowerCase()}-siblings`,
+      competitorImages: placeholderImgs.map((url, i) => ({ url, selected: i < 2 })),
       description:
         `Luftig og let at have på\n\n${finalName} er en let linnen sommerkjole med en afslappet pasform og brede stropper. Det naturlige linnen-materiale holder dig kølig på varme dage og giver et luftigt, ubesværet look.\n\n• Linnen-blanding: åndbart og let materiale til varme dage\n• Løst snit: sidder afslappet og giver god bevægelighed\n• Brede stropper: komfortabel pasform hele dagen\n• Lommer i siden: praktisk detalje\n• Enkel søm: roligt look der er nemt at style\n\n${finalName} er en kjole, der er nem at tage på, og som føles behagelig fra morgen til aften.`,
       metaDescription:
