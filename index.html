@@ -1095,6 +1095,27 @@
     *::-webkit-scrollbar-thumb:hover { background: var(--border-hover); }
 
     /* ============================================================
+       STORE SELECTOR FLAGS
+       ============================================================ */
+    .store-btn {
+      display: inline-flex !important;
+      align-items: center;
+      justify-content: center;
+      padding: 6px 14px !important;
+      min-width: 56px;
+    }
+    .flag {
+      width: 28px;
+      height: 20px;
+      border-radius: 3px;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.4), inset 0 0 0 1px rgba(255,255,255,0.08);
+      display: block;
+      flex-shrink: 0;
+    }
+    .store-btn:not(.active) .flag { opacity: 0.55; transition: opacity 0.2s var(--ease); }
+    .store-btn:hover .flag { opacity: 1; }
+
+    /* ============================================================
        LOGO
        ============================================================ */
     .logo {
@@ -1286,8 +1307,20 @@
     </div>
   </div>
   <div class="store-toggle">
-    <button class="store-btn active" onclick="setStore('dk', this)">🇩🇰 DK</button>
-    <button class="store-btn" onclick="setStore('fr', this)">🇫🇷 FR</button>
+    <button class="store-btn active" onclick="setStore('dk', this)" title="Vionna DK">
+      <svg class="flag" viewBox="0 0 28 20" xmlns="http://www.w3.org/2000/svg">
+        <rect width="28" height="20" fill="#C8102E"/>
+        <rect x="9" width="3" height="20" fill="#fff"/>
+        <rect y="8.5" width="28" height="3" fill="#fff"/>
+      </svg>
+    </button>
+    <button class="store-btn" onclick="setStore('fr', this)" title="Vionna FR">
+      <svg class="flag" viewBox="0 0 28 20" xmlns="http://www.w3.org/2000/svg">
+        <rect width="9.33" height="20" fill="#002395"/>
+        <rect x="9.33" width="9.33" height="20" fill="#fff"/>
+        <rect x="18.66" width="9.34" height="20" fill="#ED2939"/>
+      </svg>
+    </button>
   </div>
 </header>
 
