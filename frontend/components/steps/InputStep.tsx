@@ -7,14 +7,19 @@ import { useProduct } from "@/lib/product";
 import { useStep } from "@/lib/step";
 
 export function InputStep() {
-  const { input, setInput } = useProduct();
+  const { data, patch } = useProduct();
   const { setStep } = useStep();
 
-  const canSubmit = input.competitorUrl.trim().length > 0;
+  const canSubmit = data.competitorUrl.trim().length > 0;
 
   const onSubmit = () => {
     if (!canSubmit) return;
-    // For now just move to step 2. API call comes in Phase 4.
+    // Parse keywords into array for downstream steps
+    const parsedKeywords = data.keywords
+      .split("\n")
+      .map((k) => k.trim())
+      .filter(Boolean);
+    patch({ parsedKeywords });
     setStep(2);
   };
 
@@ -25,8 +30,8 @@ export function InputStep() {
           <Label>Competitor URL</Label>
           <Input
             type="text"
-            value={input.competitorUrl}
-            onChange={(e) => setInput((prev) => ({ ...prev, competitorUrl: e.target.value }))}
+            value={data.competitorUrl}
+            onChange={(e) => patch({ competitorUrl: e.target.value })}
             placeholder="Paste competitor product URL here..."
           />
         </Field>
@@ -35,8 +40,8 @@ export function InputStep() {
           <Label hint="(one per line, from Ubersuggest/Trends sheet)">Keywords</Label>
           <Textarea
             rows={6}
-            value={input.keywords}
-            onChange={(e) => setInput((prev) => ({ ...prev, keywords: e.target.value }))}
+            value={data.keywords}
+            onChange={(e) => patch({ keywords: e.target.value })}
             placeholder={
               "Put keywords researched for this product here...\n(one per line, e.g. from Ubersuggest or Google Trends)"
             }
