@@ -179,15 +179,7 @@ export function NanoBananaSteps() {
     if (!tile || !tile.url) return;
     const willSelect = !tile.selected;
 
-    let updated = current.map((r, i) => (i === slotIndex ? { ...r, selected: willSelect } : r));
-
-    if (willSelect) {
-      const selectedCount = updated.filter((r) => r.selected).length;
-      if (selectedCount > 2) {
-        const earliest = updated.findIndex((r, i) => r.selected && i !== slotIndex);
-        if (earliest >= 0) updated = updated.map((r, i) => (i === earliest ? { ...r, selected: false } : r));
-      }
-    }
+    const updated = current.map((r, i) => (i === slotIndex ? { ...r, selected: willSelect } : r));
 
     // Sync publish pool
     const tagPrefix = isStep5 ? `NB Step 5 — ${color}` : `NB Step ${stepNum}`;
