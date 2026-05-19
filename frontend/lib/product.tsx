@@ -80,7 +80,7 @@ const DEFAULT_DATA: ProductData = {
   parsedKeywords: [],
   competitorImages: [],
   bgReferenceUrl:
-    "https://rosamae.co.uk/cdn/shop/files/rosa-mae-victoria-backless-maxi-dress-maxi-dresses-black-3057636.jpg?v=1762948520&width=1000",
+    "https://rosamae.com/cdn/shop/files/rosa-mae-odette-corset-midi-dress-midi-dresses-green-4024064.png?v=1775259209&width=1200",
   productType: "dress",
   nbResults: {},
   nbResultsPerColor: {},
