@@ -1,10 +1,12 @@
 "use client";
 
+import { useEffect, useRef } from "react";
 import { Card } from "@/components/ui/Card";
 import { Chip } from "@/components/ui/Chip";
 import { Field, Label, Input } from "@/components/ui/Field";
 import { useProduct } from "@/lib/product";
 import { randomName } from "@/lib/names";
+import { slugify } from "@/lib/slug";
 
 const COLOR_DOTS: Record<string, string> = {
   "Blå": "#3b5fc0", "Sort": "#2d2d2d", "Hvid": "#f8f8f8", "Beige": "#f5f0e8",
@@ -14,6 +16,50 @@ const COLOR_DOTS: Record<string, string> = {
 
 export function ProductInfoCard() {
   const { data, patch } = useProduct();
+
+  // ── Name-sync ──
+  // When the product name changes, after a 600ms debounce, replace the OLD name
+  // with the NEW one in description / meta description / mTitleSpecs, and update
+  // the siblings handle if it followed the standard "{slug}-siblings" pattern.
+  const lastSyncedName = useRef<string | null>(null);
+  useEffect(() => {
+    if (lastSyncedName.current === null) {
+      lastSyncedName.current = data.name;
+      return;
+    }
+    if (lastSyncedName.current === data.name) return;
+
+    const t = setTimeout(() => {
+      const oldName = lastSyncedName.current ?? "";
+      const newName = data.name;
+      if (!oldName || oldName === newName) {
+        lastSyncedName.current = newName;
+        return;
+      }
+
+      const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const nameRe = new RegExp(`\\b${escape(oldName)}\\b`, "gi");
+
+      const oldSlug = slugify(oldName);
+      const newSlug = slugify(newName);
+      const handleRe = oldSlug ? new RegExp(`^${escape(oldSlug)}(?=-|$)`, "i") : null;
+
+      patch({
+        description:     data.description.replace(nameRe, newName),
+        metaDescription: data.metaDescription.replace(nameRe, newName),
+        mTitleSpecs:     data.mTitleSpecs.replace(nameRe, newName),
+        siblingsHandle:
+          handleRe && handleRe.test(data.siblingsHandle)
+            ? data.siblingsHandle.replace(handleRe, newSlug)
+            : data.siblingsHandle,
+      });
+
+      lastSyncedName.current = newName;
+    }, 600);
+
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data.name]);
 
   const removeColor = (c: string) =>
     patch({ colors: data.colors.filter((x) => x !== c) });
