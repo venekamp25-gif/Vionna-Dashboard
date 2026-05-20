@@ -10,6 +10,7 @@ import { api } from "@/lib/api";
 import {
   extractColors,
   extractVariantsByColor,
+  groupImagesByColor,
   guessProductType,
   normalizeImageUrl,
   safeHostname,
@@ -74,11 +75,10 @@ export function GenerateStep() {
         const rawColors = extractColors(product);
         const canonicalColors = rawColors.map(canonicalize);
 
-        // Take up to 30 images so per-colour filtering has enough thumbnails to
-        // choose from (multi-colour products often have 3-6 photos per colour).
-        // Nothing is pre-selected — the user picks what they actually want to use.
+        // ImagesCard "From competitor" shows just 8 thumbnails — enough for the
+        // user to pick a reference for steps 1-4. Nothing is pre-selected.
         const images = (product?.images ?? [])
-          .slice(0, 30)
+          .slice(0, 8)
           .map((img) => ({
             url: normalizeImageUrl(img.src),
             selected: false,
@@ -86,6 +86,9 @@ export function GenerateStep() {
           }));
 
         const variantsByColor = extractVariantsByColor(product, canonicalColors);
+        // Compute per-colour image groups from the FULL scraped image set so the
+        // ColorRefPicker has every back/detail shot — not just the cap-of-8.
+        const imagesByColor = groupImagesByColor(product, canonicalColors);
 
         // ── 2. Pick unique product name (checked against PRIMARY store's catalogue) ──
         setStage("names");
@@ -163,6 +166,7 @@ export function GenerateStep() {
           productType,
           competitorImages: images,
           competitorVariantsByColor: variantsByColor,
+          competitorImagesByColor: imagesByColor,
           contentByStore,
           activeViewStore: primary,
           // Active-view mirrors

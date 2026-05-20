@@ -106,6 +106,13 @@ export interface ProductData {
    * Empty list (or missing key) = no per-colour filtering possible → show all.
    */
   competitorVariantsByColor: Record<string, number[]>;
+  /**
+   * Canonical colour → ordered list of competitor image URLs that visually
+   * belong to that colour (per scrape-utils `groupImagesByColor` heuristic).
+   * This is computed from the FULL scraped image set (not the 8-image cap on
+   * `competitorImages` used in the ImagesCard).
+   */
+  competitorImagesByColor: Record<string, string[]>;
   bgReferenceUrl: string;
   productType: string;
   nbResults: Record<number, NbResult[]>;
@@ -146,6 +153,7 @@ const DEFAULT_DATA: ProductData = {
   },
   competitorImages: [],
   competitorVariantsByColor: {},
+  competitorImagesByColor: {},
   bgReferenceUrl:
     "https://rosamae.com/cdn/shop/files/rosa-mae-odette-corset-midi-dress-midi-dresses-green-4024064.png?v=1775259209&width=1200",
   productType: "dress",

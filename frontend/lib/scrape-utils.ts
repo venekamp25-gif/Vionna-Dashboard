@@ -99,3 +99,59 @@ export function extractVariantsByColor(
   }
   return result;
 }
+
+/**
+ * Group competitor images by canonical colour using a **position-after-anchor**
+ * heuristic.
+ *
+ * Why: Shopify products usually only tag `variant_ids` on the FIRST image of
+ * each colour (the variant's `featured_image`). Subsequent shots — back view,
+ * details, flat-lay — have empty `variant_ids` even though they visually belong
+ * to the same colour. Competitor product pages order their images grouped by
+ * colour, so we can walk positions in order and inherit the "current colour"
+ * from the most recent tagged image.
+ *
+ * Example (Marian top, 4 colours × 5 photos each):
+ *   pos 1: variant_ids=[Khaki…]      → current = Khaki, push to Khaki
+ *   pos 2: variant_ids=[]            → push to Khaki
+ *   pos 3-5: same                    → push to Khaki
+ *   pos 6: variant_ids=[Light Gray…] → current = Light Gray
+ *   pos 7-10: push to Light Gray
+ *   … etc.
+ *
+ * Returns a Record canonical → ordered image URLs. Untagged images that appear
+ * before the first anchor (rare) are dropped.
+ */
+export function groupImagesByColor(
+  product: ScrapedProduct["product"],
+  canonicalColors: string[]
+): Record<string, string[]> {
+  const result: Record<string, string[]> = {};
+  for (const c of canonicalColors) result[c] = [];
+  if (!product) return result;
+
+  // Variant ID → canonical colour
+  const variantsByColor = extractVariantsByColor(product, canonicalColors);
+  const variantToColor: Record<number, string> = {};
+  for (const [color, ids] of Object.entries(variantsByColor)) {
+    for (const id of ids) variantToColor[id] = color;
+  }
+
+  // Sort images by position (fallback to insertion order)
+  const images = [...(product.images ?? [])].sort(
+    (a, b) => (a.position ?? 0) - (b.position ?? 0)
+  );
+
+  let currentColor: string | null = null;
+  for (const img of images) {
+    // Switch "current colour" if this image is tagged to one of our colours
+    const matched = (img.variant_ids ?? [])
+      .map((id) => variantToColor[id])
+      .find((c): c is string => !!c);
+    if (matched) currentColor = matched;
+    if (!currentColor) continue;
+    const url = img.src.startsWith("//") ? `https:${img.src}` : img.src;
+    result[currentColor].push(url);
+  }
+  return result;
+}
