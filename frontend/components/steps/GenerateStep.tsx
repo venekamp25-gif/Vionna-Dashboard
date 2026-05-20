@@ -90,17 +90,22 @@ export function GenerateStep() {
         // ColorRefPicker has every back/detail shot — not just the cap-of-8.
         const imagesByColor = groupImagesByColor(product, canonicalColors);
 
-        // ── 2. Pick unique product name (checked against PRIMARY store's catalogue) ──
+        // ── 2. Pick unique product name (checked against ALL selected stores) ──
+        // Multi-store products must have a name that's free in EVERY catalogue we'll
+        // publish to — otherwise the user has to rename after the fact.
         setStage("names");
-        let usedFromShopify: string[] = [];
-        try {
-          const r = await api.names(primary);
-          usedFromShopify = r.names ?? [];
-        } catch {
-          // Non-fatal: continue with empty list
-        }
-        const lower = new Set(usedFromShopify.map((n) => n.toLowerCase()));
-        const chosenName = randomName(Array.from(lower));
+        const usedFromShopify = new Set<string>();
+        await Promise.all(
+          selectedStores.map(async (s) => {
+            try {
+              const r = await api.names(s);
+              (r.names ?? []).forEach((n) => usedFromShopify.add(n.toLowerCase()));
+            } catch {
+              // non-fatal for that one store
+            }
+          })
+        );
+        const chosenName = randomName(Array.from(usedFromShopify));
 
         // ── 3. Generate content for EACH selected store ──
         setStage("generating");

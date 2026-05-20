@@ -5,7 +5,7 @@ import { Card } from "@/components/ui/Card";
 import { Chip } from "@/components/ui/Chip";
 import { Field, Label, Input } from "@/components/ui/Field";
 import { useProduct, StoreContent } from "@/lib/product";
-import { useStore, StoreKey } from "@/lib/store";
+import { StoreKey, STORE_CONFIG } from "@/lib/store";
 import { randomName } from "@/lib/names";
 import { slugify } from "@/lib/slug";
 import { api } from "@/lib/api";
@@ -33,35 +33,63 @@ type NameStatus = "idle" | "checking" | "available" | "taken";
 
 export function ProductInfoCard() {
   const { data, patch, setData } = useProduct();
-  const { store } = useStore();
+  // Note: `useStore.store` follows the active tab. We intentionally do NOT use it
+  // for name validation — that has to span every selected store.
 
-  // ── Used names cache (fetched once per Review session) ──
-  const [usedNames, setUsedNames] = useState<string[]>([]);
+  // ── Used names cache (fetched per selected store, kept per-store for messaging) ──
+  const [usedNamesByStore, setUsedNamesByStore] = useState<Record<StoreKey, string[]>>({
+    dk: [],
+    fr: [],
+  });
   const [usedNamesLoading, setUsedNamesLoading] = useState(true);
 
+  const selectedStoresKey = data.selectedStores.join(",");
   useEffect(() => {
     let cancelled = false;
     setUsedNamesLoading(true);
-    api
-      .names(store)
-      .then((r) => { if (!cancelled) setUsedNames(r.names ?? []); })
-      .catch(() => {})
-      .finally(() => { if (!cancelled) setUsedNamesLoading(false); });
+    Promise.all(
+      data.selectedStores.map(async (s): Promise<[StoreKey, string[]]> => {
+        try {
+          const r = await api.names(s);
+          return [s, r.names ?? []];
+        } catch {
+          return [s, []];
+        }
+      })
+    )
+      .then((pairs) => {
+        if (cancelled) return;
+        const next: Record<StoreKey, string[]> = { dk: [], fr: [] };
+        for (const [s, names] of pairs) next[s] = names;
+        setUsedNamesByStore(next);
+      })
+      .finally(() => {
+        if (!cancelled) setUsedNamesLoading(false);
+      });
     return () => { cancelled = true; };
-  }, [store]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedStoresKey]);
 
-  // ── Name-availability check (debounced 600ms) ──
+  // ── Name-availability check (debounced 600ms; flags ANY store that owns the name) ──
   const [nameStatus, setNameStatus] = useState<NameStatus>("idle");
+  const [takenInStores, setTakenInStores] = useState<StoreKey[]>([]);
   useEffect(() => {
-    if (!data.name.trim()) { setNameStatus("idle"); return; }
+    if (!data.name.trim()) { setNameStatus("idle"); setTakenInStores([]); return; }
     if (usedNamesLoading) { setNameStatus("checking"); return; }
     setNameStatus("checking");
     const t = setTimeout(() => {
-      const taken = usedNames.some((n) => n.toLowerCase() === data.name.toLowerCase());
-      setNameStatus(taken ? "taken" : "available");
+      const lower = data.name.toLowerCase();
+      const offending: StoreKey[] = [];
+      for (const s of data.selectedStores) {
+        if ((usedNamesByStore[s] ?? []).some((n) => n.toLowerCase() === lower)) {
+          offending.push(s);
+        }
+      }
+      setTakenInStores(offending);
+      setNameStatus(offending.length > 0 ? "taken" : "available");
     }, 400);
     return () => clearTimeout(t);
-  }, [data.name, usedNames, usedNamesLoading]);
+  }, [data.name, usedNamesByStore, usedNamesLoading, selectedStoresKey, data.selectedStores]);
 
   // ── Name-sync (debounced 600ms): replace old name everywhere ACROSS ALL STORES ──
   const lastSyncedName = useRef<string | null>(null);
@@ -121,7 +149,13 @@ export function ProductInfoCard() {
   }, [data.name]);
 
   const refreshName = () => {
-    const newName = randomName([...usedNames, data.name]);
+    // Avoid any name taken in any selected store
+    const taken = new Set<string>();
+    for (const s of data.selectedStores) {
+      for (const n of usedNamesByStore[s] ?? []) taken.add(n);
+    }
+    taken.add(data.name);
+    const newName = randomName(Array.from(taken));
     patch({ name: newName });
   };
 
@@ -185,7 +219,7 @@ export function ProductInfoCard() {
             ↻
           </button>
         </div>
-        <NameStatusLine status={nameStatus} />
+        <NameStatusLine status={nameStatus} takenInStores={takenInStores} />
       </Field>
 
       <Field>
@@ -282,21 +316,31 @@ export function ProductInfoCard() {
   );
 }
 
-function NameStatusLine({ status }: { status: NameStatus }) {
+function NameStatusLine({
+  status,
+  takenInStores,
+}: {
+  status: NameStatus;
+  takenInStores: StoreKey[];
+}) {
   if (status === "idle") return <div className="h-[14px]" />;
   if (status === "checking") {
     return <div className="text-[11px] text-text-faint mt-1">Checking catalogue…</div>;
   }
   if (status === "taken") {
+    const labels = takenInStores.map(
+      (s) => STORE_CONFIG[s].label.replace("Vionna ", "")
+    );
+    const where = labels.length === 0 ? "your store" : labels.join(" + ");
     return (
       <div className="text-[11px] text-danger mt-1 flex items-center gap-1">
-        ⚠ This name is already used in your store
+        ⚠ Already used in {where}
       </div>
     );
   }
   return (
     <div className="text-[11px] text-accent mt-1 flex items-center gap-1">
-      ✓ Available
+      ✓ Available in {takenInStores.length === 0 ? "all selected stores" : "selected stores"}
     </div>
   );
 }
