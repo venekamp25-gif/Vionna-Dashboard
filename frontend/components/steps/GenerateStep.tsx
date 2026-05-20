@@ -76,6 +76,7 @@ export function GenerateStep() {
 
         // Take up to 30 images so per-colour filtering has enough thumbnails to
         // choose from (multi-colour products often have 3-6 photos per colour).
+        // Nothing is pre-selected — the user picks what they actually want to use.
         const images = (product?.images ?? [])
           .slice(0, 30)
           .map((img) => ({
@@ -83,9 +84,6 @@ export function GenerateStep() {
             selected: false,
             variantIds: img.variant_ids ?? [],
           }));
-        // Pre-select first 2 as the global fallback / step 1-4 reference
-        if (images[0]) images[0].selected = true;
-        if (images[1]) images[1].selected = true;
 
         const variantsByColor = extractVariantsByColor(product, canonicalColors);
 

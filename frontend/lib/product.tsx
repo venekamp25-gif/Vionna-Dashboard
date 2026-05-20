@@ -124,7 +124,8 @@ export interface ProductData {
 const DEFAULT_DATA: ProductData = {
   competitorUrl: "",
   keywords: "",
-  selectedStores: ["dk"],
+  // Default to both stores ticked — most imports go to DK + FR at the same time.
+  selectedStores: ["dk", "fr"],
   activeViewStore: "dk",
   competitor: null,
   name: "",
