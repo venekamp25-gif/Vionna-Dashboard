@@ -710,29 +710,41 @@ NANO_BANANA_PROMPTS = {
         "face, body, or background — only mirror the colour from those references onto our model's "
         "outfit."),
     # === Prompts 11-14: step 5 color variants in the four step formats (1-4) ===
-    # First image = the chosen favourite from the matching step (model + framing reference).
-    # Additional images = competitor color references for {color}.
-    11: ("I've uploaded reference images. The FIRST image is our model wearing the {product_type} "
-         "in a full-body styled shot. The remaining images are colour references showing the same "
-         "{product_type} in {color}. Generate a full-body model shot — same model face, same background, "
-         "same lighting and styling, in a slightly different pose — but with the {product_type} in {color}. "
-         "Use the colour references only to match the exact {color} colour, texture and fabric finish. "
-         "Do not copy the competitor's model, face or background."),
-    12: ("I've uploaded reference images. The FIRST image is our model wearing the {product_type} with "
-         "her face clearly visible and the product details prominent. The remaining images are colour "
-         "references showing the same {product_type} in {color}. Generate a detailed model shot with the "
-         "model's full face clearly visible and all product details accurately replicated — but with the "
-         "{product_type} in {color}, matching the colour references exactly. Keep our model, background "
-         "and styling identical to the first reference."),
-    13: ("I've uploaded reference images. The FIRST image is our model wearing the {product_type}. "
-         "The remaining images show the {product_type} in {color} as colour reference. Generate a realistic "
-         "BACK VIEW of the same model — same setup, same background, same model — wearing the {product_type} "
-         "in {color}. Match the colour exactly from the colour references."),
-    14: ("I've uploaded reference images. The FIRST image is our model wearing the {product_type}. The "
-         "remaining images show the {product_type} in {color} as colour reference. Generate a close-up "
-         "image of the material and texture of the {product_type} in {color}. Match the original style "
-         "and lighting from the first reference, with the colour from the additional references. Focus "
-         "clearly on the fabric texture and details."),
+    # IMAGE 1 = our existing model (framing + composition reference, NOT colour).
+    # IMAGES 2+ = competitor colour references — these are the GROUND TRUTH for colour.
+    # The colour name ({color}) is just a label; the model must NOT interpret it from prior
+    # knowledge — it must match the EXACT shade visible in the reference images.
+    11: ("I've uploaded reference images with TWO different roles:\n"
+         "- IMAGE 1: our existing model wearing a {product_type} — use her face, body, full-body framing, "
+         "background, lighting and styling. A slightly different pose is allowed.\n"
+         "- IMAGES 2+: competitor garment colour references. These define the EXACT shade, hue, saturation, "
+         "texture and fabric finish for the new variant. Use them ONLY for colour information.\n\n"
+         "Task: generate a full-body shot of OUR model (from IMAGE 1) wearing the {product_type} in the "
+         "EXACT colour shown in IMAGES 2+. Critical: do NOT guess the colour from the label '{color}' — "
+         "match precisely what you see in the reference images, including subtle tints (e.g. greys, "
+         "muted tones, sage vs. mint, dusty pink vs. bright pink). Ignore the competitor's model, face, "
+         "body and background entirely — only mirror the garment colour."),
+    12: ("I've uploaded reference images with TWO different roles:\n"
+         "- IMAGE 1: our existing model with her face clearly visible and product details prominent.\n"
+         "- IMAGES 2+: competitor garment colour references — EXACT colour ground truth.\n\n"
+         "Task: generate a detailed model shot of OUR model (from IMAGE 1) with her full face clearly "
+         "visible, wearing the {product_type} in the EXACT colour shown in IMAGES 2+. Critical: match "
+         "the precise shade from the reference photos, not your prior idea of '{color}'. Keep our model, "
+         "background and styling identical to IMAGE 1."),
+    13: ("I've uploaded reference images with TWO different roles:\n"
+         "- IMAGE 1: our existing model (same setup, model, background).\n"
+         "- IMAGES 2+: competitor garment colour references — EXACT colour ground truth.\n\n"
+         "Task: generate a realistic BACK VIEW of OUR model wearing the {product_type} in the EXACT "
+         "colour shown in IMAGES 2+. Critical: do not interpret '{color}' loosely — copy the precise "
+         "shade, saturation and finish you see in the references. Same model, same background as "
+         "IMAGE 1."),
+    14: ("I've uploaded reference images with TWO different roles:\n"
+         "- IMAGE 1: our model wearing the {product_type} (for style + lighting reference).\n"
+         "- IMAGES 2+: competitor garment colour references — EXACT colour ground truth.\n\n"
+         "Task: generate a close-up of the material and texture of the {product_type} in the EXACT "
+         "colour shown in IMAGES 2+. Critical: match the precise shade, not your idea of '{color}'. "
+         "Reproduce the lighting style from IMAGE 1 with the colour from IMAGES 2+. Focus clearly on "
+         "fabric texture and details."),
 }
 
 
