@@ -200,10 +200,17 @@ export function NanoBananaSteps() {
       return;
     }
 
-    // Reset slot for this color so the UI shows loading state
+    // Seed the slot with N empty placeholders so the UI immediately shows the
+    // animate-pulse loading tiles (the grid only renders when results.length > 0).
+    // Without this the tiles flash in only once the FIRST API call returns —
+    // which made it look like fewer tiles were "loading" for some colours.
+    const placeholders: NbResult[] = Array.from(
+      { length: stepFavourites.length },
+      () => ({ url: "", selected: false })
+    );
     setData((prev) => ({
       ...prev,
-      nbResultsPerColor: { ...prev.nbResultsPerColor, [color]: [] },
+      nbResultsPerColor: { ...prev.nbResultsPerColor, [color]: placeholders },
     }));
 
     // Fire one Higgsfield call per step-format in parallel
