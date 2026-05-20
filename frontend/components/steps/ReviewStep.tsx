@@ -9,6 +9,7 @@ import { ImagesCard } from "@/components/review/ImagesCard";
 import { NanoBananaSteps } from "@/components/review/NanoBananaSteps";
 import { PublishPoolCard } from "@/components/review/PublishPoolCard";
 import { StoreTabs } from "@/components/review/StoreTabs";
+import { PublishProgressScreen } from "@/components/review/PublishProgressScreen";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { useStep } from "@/lib/step";
@@ -119,14 +120,16 @@ export function ReviewStep() {
         };
         resultsByStore[store] = storeResult;
         lastResult = storeResult;
+        // Push partial results to state immediately so the progress screen
+        // updates the moment a store finishes (don't wait until the loop ends).
+        setData((prev) => ({
+          ...prev,
+          publishResultsByStore: { ...resultsByStore },
+          publishResult: lastResult,
+        }));
       }
 
       // All stores published successfully
-      setData((prev) => ({
-        ...prev,
-        publishResultsByStore: resultsByStore,
-        publishResult: lastResult,
-      }));
       setPublishingStore(null);
       // Show the first store's result by default
       setStore(targetStores[0]);
@@ -153,6 +156,28 @@ export function ReviewStep() {
   const activeColors = data.canonicalColors.map((c) =>
     colorLabelFor(data, c, data.activeViewStore)
   );
+
+  // Full-screen progress UI between Review and the Done step.
+  // Shown while publishing OR after a publish error (so the user can retry/back).
+  if (publishing || error) {
+    return (
+      <PublishProgressScreen
+        productName={data.name || "this product"}
+        colorCount={data.canonicalColors.length}
+        stores={targetStores}
+        publishingStore={publishingStore}
+        resultsByStore={data.publishResultsByStore}
+        error={error}
+        onRetry={() => {
+          setError(null);
+          publish();
+        }}
+        onBack={() => {
+          setError(null);
+        }}
+      />
+    );
+  }
 
   return (
     <>
