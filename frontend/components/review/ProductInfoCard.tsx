@@ -4,22 +4,35 @@ import { useEffect, useRef, useState } from "react";
 import { Card } from "@/components/ui/Card";
 import { Chip } from "@/components/ui/Chip";
 import { Field, Label, Input } from "@/components/ui/Field";
-import { useProduct } from "@/lib/product";
-import { useStore } from "@/lib/store";
+import { useProduct, StoreContent } from "@/lib/product";
+import { useStore, StoreKey } from "@/lib/store";
 import { randomName } from "@/lib/names";
 import { slugify } from "@/lib/slug";
 import { api } from "@/lib/api";
 
 const COLOR_DOTS: Record<string, string> = {
-  "Blå": "#3b5fc0", "Sort": "#2d2d2d", "Hvid": "#f8f8f8", "Beige": "#f5f0e8",
-  "Rød": "#c0392b", "Grøn": "#4a7c5c", "Brun": "#8b6347", "Grå": "#8e8e8e",
-  "Navy": "#1e2a4a", "Noir": "#1a1a1a", "Blanc": "#f8f8f8", "Écru": "#f0ead4",
+  // English canonical keys
+  "Black": "#2d2d2d", "White": "#f8f8f8", "Cream": "#f5f0e0", "Ivory": "#f8efd9",
+  "Beige": "#f5f0e8", "Red": "#c0392b", "Blue": "#3b5fc0", "Navy": "#1e2a4a",
+  "Light Blue": "#8dbce0", "Green": "#4a7c5c", "Olive": "#7d7c4f", "Sage": "#9caa90",
+  "Forest Green": "#2e4634", "Pink": "#e8a4b8", "Hot Pink": "#e8409a", "Blush": "#e8c4c4",
+  "Rose": "#d88a8a", "Purple": "#7a4ea8", "Lilac": "#bca0d8", "Mauve": "#a68aa6",
+  "Violet": "#7a4ea8", "Brown": "#8b6347", "Camel": "#b68559", "Tan": "#c9a880",
+  "Chocolate": "#3e2723", "Grey": "#8e8e8e", "Gray": "#8e8e8e", "Light Grey": "#c9c9c9",
+  "Charcoal": "#383838", "Orange": "#e07b3c", "Rust": "#a04a2a", "Terracotta": "#c4674a",
+  "Yellow": "#e8c84a", "Mustard": "#bca044", "Gold": "#c8a14a", "Silver": "#bababa",
+  "Nude": "#d9b89c", "Sand": "#d8c9a6", "Stone": "#a6a098", "Champagne": "#e8d8b4",
+  "Mint": "#a6d8c4", "Teal": "#3e8a8c", "Burgundy": "#6e1f2f", "Wine": "#5a1f2f",
+  // Legacy localised keys (kept as fallback)
+  "Blå": "#3b5fc0", "Sort": "#2d2d2d", "Hvid": "#f8f8f8", "Rød": "#c0392b",
+  "Grøn": "#4a7c5c", "Brun": "#8b6347", "Grå": "#8e8e8e", "Noir": "#1a1a1a",
+  "Blanc": "#f8f8f8", "Écru": "#f0ead4",
 };
 
 type NameStatus = "idle" | "checking" | "available" | "taken";
 
 export function ProductInfoCard() {
-  const { data, patch } = useProduct();
+  const { data, patch, setData } = useProduct();
   const { store } = useStore();
 
   // ── Used names cache (fetched once per Review session) ──
@@ -28,6 +41,7 @@ export function ProductInfoCard() {
 
   useEffect(() => {
     let cancelled = false;
+    setUsedNamesLoading(true);
     api
       .names(store)
       .then((r) => { if (!cancelled) setUsedNames(r.names ?? []); })
@@ -49,7 +63,7 @@ export function ProductInfoCard() {
     return () => clearTimeout(t);
   }, [data.name, usedNames, usedNamesLoading]);
 
-  // ── Name-sync (debounced 600ms): replace old name everywhere ──
+  // ── Name-sync (debounced 600ms): replace old name everywhere ACROSS ALL STORES ──
   const lastSyncedName = useRef<string | null>(null);
   useEffect(() => {
     if (lastSyncedName.current === null) {
@@ -73,14 +87,30 @@ export function ProductInfoCard() {
       const newSlug = slugify(newName);
       const handleRe = oldSlug ? new RegExp(`^${escape(oldSlug)}(?=-|$)`, "i") : null;
 
-      patch({
-        description:     data.description.replace(nameRe, newName),
-        metaDescription: data.metaDescription.replace(nameRe, newName),
-        mTitleSpecs:     data.mTitleSpecs.replace(nameRe, newName),
-        siblingsHandle:
-          handleRe && handleRe.test(data.siblingsHandle)
-            ? data.siblingsHandle.replace(handleRe, newSlug)
-            : data.siblingsHandle,
+      setData((prev) => {
+        // Apply name replacement across every store's content
+        const updatedContent = { ...prev.contentByStore };
+        (Object.keys(updatedContent) as StoreKey[]).forEach((s) => {
+          const c = updatedContent[s];
+          updatedContent[s] = {
+            ...c,
+            description: c.description.replace(nameRe, newName),
+            metaDescription: c.metaDescription.replace(nameRe, newName),
+            mTitleSpecs: c.mTitleSpecs.replace(nameRe, newName),
+          };
+        });
+        return {
+          ...prev,
+          contentByStore: updatedContent,
+          // Mirror the active view's updated content into the top-level fields
+          description: prev.description.replace(nameRe, newName),
+          metaDescription: prev.metaDescription.replace(nameRe, newName),
+          mTitleSpecs: prev.mTitleSpecs.replace(nameRe, newName),
+          siblingsHandle:
+            handleRe && handleRe.test(prev.siblingsHandle)
+              ? prev.siblingsHandle.replace(handleRe, newSlug)
+              : prev.siblingsHandle,
+        };
       });
 
       lastSyncedName.current = newName;
@@ -95,8 +125,45 @@ export function ProductInfoCard() {
     patch({ name: newName });
   };
 
-  const removeColor = (c: string) =>
-    patch({ colors: data.colors.filter((x) => x !== c) });
+  /** Remove a colour by INDEX so we can clean up both canonical key + every store's label. */
+  const removeColorAt = (index: number) => {
+    setData((prev) => {
+      const canonical = prev.canonicalColors[index];
+      if (!canonical) return prev;
+
+      const newCanonical = prev.canonicalColors.filter((_, i) => i !== index);
+      const newColors = prev.colors.filter((_, i) => i !== index);
+
+      // Drop this canonical key from every store's colorLabels + recompute cutline
+      const newContent: Record<StoreKey, StoreContent> = { ...prev.contentByStore };
+      (Object.keys(newContent) as StoreKey[]).forEach((s) => {
+        const labels = { ...newContent[s].colorLabels };
+        delete labels[canonical];
+        newContent[s] = {
+          ...newContent[s],
+          colorLabels: labels,
+          cutline: newCanonical.map((c) => labels[c] ?? c).join(", "),
+        };
+      });
+
+      // Drop image state keyed by this canonical colour
+      const newNbResultsPerColor = { ...prev.nbResultsPerColor };
+      delete newNbResultsPerColor[canonical];
+      const newColorRefs = { ...prev.colorRefsByColor };
+      delete newColorRefs[canonical];
+
+      return {
+        ...prev,
+        canonicalColors: newCanonical,
+        colors: newColors,
+        contentByStore: newContent,
+        cutline: newContent[prev.activeViewStore]?.cutline ?? "",
+        nbResultsPerColor: newNbResultsPerColor,
+        colorRefsByColor: newColorRefs,
+        publishPool: prev.publishPool.filter((p) => p.color !== canonical),
+      };
+    });
+  };
 
   return (
     <Card title="Product info">
@@ -124,17 +191,20 @@ export function ProductInfoCard() {
       <Field>
         <Label>Colors (from competitor)</Label>
         <div className="flex flex-wrap gap-2">
-          {data.colors.map((c) => (
-            <Chip
-              key={c}
-              variant="color"
-              color={COLOR_DOTS[c] ?? "#999"}
-              onRemove={() => removeColor(c)}
-            >
-              {c}
-            </Chip>
-          ))}
-          {data.colors.length === 0 && (
+          {data.canonicalColors.map((canonical, i) => {
+            const display = data.colors[i] ?? canonical;
+            return (
+              <Chip
+                key={canonical}
+                variant="color"
+                color={COLOR_DOTS[canonical] ?? COLOR_DOTS[display] ?? "#999"}
+                onRemove={() => removeColorAt(i)}
+              >
+                {display}
+              </Chip>
+            );
+          })}
+          {data.canonicalColors.length === 0 && (
             <span className="text-[12px] text-text-faint">No colors detected</span>
           )}
         </div>

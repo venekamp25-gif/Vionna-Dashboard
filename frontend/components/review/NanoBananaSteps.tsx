@@ -447,14 +447,20 @@ interface Step5Props {
 
 function Step5({ onGenerate, onGenerateAll, onRegenerateSlot, runningColors, toggleSelect, togglePin, onZoom }: Step5Props) {
   const { data } = useProduct();
-  const otherColors = data.colors.slice(1);
+  // Canonical colour keys (English) — used to key nbResultsPerColor / colorRefsByColor / publishPool.
+  // Display labels are looked up via data.colors which mirrors the active view.
+  const otherCanonical = data.canonicalColors.slice(1);
+  const displayLabelFor = (canonical: string): string => {
+    const idx = data.canonicalColors.indexOf(canonical);
+    return idx >= 0 ? data.colors[idx] ?? canonical : canonical;
+  };
 
   const hasModelImage =
     !!data.pinnedUrl ||
     Object.values(data.nbResults).some((arr) => arr.some((r) => r.selected));
 
   const anyRunning = Object.values(runningColors).some(Boolean);
-  const pendingColors = otherColors.filter((c) => !data.nbResultsPerColor[c]?.length);
+  const pendingColors = otherCanonical.filter((c) => !data.nbResultsPerColor[c]?.length);
   const canGenerateAll = hasModelImage && pendingColors.length > 0 && !anyRunning;
 
   return (
@@ -467,7 +473,7 @@ function Step5({ onGenerate, onGenerateAll, onRegenerateSlot, runningColors, tog
           <div className="text-[14px] font-semibold text-text">Color variants</div>
           <div className="text-[11px] text-text-faint">Per color: same model + background, different color</div>
         </div>
-        {otherColors.length > 0 && hasModelImage && (
+        {otherCanonical.length > 0 && hasModelImage && (
           <Button
             size="sm"
             variant="primary"
@@ -494,20 +500,24 @@ function Step5({ onGenerate, onGenerateAll, onRegenerateSlot, runningColors, tog
         <div className="px-4 py-3 rounded-md bg-bg-elev text-[12px] text-text-faint text-center">
           Select an image in steps 1–4 first (or pin one as model) to generate color variants.
         </div>
-      ) : otherColors.length === 0 ? (
+      ) : otherCanonical.length === 0 ? (
         <div className="px-4 py-3 rounded-md bg-bg-elev text-[12px] text-text-faint text-center">
           Only the primary color is in your list — no additional variants to generate.
         </div>
       ) : (
         <div className="space-y-4">
-          {otherColors.map((color) => {
-            const results = data.nbResultsPerColor[color] ?? [];
-            const isRunning = !!runningColors[color];
+          {otherCanonical.map((canonical) => {
+            const displayLabel = displayLabelFor(canonical);
+            const results = data.nbResultsPerColor[canonical] ?? [];
+            const isRunning = !!runningColors[canonical];
             return (
-              <div key={color} className="bg-bg-elev rounded-[10px] p-3">
+              <div key={canonical} className="bg-bg-elev rounded-[10px] p-3">
                 <div className="flex items-center justify-between gap-3 mb-3">
                   <div className="flex items-center gap-2">
-                    <span className="text-[13px] font-semibold text-text">{color}</span>
+                    <span className="text-[13px] font-semibold text-text">{displayLabel}</span>
+                    {displayLabel !== canonical && (
+                      <span className="text-[10px] text-text-faint">({canonical})</span>
+                    )}
                     {results.length > 0 && (
                       <span className="text-[10px] text-text-faint">({results.filter((r) => r.selected).length}/{results.length} selected)</span>
                     )}
@@ -515,14 +525,14 @@ function Step5({ onGenerate, onGenerateAll, onRegenerateSlot, runningColors, tog
                   <Button
                     size="sm"
                     variant="secondary"
-                    onClick={() => onGenerate(color)}
+                    onClick={() => onGenerate(canonical)}
                     disabled={isRunning}
                   >
-                    {isRunning ? "⟳ Generating…" : results.length ? "✦ Regenerate" : `✦ Generate ${color}`}
+                    {isRunning ? "⟳ Generating…" : results.length ? "✦ Regenerate" : `✦ Generate ${displayLabel}`}
                   </Button>
                 </div>
 
-                <ColorRefPicker color={color} />
+                <ColorRefPicker color={canonical} label={displayLabel} />
 
                 {results.length > 0 && (
                   <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
@@ -531,20 +541,20 @@ function Step5({ onGenerate, onGenerateAll, onRegenerateSlot, runningColors, tog
                         <ImageTile
                           key={i}
                           url={r.url}
-                          label={`${color} ${i + 1}`}
+                          label={`${displayLabel} ${i + 1}`}
                           selected={r.selected}
                           pinned={data.pinnedUrl === r.url}
-                          onToggle={() => toggleSelect(5, i, color)}
+                          onToggle={() => toggleSelect(5, i, canonical)}
                           onZoom={() => onZoom(r.url)}
                           onPin={() => togglePin(r.url)}
-                          onRegenerate={() => onRegenerateSlot(color, i)}
+                          onRegenerate={() => onRegenerateSlot(canonical, i)}
                         />
                       ) : (
                         <div
                           key={i}
                           className="aspect-[3/4] rounded-[10px] bg-gradient-to-br from-bg-elev to-bg-elev-3 animate-pulse flex items-center justify-center"
                         >
-                          <span className="text-[11px] text-text-faint">{color} {i + 1}</span>
+                          <span className="text-[11px] text-text-faint">{displayLabel} {i + 1}</span>
                         </div>
                       )
                     )}
@@ -562,11 +572,13 @@ function Step5({ onGenerate, onGenerateAll, onRegenerateSlot, runningColors, tog
 /**
  * Picker showing all competitor thumbnails. User clicks to toggle which ones
  * are used as colour references for THIS specific colour.
+ * `color` is the canonical key; `label` is what we show to the user.
  */
-function ColorRefPicker({ color }: { color: string }) {
+function ColorRefPicker({ color, label }: { color: string; label?: string }) {
   const { data, setData } = useProduct();
   if (!data.competitorImages.length) return null;
 
+  const displayName = label ?? color;
   const selected = data.colorRefsByColor[color] ?? [];
   const isSelected = (url: string) => selected.includes(url);
 
@@ -581,7 +593,7 @@ function ColorRefPicker({ color }: { color: string }) {
   return (
     <div className="mb-3">
       <div className="text-[10px] uppercase tracking-wider text-text-faint mb-1.5 flex items-center gap-1.5">
-        Colour references for {color}
+        Colour references for {displayName}
         <span className="text-text-faint/70 normal-case tracking-normal">
           ({selected.length || 0} of {data.competitorImages.length} picked
           {selected.length === 0 ? " — using globally selected as fallback" : ""})
@@ -593,7 +605,7 @@ function ColorRefPicker({ color }: { color: string }) {
             key={i}
             type="button"
             onClick={() => toggle(img.url)}
-            title={`Competitor ${i + 1} — click to ${isSelected(img.url) ? "remove from" : "use as"} color reference for ${color}`}
+            title={`Competitor ${i + 1} — click to ${isSelected(img.url) ? "remove from" : "use as"} color reference for ${displayName}`}
             className={[
               "flex-shrink-0 w-12 h-16 rounded-md overflow-hidden border-2 transition-all duration-150 relative",
               isSelected(img.url)

@@ -4,7 +4,7 @@ import { useState } from "react";
 import { Card } from "@/components/ui/Card";
 import { ImageTile } from "@/components/ui/ImageTile";
 import { Lightbox } from "@/components/ui/Lightbox";
-import { useProduct } from "@/lib/product";
+import { useProduct, colorLabelFor } from "@/lib/product";
 
 export function PublishPoolCard() {
   const { data, patch } = useProduct();
@@ -16,6 +16,18 @@ export function PublishPoolCard() {
         i === idx ? { ...p, selected: !p.selected } : p
       ),
     });
+  };
+
+  /**
+   * Re-label a pool entry so the chip shows the localised colour for the active tab.
+   * E.g. canonical "Sage" → "Salvie" (DK) / "Sauge" (FR).
+   * "shared" colour is left as-is.
+   */
+  const displayLabel = (label: string, canonical: string): string => {
+    if (!canonical || canonical === "shared") return label;
+    const localised = colorLabelFor(data, canonical, data.activeViewStore);
+    if (localised === canonical) return label;
+    return label.replace(canonical, localised);
   };
 
   const selectedCount = data.publishPool.filter((p) => p.selected).length;
@@ -35,6 +47,11 @@ export function PublishPoolCard() {
     >
       <p className="text-[12px] text-text-dim mb-3">
         Generated photos appear here. Click to check/uncheck. Selected photos (✓) will be sent to Shopify.
+        {data.selectedStores.length > 1 && (
+          <span className="text-text-faint">
+            {" "}Images are shared across all {data.selectedStores.length} stores.
+          </span>
+        )}
       </p>
 
       {data.publishPool.length === 0 ? (
@@ -49,7 +66,7 @@ export function PublishPoolCard() {
             <ImageTile
               key={i}
               url={p.url}
-              label={p.label}
+              label={displayLabel(p.label, p.color)}
               selected={p.selected}
               onToggle={() => togglePool(i)}
               onZoom={() => setZoomUrl(p.url)}

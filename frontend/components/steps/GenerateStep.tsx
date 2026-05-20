@@ -4,8 +4,8 @@ import { useEffect, useRef, useState } from "react";
 import { Spinner } from "@/components/ui/Spinner";
 import { Button } from "@/components/ui/Button";
 import { useStep } from "@/lib/step";
-import { useProduct } from "@/lib/product";
-import { useStore } from "@/lib/store";
+import { useProduct, StoreContent } from "@/lib/product";
+import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
 import { api } from "@/lib/api";
 import { extractColors, guessProductType, normalizeImageUrl, safeHostname } from "@/lib/scrape-utils";
 import { translateColor } from "@/lib/colors";
@@ -15,17 +15,29 @@ import { autoSiblingsHandle } from "@/lib/slug";
 type Stage = "scraping" | "names" | "generating" | "done";
 
 const STAGE_LABELS: Record<Stage, { main: string; sub: string; pct: number }> = {
-  scraping:   { main: "Fetching competitor product…",       sub: "Scraping product details",                          pct: 25 },
-  names:      { main: "Generating product name…",           sub: "Checking uniqueness against Shopify catalogue",     pct: 50 },
-  generating: { main: "Generating description via Claude…", sub: "Style: calm, practical, comfort-oriented",          pct: 80 },
+  scraping:   { main: "Fetching competitor product…",       sub: "Scraping product details",                          pct: 20 },
+  names:      { main: "Generating product name…",           sub: "Checking uniqueness against Shopify catalogue",     pct: 40 },
+  generating: { main: "Generating content via Claude…",     sub: "Style: calm, practical, comfort-oriented",          pct: 80 },
   done:       { main: "Preparing review…",                  sub: "Almost there",                                      pct: 100 },
 };
+
+/** Title-case a colour string for use as a canonical key. */
+function canonicalize(color: string): string {
+  const trimmed = color.trim();
+  if (!trimmed) return trimmed;
+  return trimmed
+    .toLowerCase()
+    .split(/\s+/)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
 
 export function GenerateStep() {
   const { setStep } = useStep();
   const { data, patch } = useProduct();
-  const { store } = useStore();
+  const { setStore } = useStore();
   const [stage, setStage] = useState<Stage>("scraping");
+  const [subStage, setSubStage] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const started = useRef(false);
 
@@ -35,7 +47,12 @@ export function GenerateStep() {
 
     (async () => {
       try {
-        // ── 1. Scrape competitor product ──
+        const selectedStores = data.selectedStores.length
+          ? data.selectedStores
+          : (["dk"] as StoreKey[]);
+        const primary = selectedStores[0];
+
+        // ── 1. Scrape competitor product (ONCE — shared across stores) ──
         setStage("scraping");
         const scraped = await api.scrape(data.competitorUrl);
         if (scraped.error) throw new Error(scraped.error);
@@ -49,7 +66,7 @@ export function GenerateStep() {
         };
         const productType = guessProductType(product);
         const rawColors = extractColors(product);
-        const colors = rawColors.map((c) => translateColor(c, store));
+        const canonicalColors = rawColors.map(canonicalize);
 
         const images = (product?.images ?? [])
           .slice(0, 8)
@@ -58,11 +75,11 @@ export function GenerateStep() {
         if (images[0]) images[0].selected = true;
         if (images[1]) images[1].selected = true;
 
-        // ── 2. Pick unique product name ──
+        // ── 2. Pick unique product name (checked against PRIMARY store's catalogue) ──
         setStage("names");
         let usedFromShopify: string[] = [];
         try {
-          const r = await api.names(store);
+          const r = await api.names(primary);
           usedFromShopify = r.names ?? [];
         } catch {
           // Non-fatal: continue with empty list
@@ -70,32 +87,67 @@ export function GenerateStep() {
         const lower = new Set(usedFromShopify.map((n) => n.toLowerCase()));
         const chosenName = randomName(Array.from(lower));
 
-        // ── 3. Generate content with Claude ──
+        // ── 3. Generate content for EACH selected store ──
         setStage("generating");
         const keywords = data.parsedKeywords;
-        const gen = await api.generate({
-          store,
-          product_name: chosenName,
-          product_title: product?.title ?? "",
-          keywords,
-        });
-        if (gen.error) throw new Error(gen.error);
+        const contentByStore: Record<StoreKey, StoreContent> = {
+          ...data.contentByStore,
+        };
+
+        for (const store of selectedStores) {
+          setSubStage(`${STORE_CONFIG[store].language} — ${STORE_CONFIG[store].label}`);
+          const gen = await api.generate({
+            store,
+            product_name: chosenName,
+            product_title: product?.title ?? "",
+            keywords,
+          });
+          if (gen.error) throw new Error(`${store.toUpperCase()}: ${gen.error}`);
+
+          // Build localised colour labels for this store
+          const colorLabels: Record<string, string> = {};
+          canonicalColors.forEach((canonical) => {
+            colorLabels[canonical] = translateColor(canonical, store);
+          });
+          const cutline = canonicalColors
+            .map((c) => colorLabels[c])
+            .join(", ");
+
+          contentByStore[store] = {
+            description: gen.description ?? "",
+            metaDescription: gen.meta_description ?? "",
+            mTitleSpecs: gen.m_title_specs ?? "",
+            cutline,
+            colorLabels,
+          };
+        }
 
         // ── 4. Done — patch everything ──
         setStage("done");
-        const primaryColor = colors[0] ?? "";
+        setSubStage("");
+        const primaryContent = contentByStore[primary];
+        const primaryColors = canonicalColors.map(
+          (c) => primaryContent.colorLabels[c] ?? c
+        );
+
+        // Make global useStore.store track the primary store so name validation etc. work
+        setStore(primary);
+
         patch({
           competitor,
           name: chosenName,
-          colors,
-          cutline: colors.join(", "),
+          canonicalColors,
+          colors: primaryColors,
           siblingsHandle: autoSiblingsHandle(chosenName),
           productType,
           competitorImages: images,
-          description: gen.description ?? "",
-          metaDescription: gen.meta_description ?? "",
-          mTitleSpecs: gen.m_title_specs ?? "",
-          // primary color cutline stays as-is, ColorVariantsCard shows each
+          contentByStore,
+          activeViewStore: primary,
+          // Active-view mirrors
+          description: primaryContent.description,
+          metaDescription: primaryContent.metaDescription,
+          mTitleSpecs: primaryContent.mTitleSpecs,
+          cutline: primaryContent.cutline,
         });
 
         // brief pause so user sees "Preparing review…"
@@ -137,7 +189,9 @@ export function GenerateStep() {
         <Spinner size={48} />
         <div className="flex flex-col gap-2 min-h-[58px]">
           <p className="text-sm font-medium text-text">{currentLabel.main}</p>
-          <p className="text-xs text-text-faint">{currentLabel.sub}</p>
+          <p className="text-xs text-text-faint">
+            {stage === "generating" && subStage ? subStage : currentLabel.sub}
+          </p>
         </div>
         <div className="w-full max-w-xs mt-2">
           <div className="h-1 rounded-full bg-bg-elev-2 overflow-hidden">
@@ -147,6 +201,12 @@ export function GenerateStep() {
             />
           </div>
         </div>
+        {data.selectedStores.length > 1 && (
+          <div className="text-[11px] text-text-faint">
+            Generating {data.selectedStores.length} languages:{" "}
+            {data.selectedStores.map((s) => STORE_CONFIG[s].label).join(" · ")}
+          </div>
+        )}
         <Button variant="ghost" size="sm" onClick={() => setStep(1)}>
           ✕ Cancel
         </Button>

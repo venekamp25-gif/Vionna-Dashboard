@@ -7,9 +7,22 @@ import { useProduct } from "@/lib/product";
 import { autoSiblingsHandle } from "@/lib/slug";
 
 const COLOR_DOTS: Record<string, string> = {
-  "Blå": "#3b5fc0", "Sort": "#2d2d2d", "Hvid": "#f8f8f8", "Beige": "#f5f0e8",
-  "Rød": "#c0392b", "Grøn": "#4a7c5c", "Brun": "#8b6347", "Grå": "#8e8e8e",
-  "Navy": "#1e2a4a", "Noir": "#1a1a1a", "Blanc": "#f8f8f8", "Écru": "#f0ead4",
+  // English canonical keys
+  "Black": "#2d2d2d", "White": "#f8f8f8", "Cream": "#f5f0e0", "Ivory": "#f8efd9",
+  "Beige": "#f5f0e8", "Red": "#c0392b", "Blue": "#3b5fc0", "Navy": "#1e2a4a",
+  "Light Blue": "#8dbce0", "Green": "#4a7c5c", "Olive": "#7d7c4f", "Sage": "#9caa90",
+  "Forest Green": "#2e4634", "Pink": "#e8a4b8", "Hot Pink": "#e8409a", "Blush": "#e8c4c4",
+  "Rose": "#d88a8a", "Purple": "#7a4ea8", "Lilac": "#bca0d8", "Mauve": "#a68aa6",
+  "Brown": "#8b6347", "Camel": "#b68559", "Tan": "#c9a880", "Chocolate": "#3e2723",
+  "Grey": "#8e8e8e", "Gray": "#8e8e8e", "Light Grey": "#c9c9c9", "Charcoal": "#383838",
+  "Orange": "#e07b3c", "Rust": "#a04a2a", "Terracotta": "#c4674a",
+  "Yellow": "#e8c84a", "Mustard": "#bca044", "Gold": "#c8a14a", "Silver": "#bababa",
+  "Nude": "#d9b89c", "Sand": "#d8c9a6", "Stone": "#a6a098", "Champagne": "#e8d8b4",
+  "Mint": "#a6d8c4", "Teal": "#3e8a8c", "Burgundy": "#6e1f2f", "Wine": "#5a1f2f",
+  // Localised fallback (DK / FR)
+  "Sort": "#2d2d2d", "Hvid": "#f8f8f8", "Blå": "#3b5fc0", "Rød": "#c0392b",
+  "Grøn": "#4a7c5c", "Brun": "#8b6347", "Grå": "#8e8e8e",
+  "Noir": "#1a1a1a", "Blanc": "#f8f8f8", "Écru": "#f0ead4",
 };
 
 export function ColorVariantsCard() {
@@ -57,15 +70,19 @@ export function ColorVariantsCard() {
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        {data.colors.map((color) => (
-          <VariantCard
-            key={color}
-            color={color}
-            name={data.name}
-            handle={data.siblingsHandle}
-          />
-        ))}
-        {data.colors.length === 0 && (
+        {data.canonicalColors.map((canonical, i) => {
+          const displayLabel = data.colors[i] ?? canonical;
+          return (
+            <VariantCard
+              key={canonical}
+              displayLabel={displayLabel}
+              canonical={canonical}
+              name={data.name}
+              handle={data.siblingsHandle}
+            />
+          );
+        })}
+        {data.canonicalColors.length === 0 && (
           <div className="col-span-full text-center text-[12px] text-text-faint py-4">
             Add at least one color above to see variant previews.
           </div>
@@ -75,8 +92,18 @@ export function ColorVariantsCard() {
   );
 }
 
-function VariantCard({ color, name, handle }: { color: string; name: string; handle: string }) {
-  const dotColor = COLOR_DOTS[color] ?? "#888";
+function VariantCard({
+  displayLabel,
+  canonical,
+  name,
+  handle,
+}: {
+  displayLabel: string;
+  canonical: string;
+  name: string;
+  handle: string;
+}) {
+  const dotColor = COLOR_DOTS[canonical] ?? COLOR_DOTS[displayLabel] ?? "#888";
   return (
     <div className="bg-bg-elev-2 border border-border rounded-[10px] p-3 hover:border-border-hover transition-colors">
       <div className="flex items-center gap-2 mb-2.5 font-semibold text-[13px] text-text">
@@ -84,12 +111,12 @@ function VariantCard({ color, name, handle }: { color: string; name: string; han
           className="w-3 h-3 rounded-full border border-border"
           style={{ background: dotColor }}
         />
-        Duplicate — {color}
+        Duplicate — {displayLabel}
       </div>
 
       <div className="space-y-2">
         <MiniField label="Product title" value={name} readOnly />
-        <MiniField label="Cutline metafield" value={color} readOnly />
+        <MiniField label="Cutline metafield" value={displayLabel} readOnly />
         <MiniField label="Siblings handle" value={handle || "—"} readOnly />
       </div>
 
