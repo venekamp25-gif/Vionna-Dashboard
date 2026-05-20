@@ -64,3 +64,38 @@ export function safeHostname(url: string): string {
     return "competitor.com";
   }
 }
+
+/**
+ * Map each canonical (title-case English) colour → list of competitor variant IDs.
+ * Used downstream so the per-colour ColorRefPicker can filter competitor images to
+ * just the ones the competitor tagged for that variant.
+ *
+ * Matching is case-insensitive on the competitor's `option1/2/3` value (whichever
+ * option name looks like a colour). Canonical colours that don't appear in the
+ * competitor's option values get an empty list — callers must fall back gracefully.
+ */
+export function extractVariantsByColor(
+  product: ScrapedProduct["product"],
+  canonicalColors: string[]
+): Record<string, number[]> {
+  const result: Record<string, number[]> = {};
+  for (const c of canonicalColors) result[c] = [];
+  if (!product) return result;
+
+  const opts = product.options ?? [];
+  const colorOptIndex = opts.findIndex((o) => COLOR_OPT_RE.test(o.name));
+  const optIndex = colorOptIndex >= 0 ? colorOptIndex : 0; // fall back to option1
+
+  const canonicalLower = canonicalColors.map((c) => c.toLowerCase().trim());
+
+  for (const v of product.variants ?? []) {
+    if (!v.id) continue;
+    const colorValue =
+      optIndex === 0 ? v.option1 : optIndex === 1 ? v.option2 : v.option3;
+    if (!colorValue) continue;
+    const lower = colorValue.toLowerCase().trim();
+    const idx = canonicalLower.indexOf(lower);
+    if (idx >= 0) result[canonicalColors[idx]].push(v.id);
+  }
+  return result;
+}

@@ -570,9 +570,18 @@ function Step5({ onGenerate, onGenerateAll, onRegenerateSlot, runningColors, tog
 }
 
 /**
- * Picker showing all competitor thumbnails. User clicks to toggle which ones
- * are used as colour references for THIS specific colour.
- * `color` is the canonical key; `label` is what we show to the user.
+ * Picker showing competitor thumbnails for ONE canonical colour.
+ *
+ * We use the competitor's own variant↔image tagging (from the Shopify .json the
+ * scrape returned) to filter to just the photos that competitor itself flagged
+ * as belonging to this colour. That makes picking colour references much easier
+ * when the competitor's photo set spans multiple colours.
+ *
+ * Fallback rules:
+ *   - If the canonical colour has no variants on the competitor (e.g. user added
+ *     a colour the competitor doesn't sell), show all images.
+ *   - If no image was tagged to those variants (some competitors leave the field
+ *     empty), show all images.
  */
 function ColorRefPicker({ color, label }: { color: string; label?: string }) {
   const { data, setData } = useProduct();
@@ -582,6 +591,22 @@ function ColorRefPicker({ color, label }: { color: string; label?: string }) {
   const selected = data.colorRefsByColor[color] ?? [];
   const isSelected = (url: string) => selected.includes(url);
 
+  // 1. Variant IDs that the competitor tagged for THIS colour
+  const colorVariantIds = data.competitorVariantsByColor[color] ?? [];
+  const variantSet = new Set(colorVariantIds);
+
+  // 2. Filter competitor images to ones tagged to one of those variants
+  const filtered =
+    variantSet.size > 0
+      ? data.competitorImages.filter((img) =>
+          (img.variantIds ?? []).some((id) => variantSet.has(id))
+        )
+      : [];
+
+  // 3. Decide which set to show: filtered (preferred) or all (fallback)
+  const usedFallback = filtered.length === 0;
+  const visible = usedFallback ? data.competitorImages : filtered;
+
   const toggle = (url: string) => {
     setData((prev) => {
       const cur = prev.colorRefsByColor[color] ?? [];
@@ -590,42 +615,53 @@ function ColorRefPicker({ color, label }: { color: string; label?: string }) {
     });
   };
 
+  // Counts based on the visible set (so the user sees a meaningful denominator)
+  const visibleSelectedCount = visible.filter((img) => isSelected(img.url)).length;
+
   return (
     <div className="mb-3">
       <div className="text-[10px] uppercase tracking-wider text-text-faint mb-1.5 flex items-center gap-1.5">
         Colour references for {displayName}
         <span className="text-text-faint/70 normal-case tracking-normal">
-          ({selected.length || 0} of {data.competitorImages.length} picked
-          {selected.length === 0 ? " — using globally selected as fallback" : ""})
+          ({visibleSelectedCount} of {visible.length} picked
+          {usedFallback
+            ? colorVariantIds.length === 0
+              ? " — competitor has no variant for this colour, showing all"
+              : " — no images tagged to this colour, showing all"
+            : ` — only ${displayName} variant photos`}
+          {visibleSelectedCount === 0 ? "; using globally selected as fallback" : ""})
         </span>
       </div>
       <div className="flex gap-1.5 overflow-x-auto pb-1">
-        {data.competitorImages.map((img, i) => (
-          <button
-            key={i}
-            type="button"
-            onClick={() => toggle(img.url)}
-            title={`Competitor ${i + 1} — click to ${isSelected(img.url) ? "remove from" : "use as"} color reference for ${displayName}`}
-            className={[
-              "flex-shrink-0 w-12 h-16 rounded-md overflow-hidden border-2 transition-all duration-150 relative",
-              isSelected(img.url)
-                ? "border-accent shadow-[0_0_0_2px_var(--accent-soft)]"
-                : "border-border opacity-50 hover:opacity-100 hover:border-border-hover",
-            ].join(" ")}
-          >
-            <img
-              src={img.url}
-              alt={`Competitor ${i + 1}`}
-              className="w-full h-full object-cover"
-              loading="lazy"
-            />
-            {isSelected(img.url) && (
-              <span className="absolute top-0.5 right-0.5 w-3.5 h-3.5 rounded-full bg-accent text-on-accent text-[9px] font-bold flex items-center justify-center">
-                ✓
-              </span>
-            )}
-          </button>
-        ))}
+        {visible.map((img) => {
+          const idx = data.competitorImages.indexOf(img);
+          return (
+            <button
+              key={img.url}
+              type="button"
+              onClick={() => toggle(img.url)}
+              title={`Competitor ${idx + 1} — click to ${isSelected(img.url) ? "remove from" : "use as"} color reference for ${displayName}`}
+              className={[
+                "flex-shrink-0 w-12 h-16 rounded-md overflow-hidden border-2 transition-all duration-150 relative",
+                isSelected(img.url)
+                  ? "border-accent shadow-[0_0_0_2px_var(--accent-soft)]"
+                  : "border-border opacity-50 hover:opacity-100 hover:border-border-hover",
+              ].join(" ")}
+            >
+              <img
+                src={img.url}
+                alt={`Competitor ${idx + 1}`}
+                className="w-full h-full object-cover"
+                loading="lazy"
+              />
+              {isSelected(img.url) && (
+                <span className="absolute top-0.5 right-0.5 w-3.5 h-3.5 rounded-full bg-accent text-on-accent text-[9px] font-bold flex items-center justify-center">
+                  ✓
+                </span>
+              )}
+            </button>
+          );
+        })}
       </div>
     </div>
   );

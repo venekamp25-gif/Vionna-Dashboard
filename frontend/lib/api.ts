@@ -36,9 +36,21 @@ export interface ScrapedProduct {
   product?: {
     title?: string;
     handle?: string;
-    options?: { name: string; values: string[] }[];
-    variants?: { price: string }[];
-    images?: { src: string }[];
+    options?: { name: string; values: string[]; position?: number }[];
+    variants?: {
+      id?: number;
+      option1?: string | null;
+      option2?: string | null;
+      option3?: string | null;
+      price: string;
+      featured_image?: { id?: number; src?: string; variant_ids?: number[] } | null;
+    }[];
+    images?: {
+      id?: number;
+      src: string;
+      variant_ids?: number[];
+      position?: number;
+    }[];
   };
   error?: string;
 }

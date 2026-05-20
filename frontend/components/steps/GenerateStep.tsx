@@ -7,7 +7,13 @@ import { useStep } from "@/lib/step";
 import { useProduct, StoreContent } from "@/lib/product";
 import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
 import { api } from "@/lib/api";
-import { extractColors, guessProductType, normalizeImageUrl, safeHostname } from "@/lib/scrape-utils";
+import {
+  extractColors,
+  extractVariantsByColor,
+  guessProductType,
+  normalizeImageUrl,
+  safeHostname,
+} from "@/lib/scrape-utils";
 import { translateColor } from "@/lib/colors";
 import { randomName } from "@/lib/names";
 import { autoSiblingsHandle } from "@/lib/slug";
@@ -68,12 +74,20 @@ export function GenerateStep() {
         const rawColors = extractColors(product);
         const canonicalColors = rawColors.map(canonicalize);
 
+        // Take up to 30 images so per-colour filtering has enough thumbnails to
+        // choose from (multi-colour products often have 3-6 photos per colour).
         const images = (product?.images ?? [])
-          .slice(0, 8)
-          .map((img) => ({ url: normalizeImageUrl(img.src), selected: false }));
-        // Pre-select first 2
+          .slice(0, 30)
+          .map((img) => ({
+            url: normalizeImageUrl(img.src),
+            selected: false,
+            variantIds: img.variant_ids ?? [],
+          }));
+        // Pre-select first 2 as the global fallback / step 1-4 reference
         if (images[0]) images[0].selected = true;
         if (images[1]) images[1].selected = true;
+
+        const variantsByColor = extractVariantsByColor(product, canonicalColors);
 
         // ── 2. Pick unique product name (checked against PRIMARY store's catalogue) ──
         setStage("names");
@@ -150,6 +164,7 @@ export function GenerateStep() {
           siblingsHandle: autoSiblingsHandle(chosenName),
           productType,
           competitorImages: images,
+          competitorVariantsByColor: variantsByColor,
           contentByStore,
           activeViewStore: primary,
           // Active-view mirrors

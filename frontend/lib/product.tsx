@@ -20,6 +20,8 @@ export interface PublishResult {
 export interface CompetitorImage {
   url: string;
   selected: boolean;
+  /** Shopify variant IDs this image is tagged to (from competitor .json). Empty = untagged. */
+  variantIds: number[];
 }
 
 export interface NbResult {
@@ -98,6 +100,12 @@ export interface ProductData {
 
   // ── Images (SHARED across stores; keyed by canonical colour) ──
   competitorImages: CompetitorImage[];
+  /**
+   * Canonical colour → list of competitor variant IDs for that colour.
+   * Used by the per-colour ColorRefPicker to show only the relevant thumbnails.
+   * Empty list (or missing key) = no per-colour filtering possible → show all.
+   */
+  competitorVariantsByColor: Record<string, number[]>;
   bgReferenceUrl: string;
   productType: string;
   nbResults: Record<number, NbResult[]>;
@@ -136,6 +144,7 @@ const DEFAULT_DATA: ProductData = {
     fr: { ...EMPTY_STORE_CONTENT, price: DEFAULT_PRICE_BY_STORE.fr },
   },
   competitorImages: [],
+  competitorVariantsByColor: {},
   bgReferenceUrl:
     "https://rosamae.com/cdn/shop/files/rosa-mae-odette-corset-midi-dress-midi-dresses-green-4024064.png?v=1775259209&width=1200",
   productType: "dress",
