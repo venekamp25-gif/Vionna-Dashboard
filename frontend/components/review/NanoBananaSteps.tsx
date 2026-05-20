@@ -143,6 +143,35 @@ export function NanoBananaSteps() {
   };
 
   /**
+   * Compute the list of (step, favourite reference) pairs used as input for Step 5.
+   * Order = [1,2,3,4]; steps without a favourite are skipped.
+   */
+  const computeStepFavourites = (): { step: number; ref: string }[] => {
+    const favouriteFor = (step: number): string | null => {
+      const stepResults = data.nbResults[step] ?? [];
+      if (data.pinnedUrl && stepResults.some((r) => r.url === data.pinnedUrl)) {
+        return data.pinnedUrl;
+      }
+      const selected = stepResults.find((r) => r.selected);
+      if (selected) return selected.url;
+      if (data.pinnedUrl) return data.pinnedUrl;
+      return null;
+    };
+    const out: { step: number; ref: string }[] = [];
+    for (const step of [1, 2, 3, 4]) {
+      const ref = favouriteFor(step);
+      if (ref) out.push({ step, ref });
+    }
+    return out;
+  };
+
+  const competitorColorRefs = () =>
+    data.competitorImages
+      .filter((img) => img.selected)
+      .slice(0, 3)
+      .map((img) => img.url);
+
+  /**
    * Generate 4 variants for a specific color — one per step format (1, 2, 3, 4).
    * Each variant uses the favourite from that step as the framing/model reference,
    * plus the competitor color references for colour matching.
@@ -152,30 +181,8 @@ export function NanoBananaSteps() {
     if (runningColors[color]) return;
     setRunningColors((m) => ({ ...m, [color]: true }));
 
-    // Color reference images from competitor (selected by user in the competitor grid)
-    const colorRefs = data.competitorImages
-      .filter((img) => img.selected)
-      .slice(0, 3)
-      .map((img) => img.url);
-
-    // Find the favourite per step (pinned takes precedence, then first selected)
-    const favouriteFor = (step: number): string | null => {
-      const stepResults = data.nbResults[step] ?? [];
-      if (data.pinnedUrl && stepResults.some((r) => r.url === data.pinnedUrl)) {
-        return data.pinnedUrl;
-      }
-      const selected = stepResults.find((r) => r.selected);
-      if (selected) return selected.url;
-      // Fallback: if pinned exists at all (from any step), reuse it
-      if (data.pinnedUrl) return data.pinnedUrl;
-      return null;
-    };
-
-    const stepFavourites: { step: number; ref: string }[] = [];
-    for (const step of [1, 2, 3, 4]) {
-      const ref = favouriteFor(step);
-      if (ref) stepFavourites.push({ step, ref });
-    }
+    const colorRefs = competitorColorRefs();
+    const stepFavourites = computeStepFavourites();
 
     if (stepFavourites.length === 0) {
       alert("Select at least one image in steps 1–4 first (or pin one as model).");
@@ -227,6 +234,50 @@ export function NanoBananaSteps() {
       alert(`All formats failed for ${color}. Check Higgsfield and try again.`);
     }
     setRunningColors((m) => ({ ...m, [color]: false }));
+  };
+
+  /** Regenerate one tile for a specific color. Re-runs the same step-format that produced it. */
+  const regenerateColorSlot = async (color: string, slotIndex: number) => {
+    const stepFavourites = computeStepFavourites();
+    const target = stepFavourites[slotIndex];
+    if (!target) return;
+
+    const colorRefs = competitorColorRefs();
+
+    // Drop from publish pool if it was selected
+    setData((prev) => {
+      const current = prev.nbResultsPerColor[color] ?? [];
+      const tile = current[slotIndex];
+      let pool = prev.publishPool;
+      if (tile?.selected && tile.url) {
+        pool = pool.filter((p) => p.url !== tile.url);
+      }
+      const next = current.map((r, i) => (i === slotIndex ? { url: "", selected: false } : r));
+      return {
+        ...prev,
+        nbResultsPerColor: { ...prev.nbResultsPerColor, [color]: next },
+        publishPool: pool,
+      };
+    });
+
+    try {
+      const res = await api.higgsfield({
+        prompt_type: 10 + target.step,
+        product_type: data.productType || "dress",
+        color,
+        image_urls: [target.ref, ...colorRefs],
+        count: 1,
+      });
+      const url = res.urls?.[0];
+      if (!url) throw new Error(res.error ?? "No image returned");
+      setData((prev) => {
+        const current = prev.nbResultsPerColor[color] ?? [];
+        const next = current.map((r, i) => (i === slotIndex ? { url, selected: false } : r));
+        return { ...prev, nbResultsPerColor: { ...prev.nbResultsPerColor, [color]: next } };
+      });
+    } catch {
+      // Leave placeholder so user can retry
+    }
   };
 
   /** Toggle selection on a tile. Uses functional setData so fast clicks don't lose state. */
@@ -360,6 +411,7 @@ export function NanoBananaSteps() {
         toggleSelect={toggleSelect}
         togglePin={togglePin}
         onZoom={(url) => setZoomUrl(url)}
+        onRegenerateSlot={regenerateColorSlot}
         onGenerateAll={async (colors) => {
           for (const color of colors) {
             if (data.nbResultsPerColor[color]?.length) continue;  // skip already-generated
@@ -376,13 +428,14 @@ export function NanoBananaSteps() {
 interface Step5Props {
   onGenerate: (color: string) => void;
   onGenerateAll: (colors: string[]) => Promise<void>;
+  onRegenerateSlot: (color: string, slot: number) => Promise<void>;
   runningColors: Record<string, boolean>;
   toggleSelect: (step: number, slot: number, color: string) => void;
   togglePin: (url: string) => void;
   onZoom: (url: string) => void;
 }
 
-function Step5({ onGenerate, onGenerateAll, runningColors, toggleSelect, togglePin, onZoom }: Step5Props) {
+function Step5({ onGenerate, onGenerateAll, onRegenerateSlot, runningColors, toggleSelect, togglePin, onZoom }: Step5Props) {
   const { data } = useProduct();
   const otherColors = data.colors.slice(1);
 
@@ -461,18 +514,28 @@ function Step5({ onGenerate, onGenerateAll, runningColors, toggleSelect, toggleP
 
                 {results.length > 0 && (
                   <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
-                    {results.map((r, i) => (
-                      <ImageTile
-                        key={i}
-                        url={r.url}
-                        label={`${color} ${i + 1}`}
-                        selected={r.selected}
-                        pinned={data.pinnedUrl === r.url}
-                        onToggle={() => toggleSelect(5, i, color)}
-                        onZoom={() => onZoom(r.url)}
-                        onPin={() => togglePin(r.url)}
-                      />
-                    ))}
+                    {results.map((r, i) =>
+                      r.url ? (
+                        <ImageTile
+                          key={i}
+                          url={r.url}
+                          label={`${color} ${i + 1}`}
+                          selected={r.selected}
+                          pinned={data.pinnedUrl === r.url}
+                          onToggle={() => toggleSelect(5, i, color)}
+                          onZoom={() => onZoom(r.url)}
+                          onPin={() => togglePin(r.url)}
+                          onRegenerate={() => onRegenerateSlot(color, i)}
+                        />
+                      ) : (
+                        <div
+                          key={i}
+                          className="aspect-[3/4] rounded-[10px] bg-gradient-to-br from-bg-elev to-bg-elev-3 animate-pulse flex items-center justify-center"
+                        >
+                          <span className="text-[11px] text-text-faint">{color} {i + 1}</span>
+                        </div>
+                      )
+                    )}
                   </div>
                 )}
               </div>
