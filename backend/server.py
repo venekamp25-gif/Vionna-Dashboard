@@ -703,6 +703,30 @@ NANO_BANANA_PROMPTS = {
         "different pose, wearing the {product_type} in {color}. Do not copy the competitor's model, "
         "face, body, or background — only mirror the colour from those references onto our model's "
         "outfit."),
+    # === Prompts 11-14: step 5 color variants in the four step formats (1-4) ===
+    # First image = the chosen favourite from the matching step (model + framing reference).
+    # Additional images = competitor color references for {color}.
+    11: ("I've uploaded reference images. The FIRST image is our model wearing the {product_type} "
+         "in a full-body styled shot. The remaining images are colour references showing the same "
+         "{product_type} in {color}. Generate a full-body model shot — same model face, same background, "
+         "same lighting and styling, in a slightly different pose — but with the {product_type} in {color}. "
+         "Use the colour references only to match the exact {color} colour, texture and fabric finish. "
+         "Do not copy the competitor's model, face or background."),
+    12: ("I've uploaded reference images. The FIRST image is our model wearing the {product_type} with "
+         "her face clearly visible and the product details prominent. The remaining images are colour "
+         "references showing the same {product_type} in {color}. Generate a detailed model shot with the "
+         "model's full face clearly visible and all product details accurately replicated — but with the "
+         "{product_type} in {color}, matching the colour references exactly. Keep our model, background "
+         "and styling identical to the first reference."),
+    13: ("I've uploaded reference images. The FIRST image is our model wearing the {product_type}. "
+         "The remaining images show the {product_type} in {color} as colour reference. Generate a realistic "
+         "BACK VIEW of the same model — same setup, same background, same model — wearing the {product_type} "
+         "in {color}. Match the colour exactly from the colour references."),
+    14: ("I've uploaded reference images. The FIRST image is our model wearing the {product_type}. The "
+         "remaining images show the {product_type} in {color} as colour reference. Generate a close-up "
+         "image of the material and texture of the {product_type} in {color}. Match the original style "
+         "and lighting from the first reference, with the colour from the additional references. Focus "
+         "clearly on the fabric texture and details."),
 }
 
 

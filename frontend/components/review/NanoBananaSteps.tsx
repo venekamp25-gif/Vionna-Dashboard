@@ -142,39 +142,91 @@ export function NanoBananaSteps() {
     }
   };
 
-  /** Generate 4 variants for a specific color (step 5). Multiple colors can run in parallel. */
+  /**
+   * Generate 4 variants for a specific color — one per step format (1, 2, 3, 4).
+   * Each variant uses the favourite from that step as the framing/model reference,
+   * plus the competitor color references for colour matching.
+   * Multiple colors can run in parallel.
+   */
   const runColorVariant = async (color: string) => {
     if (runningColors[color]) return;
     setRunningColors((m) => ({ ...m, [color]: true }));
 
-    const imageUrls = buildImageUrls(5);
-    if (!imageUrls.length) {
-      alert("Select an image in steps 1–4 first (or pin one as model).");
+    // Color reference images from competitor (selected by user in the competitor grid)
+    const colorRefs = data.competitorImages
+      .filter((img) => img.selected)
+      .slice(0, 3)
+      .map((img) => img.url);
+
+    // Find the favourite per step (pinned takes precedence, then first selected)
+    const favouriteFor = (step: number): string | null => {
+      const stepResults = data.nbResults[step] ?? [];
+      if (data.pinnedUrl && stepResults.some((r) => r.url === data.pinnedUrl)) {
+        return data.pinnedUrl;
+      }
+      const selected = stepResults.find((r) => r.selected);
+      if (selected) return selected.url;
+      // Fallback: if pinned exists at all (from any step), reuse it
+      if (data.pinnedUrl) return data.pinnedUrl;
+      return null;
+    };
+
+    const stepFavourites: { step: number; ref: string }[] = [];
+    for (const step of [1, 2, 3, 4]) {
+      const ref = favouriteFor(step);
+      if (ref) stepFavourites.push({ step, ref });
+    }
+
+    if (stepFavourites.length === 0) {
+      alert("Select at least one image in steps 1–4 first (or pin one as model).");
       setRunningColors((m) => ({ ...m, [color]: false }));
       return;
     }
 
-    try {
-      const res = await api.higgsfield({
-        prompt_type: 5,
-        product_type: data.productType || "dress",
-        color,
-        image_urls: imageUrls,
-        count: 4,
-      });
-      if (res.error) throw new Error(res.error);
-      const urls = res.urls ?? [];
-      const results: NbResult[] = urls.map((u) => ({ url: u, selected: false }));
-      setData((prev) => ({
-        ...prev,
-        nbResultsPerColor: { ...prev.nbResultsPerColor, [color]: results },
-      }));
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      alert(`Failed to generate ${color}: ${msg}`);
-    } finally {
-      setRunningColors((m) => ({ ...m, [color]: false }));
+    // Reset slot for this color so the UI shows loading state
+    setData((prev) => ({
+      ...prev,
+      nbResultsPerColor: { ...prev.nbResultsPerColor, [color]: [] },
+    }));
+
+    // Fire one Higgsfield call per step-format in parallel
+    const slots: (NbResult | null)[] = new Array(stepFavourites.length).fill(null);
+
+    const calls = stepFavourites.map(async ({ step, ref }, i) => {
+      try {
+        const res = await api.higgsfield({
+          prompt_type: 10 + step,   // 11, 12, 13, 14
+          product_type: data.productType || "dress",
+          color,
+          image_urls: [ref, ...colorRefs],
+          count: 1,
+        });
+        const url = res.urls?.[0];
+        if (!url) throw new Error(res.error ?? "No image returned");
+        slots[i] = { url, selected: false };
+      } catch {
+        slots[i] = null;
+      } finally {
+        const partial = slots.map((s) => s ?? { url: "", selected: false });
+        setData((prev) => ({
+          ...prev,
+          nbResultsPerColor: { ...prev.nbResultsPerColor, [color]: partial },
+        }));
+      }
+    });
+
+    await Promise.allSettled(calls);
+
+    const finalResults = slots.filter((s): s is NbResult => s !== null);
+    setData((prev) => ({
+      ...prev,
+      nbResultsPerColor: { ...prev.nbResultsPerColor, [color]: finalResults },
+    }));
+
+    if (finalResults.length === 0) {
+      alert(`All formats failed for ${color}. Check Higgsfield and try again.`);
     }
+    setRunningColors((m) => ({ ...m, [color]: false }));
   };
 
   /** Toggle selection on a tile. Uses functional setData so fast clicks don't lose state. */
