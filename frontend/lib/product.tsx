@@ -58,6 +58,7 @@ export interface ProductData {
   productType: string;
   nbResults: Record<number, NbResult[]>;   // step number → results array
   nbResultsPerColor: Record<string, NbResult[]>; // color name → results (step 5)
+  colorRefsByColor: Record<string, string[]>;    // color name → competitor URLs used as color refs
   pinnedUrl: string | null;                // model reference pinned across NB steps
   publishPool: PoolPhoto[];
   publishResult: PublishResult | null;     // filled after successful Shopify publish
@@ -84,6 +85,7 @@ const DEFAULT_DATA: ProductData = {
   productType: "dress",
   nbResults: {},
   nbResultsPerColor: {},
+  colorRefsByColor: {},
   pinnedUrl: null,
   publishPool: [],
   publishResult: null,

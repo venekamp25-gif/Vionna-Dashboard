@@ -165,11 +165,21 @@ export function NanoBananaSteps() {
     return out;
   };
 
-  const competitorColorRefs = () =>
-    data.competitorImages
+  /**
+   * Colour references for a given step-5 colour.
+   * Priority: per-colour selection (data.colorRefsByColor[color])
+   * Fallback: globally selected competitor images (legacy behaviour).
+   */
+  const competitorColorRefs = (color?: string) => {
+    if (color) {
+      const perColor = data.colorRefsByColor[color] ?? [];
+      if (perColor.length) return perColor.slice(0, 3);
+    }
+    return data.competitorImages
       .filter((img) => img.selected)
       .slice(0, 3)
       .map((img) => img.url);
+  };
 
   /**
    * Generate 4 variants for a specific color — one per step format (1, 2, 3, 4).
@@ -181,7 +191,7 @@ export function NanoBananaSteps() {
     if (runningColors[color]) return;
     setRunningColors((m) => ({ ...m, [color]: true }));
 
-    const colorRefs = competitorColorRefs();
+    const colorRefs = competitorColorRefs(color);
     const stepFavourites = computeStepFavourites();
 
     if (stepFavourites.length === 0) {
@@ -242,7 +252,7 @@ export function NanoBananaSteps() {
     const target = stepFavourites[slotIndex];
     if (!target) return;
 
-    const colorRefs = competitorColorRefs();
+    const colorRefs = competitorColorRefs(color);
 
     // Drop from publish pool if it was selected
     setData((prev) => {
@@ -512,6 +522,8 @@ function Step5({ onGenerate, onGenerateAll, onRegenerateSlot, runningColors, tog
                   </Button>
                 </div>
 
+                <ColorRefPicker color={color} />
+
                 {results.length > 0 && (
                   <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
                     {results.map((r, i) =>
@@ -543,6 +555,66 @@ function Step5({ onGenerate, onGenerateAll, onRegenerateSlot, runningColors, tog
           })}
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * Picker showing all competitor thumbnails. User clicks to toggle which ones
+ * are used as colour references for THIS specific colour.
+ */
+function ColorRefPicker({ color }: { color: string }) {
+  const { data, setData } = useProduct();
+  if (!data.competitorImages.length) return null;
+
+  const selected = data.colorRefsByColor[color] ?? [];
+  const isSelected = (url: string) => selected.includes(url);
+
+  const toggle = (url: string) => {
+    setData((prev) => {
+      const cur = prev.colorRefsByColor[color] ?? [];
+      const next = cur.includes(url) ? cur.filter((u) => u !== url) : [...cur, url];
+      return { ...prev, colorRefsByColor: { ...prev.colorRefsByColor, [color]: next } };
+    });
+  };
+
+  return (
+    <div className="mb-3">
+      <div className="text-[10px] uppercase tracking-wider text-text-faint mb-1.5 flex items-center gap-1.5">
+        Colour references for {color}
+        <span className="text-text-faint/70 normal-case tracking-normal">
+          ({selected.length || 0} of {data.competitorImages.length} picked
+          {selected.length === 0 ? " — using globally selected as fallback" : ""})
+        </span>
+      </div>
+      <div className="flex gap-1.5 overflow-x-auto pb-1">
+        {data.competitorImages.map((img, i) => (
+          <button
+            key={i}
+            type="button"
+            onClick={() => toggle(img.url)}
+            title={`Competitor ${i + 1} — click to ${isSelected(img.url) ? "remove from" : "use as"} color reference for ${color}`}
+            className={[
+              "flex-shrink-0 w-12 h-16 rounded-md overflow-hidden border-2 transition-all duration-150 relative",
+              isSelected(img.url)
+                ? "border-accent shadow-[0_0_0_2px_var(--accent-soft)]"
+                : "border-border opacity-50 hover:opacity-100 hover:border-border-hover",
+            ].join(" ")}
+          >
+            <img
+              src={img.url}
+              alt={`Competitor ${i + 1}`}
+              className="w-full h-full object-cover"
+              loading="lazy"
+            />
+            {isSelected(img.url) && (
+              <span className="absolute top-0.5 right-0.5 w-3.5 h-3.5 rounded-full bg-accent text-on-accent text-[9px] font-bold flex items-center justify-center">
+                ✓
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
