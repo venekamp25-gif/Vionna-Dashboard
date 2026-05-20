@@ -94,6 +94,11 @@ export function GenerateStep() {
           ...data.contentByStore,
         };
 
+        const defaultPriceByStore: Record<StoreKey, string> = {
+          dk: "349,00 DKK",
+          fr: "49,00 EUR",
+        };
+
         for (const store of selectedStores) {
           setSubStage(`${STORE_CONFIG[store].language} — ${STORE_CONFIG[store].label}`);
           const gen = await api.generate({
@@ -113,11 +118,15 @@ export function GenerateStep() {
             .map((c) => colorLabels[c])
             .join(", ");
 
+          // Preserve any existing price the user may have already set for this store;
+          // otherwise default to the currency-appropriate value.
+          const existingPrice = data.contentByStore[store]?.price;
           contentByStore[store] = {
             description: gen.description ?? "",
             metaDescription: gen.meta_description ?? "",
             mTitleSpecs: gen.m_title_specs ?? "",
             cutline,
+            price: existingPrice || defaultPriceByStore[store],
             colorLabels,
           };
         }
@@ -148,6 +157,7 @@ export function GenerateStep() {
           metaDescription: primaryContent.metaDescription,
           mTitleSpecs: primaryContent.mTitleSpecs,
           cutline: primaryContent.cutline,
+          price: primaryContent.price,
         });
 
         // brief pause so user sees "Preparing review…"

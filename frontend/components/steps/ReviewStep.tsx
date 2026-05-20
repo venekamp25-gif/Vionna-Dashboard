@@ -50,6 +50,7 @@ export function ReviewStep() {
       metaDescription: string;
       mTitleSpecs: string;
       cutline: string;
+      price: string;
       colorLabels: Record<string, string>;
     }> = { dk: data.contentByStore.dk, fr: data.contentByStore.fr };
     snapshotByStore[data.activeViewStore] = {
@@ -57,6 +58,7 @@ export function ReviewStep() {
       metaDescription: data.metaDescription,
       mTitleSpecs: data.mTitleSpecs,
       cutline: data.cutline,
+      price: data.price,
       colorLabels: activeColorLabels,
     };
 
@@ -87,14 +89,15 @@ export function ReviewStep() {
           (c) => storeContent.colorLabels?.[c] ?? c
         );
 
+        const storePrice = storeContent.price || data.price;
         const res = await api.publish({
           store,
           product_name: data.name,
           description: storeContent.description,
           meta_description: storeContent.metaDescription,
           m_title_specs: storeContent.mTitleSpecs,
-          price: data.price,
-          compare_at_price: calcComparePrice(data.price, data.discount),
+          price: storePrice,
+          compare_at_price: calcComparePrice(storePrice, data.discount),
           product_type: data.productType,
           colors: localisedColors,
           siblings_handle: data.siblingsHandle,

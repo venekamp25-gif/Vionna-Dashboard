@@ -66,9 +66,10 @@ export function PublishStep() {
       publishPool: [],
       publishResult: null,
       publishResultsByStore: {},
+      price: "349,00 DKK",
       contentByStore: {
-        dk: { description: "", metaDescription: "", mTitleSpecs: "", cutline: "", colorLabels: {} },
-        fr: { description: "", metaDescription: "", mTitleSpecs: "", cutline: "", colorLabels: {} },
+        dk: { description: "", metaDescription: "", mTitleSpecs: "", cutline: "", price: "349,00 DKK", colorLabels: {} },
+        fr: { description: "", metaDescription: "", mTitleSpecs: "", cutline: "", price: "49,00 EUR", colorLabels: {} },
       },
       // keep selectedStores so the user doesn't have to re-pick if they want to do another multi-store import
     }));

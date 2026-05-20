@@ -38,20 +38,28 @@ export interface PoolPhoto {
 /**
  * Per-store generated content. Lives inside `contentByStore[store]`.
  * `colorLabels` maps canonical English color → store-localised label.
+ * `price` includes the currency suffix (e.g. "349,00 DKK" / "49,00 EUR").
  */
 export interface StoreContent {
   description: string;
   metaDescription: string;
   mTitleSpecs: string;
   cutline: string;
+  price: string;
   colorLabels: Record<string, string>;
 }
+
+const DEFAULT_PRICE_BY_STORE: Record<StoreKey, string> = {
+  dk: "349,00 DKK",
+  fr: "49,00 EUR",
+};
 
 const EMPTY_STORE_CONTENT: StoreContent = {
   description: "",
   metaDescription: "",
   mTitleSpecs: "",
   cutline: "",
+  price: "",
   colorLabels: {},
 };
 
@@ -124,8 +132,8 @@ const DEFAULT_DATA: ProductData = {
   siblingsHandle: "",
   parsedKeywords: [],
   contentByStore: {
-    dk: { ...EMPTY_STORE_CONTENT },
-    fr: { ...EMPTY_STORE_CONTENT },
+    dk: { ...EMPTY_STORE_CONTENT, price: DEFAULT_PRICE_BY_STORE.dk },
+    fr: { ...EMPTY_STORE_CONTENT, price: DEFAULT_PRICE_BY_STORE.fr },
   },
   competitorImages: [],
   bgReferenceUrl:
@@ -169,6 +177,7 @@ function snapshotActive(prev: ProductData): StoreContent {
     metaDescription: prev.metaDescription,
     mTitleSpecs: prev.mTitleSpecs,
     cutline: prev.cutline,
+    price: prev.price,
     colorLabels,
   };
 }
@@ -202,6 +211,9 @@ export function ProductProvider({ children }: { children: ReactNode }) {
         metaDescription: newView.metaDescription,
         mTitleSpecs: newView.mTitleSpecs,
         cutline: newView.cutline,
+        // Fall back to a sensible default per-store price if the slot hasn't been
+        // filled yet (e.g. first switch to FR before Generate ran).
+        price: newView.price || DEFAULT_PRICE_BY_STORE[newStore] || prev.price,
         colors: newColors,
       };
     });
