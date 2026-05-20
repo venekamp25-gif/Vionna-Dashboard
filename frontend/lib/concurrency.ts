@@ -60,5 +60,5 @@ export function createLimiter(maxConcurrent: number): Limiter {
  *
  * Tune by changing this single number.
  */
-export const MAX_CONCURRENT_HIGGSFIELD = 6;
+export const MAX_CONCURRENT_HIGGSFIELD = 8;
 export const higgsfieldQueue = createLimiter(MAX_CONCURRENT_HIGGSFIELD);
