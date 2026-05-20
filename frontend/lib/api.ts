@@ -84,6 +84,23 @@ export interface PublishResponse {
   error?: string;
 }
 
+export interface PublishStartStoreResponse {
+  success: boolean;
+  collection_id?: number | null;
+  actual_handle?: string;
+  collection_url?: string | null;
+  reused?: boolean;
+  error?: string;
+}
+
+export interface PublishCreateVariantResponse {
+  success: boolean;
+  product_id?: number;
+  product_url?: string;
+  metafield_errors?: string[];
+  error?: string;
+}
+
 // ── Public API ──
 export const api = {
   status: () => call<BackendStatus>("/api/status"),
@@ -123,6 +140,28 @@ export const api = {
     images?: string[];
     images_by_color?: Record<string, string[]>;
   }) => call<PublishResponse>("/api/publish", { method: "POST", body: params }),
+
+  publishStartStore: (params: {
+    store: "dk" | "fr";
+    product_name: string;
+    siblings_handle: string;
+  }) => call<PublishStartStoreResponse>("/api/publish/start_store", { method: "POST", body: params }),
+
+  publishCreateVariant: (params: {
+    store: "dk" | "fr";
+    product_name: string;
+    color: string;
+    sizes?: string[];
+    description: string;
+    meta_description: string;
+    m_title_specs: string;
+    price: string;
+    compare_at_price?: string | null;
+    product_type: string;
+    images: string[];
+    collection_id?: number | null;
+    actual_handle: string;
+  }) => call<PublishCreateVariantResponse>("/api/publish/create_variant", { method: "POST", body: params }),
 };
 
 export const BACKEND = BACKEND_URL;

@@ -476,6 +476,318 @@ Antwoord uitsluitend als geldig JSON zonder extra tekst:
     return jsonify({'error': 'Kon respons niet parsen', 'raw': text}), 500
 
 
+# --- Publish helpers (shared by /api/publish and the granular per-variant endpoints) ---
+
+def _publish_to_html(text):
+    """Convert plain-text description to body_html (lists when '•' or '-')."""
+    lines  = (text or '').strip().splitlines()
+    html   = []
+    bullets = []
+    def flush_bullets():
+        if bullets:
+            html.append('<ul>' + ''.join(f'<li>{b}</li>' for b in bullets) + '</ul>')
+            bullets.clear()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            flush_bullets()
+            continue
+        if stripped.startswith('•') or stripped.startswith('-'):
+            bullets.append(stripped.lstrip('•- ').strip())
+        else:
+            flush_bullets()
+            html.append(f'<p>{stripped}</p>')
+    flush_bullets()
+    return '\n'.join(html)
+
+
+def _publish_strip_diacritics(text):
+    normalized = unicodedata.normalize('NFKD', text or '')
+    return ''.join(c for c in normalized if not unicodedata.combining(c))
+
+
+def _publish_slug(text):
+    ascii_text = _publish_strip_diacritics(text)
+    return re.sub(r'[^a-z0-9]+', '-', ascii_text.lower()).strip('-')
+
+
+def _publish_make_sku(p_name, color, size):
+    n = (p_name or '').strip().replace(' ', '')
+    c = (color or '').strip().replace(' ', '')
+    s = (size or '').strip().replace(' ', '')
+    return f'VIONNA-{n}-{c}-{s}'
+
+
+def _publish_make_handle(p_name, color):
+    return f'{_publish_slug(p_name)}-{_publish_slug(color)}'.strip('-')
+
+
+def _publish_normalize_price(store, price_raw):
+    """Strip currency suffix + apply per-store psychological suffix (.95 DK / .99 FR)."""
+    raw = (price_raw or '0.00').replace(',', '.').replace(' DKK', '').replace(' EUR', '').strip()
+    try:
+        price_int = int(float(raw))
+        suffix = '.95' if store == 'dk' else '.99'
+        return f'{price_int}{suffix}'
+    except Exception:
+        return raw
+
+
+def _probe_collection_by_handle(store, handle, hdrs):
+    """Return (id, handle) for any custom/smart collection at `handle`, else (None, None)."""
+    try:
+        gql_res = req.post(
+            shopify_url(store, 'graphql.json'),
+            headers=hdrs,
+            json={'query': 'query($h:String!){ collectionByHandle(handle:$h){ id handle title } }',
+                  'variables': {'h': handle}},
+            timeout=15,
+        )
+        if gql_res.status_code == 200:
+            node = (gql_res.json().get('data') or {}).get('collectionByHandle')
+            if node:
+                raw_id = node.get('id', '')
+                try:
+                    return int(raw_id.rsplit('/', 1)[-1]), node.get('handle')
+                except Exception:
+                    return None, None
+    except Exception as e:
+        print(f"[publish] collectionByHandle probe failed: {e}")
+    return None, None
+
+
+def _ensure_siblings_collection(store, product_name, siblings_handle, hdrs, base):
+    """Create or reuse the siblings collection. Returns (collection_id, actual_handle, was_reused).
+
+    Handles the case where the desired handle is already taken (custom OR smart) —
+    in that case we reuse the existing collection so we don't end up with two
+    overlapping collections + a wrong metafield (cf. Aria FR bug).
+    """
+    if not siblings_handle:
+        return None, siblings_handle, False
+
+    existing_id, existing_handle = _probe_collection_by_handle(store, siblings_handle, hdrs)
+    if existing_id and existing_handle == siblings_handle:
+        print(f"[publish] Reusing existing collection at handle '{existing_handle}' (id={existing_id})")
+        return existing_id, existing_handle, True
+
+    coll_res = req.post(f"{base}custom_collections.json", headers=hdrs, json={
+        'custom_collection': {
+            'title':     product_name + ' Siblings',
+            'handle':    siblings_handle,
+            'published': True,
+        }
+    })
+    if coll_res.status_code not in (200, 201):
+        print(f"[publish] WARNING: collection creation failed: {coll_res.status_code} — {coll_res.text[:200]}")
+        return None, siblings_handle, False
+
+    coll_payload    = coll_res.json().get('custom_collection', {})
+    collection_id   = coll_payload.get('id')
+    returned_handle = coll_payload.get('handle') or siblings_handle
+
+    if returned_handle != siblings_handle:
+        # Shopify auto-suffixed our handle. Try to find the existing collision and reuse it.
+        print(f"[publish] WARNING: Shopify renamed handle: '{siblings_handle}' -> '{returned_handle}'")
+        conflict_id, conflict_handle = _probe_collection_by_handle(store, siblings_handle, hdrs)
+        if conflict_id and conflict_handle == siblings_handle:
+            print(f"[publish] Deleting suffixed copy id={collection_id}, reusing pre-existing id={conflict_id}")
+            try:
+                req.delete(shopify_url(store, f'custom_collections/{collection_id}.json'),
+                           headers=hdrs, timeout=15)
+            except Exception as e:
+                print(f"[publish] Suffixed-copy delete failed: {e}")
+            return conflict_id, conflict_handle, True
+        return collection_id, returned_handle, False
+
+    return collection_id, returned_handle, False
+
+
+def _publish_one_variant(
+    *,
+    store, product_name, color, sizes,
+    description_html, meta_description, m_title_specs,
+    price, compare_at_price, product_type,
+    images,            # list of image URLs for THIS variant
+    collection_id,     # may be None (skip the collects.json POST)
+    actual_handle,     # value to write into theme.siblings metafield
+    hdrs, base,
+):
+    """Create one colour-variant product. Returns dict:
+        { product_id, product_url, metafield_errors, error? }
+    """
+    size_option_name = 'Størrelse' if store == 'dk' else 'Taille'
+
+    # Dedupe images while preserving order, drop non-http
+    seen_imgs = set()
+    deduped = [u for u in images if u.startswith('http') and not (u in seen_imgs or seen_imgs.add(u))]
+    img_payload = [{'src': img} for img in deduped[:10]]
+
+    product_handle = _publish_make_handle(product_name, color)
+    product_payload = {
+        'product': {
+            'title':        product_name,
+            'handle':       product_handle,
+            'body_html':    description_html,
+            'product_type': product_type,
+            'status':       'draft',
+            'variants': [
+                {
+                    'option1':              size,
+                    'price':                price,
+                    'compare_at_price':     compare_at_price,
+                    'sku':                  _publish_make_sku(product_name, color, size),
+                    'inventory_management': None,
+                }
+                for size in sizes
+            ],
+            'options': [{'name': size_option_name, 'values': sizes}],
+            'images':  img_payload,
+        }
+    }
+    print(f"[publish] Color '{color}' handle='{product_handle}' images={len(img_payload)}")
+
+    prod_res = req.post(f"{base}products.json", headers=hdrs, json=product_payload)
+    if prod_res.status_code not in (200, 201):
+        return {'error': f'Product create failed ({prod_res.status_code}): {prod_res.text[:200]}',
+                'metafield_errors': []}
+
+    prod_data = prod_res.json()['product']
+    prod_id   = prod_data['id']
+
+    # --- Metafields ---
+    metafields = [
+        {'namespace': 'theme',  'key': 'cutline',                       'value': color,            'type': 'single_line_text_field'},
+        {'namespace': 'theme',  'key': 'siblings',                      'value': actual_handle,    'type': 'single_line_text_field'},
+        {'namespace': 'custom', 'key': 'm_title_specs_multi_line_text_','value': m_title_specs,    'type': 'multi_line_text_field'},
+        {'namespace': 'global', 'key': 'description_tag',               'value': meta_description, 'type': 'single_line_text_field'},
+    ]
+    mf_errors = []
+    for mf in metafields:
+        if not mf['value']:
+            mf_errors.append(f"{mf['key']}: skipped (empty value)")
+            continue
+        mf_res = req.post(
+            shopify_url(store, f'products/{prod_id}/metafields.json'),
+            headers=hdrs,
+            json={'metafield': mf}
+        )
+        if mf_res.status_code not in (200, 201):
+            # Retry once with the alternate text-field type
+            alt_type = 'single_line_text_field' if mf['type'] == 'multi_line_text_field' else 'multi_line_text_field'
+            mf_res2 = req.post(
+                shopify_url(store, f'products/{prod_id}/metafields.json'),
+                headers=hdrs,
+                json={'metafield': {**mf, 'type': alt_type}}
+            )
+            if mf_res2.status_code not in (200, 201):
+                mf_errors.append(f"{mf['key']} (both types failed): {mf_res2.text[:120]}")
+
+    # --- Assign first image to all variants ---
+    prod_images   = prod_data.get('images', [])
+    prod_variants = prod_data.get('variants', [])
+    if prod_images and prod_variants:
+        first_image_id = prod_images[0]['id']
+        for variant in prod_variants:
+            req.put(
+                shopify_url(store, f'variants/{variant["id"]}.json'),
+                headers=hdrs,
+                json={'variant': {'id': variant['id'], 'image_id': first_image_id}}
+            )
+
+    # --- Add to siblings collection ---
+    if collection_id:
+        req.post(f"{base}collects.json", headers=hdrs, json={
+            'collect': {'product_id': prod_id, 'collection_id': collection_id}
+        })
+
+    shop_domain = tokens.get(store, {}).get('shop', '')
+    product_url = f'https://{shop_domain}/admin/products/{prod_id}' if shop_domain else ''
+    return {'product_id': prod_id, 'product_url': product_url, 'metafield_errors': mf_errors}
+
+
+# --- Granular publish endpoints (for live per-variant progress in the dashboard) ---
+
+@app.route('/api/publish/start_store', methods=['POST'])
+def publish_start_store():
+    """Step 1 of granular publish: create-or-reuse the siblings collection.
+    Returns the collection_id + actual_handle so the frontend can pass them
+    along to subsequent /create_variant calls.
+    """
+    data = request.json or {}
+    store = data.get('store', 'dk')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()} store.'}), 401
+
+    product_name    = data.get('product_name', '')
+    siblings_handle = data.get('siblings_handle', '')
+    hdrs            = shopify_headers(store)
+    base            = shopify_url(store, '')
+
+    collection_id, actual_handle, reused = _ensure_siblings_collection(
+        store, product_name, siblings_handle, hdrs, base
+    )
+
+    shop_domain    = tokens.get(store, {}).get('shop', '')
+    collection_url = (
+        f'https://{shop_domain}/admin/collections/{collection_id}'
+        if shop_domain and collection_id else None
+    )
+    return jsonify({
+        'success':        True,
+        'collection_id':  collection_id,
+        'actual_handle':  actual_handle,
+        'collection_url': collection_url,
+        'reused':         reused,
+    })
+
+
+@app.route('/api/publish/create_variant', methods=['POST'])
+def publish_create_variant():
+    """Step 2 of granular publish: create ONE colour-variant product."""
+    data = request.json or {}
+    store = data.get('store', 'dk')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()} store.'}), 401
+
+    product_name     = data.get('product_name', '')
+    color            = data.get('color', '')
+    sizes            = data.get('sizes', ['XS', 'S', 'M', 'L', 'XL'])
+    description_html = _publish_to_html(data.get('description', ''))
+    meta_description = data.get('meta_description', '')
+    m_title_specs    = data.get('m_title_specs', '')
+    product_type     = data.get('product_type', '')
+    price            = _publish_normalize_price(store, data.get('price', '0.00'))
+    compare_at_price = data.get('compare_at_price')
+    images           = data.get('images', []) or []
+    collection_id    = data.get('collection_id')
+    actual_handle    = data.get('actual_handle', '') or data.get('siblings_handle', '')
+
+    hdrs = shopify_headers(store)
+    base = shopify_url(store, '')
+
+    result = _publish_one_variant(
+        store=store,
+        product_name=product_name,
+        color=color,
+        sizes=sizes,
+        description_html=description_html,
+        meta_description=meta_description,
+        m_title_specs=m_title_specs,
+        price=price,
+        compare_at_price=compare_at_price,
+        product_type=product_type,
+        images=images,
+        collection_id=collection_id,
+        actual_handle=actual_handle,
+        hdrs=hdrs,
+        base=base,
+    )
+    if 'error' in result:
+        return jsonify({'success': False, **result}), 500
+    return jsonify({'success': True, **result})
+
+
 # --- Publish to Shopify ---
 @app.route('/api/publish', methods=['POST'])
 def publish():

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { CompetitorPreview } from "@/components/review/CompetitorPreview";
 import { ProductInfoCard } from "@/components/review/ProductInfoCard";
 import { GeneratedContentCard } from "@/components/review/GeneratedContentCard";
@@ -9,7 +9,7 @@ import { ImagesCard } from "@/components/review/ImagesCard";
 import { NanoBananaSteps } from "@/components/review/NanoBananaSteps";
 import { PublishPoolCard } from "@/components/review/PublishPoolCard";
 import { StoreTabs } from "@/components/review/StoreTabs";
-import { PublishProgressScreen } from "@/components/review/PublishProgressScreen";
+import { PublishProgressScreen, StoreProgress } from "@/components/review/PublishProgressScreen";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { useStep } from "@/lib/step";
@@ -25,6 +25,9 @@ export function ReviewStep() {
   const [publishing, setPublishing] = useState(false);
   const [publishingStore, setPublishingStore] = useState<StoreKey | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [progress, setProgress] = useState<Partial<Record<StoreKey, StoreProgress>>>({});
+  const publishStartedAt = useRef<number | null>(null);
+  const [variantsCompleted, setVariantsCompleted] = useState(0);
 
   const selectedPoolImages = data.publishPool.filter((p) => p.selected);
   const targetStores = data.selectedStores.length ? data.selectedStores : (["dk"] as StoreKey[]);
@@ -64,64 +67,147 @@ export function ReviewStep() {
     };
 
     setPublishing(true);
+    publishStartedAt.current = Date.now();
+    setVariantsCompleted(0);
+
+    // Seed per-store progress so all stores show up in the UI immediately
+    const initialProgress: Partial<Record<StoreKey, StoreProgress>> = {};
+    for (const store of targetStores) {
+      initialProgress[store] = {
+        state: "pending",
+        currentColor: null,
+        currentColorLabel: null,
+        currentColorIndex: 0,
+        totalColors: data.canonicalColors.length,
+        completedColors: [],
+        productUrls: [],
+        collectionUrl: null,
+        metafieldErrors: [],
+      };
+    }
+    setProgress(initialProgress);
+
     const resultsByStore: Partial<Record<StoreKey, PublishResult>> = {};
     let lastResult: PublishResult | null = null;
+
+    const updateProgress = (store: StoreKey, patch: Partial<StoreProgress>) =>
+      setProgress((prev) => ({
+        ...prev,
+        [store]: { ...(prev[store] as StoreProgress), ...patch },
+      }));
 
     try {
       for (const store of targetStores) {
         setPublishingStore(store);
         const storeContent = snapshotByStore[store];
 
-        // Build images_by_color using LOCALISED colour labels for THIS store
-        const imagesByColor: Record<string, string[]> = { shared: [] };
-        const imagesFlat: string[] = [];
+        // Build images_by_color using CANONICAL keys (we look up per-color later).
+        const imagesByCanonical: Record<string, string[]> = { shared: [] };
         selectedPoolImages.forEach((p) => {
-          const canonical = p.color || "shared";
-          const localisedKey =
-            canonical === "shared"
-              ? "shared"
-              : storeContent.colorLabels?.[canonical] ?? canonical;
-          if (!imagesByColor[localisedKey]) imagesByColor[localisedKey] = [];
-          imagesByColor[localisedKey].push(p.url);
-          imagesFlat.push(p.url);
+          const key = p.color || "shared";
+          if (!imagesByCanonical[key]) imagesByCanonical[key] = [];
+          imagesByCanonical[key].push(p.url);
         });
-
-        const localisedColors = data.canonicalColors.map(
-          (c) => storeContent.colorLabels?.[c] ?? c
-        );
+        const sharedImages = imagesByCanonical.shared ?? [];
 
         const storePrice = storeContent.price || data.price;
-        const res = await api.publish({
+        const compareAtPrice = calcComparePrice(storePrice, data.discount);
+
+        // 1️⃣ Ensure siblings collection
+        updateProgress(store, { state: "collection" });
+        const startRes = await api.publishStartStore({
           store,
           product_name: data.name,
-          description: storeContent.description,
-          meta_description: storeContent.metaDescription,
-          m_title_specs: storeContent.mTitleSpecs,
-          price: storePrice,
-          compare_at_price: calcComparePrice(storePrice, data.discount),
-          product_type: data.productType,
-          colors: localisedColors,
           siblings_handle: data.siblingsHandle,
-          images: Array.from(new Set(imagesFlat)),
-          images_by_color: imagesByColor,
         });
-
-        if (!res.success || res.error) {
+        if (!startRes.success || startRes.error) {
           throw new Error(
-            `${STORE_CONFIG[store].label}: ${res.error || "Unknown publish error"}`
+            `${STORE_CONFIG[store].label}: ${startRes.error || "Collection setup failed"}`
           );
         }
+        const collectionId = startRes.collection_id ?? null;
+        const actualHandle = startRes.actual_handle ?? data.siblingsHandle;
+        updateProgress(store, { collectionUrl: startRes.collection_url ?? null });
 
+        // 2️⃣ Create one product per colour, in order
+        const productUrls: string[] = [];
+        const allMetafieldErrors: string[] = [];
+        const primaryCanonical = data.canonicalColors[0] ?? null;
+
+        for (let i = 0; i < data.canonicalColors.length; i++) {
+          const canonical = data.canonicalColors[i];
+          const localisedLabel = storeContent.colorLabels?.[canonical] ?? canonical;
+          updateProgress(store, {
+            state: "variants",
+            currentColor: canonical,
+            currentColorLabel: localisedLabel,
+            currentColorIndex: i,
+          });
+
+          // Images for this colour: shared (steps 1-4) + colour-specific (step 5)
+          // Steps 1-4 photos depict the PRIMARY color only.
+          const colorSpecific = imagesByCanonical[canonical] ?? [];
+          const variantImages =
+            canonical === primaryCanonical
+              ? Array.from(new Set([...sharedImages, ...colorSpecific]))
+              : Array.from(new Set(colorSpecific));
+
+          const variantRes = await api.publishCreateVariant({
+            store,
+            product_name: data.name,
+            color: localisedLabel,
+            sizes: data.sizes,
+            description: storeContent.description,
+            meta_description: storeContent.metaDescription,
+            m_title_specs: storeContent.mTitleSpecs,
+            price: storePrice,
+            compare_at_price: compareAtPrice,
+            product_type: data.productType,
+            images: variantImages,
+            collection_id: collectionId,
+            actual_handle: actualHandle,
+          });
+
+          if (!variantRes.success || variantRes.error) {
+            throw new Error(
+              `${STORE_CONFIG[store].label} · ${localisedLabel}: ${variantRes.error || "Variant create failed"}`
+            );
+          }
+
+          if (variantRes.product_url) productUrls.push(variantRes.product_url);
+          if (variantRes.metafield_errors?.length)
+            allMetafieldErrors.push(...variantRes.metafield_errors);
+
+          // Functional updater so we don't read a stale `progress` from closure
+          // — both stores' progress can be updating in parallel-ish order.
+          setProgress((prev) => {
+            const cur = prev[store] as StoreProgress | undefined;
+            if (!cur) return prev;
+            const completed = cur.completedColors.includes(canonical)
+              ? cur.completedColors
+              : [...cur.completedColors, canonical];
+            return {
+              ...prev,
+              [store]: { ...cur, completedColors: completed, productUrls: [...productUrls] },
+            };
+          });
+          setVariantsCompleted((n) => n + 1);
+        }
+
+        // 3️⃣ Store done
         const storeResult: PublishResult = {
-          productsCreated: res.products_created ?? 0,
-          productUrls: res.product_urls ?? [],
-          collectionUrl: res.collection_url ?? null,
-          metafieldErrors: res.metafield_errors ?? [],
+          productsCreated: productUrls.length,
+          productUrls,
+          collectionUrl: startRes.collection_url ?? null,
+          metafieldErrors: allMetafieldErrors,
         };
         resultsByStore[store] = storeResult;
         lastResult = storeResult;
-        // Push partial results to state immediately so the progress screen
-        // updates the moment a store finishes (don't wait until the loop ends).
+        updateProgress(store, {
+          state: "done",
+          metafieldErrors: allMetafieldErrors,
+          productUrls,
+        });
         setData((prev) => ({
           ...prev,
           publishResultsByStore: { ...resultsByStore },
@@ -131,12 +217,14 @@ export function ReviewStep() {
 
       // All stores published successfully
       setPublishingStore(null);
-      // Show the first store's result by default
       setStore(targetStores[0]);
       setStep(4);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      // Persist any partial results so the user can see what succeeded
+      // Mark the currently-publishing store as failed for the progress UI
+      if (publishingStore) {
+        updateProgress(publishingStore, { state: "failed" });
+      }
       if (Object.keys(resultsByStore).length > 0) {
         patch({ publishResultsByStore: resultsByStore, publishResult: lastResult });
       }
@@ -165,8 +253,9 @@ export function ReviewStep() {
         productName={data.name || "this product"}
         colorCount={data.canonicalColors.length}
         stores={targetStores}
-        publishingStore={publishingStore}
-        resultsByStore={data.publishResultsByStore}
+        progress={progress}
+        startedAt={publishStartedAt.current}
+        variantsCompleted={variantsCompleted}
         error={error}
         onRetry={() => {
           setError(null);
@@ -174,6 +263,7 @@ export function ReviewStep() {
         }}
         onBack={() => {
           setError(null);
+          setProgress({});
         }}
       />
     );

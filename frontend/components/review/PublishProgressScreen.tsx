@@ -1,8 +1,8 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { Spinner } from "@/components/ui/Spinner";
 import { Button } from "@/components/ui/Button";
-import { PublishResult } from "@/lib/product";
 import { StoreKey, STORE_CONFIG } from "@/lib/store";
 
 function FlagDK() {
@@ -25,14 +25,37 @@ function FlagFR() {
 }
 const FLAGS: Record<StoreKey, React.ReactNode> = { dk: <FlagDK />, fr: <FlagFR /> };
 
-export type StoreStepStatus = "pending" | "publishing" | "done" | "failed";
+/**
+ * Live per-store progress, kept in ReviewStep and pushed down for rendering.
+ *
+ * state:
+ *   "pending"    — not started yet
+ *   "collection" — creating / reusing the siblings collection
+ *   "variants"   — actively creating colour-variant products
+ *   "done"       — all variants created, store complete
+ *   "failed"     — something errored while this store was active
+ */
+export interface StoreProgress {
+  state: "pending" | "collection" | "variants" | "done" | "failed";
+  currentColor: string | null;        // canonical
+  currentColorLabel: string | null;   // localised
+  currentColorIndex: number;          // 0-based
+  totalColors: number;
+  completedColors: string[];          // canonical
+  productUrls: string[];
+  collectionUrl: string | null;
+  metafieldErrors: string[];
+}
 
 interface Props {
   productName: string;
   colorCount: number;
   stores: StoreKey[];
-  publishingStore: StoreKey | null;
-  resultsByStore: Partial<Record<StoreKey, PublishResult>>;
+  progress: Partial<Record<StoreKey, StoreProgress>>;
+  /** Wall-clock ms when publishing started. Used to compute ETA. */
+  startedAt: number | null;
+  /** Total variants finished across ALL stores so far. */
+  variantsCompleted: number;
   error: string | null;
   onRetry: () => void;
   onBack: () => void;
@@ -40,35 +63,62 @@ interface Props {
 
 /**
  * Full-screen progress UI shown between Review and Publish-Done.
- * Tracks per-store state (pending / publishing / done / failed) and shows a
- * live progress bar. On error, offers Back-to-review + Retry buttons.
+ * Renders one row per store with a nested progress bar showing each colour
+ * duplicate's status, plus a current-step description and live ETA estimate.
  */
 export function PublishProgressScreen({
   productName,
   colorCount,
   stores,
-  publishingStore,
-  resultsByStore,
+  progress,
+  startedAt,
+  variantsCompleted,
   error,
   onRetry,
   onBack,
 }: Props) {
-  const statusFor = (store: StoreKey): StoreStepStatus => {
-    if (resultsByStore[store]) return "done";
-    if (publishingStore === store) return "publishing";
-    if (error && !publishingStore) {
-      // Errored mid-loop: stores that didn't complete are marked failed (the
-      // one that was actively publishing when it threw) or pending (later ones).
-      // Heuristic: if any subsequent store has a result, this one was earlier.
-      // Without per-store error tags we just mark "pending" for non-actives.
-      return "pending";
-    }
-    return "pending";
-  };
+  // 1Hz heartbeat so the ETA text updates every second
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!startedAt || error) return;
+    const id = setInterval(() => setTick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, [startedAt, error]);
 
-  const doneCount = stores.filter((s) => !!resultsByStore[s]).length;
-  const totalCount = stores.length;
-  const progressPct = totalCount > 0 ? (doneCount / totalCount) * 100 : 0;
+  const totalVariants = stores.length * colorCount;
+  const overallDone = stores.filter((s) => progress[s]?.state === "done").length;
+  const overallProgressPct =
+    totalVariants > 0 ? Math.min(100, (variantsCompleted / totalVariants) * 100) : 0;
+
+  // ETA: average wall-clock-ms per completed variant × remaining variants
+  let etaText = "";
+  if (startedAt && variantsCompleted > 0 && variantsCompleted < totalVariants) {
+    const elapsed = Date.now() - startedAt;
+    const avgMs = elapsed / variantsCompleted;
+    const remaining = totalVariants - variantsCompleted;
+    const etaMs = Math.round(avgMs * remaining);
+    etaText = `~${formatDuration(etaMs)} remaining`;
+  } else if (startedAt && variantsCompleted === 0) {
+    etaText = "Estimating…";
+  }
+
+  // Current-step description — pick the first store still actively publishing
+  const activeStore = stores.find((s) => {
+    const st = progress[s]?.state;
+    return st === "collection" || st === "variants";
+  });
+  let stepText = "";
+  if (activeStore) {
+    const p = progress[activeStore]!;
+    const flag = STORE_CONFIG[activeStore].label;
+    if (p.state === "collection") {
+      stepText = `${flag} · Creating siblings collection…`;
+    } else if (p.state === "variants" && p.currentColorLabel) {
+      stepText = `${flag} · Creating ${p.currentColorLabel} duplicate (${p.currentColorIndex + 1} of ${p.totalColors})…`;
+    }
+  } else if (!error && overallDone === stores.length && stores.length > 0) {
+    stepText = "Wrapping up…";
+  }
 
   return (
     <div className="max-w-2xl mx-auto">
@@ -79,80 +129,62 @@ export function PublishProgressScreen({
           <Spinner size={48} />
         )}
 
-        <div className="flex flex-col gap-1">
+        <div className="flex flex-col gap-1 max-w-md">
           <h2 className="text-[16px] font-semibold text-text">
             {error
               ? "Publish failed"
-              : doneCount === totalCount && totalCount > 0
+              : overallDone === stores.length && stores.length > 0
               ? "Finishing up…"
               : "Publishing to Shopify"}
           </h2>
-          <p className="text-[12px] text-text-faint">
+          <p className="text-[12px] text-text-faint leading-relaxed">
             {error ? (
               <>You can retry, or go back to Review and adjust.</>
             ) : (
               <>
                 Creating <strong className="text-text-dim">{productName}</strong> · {colorCount}{" "}
-                {colorCount === 1 ? "colour duplicate" : "colour duplicates"} per store · linking siblings
-                collection. Keep this tab open.
+                {colorCount === 1 ? "colour duplicate" : "colour duplicates"} per store.
+                Keep this tab open.
               </>
             )}
           </p>
+          {/* Live current-step subtitle */}
+          {!error && stepText && (
+            <p className="text-[12px] text-accent mt-2 font-medium animate-pulse">
+              {stepText}
+            </p>
+          )}
         </div>
 
-        {/* Per-store status rows */}
-        <div className="w-full max-w-md flex flex-col gap-2">
+        {/* Per-store rows with nested per-colour progress */}
+        <div className="w-full max-w-md flex flex-col gap-3">
           {stores.map((store) => {
-            const status = statusFor(store);
-            const result = resultsByStore[store];
+            const p = progress[store];
             return (
-              <div
+              <StoreRow
                 key={store}
-                className={[
-                  "flex items-center gap-3 px-3.5 py-2.5 rounded-[10px] border transition-colors",
-                  status === "publishing"
-                    ? "bg-accent/8 border-accent/40"
-                    : status === "done"
-                    ? "bg-bg-elev-2 border-border"
-                    : "bg-bg-elev-2 border-border",
-                ].join(" ")}
-              >
-                <div className="shrink-0">{FLAGS[store]}</div>
-                <div className="flex-1 min-w-0 text-left">
-                  <div className="text-[13px] font-medium text-text">
-                    {STORE_CONFIG[store].label}
-                  </div>
-                  <div className="text-[11px] text-text-faint truncate">
-                    {status === "done"
-                      ? `✓ ${result?.productsCreated ?? colorCount} ${
-                          (result?.productsCreated ?? colorCount) === 1 ? "duplicate" : "duplicates"
-                        } created · collection linked`
-                      : status === "publishing"
-                      ? `Creating ${colorCount} ${
-                          colorCount === 1 ? "duplicate" : "duplicates"
-                        } + siblings collection…`
-                      : status === "failed"
-                      ? "Failed"
-                      : "Waiting…"}
-                  </div>
-                </div>
-                <StatusBadge status={status} />
-              </div>
+                store={store}
+                progress={p}
+                colorCount={colorCount}
+              />
             );
           })}
         </div>
 
-        {/* Progress bar */}
+        {/* Overall progress bar + ETA */}
         {!error && (
           <div className="w-full max-w-xs">
             <div className="h-1 rounded-full bg-bg-elev-2 overflow-hidden">
               <div
                 className="h-full bg-accent transition-all duration-500 ease-out"
-                style={{ width: `${progressPct}%` }}
+                style={{ width: `${overallProgressPct}%` }}
               />
             </div>
-            <div className="text-[11px] text-text-faint mt-1.5">
-              {doneCount} of {totalCount} {totalCount === 1 ? "store" : "stores"} complete
+            <div className="flex items-center justify-between text-[11px] text-text-faint mt-1.5">
+              <span>
+                {variantsCompleted} of {totalVariants} duplicates
+              </span>
+              {etaText && <span>{etaText}</span>}
             </div>
           </div>
         )}
@@ -178,8 +210,78 @@ export function PublishProgressScreen({
   );
 }
 
-function StatusBadge({ status }: { status: StoreStepStatus }) {
-  if (status === "publishing") {
+function StoreRow({
+  store,
+  progress,
+  colorCount,
+}: {
+  store: StoreKey;
+  progress: StoreProgress | undefined;
+  colorCount: number;
+}) {
+  const state = progress?.state ?? "pending";
+  const done = progress?.completedColors.length ?? 0;
+  const pct = colorCount > 0 ? (done / colorCount) * 100 : 0;
+
+  let detail = "";
+  if (state === "pending") {
+    detail = "Waiting…";
+  } else if (state === "collection") {
+    detail = "Creating siblings collection…";
+  } else if (state === "variants") {
+    if (progress?.currentColorLabel) {
+      detail = `Creating ${progress.currentColorLabel} (${progress.currentColorIndex + 1} of ${colorCount})`;
+    } else {
+      detail = "Creating duplicates…";
+    }
+  } else if (state === "done") {
+    detail = `✓ ${done} ${done === 1 ? "duplicate" : "duplicates"} created · collection linked`;
+  } else if (state === "failed") {
+    detail = "Failed";
+  }
+
+  return (
+    <div
+      className={[
+        "flex flex-col gap-2 px-3.5 py-3 rounded-[10px] border transition-colors text-left",
+        state === "variants" || state === "collection"
+          ? "bg-accent/8 border-accent/40"
+          : state === "failed"
+          ? "bg-danger/10 border-danger/40"
+          : "bg-bg-elev-2 border-border",
+      ].join(" ")}
+    >
+      <div className="flex items-center gap-3">
+        <div className="shrink-0">{FLAGS[store]}</div>
+        <div className="flex-1 min-w-0">
+          <div className="text-[13px] font-medium text-text">
+            {STORE_CONFIG[store].label}
+          </div>
+          <div className="text-[11px] text-text-faint truncate">{detail}</div>
+        </div>
+        <StatusBadge state={state} />
+      </div>
+
+      {/* Per-colour mini-progress bar (visible while creating variants or after completion) */}
+      {(state === "variants" || state === "done") && colorCount > 0 && (
+        <div className="flex items-center gap-2 pl-8">
+          <div className="flex-1 h-[3px] rounded-full bg-bg-elev overflow-hidden">
+            <div
+              className="h-full bg-accent transition-all duration-500"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+          <span className="text-[10px] text-text-faint tabular-nums shrink-0">
+            {done}/{colorCount}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StatusBadge({ state }: { state: StoreProgress["state"] }) {
+  if (state === "collection" || state === "variants") {
     return (
       <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-accent shrink-0">
         <Spinner size={12} />
@@ -187,14 +289,14 @@ function StatusBadge({ status }: { status: StoreStepStatus }) {
       </span>
     );
   }
-  if (status === "done") {
+  if (state === "done") {
     return (
       <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-accent shrink-0">
         ✓ Done
       </span>
     );
   }
-  if (status === "failed") {
+  if (state === "failed") {
     return (
       <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-danger shrink-0">
         ✕ Failed
@@ -206,4 +308,14 @@ function StatusBadge({ status }: { status: StoreStepStatus }) {
       ⋯ Waiting
     </span>
   );
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return "1s";
+  const seconds = Math.ceil(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remSec = seconds % 60;
+  if (remSec === 0) return `${minutes}m`;
+  return `${minutes}m ${remSec}s`;
 }
