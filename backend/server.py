@@ -253,11 +253,27 @@ def debug_siblings():
     hdrs = shopify_headers(store)
     report = {'store': store, 'name': name, 'products': [], 'collection': None, 'issues': []}
 
-    # 1. Find all products with this title
+    # 1. Find all products with this title.
+    # NOTE: REST `products.json?title=` filter is unreliable (only matches sometimes / lags
+    # indexing). GraphQL query:"title:..." is the supported way.
     try:
-        r = req.get(shopify_url(store, f'products.json?title={urllib.parse.quote(name)}&status=any&limit=20'),
-                    headers=hdrs, timeout=15)
-        products = r.json().get('products', [])
+        # Escape double-quotes in title for safe embedding in the GQL query string.
+        safe_title = name.replace('\\', '\\\\').replace('"', '\\"')
+        gql_body = {
+            'query': '{ products(first: 20, query: "title:\\"' + safe_title + '\\"") { '
+                     'edges { node { id legacyResourceId title handle status } } } }'
+        }
+        gql_r = req.post(shopify_url(store, 'graphql.json'), headers=hdrs, json=gql_body, timeout=15)
+        edges = (gql_r.json().get('data') or {}).get('products', {}).get('edges', []) or []
+        products = []
+        for e in edges:
+            n = e.get('node') or {}
+            products.append({
+                'id':     n.get('legacyResourceId') or n.get('id', '').rsplit('/', 1)[-1],
+                'title':  n.get('title'),
+                'handle': n.get('handle'),
+                'status': (n.get('status') or '').lower(),
+            })
     except Exception as e:
         return jsonify({'error': f'Products lookup failed: {e}'}), 500
 
@@ -292,37 +308,40 @@ def debug_siblings():
         report['issues'].append('No products have a theme.siblings metafield set.')
         return jsonify(report)
 
-    # 2. For each unique siblings handle, look up the collection
+    # 2. For each unique siblings handle, look up the collection.
+    # Use GraphQL collectionByHandle which covers BOTH custom and smart collections —
+    # the previous REST `custom_collections.json?handle=` lookup missed smart collections
+    # entirely (which is why we hadn't noticed the suffix bug on Aria).
     for handle in siblings_handles:
+        coll_info = None
         try:
-            cr = req.get(shopify_url(store, f'custom_collections.json?handle={handle}'), headers=hdrs, timeout=15)
-            collections = cr.json().get('custom_collections', [])
+            safe_h = handle.replace('\\', '\\\\').replace('"', '\\"')
+            gql_body = {
+                'query': '{ collectionByHandle(handle:"' + safe_h + '") { '
+                         'id legacyResourceId handle title updatedAt productsCount { count } '
+                         'products(first: 50) { edges { node { title status } } } } }'
+            }
+            gr = req.post(shopify_url(store, 'graphql.json'), headers=hdrs, json=gql_body, timeout=15)
+            coll_info = (gr.json().get('data') or {}).get('collectionByHandle')
         except Exception as e:
             report['issues'].append(f'Collection lookup failed for {handle}: {e}')
             continue
-        if not collections:
+        if not coll_info:
             report['issues'].append(f'Collection with handle "{handle}" does not exist in Shopify.')
             continue
-        coll = collections[0]
-        # Get products in this collection
-        try:
-            pcr = req.get(shopify_url(store, f"collections/{coll['id']}/products.json?limit=50"),
-                          headers=hdrs, timeout=15)
-            coll_products = pcr.json().get('products', [])
-        except Exception:
-            coll_products = []
+        coll_products = [edge['node'] for edge in coll_info.get('products', {}).get('edges', [])]
         report['collection'] = {
-            'id': coll['id'],
-            'handle': coll.get('handle'),
-            'title': coll.get('title'),
-            'published_at': coll.get('published_at'),
-            'is_published': coll.get('published_at') is not None,
-            'product_count': len(coll_products),
-            'product_titles': [p.get('title') + ' (' + p.get('status', '?') + ')' for p in coll_products],
+            'id': coll_info.get('legacyResourceId'),
+            'handle': coll_info.get('handle'),
+            'title': coll_info.get('title'),
+            'updated_at': coll_info.get('updatedAt'),
+            'product_count': (coll_info.get('productsCount') or {}).get('count', len(coll_products)),
+            'product_titles': [
+                p.get('title') + ' (' + (p.get('status') or '?').lower() + ')'
+                for p in coll_products
+            ],
         }
-        if not coll.get('published_at'):
-            report['issues'].append('Collection is NOT published — Pipeline theme can only render published collections.')
-        if all(p.get('status') == 'draft' for p in coll_products):
+        if coll_products and all((p.get('status') or '').lower() == 'draft' for p in coll_products):
             report['issues'].append('All products in the collection are draft — theme may not show drafts.')
 
     if not report['issues']:
@@ -521,18 +540,81 @@ def publish():
     # 1. Maak siblings collectie aan
     # IMPORTANT: published=True is required for Pipeline theme siblings to work —
     # the Liquid template queries the storefront context which can't see unpublished collections.
-    collection_id = None
-    coll_res = req.post(f"{base}custom_collections.json", headers=hdrs, json={
-        'custom_collection': {
-            'title':     product_name + ' Siblings',
-            'handle':    siblings_handle,
-            'published': True,
-        }
-    })
-    if coll_res.status_code in [200, 201]:
-        collection_id = coll_res.json()['custom_collection']['id']
+    #
+    # We must ALSO handle the case where a collection (custom OR smart) already lives at
+    # `siblings_handle`. If we naively POST, Shopify will silently rename our new collection
+    # to `<handle>-1` and our publish would then write the WRONG handle into theme.siblings —
+    # which is exactly what broke Aria on FR. Strategy:
+    #   1. Probe with GraphQL collectionByHandle (covers both custom + smart).
+    #   2. If the handle is already taken, reuse that collection's id + handle.
+    #   3. Otherwise create. Always read the ACTUAL handle from the response (it may differ
+    #      from what we requested even after the probe if a race happens).
+    collection_id  = None
+    actual_handle  = siblings_handle    # what we'll write into theme.siblings metafield
+
+    def _probe_existing_collection(handle):
+        """Return (id, handle) for any custom/smart collection at `handle`, else (None, None)."""
+        try:
+            gql_res = req.post(
+                shopify_url(store, 'graphql.json'),
+                headers=hdrs,
+                json={'query': 'query($h:String!){ collectionByHandle(handle:$h){ id handle title } }',
+                      'variables': {'h': handle}},
+                timeout=15,
+            )
+            if gql_res.status_code == 200:
+                node = (gql_res.json().get('data') or {}).get('collectionByHandle')
+                if node:
+                    raw_id = node.get('id', '')
+                    try:
+                        return int(raw_id.rsplit('/', 1)[-1]), node.get('handle')
+                    except Exception:
+                        return None, None
+        except Exception as e:
+            print(f"[publish] collectionByHandle probe failed: {e}")
+        return None, None
+
+    existing_id, existing_handle = _probe_existing_collection(siblings_handle) if siblings_handle else (None, None)
+    if existing_id and existing_handle == siblings_handle:
+        collection_id = existing_id
+        actual_handle = existing_handle
+        print(f"[publish] Reusing existing collection at handle '{actual_handle}' (id={collection_id})")
     else:
-        print(f"[publish] WARNING: collection creation failed: {coll_res.status_code} — {coll_res.text[:200]}")
+        coll_res = req.post(f"{base}custom_collections.json", headers=hdrs, json={
+            'custom_collection': {
+                'title':     product_name + ' Siblings',
+                'handle':    siblings_handle,
+                'published': True,
+            }
+        })
+        if coll_res.status_code in [200, 201]:
+            coll_payload   = coll_res.json().get('custom_collection', {})
+            collection_id  = coll_payload.get('id')
+            returned_handle = coll_payload.get('handle') or siblings_handle
+            if returned_handle != siblings_handle:
+                # Shopify suffixed our handle because of a conflict we didn't catch above.
+                # Two equally-bad options: (a) accept the suffix and update metafields, or
+                # (b) delete this collection and reuse the existing one. We do (b) when we
+                # can find the original, otherwise fall back to (a).
+                print(f"[publish] WARNING: Shopify renamed handle: '{siblings_handle}' -> '{returned_handle}'")
+                conflict_id, conflict_handle = _probe_existing_collection(siblings_handle)
+                if conflict_id and conflict_handle == siblings_handle:
+                    # Throw away the suffixed copy and reuse the pre-existing one.
+                    print(f"[publish] Deleting suffixed copy id={collection_id}, reusing pre-existing id={conflict_id}")
+                    try:
+                        req.delete(shopify_url(store, f'custom_collections/{collection_id}.json'),
+                                   headers=hdrs, timeout=15)
+                    except Exception as e:
+                        print(f"[publish] Suffixed-copy delete failed: {e}")
+                    collection_id  = conflict_id
+                    actual_handle  = conflict_handle
+                else:
+                    # No pre-existing collection found at the desired handle; accept suffix.
+                    actual_handle = returned_handle
+            else:
+                actual_handle = returned_handle
+        else:
+            print(f"[publish] WARNING: collection creation failed: {coll_res.status_code} — {coll_res.text[:200]}")
 
     created = []
 
@@ -613,7 +695,10 @@ def publish():
             # Namespace+key MUST match the metafield definitions configured in the Shopify store.
             metafields = [
                 {'namespace': 'theme',  'key': 'cutline',                       'value': color,            'type': 'single_line_text_field'},
-                {'namespace': 'theme',  'key': 'siblings',                      'value': siblings_handle,  'type': 'single_line_text_field'},
+                # IMPORTANT: write the ACTUAL collection handle (may differ from siblings_handle
+                # if Shopify renamed due to a conflict). Otherwise the Pipeline theme template
+                # queries by handle and gets nothing → siblings invisible.
+                {'namespace': 'theme',  'key': 'siblings',                      'value': actual_handle,    'type': 'single_line_text_field'},
                 {'namespace': 'custom', 'key': 'm_title_specs_multi_line_text_','value': m_title_specs,    'type': 'multi_line_text_field'},
                 {'namespace': 'global', 'key': 'description_tag',               'value': meta_description, 'type': 'single_line_text_field'},
             ]
