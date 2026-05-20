@@ -6,6 +6,7 @@ import { ImageTile } from "@/components/ui/ImageTile";
 import { Lightbox } from "@/components/ui/Lightbox";
 import { useProduct, NbResult, PoolPhoto } from "@/lib/product";
 import { api } from "@/lib/api";
+import { higgsfieldQueue } from "@/lib/concurrency";
 
 const STEPS = [
   { n: 1, title: "First model shot",      desc: "Product on model with reference background (4 variants)" },
@@ -75,12 +76,12 @@ export function NanoBananaSteps() {
 
     const calls = Array.from({ length: TOTAL_VARIANTS }, async (_, i) => {
       try {
-        const res = await api.higgsfield({
+        const res = await higgsfieldQueue.run(() => api.higgsfield({
           prompt_type: stepNum,
           product_type: data.productType || "dress",
           image_urls: imageUrls,
           count: 1,
-        });
+        }));
         const url = res.urls?.[0];
         if (!url) throw new Error(res.error ?? "No image returned");
         slots[i] = { url, selected: false };
@@ -124,12 +125,12 @@ export function NanoBananaSteps() {
     });
 
     try {
-      const res = await api.higgsfield({
+      const res = await higgsfieldQueue.run(() => api.higgsfield({
         prompt_type: stepNum,
         product_type: data.productType || "dress",
         image_urls: imageUrls,
         count: 1,
-      });
+      }));
       const url = res.urls?.[0];
       if (!url) throw new Error(res.error ?? "No image returned");
       setData((prev) => {
@@ -218,13 +219,13 @@ export function NanoBananaSteps() {
 
     const calls = stepFavourites.map(async ({ step, ref }, i) => {
       try {
-        const res = await api.higgsfield({
+        const res = await higgsfieldQueue.run(() => api.higgsfield({
           prompt_type: 10 + step,   // 11, 12, 13, 14
           product_type: data.productType || "dress",
           color,
           image_urls: [ref, ...colorRefs],
           count: 1,
-        });
+        }));
         const url = res.urls?.[0];
         if (!url) throw new Error(res.error ?? "No image returned");
         slots[i] = { url, selected: false };
@@ -278,13 +279,13 @@ export function NanoBananaSteps() {
     });
 
     try {
-      const res = await api.higgsfield({
+      const res = await higgsfieldQueue.run(() => api.higgsfield({
         prompt_type: 10 + target.step,
         product_type: data.productType || "dress",
         color,
         image_urls: [target.ref, ...colorRefs],
         count: 1,
-      });
+      }));
       const url = res.urls?.[0];
       if (!url) throw new Error(res.error ?? "No image returned");
       setData((prev) => {
@@ -430,10 +431,21 @@ export function NanoBananaSteps() {
         onZoom={(url) => setZoomUrl(url)}
         onRegenerateSlot={regenerateColorSlot}
         onGenerateAll={async (colors) => {
-          for (const color of colors) {
-            if (data.nbResultsPerColor[color]?.length) continue;  // skip already-generated
-            await runColorVariant(color);
-          }
+          // Kick off ALL colours roughly in parallel, with a 1-second stagger so
+          // we don't slam the backend with a thundering herd. Actual concurrency
+          // is capped by `higgsfieldQueue` (MAX_CONCURRENT_HIGGSFIELD) — anything
+          // beyond the cap waits its turn and dispatches the instant a slot opens.
+          const pending = colors.filter((c) => !data.nbResultsPerColor[c]?.length);
+          await Promise.all(
+            pending.map(
+              (color, i) =>
+                new Promise<void>((resolve) => {
+                  setTimeout(() => {
+                    runColorVariant(color).finally(resolve);
+                  }, i * 1000);
+                })
+            )
+          );
         }}
       />
 
