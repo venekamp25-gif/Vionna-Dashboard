@@ -224,13 +224,19 @@ def status():
 # --- Scrape competitor product (server-side, geen CORS) ---
 @app.route('/api/scrape', methods=['POST'])
 def scrape():
-    url = request.json.get('url', '').rstrip('/') + '.json'
+    raw = (request.json.get('url') or '').strip()
+    # Strip tracking query params / fragments — Shopify needs a clean /products/handle URL
+    parsed = urllib.parse.urlparse(raw)
+    clean_path = parsed.path.rstrip('/')
+    if not clean_path.endswith('.json'):
+        clean_path += '.json'
+    url = urllib.parse.urlunparse((parsed.scheme or 'https', parsed.netloc, clean_path, '', '', ''))
     try:
         r = req.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
         r.raise_for_status()
         return jsonify(r.json())
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': str(e), 'url_tried': url}), 500
 
 
 # --- Debug: inspect siblings setup for a given product name ---
