@@ -331,6 +331,41 @@ export function NanoBananaSteps() {
     });
   };
 
+  /**
+   * Select / deselect all 4 tiles for a given colour in one go. Used by the
+   * "Select all" button that appears next to each colour's Generate button
+   * once every variant has finished generating.
+   */
+  const selectAllForColor = (color: string) => {
+    setData((prev) => {
+      const current = prev.nbResultsPerColor[color] ?? [];
+      // Toggle behaviour: if every tile is already selected → deselect all;
+      // otherwise select every tile that has a finished url.
+      const allSelected = current.length > 0 && current.every((r) => r.selected && r.url);
+      const willSelect = !allSelected;
+      const updated = current.map((r) => (r.url ? { ...r, selected: willSelect } : r));
+
+      const tagPrefix = `NB Step 5 — ${color}`;
+      const pool: PoolPhoto[] = prev.publishPool.filter((p) => !p.label.startsWith(tagPrefix));
+      updated.forEach((r, i) => {
+        if (r.selected && r.url) {
+          pool.push({
+            url: r.url,
+            label: `${tagPrefix}.${i + 1}`,
+            color,
+            selected: true,
+          });
+        }
+      });
+
+      return {
+        ...prev,
+        nbResultsPerColor: { ...prev.nbResultsPerColor, [color]: updated },
+        publishPool: pool,
+      };
+    });
+  };
+
   const togglePin = (url: string) => {
     patch({ pinnedUrl: data.pinnedUrl === url ? null : url });
   };
@@ -427,6 +462,7 @@ export function NanoBananaSteps() {
         onGenerate={runColorVariant}
         runningColors={runningColors}
         toggleSelect={toggleSelect}
+        selectAllForColor={selectAllForColor}
         togglePin={togglePin}
         onZoom={(url) => setZoomUrl(url)}
         onRegenerateSlot={regenerateColorSlot}
@@ -460,11 +496,12 @@ interface Step5Props {
   onRegenerateSlot: (color: string, slot: number) => Promise<void>;
   runningColors: Record<string, boolean>;
   toggleSelect: (step: number, slot: number, color: string) => void;
+  selectAllForColor: (color: string) => void;
   togglePin: (url: string) => void;
   onZoom: (url: string) => void;
 }
 
-function Step5({ onGenerate, onGenerateAll, onRegenerateSlot, runningColors, toggleSelect, togglePin, onZoom }: Step5Props) {
+function Step5({ onGenerate, onGenerateAll, onRegenerateSlot, runningColors, toggleSelect, selectAllForColor, togglePin, onZoom }: Step5Props) {
   const { data } = useProduct();
   // Canonical colour keys (English) — used to key nbResultsPerColor / colorRefsByColor / publishPool.
   // Display labels are looked up via data.colors which mirrors the active view.
@@ -529,6 +566,10 @@ function Step5({ onGenerate, onGenerateAll, onRegenerateSlot, runningColors, tog
             const displayLabel = displayLabelFor(canonical);
             const results = data.nbResultsPerColor[canonical] ?? [];
             const isRunning = !!runningColors[canonical];
+            // "Select all" only makes sense once every tile has finished loading
+            // (a url) — otherwise we'd select empty placeholders into the pool.
+            const allDone = results.length > 0 && results.every((r) => !!r.url);
+            const allSelected = allDone && results.every((r) => r.selected);
             return (
               <div key={canonical} className="bg-bg-elev rounded-[10px] p-3">
                 <div className="flex items-center justify-between gap-3 mb-3">
@@ -541,14 +582,26 @@ function Step5({ onGenerate, onGenerateAll, onRegenerateSlot, runningColors, tog
                       <span className="text-[10px] text-text-faint">({results.filter((r) => r.selected).length}/{results.length} selected)</span>
                     )}
                   </div>
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    onClick={() => onGenerate(canonical)}
-                    disabled={isRunning}
-                  >
-                    {isRunning ? "⟳ Generating…" : results.length ? "✦ Regenerate" : `✦ Generate ${displayLabel}`}
-                  </Button>
+                  <div className="flex items-center gap-2">
+                    {allDone && (
+                      <Button
+                        size="sm"
+                        variant={allSelected ? "secondary" : "primary"}
+                        onClick={() => selectAllForColor(canonical)}
+                        title={allSelected ? "Deselect all 4 photos" : "Select all 4 photos for the publish pool"}
+                      >
+                        {allSelected ? "✓ Deselect all" : "✓ Select all"}
+                      </Button>
+                    )}
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => onGenerate(canonical)}
+                      disabled={isRunning}
+                    >
+                      {isRunning ? "⟳ Generating…" : results.length ? "✦ Regenerate" : `✦ Generate ${displayLabel}`}
+                    </Button>
+                  </div>
                 </div>
 
                 <ColorRefPicker color={canonical} label={displayLabel} />
