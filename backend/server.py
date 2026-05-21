@@ -222,21 +222,208 @@ def status():
 
 
 # --- Scrape competitor product (server-side, geen CORS) ---
+_COLOR_OPT_RE = re.compile(r'colou?r|kleur|farve|couleur', re.I)
+_SIZE_OPT_RE  = re.compile(r'size|maat|taille|størrelse', re.I)
+
+
+def _scrape_slugify(text):
+    """Lowercase + diacritic-strip + dash-separated — matches how shops slug colours into handles."""
+    normalized = unicodedata.normalize('NFKD', text or '')
+    ascii_text = ''.join(c for c in normalized if not unicodedata.combining(c))
+    return re.sub(r'[^a-z0-9]+', '-', ascii_text.lower()).strip('-')
+
+
+def _find_color_sibling_handles(html_text, base_handle, color_slug):
+    """Find sibling colour-products linked from the storefront page HTML.
+
+    Catches the "one product per colour" pattern (Billy J etc.) where each colour
+    is a separate Shopify product whose handle is `<base>-<color>`. We only return
+    handles that share the base prefix with the main product, to avoid grabbing
+    unrelated products from a related-products carousel.
+    """
+    if not base_handle or not color_slug:
+        return []
+    if not base_handle.endswith('-' + color_slug):
+        return []
+    base_prefix = base_handle[:-(len(color_slug) + 1)]
+    if len(base_prefix) < 3:
+        return []  # too short to be a useful filter
+
+    # Match /products/<base_prefix>-<anything> (terminated by quote / slash / ?)
+    pattern = r'/products/(' + re.escape(base_prefix) + r'-[a-z0-9-]+)(?=[?"\'/\s>])'
+    handles = set(re.findall(pattern, html_text, flags=re.I))
+    handles.discard(base_handle)
+    return sorted(handles)
+
+
+def _fetch_product_json(scheme, netloc, handle):
+    """Fetch /products/<handle>.json and return the product dict, or None."""
+    url = f'{scheme}://{netloc}/products/{handle}.json'
+    try:
+        r = req.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        r.raise_for_status()
+        return r.json().get('product')
+    except Exception as e:
+        print(f"[scrape] sibling fetch failed for {handle}: {e}")
+        return None
+
+
+def _merge_sibling_color_products(base, siblings):
+    """Merge `base` + sibling-colour products into one canonical multi-colour product.
+
+    For each input product we identify the COLOUR option vs SIZE option (by name
+    regex). The merged product exposes a single Color option (union of all values)
+    + a single Size option (union of all values), and every input variant is
+    rewritten so option1=colour and option2=size. Image variant_ids stay intact —
+    they still point at the original variant IDs that live in the merged variants
+    array, which is what the frontend's per-colour image grouping relies on.
+    """
+    products = [base] + [s for s in siblings if s]
+
+    def find_color_opt(p):
+        for o in p.get('options', []):
+            if _COLOR_OPT_RE.search(o.get('name', '')):
+                return o, p.get('options', []).index(o)
+        return None, None
+
+    def find_size_opt(p):
+        for o in p.get('options', []):
+            if _SIZE_OPT_RE.search(o.get('name', '')):
+                return o, p.get('options', []).index(o)
+        return None, None
+
+    all_colors = []
+    seen_colors = set()
+    all_sizes = []
+    seen_sizes = set()
+    all_variants = []
+    all_images = []
+    next_pos = 1
+
+    for p in products:
+        c_opt, c_idx = find_color_opt(p)
+        s_opt, s_idx = find_size_opt(p)
+
+        # Colours
+        if c_opt:
+            for v in c_opt.get('values', []):
+                key = v.lower().strip()
+                if key not in seen_colors:
+                    seen_colors.add(key)
+                    all_colors.append(v)
+        # Sizes
+        if s_opt:
+            for v in s_opt.get('values', []):
+                if v not in seen_sizes:
+                    seen_sizes.add(v)
+                    all_sizes.append(v)
+
+        # Variants — rewrite option positions so option1=colour, option2=size
+        sibling_variant_ids = []
+        for v in p.get('variants', []):
+            color_val = (
+                [v.get('option1'), v.get('option2'), v.get('option3')][c_idx]
+                if c_idx is not None else None
+            )
+            size_val = (
+                [v.get('option1'), v.get('option2'), v.get('option3')][s_idx]
+                if s_idx is not None else None
+            )
+            new_v = dict(v)
+            new_v['option1'] = color_val
+            new_v['option2'] = size_val
+            new_v['option3'] = None
+            all_variants.append(new_v)
+            if v.get('id'):
+                sibling_variant_ids.append(v['id'])
+
+        # Images — reassign position so per-sibling groups stay contiguous, AND
+        # inject this sibling's variant_ids on every image. Many shops (Billy J et al.)
+        # leave variant_ids empty on every image, so we'd otherwise lose the
+        # per-colour grouping signal entirely. Tagging them with the sibling's
+        # variants lets the frontend's extractVariantsByColor + groupImagesByColor
+        # walk attribute each image to the right colour group.
+        for img in p.get('images', []):
+            new_img = dict(img)
+            new_img['position'] = next_pos
+            next_pos += 1
+            existing_vids = list(new_img.get('variant_ids') or [])
+            # Union — keep any vendor-supplied tagging, then fill in with the
+            # sibling's own variants so untagged images still get classified.
+            merged_vids = existing_vids[:]
+            for vid in sibling_variant_ids:
+                if vid not in merged_vids:
+                    merged_vids.append(vid)
+            new_img['variant_ids'] = merged_vids
+            all_images.append(new_img)
+
+    # Build the merged product (keep base's title/handle/etc as identity)
+    merged = dict(base)
+    merged['options'] = [
+        {'name': 'Color', 'position': 1, 'values': all_colors},
+        {'name': 'Size',  'position': 2, 'values': all_sizes or ['XS', 'S', 'M', 'L', 'XL']},
+    ]
+    merged['variants'] = all_variants
+    merged['images']   = all_images
+    return merged
+
+
 @app.route('/api/scrape', methods=['POST'])
 def scrape():
     raw = (request.json.get('url') or '').strip()
     # Strip tracking query params / fragments — Shopify needs a clean /products/handle URL
     parsed = urllib.parse.urlparse(raw)
     clean_path = parsed.path.rstrip('/')
-    if not clean_path.endswith('.json'):
-        clean_path += '.json'
-    url = urllib.parse.urlunparse((parsed.scheme or 'https', parsed.netloc, clean_path, '', '', ''))
+    json_path = clean_path if clean_path.endswith('.json') else clean_path + '.json'
+    html_path = clean_path[:-5] if clean_path.endswith('.json') else clean_path
+    scheme   = parsed.scheme or 'https'
+    json_url = urllib.parse.urlunparse((scheme, parsed.netloc, json_path, '', '', ''))
+    html_url = urllib.parse.urlunparse((scheme, parsed.netloc, html_path, '', '', ''))
+
     try:
-        r = req.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        r = req.get(json_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
         r.raise_for_status()
-        return jsonify(r.json())
+        base_data = r.json()
     except Exception as e:
-        return jsonify({'error': str(e), 'url_tried': url}), 500
+        return jsonify({'error': str(e), 'url_tried': json_url}), 500
+
+    base = base_data.get('product') or {}
+
+    # Detect the "one-product-per-colour" pattern (Billy J etc.) and merge sibling
+    # colour-products into the result so the dashboard sees ONE multi-colour product.
+    try:
+        color_opt = next(
+            (o for o in base.get('options', []) if _COLOR_OPT_RE.search(o.get('name', ''))),
+            None,
+        )
+        color_values = (color_opt or {}).get('values') or []
+        if len(color_values) == 1:
+            color_slug = _scrape_slugify(color_values[0])
+            base_handle = base.get('handle', '')
+            if base_handle.endswith('-' + color_slug):
+                # Fetch the page HTML and look for sibling links
+                try:
+                    html_r = req.get(html_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+                    html_r.raise_for_status()
+                    sibling_handles = _find_color_sibling_handles(html_r.text, base_handle, color_slug)
+                except Exception as e:
+                    print(f"[scrape] HTML fetch for siblings failed: {e}")
+                    sibling_handles = []
+
+                if sibling_handles:
+                    print(f"[scrape] Found {len(sibling_handles)} sibling colour-products for '{base_handle}'")
+                    sibs = []
+                    for sh in sibling_handles[:15]:   # cap to avoid runaway fetches
+                        sib_product = _fetch_product_json(scheme, parsed.netloc, sh)
+                        if sib_product:
+                            sibs.append(sib_product)
+                    if sibs:
+                        merged = _merge_sibling_color_products(base, sibs)
+                        return jsonify({'product': merged})
+    except Exception as e:
+        print(f"[scrape] sibling-merge step failed (continuing with base only): {e}")
+
+    return jsonify(base_data)
 
 
 # --- Debug: inspect siblings setup for a given product name ---
