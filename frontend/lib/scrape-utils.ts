@@ -100,6 +100,12 @@ export function extractVariantsByColor(
   return result;
 }
 
+/** Max competitor photos to keep per colour in the ColorRefPicker.
+ *  Larger numbers blow up bandwidth (every photo loads on page render) and
+ *  bloat the auto-saved draft in localStorage / on the server. 8 is plenty
+ *  for picking a colour reference. */
+const MAX_IMAGES_PER_COLOR = 8;
+
 /**
  * Group competitor images by canonical colour using a **position-after-anchor**
  * heuristic.
@@ -150,6 +156,8 @@ export function groupImagesByColor(
       .find((c): c is string => !!c);
     if (matched) currentColor = matched;
     if (!currentColor) continue;
+    // Cap per-colour to keep page bandwidth + draft-state small.
+    if (result[currentColor].length >= MAX_IMAGES_PER_COLOR) continue;
     const url = img.src.startsWith("//") ? `https:${img.src}` : img.src;
     result[currentColor].push(url);
   }
