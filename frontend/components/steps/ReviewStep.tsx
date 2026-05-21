@@ -10,7 +10,11 @@ import { NanoBananaSteps } from "@/components/review/NanoBananaSteps";
 import { PublishPoolCard } from "@/components/review/PublishPoolCard";
 import { StoreTabs } from "@/components/review/StoreTabs";
 import { PublishProgressScreen, StoreProgress } from "@/components/review/PublishProgressScreen";
-import { PrePublishChecklist } from "@/components/review/PrePublishChecklist";
+import {
+  buildPrePublishChecks,
+  PrePublishChecklistPopup,
+  CheckItem,
+} from "@/components/review/PrePublishChecklist";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { useStep } from "@/lib/step";
@@ -29,20 +33,31 @@ export function ReviewStep() {
   const [publishingStore, setPublishingStore] = useState<StoreKey | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<Partial<Record<StoreKey, StoreProgress>>>({});
+  const [confirmChecks, setConfirmChecks] = useState<CheckItem[] | null>(null);
   const publishStartedAt = useRef<number | null>(null);
   const [variantsCompleted, setVariantsCompleted] = useState(0);
 
   const selectedPoolImages = data.publishPool.filter((p) => p.selected);
   const targetStores = data.selectedStores.length ? data.selectedStores : (["dk"] as StoreKey[]);
 
-  const publish = async () => {
+  /**
+   * Outer publish handler — runs the checklist first and shows the popup
+   * if anything is flagged. The user clicks "Publish anyway" → we call
+   * doPublish() which has the actual orchestration logic.
+   */
+  const publish = () => {
     setError(null);
-
-    // Validate publish pool
-    if (selectedPoolImages.length === 0) {
-      const ok = confirm("No photos selected in publish pool. Publish anyway (product will have no images)?");
-      if (!ok) return;
+    const checks = buildPrePublishChecks(data, targetStores, takenNamesLower);
+    const issues = checks.filter((c) => c.level !== "ok");
+    if (issues.length > 0) {
+      setConfirmChecks(checks);
+      return;
     }
+    void doPublish();
+  };
+
+  const doPublish = async () => {
+    setConfirmChecks(null);
 
     // Persist any unsaved active-view edits into contentByStore (visual cleanup)
     syncActiveView();
@@ -301,13 +316,8 @@ export function ReviewStep() {
         </div>
       </div>
 
-      {/* Pre-publish checklist — collapsible bar above the sticky action row */}
-      <div className="mt-8">
-        <PrePublishChecklist takenNamesLower={takenNamesLower} />
-      </div>
-
       {/* Bottom bar (sticky) — bleeds to viewport edges via negative margin matching parent padding */}
-      <div className="sticky bottom-0 -mx-8 lg:-mx-12 xl:-mx-16 px-8 lg:px-12 xl:px-16 py-4 bg-bg-elev border-t border-border backdrop-blur flex items-center justify-between gap-4">
+      <div className="sticky bottom-0 mt-8 -mx-8 lg:-mx-12 xl:-mx-16 px-8 lg:px-12 xl:px-16 py-4 bg-bg-elev border-t border-border backdrop-blur flex items-center justify-between gap-4">
         <div className="flex flex-col">
           {error ? (
             <span className="text-[13px] text-danger">{error}</span>
@@ -353,6 +363,13 @@ export function ReviewStep() {
           </Button>
         </div>
       </div>
+
+      <PrePublishChecklistPopup
+        open={confirmChecks !== null}
+        checks={confirmChecks ?? []}
+        onCancel={() => setConfirmChecks(null)}
+        onPublishAnyway={() => doPublish()}
+      />
     </>
   );
 }

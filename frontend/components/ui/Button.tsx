@@ -1,6 +1,6 @@
 import { ButtonHTMLAttributes, ReactNode } from "react";
 
-type Variant = "primary" | "secondary" | "ghost" | "publish";
+type Variant = "primary" | "secondary" | "ghost" | "publish" | "danger";
 type Size = "sm" | "md" | "lg";
 
 const base =
@@ -15,6 +15,8 @@ const variants: Record<Variant, string> = {
     "text-text-dim hover:bg-bg-elev-2 hover:text-text",
   publish:
     "bg-accent text-on-accent shadow-[0_4px_14px_var(--accent-glow)] hover:bg-accent-hover hover:shadow-[0_6px_20px_var(--accent-glow)]",
+  danger:
+    "bg-danger text-on-accent shadow-sm hover:bg-danger/90 hover:-translate-y-px",
 };
 
 const sizes: Record<Size, string> = {

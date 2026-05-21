@@ -568,6 +568,73 @@ def debug_metafields():
         return jsonify({'error': str(e)}), 500
 
 
+# --- Recent product descriptions (used as tone references in Settings) ---
+
+@app.route('/api/recent_descriptions', methods=['GET'])
+def recent_descriptions():
+    """Return the most recent ACTIVE products' body_html for a store, stripped of
+    HTML tags so the dashboard can show them as plain-text tone examples.
+
+    Query params:
+      - store=dk|fr (required)
+      - limit=N    (default 5, max 15)
+    """
+    store = (request.args.get('store') or '').strip().lower()
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store}'}), 401
+    try:
+        limit = min(15, int(request.args.get('limit', 5) or 5))
+    except Exception:
+        limit = 5
+
+    hdrs = shopify_headers(store)
+    # GraphQL is way faster than REST here (one round trip, body_html in result)
+    query = (
+        '{ products(first: %d, sortKey: CREATED_AT, reverse: true, query: "status:active") '
+        '{ edges { node { title handle descriptionHtml createdAt } } } }'
+    ) % limit
+    try:
+        r = req.post(shopify_url(store, 'graphql.json'),
+                     headers=hdrs, json={'query': query}, timeout=20)
+        edges = (r.json().get('data') or {}).get('products', {}).get('edges', [])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    def html_to_text(html):
+        if not html:
+            return ''
+        # Convert paragraphs / list items to newlines, then strip remaining tags
+        text = re.sub(r'</p\s*>', '\n\n', html, flags=re.I)
+        text = re.sub(r'<li[^>]*>', '• ', text, flags=re.I)
+        text = re.sub(r'</li\s*>', '\n', text, flags=re.I)
+        text = re.sub(r'<br\s*/?\s*>', '\n', text, flags=re.I)
+        text = re.sub(r'<[^>]+>', '', text)
+        # Decode common entities
+        text = (text.replace('&nbsp;', ' ')
+                    .replace('&amp;', '&')
+                    .replace('&lt;', '<')
+                    .replace('&gt;', '>')
+                    .replace('&quot;', '"')
+                    .replace('&#39;', "'"))
+        # Collapse 3+ newlines and trim
+        text = re.sub(r'\n{3,}', '\n\n', text).strip()
+        return text
+
+    items = []
+    for e in edges:
+        n = e.get('node', {})
+        body = html_to_text(n.get('descriptionHtml', ''))
+        if not body:
+            continue
+        items.append({
+            'title':       n.get('title'),
+            'handle':      n.get('handle'),
+            'created_at':  n.get('createdAt'),
+            'description': body,
+        })
+    return jsonify({'store': store, 'items': items})
+
+
 # --- Get existing product names to avoid duplicates ---
 @app.route('/api/names', methods=['POST'])
 def get_names():

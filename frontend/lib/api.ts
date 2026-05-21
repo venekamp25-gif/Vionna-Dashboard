@@ -172,6 +172,17 @@ export const api = {
     siblings_handle: string;
   }) => call<PublishStartStoreResponse>("/api/publish/start_store", { method: "POST", body: params }),
 
+  recentDescriptions: (params: { store: "dk" | "fr"; limit?: number }) => {
+    const qs = new URLSearchParams();
+    qs.set("store", params.store);
+    if (params.limit) qs.set("limit", String(params.limit));
+    return call<{
+      store: "dk" | "fr";
+      items: { title: string; handle: string; created_at: string; description: string }[];
+      error?: string;
+    }>(`/api/recent_descriptions?${qs.toString()}`);
+  },
+
   history: (params?: { limit?: number; store?: "dk" | "fr"; product?: string }) => {
     const qs = new URLSearchParams();
     if (params?.limit) qs.set("limit", String(params.limit));

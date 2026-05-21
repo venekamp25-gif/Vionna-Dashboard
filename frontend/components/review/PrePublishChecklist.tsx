@@ -1,111 +1,29 @@
 "use client";
 
-import { useState } from "react";
 import { useProduct, colorLabelFor } from "@/lib/product";
 import { StoreKey, STORE_CONFIG } from "@/lib/store";
+import { Button } from "@/components/ui/Button";
 
-interface CheckItem {
+export interface CheckItem {
   id: string;
   label: string;
   level: "ok" | "warn" | "fail";
   detail?: string;
 }
 
-interface Props {
-  /** Names already used across all selected stores (lowercased). */
-  takenNamesLower: Set<string>;
-}
-
 /**
- * Live pre-flight checks shown right above the Publish button. Catches the
- * most common mistakes before they hit Shopify — missing colour photos, name
- * conflicts, meta description over 160 chars, no siblings handle, etc.
- *
- * Each check returns one of:
- *   - "ok"   — green, no issue
- *   - "warn" — yellow, will publish but probably not what you want
- *   - "fail" — red, will likely break something (Shopify rejection / theme bug)
+ * Live pre-publish checks. Used both as a confirmation popup (when the user
+ * clicks Publish and there are issues) and as a programmatic "is anything
+ * wrong?" inspector for the publish flow.
  */
-export function PrePublishChecklist({ takenNamesLower }: Props) {
-  const { data } = useProduct();
-  const [expanded, setExpanded] = useState(false);
-
-  const targetStores = data.selectedStores.length
-    ? data.selectedStores
-    : (["dk"] as StoreKey[]);
-
-  const checks = buildChecks(data, targetStores, takenNamesLower);
-  const failCount = checks.filter((c) => c.level === "fail").length;
-  const warnCount = checks.filter((c) => c.level === "warn").length;
-  const allOk = failCount === 0 && warnCount === 0;
-
-  const summary = allOk
-    ? "✓ Ready to publish"
-    : failCount > 0
-    ? `⚠ ${failCount} ${failCount === 1 ? "issue" : "issues"} to fix${warnCount > 0 ? ` · ${warnCount} warning${warnCount === 1 ? "" : "s"}` : ""}`
-    : `⚠ ${warnCount} warning${warnCount === 1 ? "" : "s"}`;
-
-  const headerColor = allOk
-    ? "text-accent border-accent/40 bg-accent/8"
-    : failCount > 0
-    ? "text-danger border-danger/40 bg-danger/8"
-    : "text-warning border-warning/40 bg-warning/10";
-
-  return (
-    <div className="mb-4">
-      <button
-        type="button"
-        onClick={() => setExpanded((e) => !e)}
-        className={`w-full flex items-center justify-between gap-3 px-3.5 py-2.5 rounded-[10px] border text-[12px] font-medium transition-colors ${headerColor}`}
-      >
-        <span className="flex items-center gap-2">
-          <span>Pre-publish checklist</span>
-          <span className="text-text-faint font-normal">— {summary}</span>
-        </span>
-        <span className="text-[10px] text-text-faint">{expanded ? "▲ Hide" : "▼ Show"}</span>
-      </button>
-
-      {expanded && (
-        <div className="mt-2 px-3 py-2.5 rounded-[10px] bg-bg-elev-2 border border-border space-y-1.5">
-          {checks.map((c) => (
-            <CheckLine key={c.id} item={c} />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function CheckLine({ item }: { item: CheckItem }) {
-  const icon =
-    item.level === "ok" ? "✓" : item.level === "warn" ? "⚠" : "✗";
-  const color =
-    item.level === "ok"
-      ? "text-accent"
-      : item.level === "warn"
-      ? "text-warning"
-      : "text-danger";
-  return (
-    <div className="flex items-start gap-2 text-[12px] leading-relaxed">
-      <span className={`${color} font-bold w-4 shrink-0 text-center`}>{icon}</span>
-      <div className="flex-1">
-        <span className="text-text">{item.label}</span>
-        {item.detail && (
-          <span className="ml-2 text-[11px] text-text-faint">{item.detail}</span>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function buildChecks(
+export function buildPrePublishChecks(
   data: ReturnType<typeof useProduct>["data"],
   stores: StoreKey[],
   takenNamesLower: Set<string>
 ): CheckItem[] {
   const out: CheckItem[] = [];
 
-  // 1. Product name set
+  // 1. Product name set + unique
   if (!data.name.trim()) {
     out.push({ id: "name", label: "Product name is empty", level: "fail" });
   } else if (takenNamesLower.has(data.name.toLowerCase())) {
@@ -155,7 +73,6 @@ function buildChecks(
       detail: "Products will be created without images",
     });
   } else {
-    // Per-colour image coverage. "shared" images count toward the primary colour.
     const primaryCanonical = data.canonicalColors[0] ?? null;
     const hasSharedImages = selectedPool.some((p) => p.color === "shared");
     const missing: string[] = [];
@@ -216,12 +133,6 @@ function buildChecks(
         level: "warn",
         detail: `${metaLen} / 160`,
       });
-    } else {
-      out.push({
-        id: `meta-${store}`,
-        label: `${storeLabel}: meta description ${metaLen} chars`,
-        level: "ok",
-      });
     }
 
     if (!mTitleSpecs.trim()) {
@@ -240,7 +151,6 @@ function buildChecks(
       });
     }
 
-    // Colour labels populated for every canonical colour?
     const labelsFilled =
       data.canonicalColors.length === 0 ||
       data.canonicalColors.every((c) =>
@@ -256,4 +166,113 @@ function buildChecks(
   }
 
   return out;
+}
+
+interface PopupProps {
+  open: boolean;
+  checks: CheckItem[];
+  onCancel: () => void;
+  onPublishAnyway: () => void;
+}
+
+/**
+ * Confirmation modal shown when the user clicks Publish but the checks
+ * surfaced one or more issues. Lists every issue with its severity and lets
+ * the user proceed anyway (for warnings) or block (for fails — but we still
+ * allow override since some checks are heuristics).
+ */
+export function PrePublishChecklistPopup({
+  open,
+  checks,
+  onCancel,
+  onPublishAnyway,
+}: PopupProps) {
+  if (!open) return null;
+
+  const fails = checks.filter((c) => c.level === "fail");
+  const warns = checks.filter((c) => c.level === "warn");
+  const hasFails = fails.length > 0;
+
+  return (
+    <div
+      className="fixed inset-0 z-[70] bg-black/50 backdrop-blur-sm flex items-center justify-center px-4"
+      onClick={onCancel}
+    >
+      <div
+        className="w-full max-w-lg bg-bg-elev border border-border rounded-2xl shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-6 py-4 border-b border-border">
+          <div className="flex items-start gap-3">
+            <div
+              className={[
+                "w-10 h-10 rounded-full flex items-center justify-center text-xl font-bold shrink-0",
+                hasFails
+                  ? "bg-danger/20 text-danger"
+                  : "bg-warning/20 text-warning",
+              ].join(" ")}
+            >
+              {hasFails ? "!" : "⚠"}
+            </div>
+            <div>
+              <h2 className="text-[15px] font-semibold text-text">
+                {hasFails
+                  ? `${fails.length} issue${fails.length === 1 ? "" : "s"} found`
+                  : `${warns.length} warning${warns.length === 1 ? "" : "s"}`}
+                {hasFails && warns.length > 0 && ` · ${warns.length} warning${warns.length === 1 ? "" : "s"}`}
+              </h2>
+              <p className="text-[12px] text-text-faint mt-1">
+                {hasFails
+                  ? "We found problems that may cause your publish to fail or render incorrectly. Review below."
+                  : "Things to double-check before publishing. You can proceed anyway if you've already considered them."}
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <div className="px-6 py-4 max-h-[50vh] overflow-y-auto space-y-1.5">
+          {fails.map((c) => (
+            <CheckLine key={c.id} item={c} />
+          ))}
+          {warns.map((c) => (
+            <CheckLine key={c.id} item={c} />
+          ))}
+        </div>
+
+        <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-border bg-bg-elev-2 rounded-b-2xl">
+          <Button variant="secondary" size="sm" onClick={onCancel}>
+            ← Back to review
+          </Button>
+          <Button
+            variant={hasFails ? "danger" : "primary"}
+            size="sm"
+            onClick={onPublishAnyway}
+          >
+            Publish anyway →
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CheckLine({ item }: { item: CheckItem }) {
+  const icon = item.level === "ok" ? "✓" : item.level === "warn" ? "⚠" : "✗";
+  const color =
+    item.level === "ok"
+      ? "text-accent"
+      : item.level === "warn"
+      ? "text-warning"
+      : "text-danger";
+  return (
+    <div className="flex items-start gap-2 text-[13px] leading-relaxed">
+      <span className={`${color} font-bold w-4 shrink-0 text-center`}>{icon}</span>
+      <div className="flex-1">
+        <span className="text-text">{item.label}</span>
+        {item.detail && (
+          <div className="text-[11px] text-text-faint mt-0.5">{item.detail}</div>
+        )}
+      </div>
+    </div>
+  );
 }

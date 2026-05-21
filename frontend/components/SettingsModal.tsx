@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useToneReferences, ToneReferences } from "@/lib/toneReference";
 import { StoreKey, STORE_CONFIG } from "@/lib/store";
 import { Button } from "@/components/ui/Button";
+import { api } from "@/lib/api";
 
 interface Props {
   open: boolean;
@@ -20,6 +21,8 @@ export function SettingsModal({ open, onClose }: Props) {
   const { refs, update } = useToneReferences();
   const [draft, setDraft] = useState<ToneReferences>({ dk: [], fr: [] });
   const [activeTab, setActiveTab] = useState<StoreKey>("dk");
+  const [fetching, setFetching] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
 
   // Re-sync the local draft each time the modal opens (so cancel works)
   useEffect(() => {
@@ -42,6 +45,26 @@ export function SettingsModal({ open, onClose }: Props) {
   };
   const addExample = () => {
     setDraft({ ...draft, [activeTab]: [...examples, ""] });
+  };
+
+  const handleFetchFromShopify = async () => {
+    setFetching(true);
+    setFetchError(null);
+    try {
+      const r = await api.recentDescriptions({ store: activeTab, limit: 3 });
+      if (r.error) throw new Error(r.error);
+      const fetched = (r.items ?? []).map((i) => i.description).filter(Boolean);
+      if (fetched.length === 0) {
+        setFetchError("No active products with descriptions found in this store.");
+        return;
+      }
+      // Replace the active store's examples with the freshly fetched ones
+      setDraft({ ...draft, [activeTab]: fetched });
+    } catch (e) {
+      setFetchError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFetching(false);
+    }
   };
 
   const handleSave = () => {
@@ -106,10 +129,24 @@ export function SettingsModal({ open, onClose }: Props) {
           </div>
 
           <p className="text-[12px] text-text-faint mb-3 leading-relaxed">
-            Paste 1-3 product descriptions from your existing {STORE_CONFIG[activeTab].label} catalogue.
-            Claude will mirror their length, tone and bullet structure when generating
-            new content. Leave empty to use the default house style.
+            Paste 1-3 product descriptions from your existing {STORE_CONFIG[activeTab].label} catalogue,
+            or auto-fetch the 3 most recent active products from Shopify. Claude will mirror their
+            length, tone and bullet structure when generating new content. Leave empty to use the
+            default house style.
           </p>
+          <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={handleFetchFromShopify}
+              disabled={fetching}
+            >
+              {fetching ? "Fetching…" : `↓ Fetch 3 recent from ${STORE_CONFIG[activeTab].label}`}
+            </Button>
+            {fetchError && (
+              <span className="text-[11px] text-danger">{fetchError}</span>
+            )}
+          </div>
 
           {examples.length === 0 && (
             <div className="text-center py-8 px-4 rounded-[10px] bg-bg-elev-2/50 border border-dashed border-border">
