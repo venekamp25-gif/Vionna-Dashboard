@@ -331,11 +331,17 @@ export function ProductProvider({ children }: { children: ReactNode }) {
   }, [data]);
 
   // ── Auto-save to server (debounced 1s) — cross-device persistence. ──
-  // Shortened from 2s so a rapid tab-close drops less work. Combined with the
-  // sendBeacon flush below, the typical lost-data window is now <1s.
+  //
+  // CRITICAL: don't auto-save while the Resume-this-draft banner is still
+  // visible. Otherwise: user lands on Input, sees the banner, but starts
+  // typing a new URL without clicking Resume → auto-save fires with the new
+  // (mostly empty) data → server's old photo-filled draft is overwritten and
+  // the photos are gone forever. The user must explicitly Resume or Discard
+  // first; until they do, the server draft is locked.
   useEffect(() => {
     if (typeof window === "undefined") return;
     if (!hasMountedRef.current) return;
+    if (hasSavedDraft) return;  // ← banner still open — don't clobber
     const owner = ownerRef.current;
     if (!owner) return;
     if (!isDraftWorthSaving(data)) return;
@@ -347,7 +353,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
         });
     }, 1000);
     return () => clearTimeout(id);
-  }, [data]);
+  }, [data, hasSavedDraft]);
 
   // ── Last-chance flush when the page is about to unload ──
   // navigator.sendBeacon survives tab-close where regular fetch would be aborted.
@@ -357,6 +363,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     const handler = () => {
       const owner = ownerRef.current;
       if (!owner) return;
+      if (hasSavedDraft) return;  // banner still open — don't clobber server draft
       if (!isDraftWorthSaving(data)) return;
       try {
         const url =
@@ -377,7 +384,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
       window.removeEventListener("pagehide", handler);
       window.removeEventListener("beforeunload", handler);
     };
-  }, [data]);
+  }, [data, hasSavedDraft]);
 
   const restoreDraft = useCallback(() => {
     if (savedDraftRef.current) {

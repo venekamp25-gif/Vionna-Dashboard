@@ -129,26 +129,30 @@ export function InputStep() {
   return (
     <div className="max-w-3xl mx-auto">
       {hasSavedDraft && (
-        <div className="mb-4 flex items-start gap-3 px-4 py-3 rounded-[10px] bg-accent/8 border border-accent/40">
-          <span className="text-accent text-base mt-0.5">↺</span>
+        <div className="mb-4 flex items-start gap-3 px-4 py-3.5 rounded-[10px] bg-accent/15 border-2 border-accent shadow-[0_0_0_4px_var(--accent-soft)]">
+          <span className="text-accent text-xl mt-0.5">↺</span>
           <div className="flex-1 text-[13px]">
             <div className="font-semibold text-text">Resume your previous work?</div>
-            <div className="text-text-faint text-[12px] mt-0.5">
+            <div className="text-text-dim text-[12px] mt-0.5 leading-relaxed">
               {draftSource === "server"
-                ? "Auto-saved to the cloud — picks up across all your devices."
-                : "Auto-saved in this browser."}
+                ? "Saved to the cloud — picks up across all your devices."
+                : "Saved in this browser."}
               {draftSavedAt && (
                 <span className="ml-1">
                   Last saved {formatRelative(draftSavedAt)}.
                 </span>
               )}
+              <div className="text-warning mt-1 text-[11px]">
+                ⚠ Choose <strong>Resume</strong> or <strong>Discard</strong> before starting a new product —
+                otherwise your saved work might be overwritten.
+              </div>
             </div>
           </div>
-          <div className="flex gap-2">
+          <div className="flex gap-2 shrink-0">
             <button
               type="button"
               onClick={clearDraft}
-              className="text-[11px] font-semibold tracking-wider uppercase px-3 py-1.5 rounded-md border border-border bg-bg-elev-2 text-text-dim hover:border-border-hover hover:text-text"
+              className="text-[11px] font-semibold tracking-wider uppercase px-3 py-1.5 rounded-md border border-border bg-bg-elev-2 text-text-dim hover:border-danger hover:text-danger"
             >
               Discard
             </button>
