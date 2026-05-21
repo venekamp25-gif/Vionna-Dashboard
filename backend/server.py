@@ -108,6 +108,11 @@ STORES = {
 # We use a JSON-lines file rather than a database so it's trivial to inspect on the droplet.
 HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'publish_history.jsonl')
 
+# Per-user draft storage. Each employee's auto-save state lives in `drafts/<email>.json`
+# so drafts survive cross-device (any browser they log into).
+DRAFTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drafts')
+os.makedirs(DRAFTS_DIR, exist_ok=True)
+
 SCOPES      = 'write_products,read_products'
 # APP_URL env var should be set on Railway to https://your-app.up.railway.app
 _APP_URL    = os.getenv('APP_URL', 'http://localhost:5000').rstrip('/')
@@ -566,6 +571,81 @@ def debug_metafields():
         return jsonify({'count': len(simplified), 'definitions': simplified})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# --- Per-user draft storage ---
+
+def _sanitize_owner(raw):
+    """Map an email-ish identifier to a filesystem-safe filename. Strips anything
+    outside [a-z0-9._@-] and truncates to 100 chars — keeps the email recognisable
+    in the drafts/ folder while preventing path-traversal."""
+    s = (raw or '').strip().lower()
+    s = re.sub(r'[^a-z0-9._@\-]', '', s)
+    return s[:100]
+
+
+def _draft_path(owner_slug):
+    return os.path.join(DRAFTS_DIR, f'{owner_slug}.json')
+
+
+@app.route('/api/drafts', methods=['GET'])
+def drafts_load():
+    """Return the saved draft for `?owner=<email>`, or 404 if none exists.
+
+    Auth model: the frontend's Next.js layout has already gated this — we accept
+    the email as a query param. For an internal tool with 2-3 users it's fine
+    that the backend trusts the value (matches the trust model of the rest of
+    /api/*).
+    """
+    owner = _sanitize_owner(request.args.get('owner', ''))
+    if not owner:
+        return jsonify({'error': 'owner query param required'}), 400
+    path = _draft_path(owner)
+    if not os.path.exists(path):
+        return jsonify({'draft': None})
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return jsonify({'draft': data, 'saved_at': data.get('_saved_at')})
+    except Exception as e:
+        return jsonify({'error': f'Could not read draft: {e}'}), 500
+
+
+@app.route('/api/drafts', methods=['POST'])
+def drafts_save():
+    """Save the JSON body as the draft for `?owner=<email>`."""
+    owner = _sanitize_owner(request.args.get('owner', ''))
+    if not owner:
+        return jsonify({'error': 'owner query param required'}), 400
+    payload = request.json or {}
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'expected a JSON object body'}), 400
+    payload['_saved_at'] = datetime.datetime.utcnow().isoformat() + 'Z'
+    path = _draft_path(owner)
+    try:
+        # Atomic write: temp file then rename
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as e:
+        return jsonify({'error': f'Could not save draft: {e}'}), 500
+    return jsonify({'success': True, 'saved_at': payload['_saved_at']})
+
+
+@app.route('/api/drafts', methods=['DELETE'])
+def drafts_clear():
+    """Delete the saved draft for `?owner=<email>`."""
+    owner = _sanitize_owner(request.args.get('owner', ''))
+    if not owner:
+        return jsonify({'error': 'owner query param required'}), 400
+    path = _draft_path(owner)
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception as e:
+            return jsonify({'error': f'Could not clear draft: {e}'}), 500
+    return jsonify({'success': True})
 
 
 # --- Recent product descriptions (used as tone references in Settings) ---

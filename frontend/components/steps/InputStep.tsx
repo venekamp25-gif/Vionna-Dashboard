@@ -9,6 +9,20 @@ import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
 
 const ALL_STORES: StoreKey[] = ["dk", "fr"];
 
+function formatRelative(iso: string): string {
+  try {
+    const then = new Date(iso).getTime();
+    const diffSec = Math.max(0, Math.round((Date.now() - then) / 1000));
+    if (diffSec < 60) return "just now";
+    if (diffSec < 60 * 60) return `${Math.round(diffSec / 60)}m ago`;
+    if (diffSec < 24 * 60 * 60) return `${Math.round(diffSec / 3600)}h ago`;
+    const d = new Date(iso);
+    return d.toLocaleString(undefined, { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return "recently";
+  }
+}
+
 function FlagDK() {
   return (
     <svg className="w-5 h-3.5 rounded-sm shadow-sm" viewBox="0 0 28 20" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
@@ -35,7 +49,10 @@ const FLAGS: Record<StoreKey, React.ReactNode> = {
 };
 
 export function InputStep() {
-  const { data, patch, hasSavedDraft, restoreDraft, clearDraft } = useProduct();
+  const {
+    data, patch,
+    hasSavedDraft, draftSource, draftSavedAt, restoreDraft, clearDraft,
+  } = useProduct();
   const { setStep } = useStep();
   const { setStore } = useStore();
 
@@ -117,7 +134,14 @@ export function InputStep() {
           <div className="flex-1 text-[13px]">
             <div className="font-semibold text-text">Resume your previous work?</div>
             <div className="text-text-faint text-[12px] mt-0.5">
-              We auto-saved your last product so you can pick up where you left off.
+              {draftSource === "server"
+                ? "Auto-saved to the cloud — picks up across all your devices."
+                : "Auto-saved in this browser."}
+              {draftSavedAt && (
+                <span className="ml-1">
+                  Last saved {formatRelative(draftSavedAt)}.
+                </span>
+              )}
             </div>
           </div>
           <div className="flex gap-2">

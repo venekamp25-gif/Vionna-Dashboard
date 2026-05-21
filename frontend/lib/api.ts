@@ -210,3 +210,40 @@ export const api = {
 };
 
 export const BACKEND = BACKEND_URL;
+
+// ── Auth: who's logged in (served by Next.js, not the Python backend) ──
+
+export async function fetchCurrentUser(): Promise<{ email: string | null }> {
+  try {
+    const res = await fetch("/api/me", { credentials: "include", cache: "no-store" });
+    if (!res.ok) return { email: null };
+    return (await res.json()) as { email: string | null };
+  } catch {
+    return { email: null };
+  }
+}
+
+// ── Per-user drafts (server-side, keyed by email) ──
+
+export interface DraftLoadResponse<T = unknown> {
+  draft: (T & { _saved_at?: string }) | null;
+  saved_at?: string;
+  error?: string;
+}
+
+export const draftsApi = {
+  load: <T = unknown>(owner: string) =>
+    call<DraftLoadResponse<T>>(`/api/drafts?owner=${encodeURIComponent(owner)}`),
+
+  save: <T = unknown>(owner: string, draft: T) =>
+    call<{ success: boolean; saved_at: string; error?: string }>(
+      `/api/drafts?owner=${encodeURIComponent(owner)}`,
+      { method: "POST", body: draft as unknown }
+    ),
+
+  clear: (owner: string) =>
+    fetch(`${BACKEND_URL}/api/drafts?owner=${encodeURIComponent(owner)}`, {
+      method: "DELETE",
+      credentials: "include",
+    }).catch(() => {}),
+};

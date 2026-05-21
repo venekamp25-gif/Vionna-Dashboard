@@ -2,10 +2,12 @@
 
 import { createContext, useContext, useState, useCallback, useEffect, useRef, ReactNode } from "react";
 import { StoreKey } from "./store";
+import { draftsApi, fetchCurrentUser } from "./api";
 
 /**
  * localStorage key for the auto-saved draft. Bump the suffix when the ProductData
  * shape changes in a non-backward-compatible way so stale drafts get discarded.
+ * Used as an offline fallback when server-side drafts are unreachable.
  */
 const DRAFT_STORAGE_KEY = "vionna-dashboard:active-draft-v1";
 
@@ -172,6 +174,9 @@ const DEFAULT_DATA: ProductData = {
   publishResultsByStore: {},
 };
 
+/** Where the most recent saved draft was found (or `null` if no draft). */
+export type DraftSource = "server" | "local" | null;
+
 interface ProductContextType {
   data: ProductData;
   setData: (d: ProductData | ((prev: ProductData) => ProductData)) => void;
@@ -182,6 +187,10 @@ interface ProductContextType {
   syncActiveView: () => void;
   /** True if there's a saved draft from a previous session (set on mount). */
   hasSavedDraft: boolean;
+  /** Where the discovered draft came from — informs the Resume banner copy. */
+  draftSource: DraftSource;
+  /** Wall-clock timestamp from the server when the draft was last saved. */
+  draftSavedAt: string | null;
   /** Restore the saved draft into state. No-op if there's none. */
   restoreDraft: () => void;
   /** Discard any saved draft (called after a successful publish or explicit reset). */
@@ -195,6 +204,8 @@ const ProductContext = createContext<ProductContextType>({
   switchView: () => {},
   syncActiveView: () => {},
   hasSavedDraft: false,
+  draftSource: null,
+  draftSavedAt: null,
   restoreDraft: () => {},
   clearDraft: () => {},
 });
@@ -215,6 +226,13 @@ function snapshotActive(prev: ProductData): StoreContent {
   };
 }
 
+/** Strip server-injected internal fields (e.g. `_saved_at`) before pushing into state. */
+function stripInternalKeys(d: ProductData & { _saved_at?: string }): ProductData {
+  const { _saved_at, ...rest } = d;
+  void _saved_at;
+  return rest as ProductData;
+}
+
 /** Minimum "draft is worth saving" check — only persist once the user has done meaningful work. */
 function isDraftWorthSaving(d: ProductData): boolean {
   return (
@@ -228,32 +246,76 @@ function isDraftWorthSaving(d: ProductData): boolean {
 export function ProductProvider({ children }: { children: ReactNode }) {
   const [data, setData] = useState<ProductData>(DEFAULT_DATA);
   const [hasSavedDraft, setHasSavedDraft] = useState(false);
+  const [draftSource, setDraftSource] = useState<DraftSource>(null);
+  const [draftSavedAt, setDraftSavedAt] = useState<string | null>(null);
   const savedDraftRef = useRef<ProductData | null>(null);
   const hasMountedRef = useRef(false);
+  /** Email of the currently logged-in user, populated by /api/me. Drafts on the
+   *  server are keyed by this. `null` until the fetch resolves, then either a
+   *  real email or the empty string when not logged in. */
+  const ownerRef = useRef<string | null>(null);
 
-  // ── Load saved draft on mount (but don't auto-restore — show a banner instead) ──
+  // ── On mount: figure out who we are, then load the most recent draft. ──
+  // Order: server (cross-device) → localStorage (offline fallback).
   useEffect(() => {
     if (typeof window === "undefined") return;
-    try {
-      const raw = window.localStorage.getItem(DRAFT_STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as ProductData;
-        if (isDraftWorthSaving(parsed)) {
-          savedDraftRef.current = parsed;
-          setHasSavedDraft(true);
+    let cancelled = false;
+
+    (async () => {
+      // 1. Get current user — runs even when offline; just returns null.
+      let owner = "";
+      try {
+        const me = await fetchCurrentUser();
+        owner = (me.email ?? "").trim();
+      } catch {
+        // ignore — fall through to localStorage
+      }
+      if (cancelled) return;
+      ownerRef.current = owner;
+
+      // 2. Try server draft first (only if we know who we are).
+      if (owner) {
+        try {
+          const r = await draftsApi.load<ProductData>(owner);
+          if (cancelled) return;
+          const serverDraft = r.draft;
+          if (serverDraft && isDraftWorthSaving(serverDraft)) {
+            savedDraftRef.current = stripInternalKeys(serverDraft);
+            setDraftSource("server");
+            setDraftSavedAt(r.saved_at ?? serverDraft._saved_at ?? null);
+            setHasSavedDraft(true);
+            hasMountedRef.current = true;
+            return;
+          }
+        } catch {
+          // Server unreachable — drop to localStorage
         }
       }
-    } catch {
-      // Corrupt draft — drop it
-      window.localStorage.removeItem(DRAFT_STORAGE_KEY);
-    }
-    hasMountedRef.current = true;
+
+      // 3. Fallback: localStorage.
+      try {
+        const raw = window.localStorage.getItem(DRAFT_STORAGE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw) as ProductData;
+          if (isDraftWorthSaving(parsed)) {
+            savedDraftRef.current = parsed;
+            setDraftSource("local");
+            setHasSavedDraft(true);
+          }
+        }
+      } catch {
+        window.localStorage.removeItem(DRAFT_STORAGE_KEY);
+      }
+      hasMountedRef.current = true;
+    })();
+
+    return () => { cancelled = true; };
   }, []);
 
-  // ── Auto-save current state on every change (debounced 500ms) ──
+  // ── Auto-save to localStorage on every change (debounced 500ms) — fast cache. ──
   useEffect(() => {
     if (typeof window === "undefined") return;
-    if (!hasMountedRef.current) return;  // skip the initial render's commit
+    if (!hasMountedRef.current) return;
     const id = setTimeout(() => {
       try {
         if (isDraftWorthSaving(data)) {
@@ -262,9 +324,26 @@ export function ProductProvider({ children }: { children: ReactNode }) {
           window.localStorage.removeItem(DRAFT_STORAGE_KEY);
         }
       } catch {
-        // Quota exceeded or similar — silently skip
+        // Quota exceeded — skip
       }
     }, 500);
+    return () => clearTimeout(id);
+  }, [data]);
+
+  // ── Auto-save to server (debounced 2s) — cross-device persistence. ──
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!hasMountedRef.current) return;
+    const owner = ownerRef.current;
+    if (!owner) return;  // not logged in yet, or anonymous
+    if (!isDraftWorthSaving(data)) return;
+    const id = setTimeout(() => {
+      draftsApi
+        .save(owner, data)
+        .catch(() => {
+          // Network issues — localStorage already has the data
+        });
+    }, 2000);
     return () => clearTimeout(id);
   }, [data]);
 
@@ -281,6 +360,12 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     }
     savedDraftRef.current = null;
     setHasSavedDraft(false);
+    setDraftSource(null);
+    setDraftSavedAt(null);
+    const owner = ownerRef.current;
+    if (owner) {
+      void draftsApi.clear(owner);
+    }
   }, []);
 
   const patch = useCallback(
@@ -330,7 +415,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
   return (
     <ProductContext.Provider value={{
       data, setData, patch, switchView, syncActiveView,
-      hasSavedDraft, restoreDraft, clearDraft,
+      hasSavedDraft, draftSource, draftSavedAt, restoreDraft, clearDraft,
     }}>
       {children}
     </ProductContext.Provider>
