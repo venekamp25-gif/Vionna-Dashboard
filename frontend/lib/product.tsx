@@ -330,12 +330,14 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     return () => clearTimeout(id);
   }, [data]);
 
-  // ── Auto-save to server (debounced 2s) — cross-device persistence. ──
+  // ── Auto-save to server (debounced 1s) — cross-device persistence. ──
+  // Shortened from 2s so a rapid tab-close drops less work. Combined with the
+  // sendBeacon flush below, the typical lost-data window is now <1s.
   useEffect(() => {
     if (typeof window === "undefined") return;
     if (!hasMountedRef.current) return;
     const owner = ownerRef.current;
-    if (!owner) return;  // not logged in yet, or anonymous
+    if (!owner) return;
     if (!isDraftWorthSaving(data)) return;
     const id = setTimeout(() => {
       draftsApi
@@ -343,8 +345,38 @@ export function ProductProvider({ children }: { children: ReactNode }) {
         .catch(() => {
           // Network issues — localStorage already has the data
         });
-    }, 2000);
+    }, 1000);
     return () => clearTimeout(id);
+  }, [data]);
+
+  // ── Last-chance flush when the page is about to unload ──
+  // navigator.sendBeacon survives tab-close where regular fetch would be aborted.
+  // It uses a fire-and-forget POST so we don't need to wait for a response.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handler = () => {
+      const owner = ownerRef.current;
+      if (!owner) return;
+      if (!isDraftWorthSaving(data)) return;
+      try {
+        const url =
+          (process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/+$/, "") ||
+            "http://localhost:5000") +
+          `/api/drafts?owner=${encodeURIComponent(owner)}`;
+        const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+        navigator.sendBeacon(url, blob);
+      } catch {
+        // Best effort; localStorage still has the data anyway.
+      }
+    };
+    // pagehide fires both on unload AND on bfcache (back/forward cache); more
+    // reliable than beforeunload across browsers.
+    window.addEventListener("pagehide", handler);
+    window.addEventListener("beforeunload", handler);
+    return () => {
+      window.removeEventListener("pagehide", handler);
+      window.removeEventListener("beforeunload", handler);
+    };
   }, [data]);
 
   const restoreDraft = useCallback(() => {

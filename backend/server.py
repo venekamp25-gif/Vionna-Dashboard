@@ -633,6 +633,76 @@ def drafts_save():
     return jsonify({'success': True, 'saved_at': payload['_saved_at']})
 
 
+@app.route('/api/drafts/debug', methods=['GET'])
+def drafts_debug():
+    """Inspect what's actually in a saved draft without exposing PII / image URLs.
+    Returns shape + counts of each major field — useful for diagnosing
+    'photos went missing after Resume' type issues.
+    """
+    owner = _sanitize_owner(request.args.get('owner', ''))
+    if not owner:
+        # No owner = list every draft on the droplet
+        try:
+            files = sorted(os.listdir(DRAFTS_DIR))
+            info = []
+            for f in files:
+                if not f.endswith('.json'):
+                    continue
+                path = os.path.join(DRAFTS_DIR, f)
+                try:
+                    info.append({
+                        'owner': f[:-5],
+                        'size_bytes': os.path.getsize(path),
+                        'mtime': datetime.datetime.fromtimestamp(os.path.getmtime(path)).isoformat() + 'Z',
+                    })
+                except Exception:
+                    pass
+            return jsonify({'drafts': info})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    path = _draft_path(owner)
+    if not os.path.exists(path):
+        return jsonify({'owner': owner, 'exists': False})
+    try:
+        size = os.path.getsize(path)
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        def count_list(x):
+            if isinstance(x, list):
+                return len(x)
+            return None
+
+        def count_record(x):
+            if isinstance(x, dict):
+                return {str(k): count_list(v) for k, v in x.items()}
+            return None
+
+        summary = {
+            'owner':              owner,
+            'exists':             True,
+            'size_bytes':         size,
+            'saved_at':           data.get('_saved_at'),
+            'fields_present':     sorted([k for k in data.keys() if k != '_saved_at']),
+            # counts of the things that matter for "where did my photos go"
+            'name':               data.get('name'),
+            'competitorUrl':      bool(data.get('competitorUrl')),
+            'canonical_colors':   data.get('canonicalColors'),
+            'selected_stores':    data.get('selectedStores'),
+            'nb_results':         count_record(data.get('nbResults')),
+            'nb_results_per_color': count_record(data.get('nbResultsPerColor')),
+            'publish_pool_size':  count_list(data.get('publishPool')),
+            'publish_pool_selected': sum(1 for p in (data.get('publishPool') or []) if isinstance(p, dict) and p.get('selected')),
+            'competitor_images':  count_list(data.get('competitorImages')),
+            'competitor_images_by_color': count_record(data.get('competitorImagesByColor')),
+            'pinned_url_set':     bool(data.get('pinnedUrl')),
+        }
+        return jsonify(summary)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/drafts', methods=['DELETE'])
 def drafts_clear():
     """Delete the saved draft for `?owner=<email>`."""
