@@ -668,10 +668,13 @@ def recent_descriptions():
         limit = 5
 
     hdrs = shopify_headers(store)
-    # GraphQL is way faster than REST here (one round trip, body_html in result)
+    # GraphQL is way faster than REST here (one round trip, body_html in result).
+    # Pull both ACTIVE and DRAFT products — the user wants their style anchor
+    # to include the most recent work even if not yet published live (and some
+    # stores like Vionna FR have all-draft recent imports).
     query = (
-        '{ products(first: %d, sortKey: CREATED_AT, reverse: true, query: "status:active") '
-        '{ edges { node { title handle descriptionHtml createdAt } } } }'
+        '{ products(first: %d, sortKey: CREATED_AT, reverse: true, query: "status:active OR status:draft") '
+        '{ edges { node { title handle descriptionHtml createdAt status } } } }'
     ) % limit
     try:
         r = req.post(shopify_url(store, 'graphql.json'),
