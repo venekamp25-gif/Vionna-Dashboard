@@ -61,11 +61,13 @@ export interface NamesResponse {
 }
 
 export interface GenerateResponse {
-  description: string;
-  meta_description: string;
-  m_title_specs: string;
+  description?: string;
+  meta_description?: string;
+  m_title_specs?: string;
   error?: string;
 }
+
+export type GenerateField = "description" | "meta_description" | "m_title_specs";
 
 export interface HiggsfieldResponse {
   urls?: string[];
@@ -93,6 +95,18 @@ export interface PublishStartStoreResponse {
   error?: string;
 }
 
+export interface HistoryEntry {
+  timestamp: string;            // ISO UTC
+  store: "dk" | "fr";
+  product_name: string;
+  color: string;
+  product_id?: number | null;
+  product_url?: string | null;
+  collection_handle?: string | null;
+  image_count?: number;
+  metafield_errors?: string[];
+}
+
 export interface PublishCreateVariantResponse {
   success: boolean;
   product_id?: number;
@@ -116,6 +130,17 @@ export const api = {
     product_name: string;
     product_title: string;
     keywords: string[];
+    /** Regenerate only this one field. When omitted, all three fields are generated. */
+    only_field?: GenerateField;
+    /** Existing values for the OTHER fields, so partial regenerations stay consistent. */
+    current_description?: string;
+    current_meta_description?: string;
+    current_m_title_specs?: string;
+    /**
+     * Optional list of full product descriptions the user marked as tone references —
+     * Claude uses them as style anchors (length, voice, bullet structure).
+     */
+    tone_references?: string[];
   }) => call<GenerateResponse>("/api/generate", { method: "POST", body: params }),
 
   higgsfield: (params: {
@@ -146,6 +171,15 @@ export const api = {
     product_name: string;
     siblings_handle: string;
   }) => call<PublishStartStoreResponse>("/api/publish/start_store", { method: "POST", body: params }),
+
+  history: (params?: { limit?: number; store?: "dk" | "fr"; product?: string }) => {
+    const qs = new URLSearchParams();
+    if (params?.limit) qs.set("limit", String(params.limit));
+    if (params?.store) qs.set("store", params.store);
+    if (params?.product) qs.set("product", params.product);
+    const path = "/api/history" + (qs.toString() ? `?${qs.toString()}` : "");
+    return call<{ entries: HistoryEntry[]; total: number; error?: string }>(path);
+  },
 
   publishCreateVariant: (params: {
     store: "dk" | "fr";

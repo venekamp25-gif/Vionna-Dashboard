@@ -1,4 +1,4 @@
-import os, sys, json, re, hashlib, urllib.parse, subprocess, tempfile, shutil, platform, unicodedata
+import os, sys, json, re, hashlib, urllib.parse, subprocess, tempfile, shutil, platform, unicodedata, datetime
 from flask import Flask, request, redirect, session, jsonify, send_from_directory
 from flask_cors import CORS
 import requests as req
@@ -103,6 +103,10 @@ STORES = {
     'dk': os.getenv('SHOPIFY_DK_DOMAIN'),
     'fr': os.getenv('SHOPIFY_FR_DOMAIN'),
 }
+
+# Append-only publish log — every successful create_variant call gets one entry.
+# We use a JSON-lines file rather than a database so it's trivial to inspect on the droplet.
+HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'publish_history.jsonl')
 
 SCOPES      = 'write_products,read_products'
 # APP_URL env var should be set on Railway to https://your-app.up.railway.app
@@ -611,9 +615,37 @@ def generate():
     product_name  = data.get('product_name', '')
     product_title = data.get('product_title', '')
     keywords      = data.get('keywords', [])
+    # When set, regenerate ONLY this single field — one of:
+    #   'description' / 'meta_description' / 'm_title_specs'
+    # The frontend uses this for per-field "↻" buttons in the Review screen.
+    only_field    = (data.get('only_field') or '').strip()
+    # Optional existing values, included in the prompt so partial regenerations
+    # stay consistent with the other fields the user is keeping.
+    current_description       = data.get('current_description', '')
+    current_meta_description  = data.get('current_meta_description', '')
+    current_m_title_specs     = data.get('current_m_title_specs', '')
+    # Optional list of full product descriptions from the user's own catalogue.
+    # When non-empty, we use the FIRST entry as the style anchor (replacing the
+    # hard-coded Liviah example) — keeps the dashboard-generated content sounding
+    # consistent with their existing voice. Other entries are listed as additional
+    # references the model can lean on.
+    tone_references = data.get('tone_references') or []
+    if not isinstance(tone_references, list):
+        tone_references = []
+    tone_references = [s for s in tone_references if isinstance(s, str) and s.strip()]
     language      = 'Deens' if store == 'dk' else 'Frans'
 
-    example = """Komfortabel og nem at bære
+    # Style anchor: user-supplied tone reference if provided, otherwise the
+    # hard-coded Liviah default. The first user example replaces the example;
+    # additional examples are appended as a separate "more references" block.
+    extra_refs_block = ""
+    if tone_references:
+        example = tone_references[0]
+        if len(tone_references) > 1:
+            joined = "\n\n---\n\n".join(tone_references[1:])
+            extra_refs_block = f"\n\nMeer voorbeelden ter referentie:\n---\n{joined}\n---"
+    else:
+        example = """Komfortabel og nem at bære
 
 Liviah er en bluse med krave og V-udskæring med knapper foran. De korte ærmer giver et afslappet udtryk og gør blusen behagelig til daglig brug. Det ensfarvede design giver et roligt look og er nemt at kombinere med forskellige bukser.
 
@@ -624,7 +656,81 @@ Liviah er en bluse med krave og V-udskæring med knapper foran. De korte ærmer 
 • Normal pasform: sidder komfortabelt og giver god bevægelighed
 
 Liviah er en bluse, som er nem at tage på, og som føles behagelig hele dagen."""
+    # Inject "more references" right after the primary example block in both
+    # the single-field and full prompts below — done by string-concatenation
+    # at the @Schrijf exact in de stijl van@ anchor.
 
+    # ── Single-field regeneration (per-field ↻ buttons) ──
+    if only_field in ('description', 'meta_description', 'm_title_specs'):
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+
+        context_block = f"""Producttitel competitor: {product_title}
+Keywords (verwerk de relevantste): {', '.join(keywords[:12])}
+Productnaam: {product_name}
+Taal: {language}"""
+
+        if only_field == 'description':
+            sub_prompt = f"""{context_block}
+
+Schrijf ALLEEN de productbeschrijving (description) opnieuw, in exact deze stijl:
+---
+{example}
+---
+
+Regels:
+- Gebruik productnaam ({product_name}) in eerste én laatste zin
+- Eerste regel: korte pakkende zin over comfort/draagbaarheid (geen uitroepteken)
+- Dan alinea met productnaam + kernkenmerken
+- Dan 5 bulletpoints: **eigenschap**: korte uitleg
+- Slotszin over hoe het voelt om te dragen
+- Rustige toon, geen hype, geen superlatieven
+
+Bestaande meta description (handhaaf consistentie): {current_meta_description!r}
+
+Antwoord ALLEEN als geldig JSON:
+{{"description": "..."}}"""
+            max_tokens = 1000
+
+        elif only_field == 'meta_description':
+            sub_prompt = f"""{context_block}
+
+Schrijf ALLEEN een nieuwe meta_description (max 155 tekens, SEO-geoptimaliseerd voor {language}).
+
+Bestaande description (gebruik dezelfde toon + key benefits):
+---
+{current_description}
+---
+
+Antwoord ALLEEN als geldig JSON:
+{{"meta_description": "..."}}"""
+            max_tokens = 200
+
+        else:  # m_title_specs
+            sub_prompt = f"""{context_block}
+
+Schrijf ALLEEN een nieuwe m_title_specs: één beschrijvende zin voor Google Shopping. Wordt gebruikt als: {product_name} | m_title_specs
+
+Bestaande description (haal de hoofdkenmerken hieruit):
+---
+{current_description}
+---
+
+Antwoord ALLEEN als geldig JSON:
+{{"m_title_specs": "..."}}"""
+            max_tokens = 200
+
+        msg = client.messages.create(
+            model='claude-sonnet-4-5',
+            max_tokens=max_tokens,
+            messages=[{'role': 'user', 'content': sub_prompt}]
+        )
+        text = msg.content[0].text.strip()
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            return jsonify(json.loads(match.group()))
+        return jsonify({'error': 'Kon respons niet parsen', 'raw': text}), 500
+
+    # ── Full generation (default — all three fields at once) ──
     prompt = f"""Je bent een productschrijver voor een vrouwenmodezaak. Schrijf productcontent in het {language} voor een product genaamd "{product_name}".
 
 Competitor producttitel: {product_title}
@@ -633,7 +739,7 @@ Keywords (verwerk de relevantste): {', '.join(keywords[:12])}
 Schrijf exact in de stijl van dit voorbeeld:
 ---
 {example}
----
+---{extra_refs_block}
 
 Regels:
 - Gebruik productnaam ({product_name}) in eerste én laatste zin
@@ -661,6 +767,61 @@ Antwoord uitsluitend als geldig JSON zonder extra tekst:
     if match:
         return jsonify(json.loads(match.group()))
     return jsonify({'error': 'Kon respons niet parsen', 'raw': text}), 500
+
+
+# --- Publish history (append-only JSONL log of every variant created) ---
+
+def _append_history(entry):
+    """Best-effort write to publish_history.jsonl. Never raise — history is observability."""
+    try:
+        entry = {**entry, 'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'}
+        with open(HISTORY_PATH, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    except Exception as e:
+        print(f"[history] append failed (ignored): {e}")
+
+
+@app.route('/api/history')
+def history():
+    """Return the publish log as a list of entries, most recent first.
+
+    Query params:
+      - limit (default 200, max 500)
+      - store (filter: dk | fr)
+      - product (filter: case-insensitive substring of product name)
+    """
+    try:
+        limit = min(500, int(request.args.get('limit', 200) or 200))
+    except Exception:
+        limit = 200
+    filter_store = (request.args.get('store') or '').strip().lower()
+    filter_product = (request.args.get('product') or '').strip().lower()
+
+    if not os.path.exists(HISTORY_PATH):
+        return jsonify({'entries': [], 'total': 0})
+
+    entries = []
+    try:
+        with open(HISTORY_PATH, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if filter_store and e.get('store') != filter_store:
+                    continue
+                if filter_product and filter_product not in (e.get('product_name') or '').lower():
+                    continue
+                entries.append(e)
+    except Exception as e:
+        return jsonify({'error': f'Could not read history: {e}'}), 500
+
+    entries.reverse()  # most recent first
+    total = len(entries)
+    return jsonify({'entries': entries[:limit], 'total': total})
 
 
 # --- Publish helpers (shared by /api/publish and the granular per-variant endpoints) ---
@@ -972,6 +1133,18 @@ def publish_create_variant():
     )
     if 'error' in result:
         return jsonify({'success': False, **result}), 500
+
+    # Log to publish history (best-effort, ignored on failure)
+    _append_history({
+        'store':         store,
+        'product_name':  product_name,
+        'color':         color,
+        'product_id':    result.get('product_id'),
+        'product_url':   result.get('product_url'),
+        'collection_handle': actual_handle,
+        'image_count':   len(images),
+        'metafield_errors': result.get('metafield_errors') or [],
+    })
     return jsonify({'success': True, **result})
 
 

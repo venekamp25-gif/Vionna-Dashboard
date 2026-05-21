@@ -29,7 +29,7 @@ function FlagFR() {
 const FLAGS: Record<StoreKey, React.ReactNode> = { dk: <FlagDK />, fr: <FlagFR /> };
 
 export function PublishStep() {
-  const { data, setData } = useProduct();
+  const { data, setData, clearDraft } = useProduct();
   const { setStore } = useStore();
   const { setStep } = useStep();
 
@@ -73,6 +73,7 @@ export function PublishStep() {
       },
       // keep selectedStores so the user doesn't have to re-pick if they want to do another multi-store import
     }));
+    clearDraft();
     setStep(1);
   };
 

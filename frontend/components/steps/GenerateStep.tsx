@@ -18,6 +18,7 @@ import {
 import { translateColor } from "@/lib/colors";
 import { randomName } from "@/lib/names";
 import { autoSiblingsHandle } from "@/lib/slug";
+import { loadToneReferences } from "@/lib/toneReference";
 
 type Stage = "scraping" | "names" | "generating" | "done";
 
@@ -119,6 +120,7 @@ export function GenerateStep() {
           fr: "49,00 EUR",
         };
 
+        const toneRefs = loadToneReferences();
         for (const store of selectedStores) {
           setSubStage(`${STORE_CONFIG[store].language} — ${STORE_CONFIG[store].label}`);
           const gen = await api.generate({
@@ -126,6 +128,7 @@ export function GenerateStep() {
             product_name: chosenName,
             product_title: product?.title ?? "",
             keywords,
+            tone_references: toneRefs[store],
           });
           if (gen.error) throw new Error(`${store.toUpperCase()}: ${gen.error}`);
 

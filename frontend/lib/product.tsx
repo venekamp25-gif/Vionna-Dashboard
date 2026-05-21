@@ -1,7 +1,13 @@
 "use client";
 
-import { createContext, useContext, useState, useCallback, ReactNode } from "react";
+import { createContext, useContext, useState, useCallback, useEffect, useRef, ReactNode } from "react";
 import { StoreKey } from "./store";
+
+/**
+ * localStorage key for the auto-saved draft. Bump the suffix when the ProductData
+ * shape changes in a non-backward-compatible way so stale drafts get discarded.
+ */
+const DRAFT_STORAGE_KEY = "vionna-dashboard:active-draft-v1";
 
 export interface CompetitorInfo {
   title: string;
@@ -174,6 +180,12 @@ interface ProductContextType {
   switchView: (store: StoreKey) => void;
   /** Force-flush current top-level mirrors into contentByStore[activeViewStore]. */
   syncActiveView: () => void;
+  /** True if there's a saved draft from a previous session (set on mount). */
+  hasSavedDraft: boolean;
+  /** Restore the saved draft into state. No-op if there's none. */
+  restoreDraft: () => void;
+  /** Discard any saved draft (called after a successful publish or explicit reset). */
+  clearDraft: () => void;
 }
 
 const ProductContext = createContext<ProductContextType>({
@@ -182,6 +194,9 @@ const ProductContext = createContext<ProductContextType>({
   patch: () => {},
   switchView: () => {},
   syncActiveView: () => {},
+  hasSavedDraft: false,
+  restoreDraft: () => {},
+  clearDraft: () => {},
 });
 
 /** Build a StoreContent snapshot from the current top-level mirror fields. */
@@ -200,8 +215,73 @@ function snapshotActive(prev: ProductData): StoreContent {
   };
 }
 
+/** Minimum "draft is worth saving" check — only persist once the user has done meaningful work. */
+function isDraftWorthSaving(d: ProductData): boolean {
+  return (
+    !!d.competitorUrl.trim() ||
+    !!d.name.trim() ||
+    d.canonicalColors.length > 0 ||
+    d.publishPool.length > 0
+  );
+}
+
 export function ProductProvider({ children }: { children: ReactNode }) {
   const [data, setData] = useState<ProductData>(DEFAULT_DATA);
+  const [hasSavedDraft, setHasSavedDraft] = useState(false);
+  const savedDraftRef = useRef<ProductData | null>(null);
+  const hasMountedRef = useRef(false);
+
+  // ── Load saved draft on mount (but don't auto-restore — show a banner instead) ──
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = window.localStorage.getItem(DRAFT_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as ProductData;
+        if (isDraftWorthSaving(parsed)) {
+          savedDraftRef.current = parsed;
+          setHasSavedDraft(true);
+        }
+      }
+    } catch {
+      // Corrupt draft — drop it
+      window.localStorage.removeItem(DRAFT_STORAGE_KEY);
+    }
+    hasMountedRef.current = true;
+  }, []);
+
+  // ── Auto-save current state on every change (debounced 500ms) ──
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!hasMountedRef.current) return;  // skip the initial render's commit
+    const id = setTimeout(() => {
+      try {
+        if (isDraftWorthSaving(data)) {
+          window.localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(data));
+        } else {
+          window.localStorage.removeItem(DRAFT_STORAGE_KEY);
+        }
+      } catch {
+        // Quota exceeded or similar — silently skip
+      }
+    }, 500);
+    return () => clearTimeout(id);
+  }, [data]);
+
+  const restoreDraft = useCallback(() => {
+    if (savedDraftRef.current) {
+      setData(savedDraftRef.current);
+      setHasSavedDraft(false);
+    }
+  }, []);
+
+  const clearDraft = useCallback(() => {
+    if (typeof window !== "undefined") {
+      window.localStorage.removeItem(DRAFT_STORAGE_KEY);
+    }
+    savedDraftRef.current = null;
+    setHasSavedDraft(false);
+  }, []);
 
   const patch = useCallback(
     (partial: Partial<ProductData>) =>
@@ -248,7 +328,10 @@ export function ProductProvider({ children }: { children: ReactNode }) {
   }, []);
 
   return (
-    <ProductContext.Provider value={{ data, setData, patch, switchView, syncActiveView }}>
+    <ProductContext.Provider value={{
+      data, setData, patch, switchView, syncActiveView,
+      hasSavedDraft, restoreDraft, clearDraft,
+    }}>
       {children}
     </ProductContext.Provider>
   );

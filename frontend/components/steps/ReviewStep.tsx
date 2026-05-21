@@ -10,6 +10,7 @@ import { NanoBananaSteps } from "@/components/review/NanoBananaSteps";
 import { PublishPoolCard } from "@/components/review/PublishPoolCard";
 import { StoreTabs } from "@/components/review/StoreTabs";
 import { PublishProgressScreen, StoreProgress } from "@/components/review/PublishProgressScreen";
+import { PrePublishChecklist } from "@/components/review/PrePublishChecklist";
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { useStep } from "@/lib/step";
@@ -17,11 +18,13 @@ import { useProduct, PublishResult, colorLabelFor } from "@/lib/product";
 import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
 import { api } from "@/lib/api";
 import { calcComparePrice } from "@/lib/pricing";
+import { useUsedNames } from "@/lib/useUsedNames";
 
 export function ReviewStep() {
   const { setStep } = useStep();
-  const { data, patch, setData, syncActiveView } = useProduct();
+  const { data, patch, setData, syncActiveView, clearDraft } = useProduct();
   const { setStore } = useStore();
+  const { takenLower: takenNamesLower } = useUsedNames();
   const [publishing, setPublishing] = useState(false);
   const [publishingStore, setPublishingStore] = useState<StoreKey | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -215,7 +218,8 @@ export function ReviewStep() {
         }));
       }
 
-      // All stores published successfully
+      // All stores published successfully — drop the auto-saved draft
+      clearDraft();
       setPublishingStore(null);
       setStore(targetStores[0]);
       setStep(4);
@@ -297,8 +301,13 @@ export function ReviewStep() {
         </div>
       </div>
 
+      {/* Pre-publish checklist — collapsible bar above the sticky action row */}
+      <div className="mt-8">
+        <PrePublishChecklist takenNamesLower={takenNamesLower} />
+      </div>
+
       {/* Bottom bar (sticky) — bleeds to viewport edges via negative margin matching parent padding */}
-      <div className="sticky bottom-0 mt-8 -mx-8 lg:-mx-12 xl:-mx-16 px-8 lg:px-12 xl:px-16 py-4 bg-bg-elev border-t border-border backdrop-blur flex items-center justify-between gap-4">
+      <div className="sticky bottom-0 -mx-8 lg:-mx-12 xl:-mx-16 px-8 lg:px-12 xl:px-16 py-4 bg-bg-elev border-t border-border backdrop-blur flex items-center justify-between gap-4">
         <div className="flex flex-col">
           {error ? (
             <span className="text-[13px] text-danger">{error}</span>

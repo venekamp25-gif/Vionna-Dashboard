@@ -35,7 +35,7 @@ const FLAGS: Record<StoreKey, React.ReactNode> = {
 };
 
 export function InputStep() {
-  const { data, patch } = useProduct();
+  const { data, patch, hasSavedDraft, restoreDraft, clearDraft } = useProduct();
   const { setStep } = useStep();
   const { setStore } = useStore();
 
@@ -83,8 +83,62 @@ export function InputStep() {
     setStep(2);
   };
 
+  // If a draft was auto-saved in a previous session and the user lands here with
+  // empty input, offer to resume.
+  const handleResume = () => {
+    restoreDraft();
+    // After restoring, if the product has gone past the Generate stage,
+    // jump straight to Review so the user lands where they left off.
+    setTimeout(() => {
+      const d = data;
+      // Note: data is stale here (closure), but restoreDraft sets new state which
+      // triggers a re-render. We use a microtask to read the latest by checking
+      // localStorage one more time — simpler than threading the latest data.
+      try {
+        const raw = window.localStorage.getItem("vionna-dashboard:active-draft-v1");
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed?.canonicalColors?.length > 0) {
+            setStep(3);
+            return;
+          }
+        }
+      } catch {}
+      // Otherwise leave the user on Input with the URL pre-filled
+      void d;
+    }, 0);
+  };
+
   return (
     <div className="max-w-3xl mx-auto">
+      {hasSavedDraft && (
+        <div className="mb-4 flex items-start gap-3 px-4 py-3 rounded-[10px] bg-accent/8 border border-accent/40">
+          <span className="text-accent text-base mt-0.5">↺</span>
+          <div className="flex-1 text-[13px]">
+            <div className="font-semibold text-text">Resume your previous work?</div>
+            <div className="text-text-faint text-[12px] mt-0.5">
+              We auto-saved your last product so you can pick up where you left off.
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={clearDraft}
+              className="text-[11px] font-semibold tracking-wider uppercase px-3 py-1.5 rounded-md border border-border bg-bg-elev-2 text-text-dim hover:border-border-hover hover:text-text"
+            >
+              Discard
+            </button>
+            <button
+              type="button"
+              onClick={handleResume}
+              className="text-[11px] font-semibold tracking-wider uppercase px-3 py-1.5 rounded-md bg-accent text-on-accent hover:bg-accent-hover"
+            >
+              Resume →
+            </button>
+          </div>
+        </div>
+      )}
+
       <Card title="Competitor product">
         <Field>
           <Label hint="(content auto-generated per selected store)">Publish to</Label>

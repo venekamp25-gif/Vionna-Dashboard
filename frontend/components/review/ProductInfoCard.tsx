@@ -8,7 +8,7 @@ import { useProduct, StoreContent } from "@/lib/product";
 import { StoreKey, STORE_CONFIG } from "@/lib/store";
 import { randomName } from "@/lib/names";
 import { slugify } from "@/lib/slug";
-import { api } from "@/lib/api";
+import { useUsedNames } from "@/lib/useUsedNames";
 
 const COLOR_DOTS: Record<string, string> = {
   // English canonical keys
@@ -36,39 +36,9 @@ export function ProductInfoCard() {
   // Note: `useStore.store` follows the active tab. We intentionally do NOT use it
   // for name validation — that has to span every selected store.
 
-  // ── Used names cache (fetched per selected store, kept per-store for messaging) ──
-  const [usedNamesByStore, setUsedNamesByStore] = useState<Record<StoreKey, string[]>>({
-    dk: [],
-    fr: [],
-  });
-  const [usedNamesLoading, setUsedNamesLoading] = useState(true);
-
+  // Shared cache of "already used" product names across all selected stores
+  const { byStore: usedNamesByStore, loading: usedNamesLoading } = useUsedNames();
   const selectedStoresKey = data.selectedStores.join(",");
-  useEffect(() => {
-    let cancelled = false;
-    setUsedNamesLoading(true);
-    Promise.all(
-      data.selectedStores.map(async (s): Promise<[StoreKey, string[]]> => {
-        try {
-          const r = await api.names(s);
-          return [s, r.names ?? []];
-        } catch {
-          return [s, []];
-        }
-      })
-    )
-      .then((pairs) => {
-        if (cancelled) return;
-        const next: Record<StoreKey, string[]> = { dk: [], fr: [] };
-        for (const [s, names] of pairs) next[s] = names;
-        setUsedNamesByStore(next);
-      })
-      .finally(() => {
-        if (!cancelled) setUsedNamesLoading(false);
-      });
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedStoresKey]);
 
   // ── Name-availability check (debounced 600ms; flags ANY store that owns the name) ──
   const [nameStatus, setNameStatus] = useState<NameStatus>("idle");
