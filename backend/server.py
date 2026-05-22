@@ -234,6 +234,28 @@ def status():
 _COLOR_OPT_RE = re.compile(r'colou?r|kleur|farve|couleur', re.I)
 _SIZE_OPT_RE  = re.compile(r'size|maat|taille|størrelse', re.I)
 
+# Some Shopify stores (e.g. rosamae.co.uk) enable Bot Protection that blocks
+# every UA starting with "Mozilla/" while letting non-browser UAs through.
+# We default to an explicit dashboard UA so those stores work out of the box,
+# and only fall back to Mozilla if the first try returns a 403 (some other
+# stores might preferentially serve Mozilla — covers both cases without
+# burning two requests on the happy path).
+_SCRAPE_UA_PRIMARY  = 'VionnaProductDashboard/1.0 (+https://vionna-dashboard.netlify.app)'
+_SCRAPE_UA_FALLBACK = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+
+def _scrape_get(url, timeout=10):
+    """GET a competitor URL with UA fallback. Returns the requests.Response.
+    Raises on the LAST attempt's failure so callers can inspect r.status_code /
+    r.text just like before."""
+    r = req.get(url, timeout=timeout, headers={'User-Agent': _SCRAPE_UA_PRIMARY,
+                                                'Accept': 'application/json, text/html;q=0.9, */*;q=0.5'})
+    if r.status_code == 403:
+        # Some shops do the opposite: they ONLY accept browser UAs and 403 us.
+        r = req.get(url, timeout=timeout, headers={'User-Agent': _SCRAPE_UA_FALLBACK,
+                                                    'Accept': 'application/json, text/html;q=0.9, */*;q=0.5'})
+    return r
+
 
 def _scrape_slugify(text):
     """Lowercase + diacritic-strip + dash-separated — matches how shops slug colours into handles."""
@@ -269,7 +291,7 @@ def _fetch_product_json(scheme, netloc, handle):
     """Fetch /products/<handle>.json and return the product dict, or None."""
     url = f'{scheme}://{netloc}/products/{handle}.json'
     try:
-        r = req.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        r = _scrape_get(url, timeout=10)
         r.raise_for_status()
         return r.json().get('product')
     except Exception as e:
@@ -390,7 +412,7 @@ def scrape():
     html_url = urllib.parse.urlunparse((scheme, parsed.netloc, html_path, '', '', ''))
 
     try:
-        r = req.get(json_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        r = _scrape_get(json_url, timeout=10)
         r.raise_for_status()
         base_data = r.json()
     except Exception as e:
@@ -412,7 +434,7 @@ def scrape():
             if base_handle.endswith('-' + color_slug):
                 # Fetch the page HTML and look for sibling links
                 try:
-                    html_r = req.get(html_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+                    html_r = _scrape_get(html_url, timeout=10)
                     html_r.raise_for_status()
                     sibling_handles = _find_color_sibling_handles(html_r.text, base_handle, color_slug)
                 except Exception as e:
@@ -1823,7 +1845,7 @@ def higgsfield_generate():
         for i, url in enumerate(image_urls[:4]):
             img_path = os.path.join(tmp_dir, f'ref_{i}.jpg')
             try:
-                r = req.get(url, timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
+                r = _scrape_get(url, timeout=15)
                 r.raise_for_status()
                 with open(img_path, 'wb') as f:
                     f.write(r.content)
