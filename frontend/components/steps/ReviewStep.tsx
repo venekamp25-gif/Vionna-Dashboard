@@ -23,6 +23,7 @@ import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
 import { api } from "@/lib/api";
 import { calcComparePrice } from "@/lib/pricing";
 import { useUsedNames } from "@/lib/useUsedNames";
+import { notify, requestNotificationPermission } from "@/lib/notifications";
 
 export function ReviewStep() {
   const { setStep } = useStep();
@@ -84,6 +85,7 @@ export function ReviewStep() {
       colorLabels: activeColorLabels,
     };
 
+    void requestNotificationPermission();
     setPublishing(true);
     publishStartedAt.current = Date.now();
     setVariantsCompleted(0);
@@ -235,6 +237,11 @@ export function ReviewStep() {
 
       // All stores published successfully — drop the auto-saved draft
       clearDraft();
+      notify(
+        `${data.name} published`,
+        `${data.canonicalColors.length} colour duplicates × ${targetStores.length} ${targetStores.length === 1 ? "store" : "stores"}.`,
+        "publish-done"
+      );
       setPublishingStore(null);
       setStore(targetStores[0]);
       setStep(4);

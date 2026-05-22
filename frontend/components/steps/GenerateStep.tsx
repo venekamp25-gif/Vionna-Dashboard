@@ -7,6 +7,7 @@ import { useStep } from "@/lib/step";
 import { useProduct, StoreContent } from "@/lib/product";
 import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
 import { api } from "@/lib/api";
+import { notify } from "@/lib/notifications";
 import {
   extractColors,
   extractVariantsByColor,
@@ -42,7 +43,7 @@ function canonicalize(color: string): string {
 
 export function GenerateStep() {
   const { setStep } = useStep();
-  const { data, patch } = useProduct();
+  const { data, patch, flushDraft } = useProduct();
   const { setStore } = useStore();
   const [stage, setStage] = useState<Stage>("scraping");
   const [subStage, setSubStage] = useState<string>("");
@@ -190,6 +191,14 @@ export function GenerateStep() {
         });
 
         // brief pause so user sees "Preparing review…"
+        notify(
+          `${chosenName} ready for review`,
+          `Scraped + ${selectedStores.length === 1 ? "1 language" : `${selectedStores.length} languages`} generated.`,
+          "generate-done"
+        );
+        // Force-flush so a crash between Generate and Review never costs the
+        // scraped data + Claude-generated copy.
+        setTimeout(() => flushDraft(), 0);
         setTimeout(() => setStep(3), 500);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);

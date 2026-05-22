@@ -227,6 +227,10 @@ interface ProductContextType {
   restoreDraft: () => void;
   /** Discard any saved draft (called after a successful publish or explicit reset). */
   clearDraft: () => void;
+  /** Force-flush the current state to the server NOW, bypassing the 1s debounce.
+   *  Call this after key milestones (NB step finished, publish done) so a crash
+   *  immediately after never costs more than the most recent change. */
+  flushDraft: () => void;
 }
 
 const ProductContext = createContext<ProductContextType>({
@@ -240,6 +244,7 @@ const ProductContext = createContext<ProductContextType>({
   draftSavedAt: null,
   restoreDraft: () => {},
   clearDraft: () => {},
+  flushDraft: () => {},
 });
 
 /** Build a StoreContent snapshot from the current top-level mirror fields. */
@@ -481,6 +486,26 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  // Always-fresh `data` for the flushDraft helper (otherwise its closure would
+  // see whatever data was current when the provider mounted).
+  const dataRef = useRef(data);
+  useEffect(() => { dataRef.current = data; }, [data]);
+
+  const flushDraft = useCallback(() => {
+    if (typeof window === "undefined") return;
+    const owner = ownerRef.current;
+    if (!owner) return;
+    if (hasSavedDraft) return;  // banner not yet answered — don't clobber
+    const current = dataRef.current;
+    if (!isDraftWorthSaving(current)) return;
+    // localStorage is synchronous and bulletproof — write there first
+    try {
+      window.localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(current));
+    } catch {}
+    // Server is fire-and-forget — debounced effect can race; that's fine.
+    void draftsApi.save(owner, current).catch(() => {});
+  }, [hasSavedDraft]);
+
   const patch = useCallback(
     (partial: Partial<ProductData>) =>
       setData((prev) => ({ ...prev, ...partial })),
@@ -543,7 +568,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
   return (
     <ProductContext.Provider value={{
       data, setData, patch, switchView, syncActiveView,
-      hasSavedDraft, draftSource, draftSavedAt, restoreDraft, clearDraft,
+      hasSavedDraft, draftSource, draftSavedAt, restoreDraft, clearDraft, flushDraft,
     }}>
       {children}
     </ProductContext.Provider>

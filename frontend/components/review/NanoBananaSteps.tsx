@@ -8,6 +8,7 @@ import { useProduct, NbResult, PoolPhoto } from "@/lib/product";
 import { api } from "@/lib/api";
 import { higgsfieldQueue } from "@/lib/concurrency";
 import { MAX_IMAGES_PER_COLOR } from "@/lib/scrape-utils";
+import { notify, requestNotificationPermission } from "@/lib/notifications";
 
 const STEPS = [
   { n: 1, title: "First model shot",      desc: "Product on model with reference background (4 variants)" },
@@ -19,7 +20,7 @@ const STEPS = [
 const TOTAL_VARIANTS = 4;
 
 export function NanoBananaSteps() {
-  const { data, patch, setData } = useProduct();
+  const { data, patch, setData, flushDraft } = useProduct();
   const [running, setRunning] = useState<Record<number, boolean>>({});
   const [progress, setProgress] = useState<Record<number, number>>({});
   const [stepErrors, setStepErrors] = useState<Record<number, string | null>>({});
@@ -64,6 +65,8 @@ export function NanoBananaSteps() {
   /** Run one of the steps 1-4: 4 parallel API calls, each yields one image. */
   const runStep = async (stepNum: number) => {
     if (running[stepNum]) return;
+    // Ask once (the API only prompts the user the FIRST time it sees default).
+    void requestNotificationPermission();
     setRunning((r) => ({ ...r, [stepNum]: true }));
     setStepErrors((e) => ({ ...e, [stepNum]: null }));
     setProgress((p) => ({ ...p, [stepNum]: 0 }));
@@ -102,8 +105,16 @@ export function NanoBananaSteps() {
 
     if (finalResults.length === 0) {
       setStepErrors((e) => ({ ...e, [stepNum]: "All variants failed. Check Higgsfield + try again." }));
+    } else {
+      notify(
+        `Step ${stepNum} ready`,
+        `${finalResults.length} variants generated — back to review.`,
+        `nb-step-${stepNum}`
+      );
     }
     setRunning((r) => ({ ...r, [stepNum]: false }));
+    // Persist immediately — a crash now should never cost the generated URLs.
+    flushDraft();
   };
 
   /** Regenerate just one slot. */
@@ -248,6 +259,11 @@ export function NanoBananaSteps() {
       ...prev,
       nbResultsPerColor: { ...prev.nbResultsPerColor, [color]: finalResults },
     }));
+
+    if (finalResults.length > 0) {
+      notify(`${color} variants ready`, `${finalResults.length} of ${stepFavourites.length} formats generated.`, `nb-color-${color}`);
+    }
+    flushDraft();
 
     if (finalResults.length === 0) {
       alert(`All formats failed for ${color}. Check Higgsfield and try again.`);
@@ -472,6 +488,7 @@ export function NanoBananaSteps() {
           // we don't slam the backend with a thundering herd. Actual concurrency
           // is capped by `higgsfieldQueue` (MAX_CONCURRENT_HIGGSFIELD) — anything
           // beyond the cap waits its turn and dispatches the instant a slot opens.
+          void requestNotificationPermission();
           const pending = colors.filter((c) => !data.nbResultsPerColor[c]?.length);
           await Promise.all(
             pending.map(
@@ -483,6 +500,14 @@ export function NanoBananaSteps() {
                 })
             )
           );
+          // Master "everything's done" ping so the user knows they can come back
+          // to the tab once the whole Generate-all run is finished.
+          notify(
+            "All colour variants ready",
+            `${pending.length} colours finished generating — back to review.`,
+            "nb-generate-all"
+          );
+          flushDraft();
         }}
       />
 
