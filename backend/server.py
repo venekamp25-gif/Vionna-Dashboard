@@ -1729,7 +1729,8 @@ NANO_BANANA_PROMPTS = {
          "Task: generate a detailed model shot of OUR model (from IMAGE 1) with her full face clearly "
          "visible, wearing the {product_type} in the EXACT colour shown in IMAGES 2+. Critical: match "
          "the precise shade from the reference photos, not your prior idea of '{color}'. Keep our model, "
-         "background and styling identical to IMAGE 1."),
+         "background and styling identical to IMAGE 1, but make sure the model has a different pose "
+         "than in IMAGE 1."),
     13: ("I've uploaded reference images with TWO different roles:\n"
          "- IMAGE 1: our existing model (same setup, model, background).\n"
          "- IMAGES 2+: competitor garment colour references — EXACT colour ground truth.\n\n"
