@@ -56,8 +56,22 @@ export function InputStep() {
   const { setStep } = useStep();
   const { setStore } = useStore();
 
+  // For multi-store: at least one store's keywords must be set.
+  // For single-store: that store's keywords field is the one to check.
+  // (Both end up parsed at Generate time; empty keywords just means Claude
+  // gets none — not a blocker, so we don't enforce it at the form level.)
   const canSubmit =
     data.competitorUrl.trim().length > 0 && data.selectedStores.length > 0;
+
+  const setKeywordsForStore = (store: StoreKey, value: string) => {
+    const isPrimary = store === data.selectedStores[0];
+    patch({
+      keywordsByStore: { ...data.keywordsByStore, [store]: value },
+      // Keep the legacy mirror in sync with the primary store so anything that
+      // still reads data.keywords / data.parsedKeywords keeps working.
+      ...(isPrimary ? { keywords: value } : {}),
+    });
+  };
 
   const toggleStore = (store: StoreKey) => {
     const isSelected = data.selectedStores.includes(store);
@@ -82,19 +96,27 @@ export function InputStep() {
 
   const onSubmit = () => {
     if (!canSubmit) return;
-    // Parse keywords into array for downstream steps
-    const parsedKeywords = data.keywords
-      .split("\n")
-      .map((k) => k.trim())
-      .filter(Boolean);
+    const primary = data.selectedStores[0];
+
+    // Parse per-store keywords. Each store sends its OWN array to /api/generate
+    // so the Danish copy isn't seeded by French keywords (and vice versa).
+    const parse = (raw: string) =>
+      raw.split("\n").map((k) => k.trim()).filter(Boolean);
+    const parsedByStore: Record<StoreKey, string[]> = { dk: [], fr: [] };
+    for (const s of ALL_STORES) {
+      parsedByStore[s] = parse(data.keywordsByStore[s] ?? "");
+    }
+    // Legacy mirror = primary store's parsed list
+    const parsedKeywords = parsedByStore[primary] ?? [];
 
     // Make the global useStore.store track the first selected store
     // so APIs like /api/names use the primary language until Review tabs override it.
-    const primary = data.selectedStores[0];
     setStore(primary);
 
     patch({
       parsedKeywords,
+      parsedKeywordsByStore: parsedByStore,
+      keywords: data.keywordsByStore[primary] ?? "",
       activeViewStore: primary,
     });
     setStep(2);
@@ -222,17 +244,41 @@ export function InputStep() {
           />
         </Field>
 
-        <Field>
-          <Label hint="(one per line, from Ubersuggest/Trends sheet)">Keywords</Label>
-          <Textarea
-            rows={6}
-            value={data.keywords}
-            onChange={(e) => patch({ keywords: e.target.value })}
-            placeholder={
-              "Put keywords researched for this product here...\n(one per line, e.g. from Ubersuggest or Google Trends)"
-            }
-          />
-        </Field>
+        {data.selectedStores.length <= 1 ? (
+          <Field>
+            <Label hint="(one per line, from Ubersuggest/Trends sheet)">Keywords</Label>
+            <Textarea
+              rows={6}
+              value={data.keywordsByStore[data.selectedStores[0] ?? "dk"] ?? ""}
+              onChange={(e) => setKeywordsForStore(data.selectedStores[0] ?? "dk", e.target.value)}
+              placeholder={
+                "Put keywords researched for this product here...\n(one per line, e.g. from Ubersuggest or Google Trends)"
+              }
+            />
+          </Field>
+        ) : (
+          <>
+            <div className="text-[11px] text-text-faint mb-2 leading-relaxed">
+              Each store uses its own keyword list — language-specific SEO research goes in the matching box.
+            </div>
+            {data.selectedStores.map((s) => (
+              <Field key={s}>
+                <Label hint={`— used for ${STORE_CONFIG[s].language} content only`}>
+                  <span className="inline-flex items-center gap-2">
+                    {FLAGS[s]}
+                    Keywords for {STORE_CONFIG[s].label}
+                  </span>
+                </Label>
+                <Textarea
+                  rows={5}
+                  value={data.keywordsByStore[s] ?? ""}
+                  onChange={(e) => setKeywordsForStore(s, e.target.value)}
+                  placeholder={`Keywords in ${STORE_CONFIG[s].language}, one per line`}
+                />
+              </Field>
+            ))}
+          </>
+        )}
 
         <Button onClick={onSubmit} disabled={!canSubmit}>
           Import &amp; Generate →

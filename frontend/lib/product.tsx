@@ -76,7 +76,14 @@ const EMPTY_STORE_CONTENT: StoreContent = {
 export interface ProductData {
   // ── Input ──
   competitorUrl: string;
+  /** Active-view mirror of keywordsByStore[activeViewStore]. Kept for backward
+   *  compat with components that read data.keywords directly. */
   keywords: string;
+  /** Per-store raw keyword text. When the user selects DK + FR at Input they
+   *  fill in two separate textareas — each store's content is then generated
+   *  against its OWN keywords so the Danish copy isn't seeded by French SEO
+   *  research (and vice versa). */
+  keywordsByStore: Record<StoreKey, string>;
   /** Stores the user wants to publish to. Picked at Input step. */
   selectedStores: StoreKey[];
   /** Which selected store's content is currently shown in the editable UI mirror. */
@@ -96,6 +103,8 @@ export interface ProductData {
   discount: 0 | 25 | 50;
   siblingsHandle: string;
   parsedKeywords: string[];
+  /** Per-store parsed keyword arrays, mirrors keywordsByStore split on newlines. */
+  parsedKeywordsByStore: Record<StoreKey, string[]>;
 
   // ── Active-view mirrors of contentByStore[activeViewStore] ──
   description: string;
@@ -139,6 +148,7 @@ export interface ProductData {
 const DEFAULT_DATA: ProductData = {
   competitorUrl: "",
   keywords: "",
+  keywordsByStore: { dk: "", fr: "" },
   // Default to both stores ticked — most imports go to DK + FR at the same time.
   selectedStores: ["dk", "fr"],
   activeViewStore: "dk",
@@ -155,6 +165,7 @@ const DEFAULT_DATA: ProductData = {
   cutline: "",
   siblingsHandle: "",
   parsedKeywords: [],
+  parsedKeywordsByStore: { dk: [], fr: [] },
   contentByStore: {
     dk: { ...EMPTY_STORE_CONTENT, price: DEFAULT_PRICE_BY_STORE.dk },
     fr: { ...EMPTY_STORE_CONTENT, price: DEFAULT_PRICE_BY_STORE.fr },
@@ -226,11 +237,53 @@ function snapshotActive(prev: ProductData): StoreContent {
   };
 }
 
-/** Strip server-injected internal fields (e.g. `_saved_at`) before pushing into state. */
+/**
+ * Strip server-injected internal fields and back-fill any new fields that
+ * older drafts wouldn't have known about. Without this a draft saved before
+ * we added e.g. `keywordsByStore` would crash on first `data.keywordsByStore[s]`
+ * access.
+ */
 function stripInternalKeys(d: ProductData & { _saved_at?: string }): ProductData {
   const { _saved_at, ...rest } = d;
   void _saved_at;
-  return rest as ProductData;
+  const merged: ProductData = {
+    ...DEFAULT_DATA,
+    ...(rest as ProductData),
+    // Deep-merge nested per-store maps so partial drafts pick up new defaults.
+    keywordsByStore: {
+      ...DEFAULT_DATA.keywordsByStore,
+      ...((rest as Partial<ProductData>).keywordsByStore ?? {}),
+    },
+    parsedKeywordsByStore: {
+      ...DEFAULT_DATA.parsedKeywordsByStore,
+      ...((rest as Partial<ProductData>).parsedKeywordsByStore ?? {}),
+    },
+    contentByStore: {
+      ...DEFAULT_DATA.contentByStore,
+      ...((rest as Partial<ProductData>).contentByStore ?? {}),
+    },
+  };
+
+  // Migration: older drafts only had the flat `keywords` field — copy it into
+  // every selected store's slot so existing in-progress drafts don't lose the
+  // SEO research the user entered before this update.
+  const hasAnyByStore =
+    (merged.keywordsByStore.dk || "").trim().length > 0 ||
+    (merged.keywordsByStore.fr || "").trim().length > 0;
+  if (!hasAnyByStore && merged.keywords) {
+    for (const s of merged.selectedStores) {
+      merged.keywordsByStore[s] = merged.keywords;
+    }
+  }
+  const hasAnyParsedByStore =
+    (merged.parsedKeywordsByStore.dk?.length ?? 0) > 0 ||
+    (merged.parsedKeywordsByStore.fr?.length ?? 0) > 0;
+  if (!hasAnyParsedByStore && merged.parsedKeywords.length > 0) {
+    for (const s of merged.selectedStores) {
+      merged.parsedKeywordsByStore[s] = merged.parsedKeywords;
+    }
+  }
+  return merged;
 }
 
 /** Minimum "draft is worth saving" check — only persist once the user has done meaningful work. */
@@ -421,6 +474,16 @@ export function ProductProvider({ children }: { children: ReactNode }) {
         ...prev.contentByStore,
         [prev.activeViewStore]: saved,
       };
+      // Persist the active view's keyword mirrors back to the per-store map
+      // so a tab switch never loses keyword edits.
+      const updatedKeywordsByStore = {
+        ...prev.keywordsByStore,
+        [prev.activeViewStore]: prev.keywords,
+      };
+      const updatedParsedKeywordsByStore = {
+        ...prev.parsedKeywordsByStore,
+        [prev.activeViewStore]: prev.parsedKeywords,
+      };
       const newView = updatedContent[newStore] ?? EMPTY_STORE_CONTENT;
       const newColors = prev.canonicalColors.map(
         (c) => newView.colorLabels[c] ?? c
@@ -429,6 +492,8 @@ export function ProductProvider({ children }: { children: ReactNode }) {
         ...prev,
         activeViewStore: newStore,
         contentByStore: updatedContent,
+        keywordsByStore: updatedKeywordsByStore,
+        parsedKeywordsByStore: updatedParsedKeywordsByStore,
         description: newView.description,
         metaDescription: newView.metaDescription,
         mTitleSpecs: newView.mTitleSpecs,
@@ -437,6 +502,9 @@ export function ProductProvider({ children }: { children: ReactNode }) {
         // filled yet (e.g. first switch to FR before Generate ran).
         price: newView.price || DEFAULT_PRICE_BY_STORE[newStore] || prev.price,
         colors: newColors,
+        // Load the new store's keywords into the active-view mirror
+        keywords: updatedKeywordsByStore[newStore] ?? "",
+        parsedKeywords: updatedParsedKeywordsByStore[newStore] ?? [],
       };
     });
   }, []);

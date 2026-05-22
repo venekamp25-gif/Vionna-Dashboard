@@ -110,7 +110,6 @@ export function GenerateStep() {
 
         // ── 3. Generate content for EACH selected store ──
         setStage("generating");
-        const keywords = data.parsedKeywords;
         const contentByStore: Record<StoreKey, StoreContent> = {
           ...data.contentByStore,
         };
@@ -123,11 +122,16 @@ export function GenerateStep() {
         const toneRefs = loadToneReferences();
         for (const store of selectedStores) {
           setSubStage(`${STORE_CONFIG[store].language} — ${STORE_CONFIG[store].label}`);
+          // Each store ships its OWN keyword list (parsed at Input). The Danish
+          // copy should never be seeded by French SEO research and vice versa.
+          // Falls back to the legacy flat list for drafts that pre-date the split.
+          const perStore = data.parsedKeywordsByStore?.[store] ?? [];
+          const storeKeywords = perStore.length > 0 ? perStore : data.parsedKeywords;
           const gen = await api.generate({
             store,
             product_name: chosenName,
             product_title: product?.title ?? "",
-            keywords,
+            keywords: storeKeywords,
             tone_references: toneRefs[store],
           });
           if (gen.error) throw new Error(`${store.toUpperCase()}: ${gen.error}`);
