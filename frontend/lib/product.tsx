@@ -11,6 +11,25 @@ import { draftsApi, fetchCurrentUser } from "./api";
  */
 const DRAFT_STORAGE_KEY = "vionna-dashboard:active-draft-v1";
 
+/**
+ * Pool of background-reference URLs we cycle through randomly each time a
+ * NEW product starts. The same URL is kept for the entire NB run of that
+ * product (consistent model + background across steps 1-4), but different
+ * products in the same session — and different sessions — get different
+ * starting points. That keeps the published catalogue from looking like
+ * every product uses the exact same model setup.
+ */
+export const BG_REFERENCE_OPTIONS: string[] = [
+  "https://rosamae.com/cdn/shop/files/rosa-mae-anastasia-corset-lace-maxi-dress-maxi-dresses-white-3674260.png?v=1778076206&width=1200",
+  "https://rosamae.com/cdn/shop/files/rosa-mae-sandra-striped-maxi-dress-maxi-dresses-blue-6229760.png?v=1775673464&width=1200",
+  "https://rosamae.com/cdn/shop/files/rosa-mae-althea-long-sleeve-top-tops-blue-8792039.png?v=1778905256&width=1200",
+  "https://rosamae.co.uk/cdn/shop/files/rosa-mae-ruth-cloud-knit-long-sleeve-top-tops-black-2308554.jpg?v=1762948524&width=1000",
+];
+
+export function pickRandomBgReferenceUrl(): string {
+  return BG_REFERENCE_OPTIONS[Math.floor(Math.random() * BG_REFERENCE_OPTIONS.length)];
+}
+
 export interface CompetitorInfo {
   title: string;
   hostname: string;
@@ -173,8 +192,10 @@ const DEFAULT_DATA: ProductData = {
   competitorImages: [],
   competitorVariantsByColor: {},
   competitorImagesByColor: {},
-  bgReferenceUrl:
-    "https://rosamae.com/cdn/shop/files/rosa-mae-odette-corset-midi-dress-midi-dresses-green-4024064.png?v=1775259209&width=1200",
+  // Initial bg-reference is picked randomly from BG_REFERENCE_OPTIONS at module
+  // load (= per page open). resetForNewProduct re-rolls it so each new product
+  // started without a reload also gets a fresh model.
+  bgReferenceUrl: pickRandomBgReferenceUrl(),
   productType: "dress",
   nbResults: {},
   nbResultsPerColor: {},

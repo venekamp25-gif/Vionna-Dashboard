@@ -2,7 +2,7 @@
 
 import { AnimatedCheckmark } from "@/components/ui/AnimatedCheckmark";
 import { Button } from "@/components/ui/Button";
-import { useProduct, colorLabelFor } from "@/lib/product";
+import { useProduct, colorLabelFor, pickRandomBgReferenceUrl } from "@/lib/product";
 import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
 import { useStep } from "@/lib/step";
 
@@ -71,6 +71,9 @@ export function PublishStep() {
         dk: { description: "", metaDescription: "", mTitleSpecs: "", cutline: "", price: "349,00 DKK", colorLabels: {} },
         fr: { description: "", metaDescription: "", mTitleSpecs: "", cutline: "", price: "49,00 EUR", colorLabels: {} },
       },
+      // Re-roll the background reference so each new product gets a different
+      // model setup — keeps the catalogue from all looking the same.
+      bgReferenceUrl: pickRandomBgReferenceUrl(),
       // keep selectedStores so the user doesn't have to re-pick if they want to do another multi-store import
     }));
     clearDraft();
