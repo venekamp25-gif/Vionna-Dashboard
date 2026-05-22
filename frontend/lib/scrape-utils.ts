@@ -103,8 +103,13 @@ export function extractVariantsByColor(
 /** Max competitor photos to keep per colour in the ColorRefPicker.
  *  Larger numbers blow up bandwidth (every photo loads on page render) and
  *  bloat the auto-saved draft in localStorage / on the server. 8 is plenty
- *  for picking a colour reference. */
-const MAX_IMAGES_PER_COLOR = 8;
+ *  for picking a colour reference.
+ *
+ *  Exported because the ColorRefPicker also re-applies the cap at render time —
+ *  some users have drafts saved BEFORE the cap was added, and those drafts
+ *  contain hundreds of URLs per colour.
+ */
+export const MAX_IMAGES_PER_COLOR = 8;
 
 /**
  * Group competitor images by canonical colour using a **position-after-anchor**

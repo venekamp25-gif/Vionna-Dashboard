@@ -7,6 +7,7 @@ import { Lightbox } from "@/components/ui/Lightbox";
 import { useProduct, NbResult, PoolPhoto } from "@/lib/product";
 import { api } from "@/lib/api";
 import { higgsfieldQueue } from "@/lib/concurrency";
+import { MAX_IMAGES_PER_COLOR } from "@/lib/scrape-utils";
 
 const STEPS = [
   { n: 1, title: "First model shot",      desc: "Product on model with reference background (4 variants)" },
@@ -685,6 +686,13 @@ function ColorRefPicker({ color, label }: { color: string; label?: string }) {
   } else {
     visibleUrls = data.competitorImages.map((img) => img.url);
     mode = "all";
+  }
+  // Belt-and-suspenders: cap at render time too. Old drafts saved before the
+  // groupImagesByColor cap was added can contain hundreds of URLs per colour
+  // (cf. the Hana Dusty Pink draft with 173 entries). This guarantees the
+  // picker never shows more than MAX_IMAGES_PER_COLOR regardless of source.
+  if (visibleUrls.length > MAX_IMAGES_PER_COLOR) {
+    visibleUrls = visibleUrls.slice(0, MAX_IMAGES_PER_COLOR);
   }
 
   const toggle = (url: string) => {
