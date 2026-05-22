@@ -23,6 +23,7 @@ import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
 import { api } from "@/lib/api";
 import { calcComparePrice } from "@/lib/pricing";
 import { useUsedNames } from "@/lib/useUsedNames";
+import { useRecentHistory, findRecentDuplicate } from "@/lib/useRecentHistory";
 import { notify, requestNotificationPermission } from "@/lib/notifications";
 
 export function ReviewStep() {
@@ -30,6 +31,7 @@ export function ReviewStep() {
   const { data, patch, setData, syncActiveView, clearDraft } = useProduct();
   const { setStore } = useStore();
   const { takenLower: takenNamesLower } = useUsedNames();
+  const { entries: recentHistory } = useRecentHistory(200);
   const [publishing, setPublishing] = useState(false);
   const [publishingStore, setPublishingStore] = useState<StoreKey | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -49,6 +51,23 @@ export function ReviewStep() {
   const publish = () => {
     setError(null);
     const checks = buildPrePublishChecks(data, targetStores, takenNamesLower);
+    // Extra check: was this same product name JUST published? (within 7 days)
+    // Catches accidental double-publishes when the publish flow errored halfway,
+    // OR when the user resumes an old draft and forgets that already shipped.
+    const dup = findRecentDuplicate(recentHistory, data.name, 7);
+    if (dup) {
+      let when = "recently";
+      try {
+        const hours = Math.round((Date.now() - new Date(dup.timestamp).getTime()) / 3600000);
+        when = hours < 24 ? `${hours}h ago` : `${Math.round(hours / 24)}d ago`;
+      } catch {}
+      checks.push({
+        id: "duplicate-recent",
+        label: `'${data.name}' was already published ${when}`,
+        level: "warn",
+        detail: `Store: ${dup.store.toUpperCase()}. Are you sure you want to publish again?`,
+      });
+    }
     const issues = checks.filter((c) => c.level !== "ok");
     if (issues.length > 0) {
       setConfirmChecks(checks);
