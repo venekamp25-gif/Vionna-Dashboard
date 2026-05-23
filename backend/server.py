@@ -587,8 +587,12 @@ def scrape():
             html_r = _scrape_get(html_url, timeout=10)
             html_r.raise_for_status()
             fallback_html = html_r.text
-            # Derive handle from the path
-            handle_from_path = clean_path.rstrip('.json').rsplit('/', 1)[-1]
+            # Derive handle from the path. NB: do NOT use .rstrip('.json'),
+            # rstrip operates on a CHAR SET so it would chew through letters
+            # like 'on' / 'n' at the end of the handle (the SKIMS "-melon"
+            # got truncated to "-mel" that way).
+            path_no_json = clean_path[:-5] if clean_path.endswith('.json') else clean_path
+            handle_from_path = path_no_json.rsplit('/', 1)[-1]
             base = _scrape_product_from_html(scheme, parsed.netloc, handle_from_path, html_text=fallback_html)
             if not base:
                 return jsonify({
