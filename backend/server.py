@@ -288,15 +288,179 @@ def _find_color_sibling_handles(html_text, base_handle, color_slug):
 
 
 def _fetch_product_json(scheme, netloc, handle):
-    """Fetch /products/<handle>.json and return the product dict, or None."""
-    url = f'{scheme}://{netloc}/products/{handle}.json'
+    """Fetch /products/<handle>.json and return the product dict, or None.
+    Falls back to HTML+JSON-LD scraping for Shopify Plus stores that have
+    disabled the public .json endpoint (e.g. SKIMS)."""
+    json_url = f'{scheme}://{netloc}/products/{handle}.json'
     try:
-        r = _scrape_get(url, timeout=10)
+        r = _scrape_get(json_url, timeout=10)
+        if r.status_code == 404:
+            # Try HTML fallback
+            return _scrape_product_from_html(scheme, netloc, handle)
         r.raise_for_status()
         return r.json().get('product')
     except Exception as e:
-        print(f"[scrape] sibling fetch failed for {handle}: {e}")
+        print(f"[scrape] sibling .json failed for {handle}: {e} — trying HTML fallback")
+        try:
+            return _scrape_product_from_html(scheme, netloc, handle)
+        except Exception as e2:
+            print(f"[scrape] HTML fallback also failed for {handle}: {e2}")
+            return None
+
+
+def _scrape_product_from_html(scheme, netloc, handle, html_text=None):
+    """Build a Shopify-style product dict from the storefront HTML.
+
+    Used for Shopify Plus stores that block /products/<handle>.json. Parses the
+    embedded JSON-LD ProductGroup schema for name + variants + the offer price,
+    extracts the colour from the URL handle (assumes the handle ends with -<colour>),
+    and filters CDN image URLs by the productGroupID SKU prefix to find images
+    that belong to THIS colour variant. The result matches the shape of a
+    regular `/products/handle.json` response so downstream code (sibling merge,
+    extractVariantsByColor, groupImagesByColor) can run unchanged.
+    """
+    if html_text is None:
+        url = f'{scheme}://{netloc}/products/{handle}'
+        # also handle stores that include a locale prefix (e.g. /en-nl/products/...)
+        # by trying the bare path first; if it 404s the caller will have given us
+        # html_text from the canonical URL anyway
+        r = _scrape_get(url, timeout=10)
+        r.raise_for_status()
+        html_text = r.text
+
+    # 1. Pull ALL JSON-LD blocks; pick the ProductGroup (or Product) one
+    pg = None
+    for m in re.finditer(r'<script[^>]*type="application/ld\+json"[^>]*>([\s\S]*?)</script>', html_text):
+        try:
+            obj = json.loads(m.group(1).strip())
+        except Exception:
+            continue
+        if isinstance(obj, dict) and obj.get('@type') in ('ProductGroup', 'Product'):
+            pg = obj
+            break
+    if not pg:
         return None
+
+    # 2. Determine colour. Prefer the suffix on the handle; fall back to the
+    #    " | COLOUR" tail in the name.
+    raw_name = (pg.get('name') or '').strip()
+    parts = re.split(r'\s*[\|]\s*', raw_name)
+    if len(parts) >= 2:
+        # SKIMS pattern: "PRODUCT NAME | COLOR" or "PRODUCT NAME | COLOR | SIZE"
+        clean_title = parts[0].title()
+        # Pick whichever later part is most likely the colour — skip size-shaped tokens.
+        colour_guess = next(
+            (p for p in parts[1:] if not re.match(r'^(X{0,4}S|M|L|X{0,4}L|XX{0,3}L|\d+)$', p.strip(), re.I)),
+            parts[1],
+        ).strip().title()
+    else:
+        clean_title = raw_name.title() or handle.replace('-', ' ').title()
+        colour_guess = ''
+
+    # If colour is empty, derive it from the handle's final segment
+    if not colour_guess:
+        tail = handle.rsplit('-', 1)[-1] if '-' in handle else handle
+        colour_guess = tail.replace('-', ' ').title()
+
+    # 3. Build variants from hasVariant entries
+    hv = pg.get('hasVariant') or []
+    if not isinstance(hv, list):
+        hv = []
+    variants = []
+    sizes_seen = []
+    for v in hv:
+        if not isinstance(v, dict):
+            continue
+        size = (v.get('size') or '').strip()
+        if not size:
+            # Some variants embed size only in name: "... | SIZE"
+            n = (v.get('name') or '').split('|')
+            size = (n[-1].strip() if n else '') or ''
+        offers = v.get('offers') or {}
+        if isinstance(offers, list):
+            offers = offers[0] if offers else {}
+        price = offers.get('price') if isinstance(offers, dict) else None
+        # Synthetic numeric variant id (the merge logic needs uniqueness, not
+        # a real Shopify ID).
+        mpn = v.get('mpn') or v.get('sku') or v.get('gtin') or v.get('@id') or f'{handle}-{size}'
+        synthetic_id = abs(hash(mpn)) % (10 ** 14)
+        if size and size not in sizes_seen:
+            sizes_seen.append(size)
+        variants.append({
+            'id':      synthetic_id,
+            'option1': colour_guess,
+            'option2': size,
+            'option3': None,
+            'price':   str(price) if price is not None else '0.00',
+            'sku':     v.get('mpn') or v.get('sku') or '',
+            'featured_image': None,
+        })
+
+    # 4. Extract images. Strategy:
+    #    a) Anything in the ProductGroup's `image` list, if present.
+    #    b) All Shopify CDN URLs in the HTML that contain the productGroupID
+    #       SKU prefix — these are guaranteed to be THIS colour's photos.
+    #    c) Strip trailing backslashes (Shopify Plus sometimes serialises
+    #       escaped paths).
+    img_urls = []
+    seen = set()
+    def _add_img(u):
+        if not u or not isinstance(u, str): return
+        u = u.rstrip('\\').strip()
+        u = u.replace('\\/', '/')
+        if u in seen: return
+        seen.add(u)
+        img_urls.append(u)
+
+    for src in (pg.get('image') or []):
+        if isinstance(src, str):
+            _add_img(src)
+        elif isinstance(src, dict):
+            _add_img(src.get('url') or src.get('contentUrl'))
+
+    pgid = pg.get('productGroupID') or ''
+    # Build a colour-aware SKU prefix: productGroupID + the standard variant
+    # SKU pattern. SKIMS uses "<pgid>-<COLOUR_CODE>" so e.g. BT-TRI-8466W-MLN.
+    # We can't reliably know the colour code, so we look for any image whose
+    # filename starts with the productGroupID.
+    if pgid:
+        # Find all CDN images whose path contains the productGroupID
+        cdn_pattern = re.compile(
+            r'https://cdn\.shopify\.com/s/files/[^\s"\'<>\\]+\.(?:jpe?g|png|webp)(?:\?[^\s"\'<>\\]*)?',
+            re.I,
+        )
+        for m in cdn_pattern.finditer(html_text):
+            u = m.group(0)
+            if pgid.upper() in u.upper():
+                _add_img(u)
+
+    # If we found nothing, take any image from the variant entries themselves
+    if not img_urls:
+        for v in hv:
+            if isinstance(v, dict):
+                _add_img(v.get('image'))
+
+    images = []
+    for i, u in enumerate(img_urls, start=1):
+        images.append({
+            'id':          abs(hash(f'{handle}-img-{i}')) % (10 ** 14),
+            'src':         u,
+            'position':    i,
+            'variant_ids': [],
+        })
+
+    product = {
+        'id':       abs(hash(f'{handle}-product')) % (10 ** 14),
+        'title':    clean_title,
+        'handle':   handle,
+        'options': [
+            {'name': 'Color', 'position': 1, 'values': [colour_guess] if colour_guess else []},
+            {'name': 'Size',  'position': 2, 'values': sizes_seen or ['XS', 'S', 'M', 'L', 'XL']},
+        ],
+        'variants': variants,
+        'images':   images,
+    }
+    return product
 
 
 def _merge_sibling_color_products(base, siblings):
@@ -411,14 +575,34 @@ def scrape():
     json_url = urllib.parse.urlunparse((scheme, parsed.netloc, json_path, '', '', ''))
     html_url = urllib.parse.urlunparse((scheme, parsed.netloc, html_path, '', '', ''))
 
+    base = None
+    fallback_html = None
     try:
         r = _scrape_get(json_url, timeout=10)
-        r.raise_for_status()
-        base_data = r.json()
+        if r.status_code == 404:
+            # Some Shopify Plus stores disable the public .json endpoint (e.g.
+            # SKIMS). Fall back to scraping the embedded JSON-LD ProductGroup
+            # from the HTML.
+            print(f"[scrape] .json 404 — trying HTML fallback for {json_url}")
+            html_r = _scrape_get(html_url, timeout=10)
+            html_r.raise_for_status()
+            fallback_html = html_r.text
+            # Derive handle from the path
+            handle_from_path = clean_path.rstrip('.json').rsplit('/', 1)[-1]
+            base = _scrape_product_from_html(scheme, parsed.netloc, handle_from_path, html_text=fallback_html)
+            if not base:
+                return jsonify({
+                    'error': 'Could not extract product data from HTML (no JSON-LD ProductGroup found).',
+                    'url_tried': json_url,
+                }), 500
+        else:
+            r.raise_for_status()
+            base_data = r.json()
+            base = base_data.get('product') or {}
     except Exception as e:
         return jsonify({'error': str(e), 'url_tried': json_url}), 500
-
-    base = base_data.get('product') or {}
+    if base is None:
+        base = {}
 
     # Detect the "one-product-per-colour" pattern (Billy J etc.) and merge sibling
     # colour-products into the result so the dashboard sees ONE multi-colour product.
@@ -432,14 +616,18 @@ def scrape():
             color_slug = _scrape_slugify(color_values[0])
             base_handle = base.get('handle', '')
             if base_handle.endswith('-' + color_slug):
-                # Fetch the page HTML and look for sibling links
-                try:
-                    html_r = _scrape_get(html_url, timeout=10)
-                    html_r.raise_for_status()
-                    sibling_handles = _find_color_sibling_handles(html_r.text, base_handle, color_slug)
-                except Exception as e:
-                    print(f"[scrape] HTML fetch for siblings failed: {e}")
-                    sibling_handles = []
+                # Reuse the HTML we already fetched if we came in via the
+                # fallback path; otherwise fetch it now for sibling discovery.
+                html_text = fallback_html
+                if html_text is None:
+                    try:
+                        html_r = _scrape_get(html_url, timeout=10)
+                        html_r.raise_for_status()
+                        html_text = html_r.text
+                    except Exception as e:
+                        print(f"[scrape] HTML fetch for siblings failed: {e}")
+                        html_text = ''
+                sibling_handles = _find_color_sibling_handles(html_text or '', base_handle, color_slug)
 
                 if sibling_handles:
                     print(f"[scrape] Found {len(sibling_handles)} sibling colour-products for '{base_handle}'")
@@ -454,7 +642,7 @@ def scrape():
     except Exception as e:
         print(f"[scrape] sibling-merge step failed (continuing with base only): {e}")
 
-    return jsonify(base_data)
+    return jsonify({'product': base})
 
 
 # --- Debug: inspect siblings setup for a given product name ---
