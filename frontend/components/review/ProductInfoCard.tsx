@@ -119,14 +119,42 @@ export function ProductInfoCard() {
   }, [data.name]);
 
   const refreshName = () => {
-    // Avoid any name taken in any selected store
+    // Avoid any name taken in any selected store. Add the current name too so
+    // we don't get the same one back. Try up to 5 picks to dodge the (extremely
+    // unlikely) case that randomName returns the same name twice running.
     const taken = new Set<string>();
     for (const s of data.selectedStores) {
       for (const n of usedNamesByStore[s] ?? []) taken.add(n);
     }
-    taken.add(data.name);
-    const newName = randomName(Array.from(taken));
-    patch({ name: newName });
+    const current = data.name;
+    if (current) taken.add(current);
+
+    let newName = "";
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const candidate = randomName(Array.from(taken));
+      if (candidate && candidate !== current) {
+        newName = candidate;
+        break;
+      }
+      // If randomName handed back the same name (only possible at tier-2
+      // fallback edge cases) add this attempt to the exclude list and try again.
+      if (candidate) taken.add(candidate);
+    }
+
+    if (typeof window !== "undefined" && (window as Window & { __VIONNA_DEBUG?: boolean }).__VIONNA_DEBUG) {
+      // Set window.__VIONNA_DEBUG = true in DevTools to opt in to verbose logs.
+      // eslint-disable-next-line no-console
+      console.log("[refreshName]", {
+        current,
+        excludedCount: taken.size,
+        firstFew: Array.from(taken).slice(0, 8),
+        picked: newName,
+      });
+    }
+
+    if (newName && newName !== current) {
+      patch({ name: newName });
+    }
   };
 
   /** Remove a colour by INDEX so we can clean up both canonical key + every store's label. */
