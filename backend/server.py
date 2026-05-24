@@ -165,6 +165,25 @@ def index():
     return send_from_directory('.', 'index.html')
 
 
+def _current_redirect_uri():
+    """Build the OAuth callback URI from the live request so the same code
+    works on localhost (dev) AND on the droplet (prod) without needing APP_URL
+    to be set in the environment. Falls back to the build-time REDIRECT_URI
+    if we're somehow called outside a request context."""
+    try:
+        host = (request.host_url or '').rstrip('/')
+        if host:
+            # If we're behind Caddy (droplet) the external scheme is https even
+            # though Werkzeug sees http — respect the X-Forwarded-Proto header.
+            xfp = request.headers.get('X-Forwarded-Proto')
+            if xfp == 'https' and host.startswith('http://'):
+                host = 'https://' + host[len('http://'):]
+            return host + '/callback'
+    except Exception:
+        pass
+    return REDIRECT_URI
+
+
 # --- Auth ---
 @app.route('/auth/<store_key>')
 def auth(store_key):
@@ -175,10 +194,11 @@ def auth(store_key):
     state = hashlib.sha256(os.urandom(16)).hexdigest()
     session['oauth_state'] = state
     session['store_key']   = store_key
+    session['redirect_uri'] = _current_redirect_uri()  # remembered for /callback
     params = urllib.parse.urlencode({
         'client_id':    creds['client_id'],
         'scope':        SCOPES,
-        'redirect_uri': REDIRECT_URI,
+        'redirect_uri': session['redirect_uri'],
         'state':        state,
     })
     return redirect(f"https://{shop}/admin/oauth/authorize?{params}")
