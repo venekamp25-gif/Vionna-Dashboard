@@ -113,7 +113,12 @@ HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'publish
 DRAFTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drafts')
 os.makedirs(DRAFTS_DIR, exist_ok=True)
 
-SCOPES      = 'write_products,read_products'
+# Scopes the dashboard needs from Shopify. After changing this list, every
+# already-authorised store needs to re-grant — visit /auth/dk and /auth/fr
+# once to issue a fresh token with the new scopes. publications scopes are
+# required for the GraphQL `publishablePublish` mutation that links each
+# created product to Online Store / Facebook / Google sales channels.
+SCOPES      = 'write_products,read_products,read_publications,write_publications'
 # APP_URL env var should be set on Railway to https://your-app.up.railway.app
 _APP_URL    = os.getenv('APP_URL', 'http://localhost:5000').rstrip('/')
 REDIRECT_URI = f'{_APP_URL}/callback'
@@ -787,6 +792,82 @@ def debug_metafields():
         return jsonify({'error': str(e)}), 500
 
 
+# --- Backfill: ensure every existing product is on Online Store + Facebook + Google ---
+
+@app.route('/api/backfill_sales_channels', methods=['POST'])
+def backfill_sales_channels():
+    """Walk every product in a store and (re-)publish it to the three default
+    sales channels. Idempotent — products already on a channel are silently
+    re-confirmed by Shopify, no duplicate publications get created.
+
+    Usage:
+      curl -X POST .../api/backfill_sales_channels?store=dk
+      curl -X POST .../api/backfill_sales_channels?store=fr
+
+    Returns a per-store summary with counts of successes / failures and any
+    error messages encountered.
+    """
+    store = request.args.get('store', 'dk')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()} store.'}), 401
+
+    hdrs = shopify_headers(store)
+    pubs = _list_publications(store, hdrs)
+    targets = _default_publication_targets(pubs)
+    if not targets:
+        return jsonify({
+            'error': 'No matching publications (Online Store / Facebook / Google) found in this shop.',
+            'available_publications': [p.get('name') for p in pubs],
+        }), 400
+
+    successes = 0
+    failures = []
+    samples_published = []
+
+    # Paginate via the Link header — Shopify returns up to 250 per page.
+    next_url = shopify_url(store, 'products.json?limit=250&fields=id,title,status&status=active,draft,archived')
+    while next_url:
+        try:
+            r = req.get(next_url, headers=hdrs, timeout=20)
+        except Exception as e:
+            failures.append({'page': next_url, 'error': str(e)})
+            break
+        if r.status_code != 200:
+            failures.append({'page': next_url, 'status': r.status_code, 'body': r.text[:200]})
+            break
+
+        products = r.json().get('products', [])
+        for p in products:
+            pid = p.get('id')
+            if not pid:
+                continue
+            errs = _publish_to_default_channels(store, pid, hdrs)
+            if errs:
+                failures.append({'product_id': pid, 'title': p.get('title'), 'errors': errs})
+            else:
+                successes += 1
+                if len(samples_published) < 5:
+                    samples_published.append({
+                        'id': pid,
+                        'title': p.get('title'),
+                        'status': p.get('status'),
+                    })
+
+        # Next page via Link header
+        link = r.headers.get('Link') or r.headers.get('link') or ''
+        m = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        next_url = m.group(1) if m else None
+
+    return jsonify({
+        'store': store,
+        'targets': [p.get('name') for p in targets],
+        'successes': successes,
+        'failures_count': len(failures),
+        'failures': failures[:20],
+        'samples_published': samples_published,
+    })
+
+
 # --- Per-user draft storage ---
 
 def _sanitize_owner(raw):
@@ -1338,6 +1419,90 @@ def _probe_collection_by_handle(store, handle, hdrs):
     return None, None
 
 
+# ── Sales-channel publishing ──────────────────────────────────────────
+#
+# Every product we create needs to live on Online Store + Facebook + Google
+# regardless of its active/draft status. Shopify models this as a per-channel
+# "publication" linked to the product. Listing publications is REST, but the
+# actual link goes through GraphQL `publishablePublish` (the REST product
+# publications resource is partially deprecated and doesn't cover all channels).
+#
+# Publications rarely change, so we cache the lookup per process — first
+# product publish does the fetch, subsequent ones reuse it. Restart the
+# backend if a sales channel gets added/renamed.
+_PUBLICATION_CACHE: dict = {}  # store_key -> list of {id, name}
+
+# Match shop-configured publication names case-insensitively. Shopify renames
+# these every couple of years (Facebook → Facebook & Instagram, Google →
+# Google & YouTube, etc.) so we use substring matches.
+_DEFAULT_PUBLICATION_MATCHERS = ('online store', 'facebook', 'google')
+
+
+def _list_publications(store, hdrs):
+    if store in _PUBLICATION_CACHE:
+        return _PUBLICATION_CACHE[store]
+    try:
+        r = req.get(shopify_url(store, 'publications.json'), headers=hdrs, timeout=15)
+        if r.status_code == 200:
+            pubs = r.json().get('publications', [])
+            _PUBLICATION_CACHE[store] = pubs
+            return pubs
+        print(f"[publications] list failed ({store}): {r.status_code} — {r.text[:200]}")
+    except Exception as e:
+        print(f"[publications] list error ({store}): {e}")
+    _PUBLICATION_CACHE[store] = []
+    return []
+
+
+def _default_publication_targets(pubs):
+    """Filter to the three sales channels we always want products on."""
+    out = []
+    for p in pubs:
+        name = (p.get('name') or '').lower()
+        if any(needle in name for needle in _DEFAULT_PUBLICATION_MATCHERS):
+            out.append(p)
+    return out
+
+
+def _publish_to_default_channels(store, product_id, hdrs):
+    """Run the publishablePublish GraphQL mutation against the standard channels.
+    Returns a list of error strings (empty = full success)."""
+    pubs = _list_publications(store, hdrs)
+    targets = _default_publication_targets(pubs)
+    if not targets:
+        return ['no matching publications (Online Store / Facebook / Google) found in shop']
+
+    product_gid = f'gid://shopify/Product/{product_id}'
+    publication_inputs = [
+        {'publicationId': f'gid://shopify/Publication/{p["id"]}'} for p in targets
+    ]
+    mutation = (
+        'mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {'
+        ' publishablePublish(id: $id, input: $input) {'
+        '   publishable { ... on Product { id } }'
+        '   userErrors { field message }'
+        ' }'
+        '}'
+    )
+    body = {
+        'query': mutation,
+        'variables': {'id': product_gid, 'input': publication_inputs},
+    }
+    try:
+        r = req.post(shopify_url(store, 'graphql.json'), headers=hdrs, json=body, timeout=15)
+    except Exception as e:
+        return [f'graphql request failed: {e}']
+    if r.status_code != 200:
+        return [f'graphql HTTP {r.status_code}: {r.text[:200]}']
+
+    payload = r.json() or {}
+    if payload.get('errors'):
+        return [str(e.get('message') or e) for e in payload['errors']]
+    pub_payload = (payload.get('data') or {}).get('publishablePublish') or {}
+    user_errors = pub_payload.get('userErrors') or []
+    return [f"{(ue.get('field') or [''])[0]}: {ue.get('message')}" for ue in user_errors]
+
+
 def _ensure_siblings_collection(store, product_name, siblings_handle, hdrs, base):
     """Create or reuse the siblings collection. Returns (collection_id, actual_handle, was_reused).
 
@@ -1482,6 +1647,17 @@ def _publish_one_variant(
         req.post(f"{base}collects.json", headers=hdrs, json={
             'collect': {'product_id': prod_id, 'collection_id': collection_id}
         })
+
+    # --- Publish to default sales channels (Online Store, Facebook, Google) ---
+    # Done unconditionally regardless of product status (draft or active) — the
+    # user wants every duplicate listed on every channel from day one.
+    try:
+        channel_errors = _publish_to_default_channels(store, prod_id, hdrs)
+        if channel_errors:
+            for err in channel_errors:
+                mf_errors.append(f'sales channels: {err}')
+    except Exception as e:
+        mf_errors.append(f'sales channels: {e}')
 
     shop_domain = tokens.get(store, {}).get('shop', '')
     product_url = f'https://{shop_domain}/admin/products/{prod_id}' if shop_domain else ''
