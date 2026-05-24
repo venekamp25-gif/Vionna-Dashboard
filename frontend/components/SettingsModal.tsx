@@ -24,6 +24,31 @@ export function SettingsModal({ open, onClose }: Props) {
   const [fetching, setFetching] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
 
+  // Sales-channel backfill state
+  type ChannelResult = Awaited<ReturnType<typeof api.backfillSalesChannels>>;
+  const [backfillBusy, setBackfillBusy] = useState<StoreKey | null>(null);
+  const [backfillResult, setBackfillResult] = useState<
+    Partial<Record<StoreKey, ChannelResult>>
+  >({});
+
+  const runBackfill = async (store: StoreKey) => {
+    setBackfillBusy(store);
+    try {
+      const res = await api.backfillSalesChannels(store);
+      setBackfillResult((r) => ({ ...r, [store]: res }));
+    } catch (e) {
+      setBackfillResult((r) => ({
+        ...r,
+        [store]: {
+          store, targets: [], successes: 0, failures_count: 0, failures: [],
+          error: e instanceof Error ? e.message : String(e),
+        } as ChannelResult,
+      }));
+    } finally {
+      setBackfillBusy(null);
+    }
+  };
+
   // Re-sync the local draft each time the modal opens (so cancel works)
   useEffect(() => {
     if (open) {
@@ -191,6 +216,65 @@ export function SettingsModal({ open, onClose }: Props) {
               + Add another example
             </Button>
           )}
+
+          {/* ── Sales channels backfill ────────────────────────────── */}
+          <div className="mt-8 pt-6 border-t border-border">
+            <div className="text-[14px] font-semibold text-text mb-1">
+              Sales channels
+            </div>
+            <p className="text-[12px] text-text-faint mb-3 leading-relaxed">
+              Every newly imported product is automatically published to
+              Online Store, Facebook and Google. Click the button below to
+              also retroactively publish every <em>existing</em> product in
+              your catalogue (active or draft) to the same three channels.
+              Idempotent — products already on a channel are silently
+              re-confirmed.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {(["dk", "fr"] as StoreKey[]).map((s) => {
+                const busy = backfillBusy === s;
+                const result = backfillResult[s];
+                return (
+                  <div key={s} className="flex flex-col gap-1 min-w-[200px]">
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => runBackfill(s)}
+                      disabled={busy || backfillBusy !== null}
+                    >
+                      {busy
+                        ? `⟳ Running on ${STORE_CONFIG[s].label}…`
+                        : `↻ Backfill ${STORE_CONFIG[s].label}`}
+                    </Button>
+                    {result && (
+                      <div className="text-[11px] leading-relaxed">
+                        {result.error ? (
+                          <span className="text-danger">
+                            ✕ {result.error}
+                            {result.available_publications && result.available_publications.length > 0 && (
+                              <span className="block text-text-faint">
+                                Available: {result.available_publications.join(", ")}
+                              </span>
+                            )}
+                          </span>
+                        ) : (
+                          <span className="text-accent">
+                            ✓ Published {result.successes} products to{" "}
+                            {result.targets.join(", ")}
+                            {result.failures_count > 0 && (
+                              <span className="block text-warning">
+                                ⚠ {result.failures_count} failed — see console
+                              </span>
+                            )}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
         </div>
 
         <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-border bg-bg-elev-2 rounded-b-2xl">

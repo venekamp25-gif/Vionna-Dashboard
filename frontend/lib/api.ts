@@ -172,6 +172,18 @@ export const api = {
     siblings_handle: string;
   }) => call<PublishStartStoreResponse>("/api/publish/start_store", { method: "POST", body: params }),
 
+  backfillSalesChannels: (store: "dk" | "fr") =>
+    call<{
+      store: string;
+      targets: string[];
+      successes: number;
+      failures_count: number;
+      failures: { product_id?: number; title?: string; errors?: string[] }[];
+      samples_published?: { id: number; title: string; status: string }[];
+      error?: string;
+      available_publications?: string[];
+    }>(`/api/backfill_sales_channels?store=${store}`, { method: "POST" }),
+
   recentDescriptions: (params: { store: "dk" | "fr"; limit?: number }) => {
     const qs = new URLSearchParams();
     qs.set("store", params.store);
