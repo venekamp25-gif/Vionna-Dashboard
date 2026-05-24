@@ -258,12 +258,23 @@ export function SettingsModal({ open, onClose }: Props) {
                             )}
                           </span>
                         ) : (
-                          <span className="text-accent">
-                            ✓ Published {result.successes} products to{" "}
+                          <span className={result.successes > 0 ? "text-accent" : "text-warning"}>
+                            {result.successes > 0 ? "✓" : "⚠"} {result.successes} of{" "}
+                            {result.successes + result.failures_count} products published to{" "}
                             {result.targets.join(", ")}
                             {result.failures_count > 0 && (
-                              <span className="block text-warning">
-                                ⚠ {result.failures_count} failed — see console
+                              <span className="block text-warning mt-1">
+                                ⚠ {result.failures_count} failed
+                                {result.first_failure_error && (
+                                  <span className="block text-danger mt-0.5 break-words">
+                                    First error: {result.first_failure_error}
+                                  </span>
+                                )}
+                                {result.error_summary && Object.keys(result.error_summary).length > 1 && (
+                                  <span className="block text-text-faint mt-0.5">
+                                    {Object.keys(result.error_summary).length} distinct error types
+                                  </span>
+                                )}
                               </span>
                             )}
                           </span>

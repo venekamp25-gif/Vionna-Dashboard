@@ -179,6 +179,8 @@ export const api = {
       successes: number;
       failures_count: number;
       failures: { product_id?: number; title?: string; errors?: string[] }[];
+      first_failure_error?: string | null;
+      error_summary?: Record<string, number>;
       samples_published?: { id: number; title: string; status: string }[];
       error?: string;
       available_publications?: string[];

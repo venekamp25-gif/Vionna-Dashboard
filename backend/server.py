@@ -878,12 +878,24 @@ def backfill_sales_channels():
         m = re.search(r'<([^>]+)>;\s*rel="next"', link)
         next_url = m.group(1) if m else None
 
+    # Pull out a representative first-failure error so the dashboard can
+    # surface WHY everything blew up without forcing the user to dig into
+    # the full failures list. Group by the first error message so we can
+    # tell whether 1274 failures are 1 root cause or many distinct ones.
+    error_summary: dict = {}
+    for f in failures:
+        errs = f.get('errors') or [f.get('error') or '?']
+        key = (errs[0] or '?')[:200]
+        error_summary[key] = error_summary.get(key, 0) + 1
+
     return jsonify({
         'store': store,
         'targets': [p.get('name') for p in targets],
         'successes': successes,
         'failures_count': len(failures),
         'failures': failures[:20],
+        'first_failure_error': (failures[0].get('errors') or [failures[0].get('error')])[0] if failures else None,
+        'error_summary': error_summary,
         'samples_published': samples_published,
     })
 
@@ -1475,13 +1487,18 @@ def _list_publications(store, hdrs):
 
 
 def _default_publication_targets(pubs):
-    """Filter to the three sales channels we always want products on."""
-    out = []
+    """Filter to the three sales channels we always want products on. Picks at
+    most ONE publication per category (online-store / facebook / google) — some
+    shops have multiple Facebook channels (Shop, Marketplace, Instagram) which
+    would otherwise inflate the list and waste mutations on near-duplicates."""
+    chosen_by_category: dict = {}
     for p in pubs:
         name = (p.get('name') or '').lower()
-        if any(needle in name for needle in _DEFAULT_PUBLICATION_MATCHERS):
-            out.append(p)
-    return out
+        for needle in _DEFAULT_PUBLICATION_MATCHERS:
+            if needle in name and needle not in chosen_by_category:
+                chosen_by_category[needle] = p
+                break
+    return list(chosen_by_category.values())
 
 
 def _publish_to_default_channels(store, product_id, hdrs):
