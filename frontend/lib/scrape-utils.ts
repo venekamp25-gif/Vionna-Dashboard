@@ -1,20 +1,41 @@
 import type { ScrapedProduct } from "./api";
 
-const SIZE_RE = /^(xs|s|m|l|xl|xxl|xxxl|one size|os|\d{1,3}(cm)?)$/i;
-const COLOR_OPT_RE = /colou?r|kleur|farve|couleur/i;
+// Recognise the full Shopify-ish size lexicon so an option like
+// ["XXS","XS","S","M","L","XL","XXL","3XL"] is correctly identified as
+// SIZES rather than mistaken for colour values (would otherwise cause the
+// dashboard to show "Xxs / Xs / S / M / L / Xl" as colour chips).
+const SIZE_RE = /^(x{0,5}s|m|l|x{0,5}l|[2-5]xs|[2-5]xl|one\s?size|os|free\s?size|\d{1,3}(cm|mm)?|(uk|us|eu|fr|it)\s?\d{1,2}(\.\d)?)$/i;
+const COLOR_OPT_RE = /colou?r|kleur|farve|couleur|colore/i;
+const SIZE_OPT_NAME_RE = /size|maat|taille|størrelse|talla/i;
 
 /** Extract color list from a scraped product (Shopify .json format). */
 export function extractColors(product: ScrapedProduct["product"]): string[] {
   if (!product) return [];
 
   const isSize = (v: string) => SIZE_RE.test(v.trim());
+  const isSizeOption = (name: string) => SIZE_OPT_NAME_RE.test(name || "");
 
-  // Find an option named like "Color/Colour/Kleur/Farve/Couleur",
-  // else any option whose values are NOT all sizes.
   const opts = product.options ?? [];
-  const colorOpt =
-    opts.find((o) => COLOR_OPT_RE.test(o.name)) ||
-    opts.find((o) => o.values?.length && !o.values.every(isSize));
+
+  // 1. Highest-confidence match: option NAME literally contains "color".
+  let colorOpt =
+    opts.find((o) => COLOR_OPT_RE.test(o.name)) || null;
+
+  // 2. If no name-based match, take ANY option that is NOT explicitly named
+  //    "size" AND whose values are not all sizes. The size-name exclusion is
+  //    what catches meshki.co.uk where the only option is `SIZE` with values
+  //    ["XXS","XS",...,"3XL"] — without it, an exotic size like "3XL" that
+  //    slipped past SIZE_RE would make us misinterpret the whole option as a
+  //    colour list.
+  if (!colorOpt) {
+    colorOpt =
+      opts.find(
+        (o) =>
+          !isSizeOption(o.name) &&
+          o.values?.length &&
+          !o.values.every(isSize)
+      ) || null;
+  }
 
   if (colorOpt?.values?.length && !colorOpt.values.every(isSize)) {
     return colorOpt.values.slice(0, 6);
@@ -22,11 +43,29 @@ export function extractColors(product: ScrapedProduct["product"]): string[] {
 
   // Fallback: derive from handle (skip generic clothing words).
   const handle = product.handle || "";
-  const skip = /^(dress|top|skirt|blouse|coat|jacket|shirt|pants|jeans|mini|maxi|midi|womens|women)$/i;
-  const last = handle.split("-").filter((w) => w.length > 2 && !skip.test(w)).pop();
-  if (last) return [last.charAt(0).toUpperCase() + last.slice(1)];
+  const skip = /^(dress|top|skirt|blouse|coat|jacket|shirt|pants|jeans|mini|maxi|midi|womens|women|lace|satin|silk|cotton|linen|long|short|sleeve|sleeveless)$/i;
+  // Single-colour names are usually 1 word at the end of the handle (e.g.
+  // `dinah-lace-and-satin-maxi-dress-black`). Two-word colours (e.g.
+  // `royal-blue`, `dusty-pink`) are common enough that we also try the last
+  // TWO tokens combined when the last one is a generic colour modifier.
+  const tokens = handle.split("-").filter((w) => w.length > 1 && !skip.test(w));
+  if (tokens.length === 0) return [];
+  const lastTwo = tokens.slice(-2).join(" ");
+  const lastOne = tokens[tokens.length - 1];
+  // Prefer the two-token form ONLY when both look like real words (no digits)
+  // and the first of the two is a known colour modifier.
+  const modifier = /^(light|dark|deep|bright|hot|baby|dusty|royal|navy|forest|burnt|rose|ice)$/i;
+  if (tokens.length >= 2 && modifier.test(tokens[tokens.length - 2])) {
+    return [titleCase(lastTwo)];
+  }
+  return [titleCase(lastOne)];
+}
 
-  return [];
+function titleCase(s: string): string {
+  return s
+    .split(/\s+/)
+    .map((w) => (w ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : w))
+    .join(" ");
 }
 
 const TYPE_MAP: [string, RegExp][] = [
