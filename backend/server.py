@@ -256,8 +256,72 @@ def status():
 
 
 # --- Scrape competitor product (server-side, geen CORS) ---
-_COLOR_OPT_RE = re.compile(r'colou?r|kleur|farve|couleur', re.I)
-_SIZE_OPT_RE  = re.compile(r'size|maat|taille|størrelse', re.I)
+_COLOR_OPT_RE = re.compile(r'colou?r|kleur|farve|couleur|colore', re.I)
+_SIZE_OPT_RE  = re.compile(r'size|maat|taille|størrelse|talla', re.I)
+
+# Handle-token classifiers used to derive a colour from a product handle when
+# the product itself has no Color option (e.g. meshki.co.uk where the variants
+# are split per-colour as separate products and the only option is "SIZE").
+_HANDLE_NOISE_WORDS = re.compile(
+    r'^(dress|top|skirt|blouse|coat|jacket|shirt|pants|jeans|mini|maxi|midi|'
+    r'womens?|men|mens|kids?|lace|satin|silk|cotton|linen|long|short|'
+    r'sleeve|sleeveless|knit|woven|with|and|the|of|for|new|sale)$', re.I
+)
+_HANDLE_COLOR_MODIFIER = re.compile(
+    r'^(light|dark|deep|bright|hot|baby|dusty|royal|navy|forest|burnt|rose|ice|'
+    r'pastel|neon|soft|warm|cool|pale)$', re.I
+)
+
+
+def _derive_color_from_handle(handle):
+    """Extract a colour name from a product handle when there's no Color
+    option. Mirrors the frontend's extractColors fallback so backend +
+    frontend agree on what counts as 'the colour' for sibling discovery."""
+    if not handle:
+        return None
+    tokens = [
+        t for t in handle.split('-')
+        if len(t) > 1 and not _HANDLE_NOISE_WORDS.match(t) and not t.isdigit()
+    ]
+    if not tokens:
+        return None
+    last = tokens[-1]
+    # Two-word colours: "royal-blue", "dusty-pink", "light-grey"
+    if len(tokens) >= 2 and _HANDLE_COLOR_MODIFIER.match(tokens[-2]):
+        return f'{tokens[-2].capitalize()} {last.capitalize()}'
+    return last.capitalize()
+
+
+def _ensure_color_option(product):
+    """If a product has no Color option, synthesize one from the handle suffix
+    and inject it as option1 + variant.option1. Idempotent — no-op if a Color
+    option already exists. Used so the sibling-merge logic works the same on
+    'one-product-per-colour' shops that don't declare Color in their .json
+    (meshki.co.uk et al.)."""
+    if not isinstance(product, dict):
+        return product
+    opts = product.get('options') or []
+    if any(_COLOR_OPT_RE.search(o.get('name', '') or '') for o in opts):
+        return product
+    derived = _derive_color_from_handle(product.get('handle', ''))
+    if not derived:
+        return product
+
+    # Build the new options list with Color first.
+    new_opts = [{'name': 'Color', 'position': 1, 'values': [derived]}]
+    for o in opts:
+        new_opts.append({**o, 'position': (o.get('position') or 1) + 1})
+    product['options'] = new_opts
+
+    # Re-slot every variant so option1 = colour, option2 = whatever option1
+    # used to be (typically size). Preserves option3 as None.
+    for v in product.get('variants') or []:
+        old1 = v.get('option1')
+        old2 = v.get('option2')
+        v['option1'] = derived
+        v['option2'] = old1 if old1 is not None else old2
+        v['option3'] = None
+    return product
 
 # Some Shopify stores (e.g. rosamae.co.uk) enable Bot Protection that blocks
 # every UA starting with "Mozilla/" while letting non-browser UAs through.
@@ -315,22 +379,29 @@ def _find_color_sibling_handles(html_text, base_handle, color_slug):
 def _fetch_product_json(scheme, netloc, handle):
     """Fetch /products/<handle>.json and return the product dict, or None.
     Falls back to HTML+JSON-LD scraping for Shopify Plus stores that have
-    disabled the public .json endpoint (e.g. SKIMS)."""
+    disabled the public .json endpoint (e.g. SKIMS).
+
+    Always normalises the returned product so it has a Color option (derived
+    from the handle suffix when the store doesn't declare one) — needed for
+    the sibling-merge to attribute images to the right colour bucket on
+    'one-product-per-colour' shops like meshki.co.uk."""
     json_url = f'{scheme}://{netloc}/products/{handle}.json'
+    p = None
     try:
         r = _scrape_get(json_url, timeout=10)
         if r.status_code == 404:
-            # Try HTML fallback
-            return _scrape_product_from_html(scheme, netloc, handle)
-        r.raise_for_status()
-        return r.json().get('product')
+            p = _scrape_product_from_html(scheme, netloc, handle)
+        else:
+            r.raise_for_status()
+            p = r.json().get('product')
     except Exception as e:
         print(f"[scrape] sibling .json failed for {handle}: {e} — trying HTML fallback")
         try:
-            return _scrape_product_from_html(scheme, netloc, handle)
+            p = _scrape_product_from_html(scheme, netloc, handle)
         except Exception as e2:
             print(f"[scrape] HTML fallback also failed for {handle}: {e2}")
             return None
+    return _ensure_color_option(p) if p else None
 
 
 def _scrape_product_from_html(scheme, netloc, handle, html_text=None):
@@ -632,6 +703,12 @@ def scrape():
         return jsonify({'error': str(e), 'url_tried': json_url}), 500
     if base is None:
         base = {}
+
+    # Make sure the base product has a Color option even if the shop only
+    # exposes Size (meshki.co.uk pattern). After this, the sibling-discovery
+    # code below works uniformly regardless of how the upstream shop models
+    # colour.
+    base = _ensure_color_option(base)
 
     # Detect the "one-product-per-colour" pattern (Billy J etc.) and merge sibling
     # colour-products into the result so the dashboard sees ONE multi-colour product.
