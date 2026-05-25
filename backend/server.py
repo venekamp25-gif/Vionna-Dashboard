@@ -662,6 +662,13 @@ def _merge_sibling_color_products(base, siblings):
 @app.route('/api/scrape', methods=['POST'])
 def scrape():
     raw = (request.json.get('url') or '').strip()
+    # Defensive: if the user accidentally pasted the URL twice (e.g. Ctrl+V
+    # into a field that already contained the URL), strip everything from the
+    # SECOND http(s):// onward. Otherwise urlparse mashes both into one path
+    # and we end up requesting "/products/<handle>https://..." which 404s.
+    second = raw.find('http', 1)
+    if second > 0:
+        raw = raw[:second].rstrip()
     # Strip tracking query params / fragments — Shopify needs a clean /products/handle URL
     parsed = urllib.parse.urlparse(raw)
     clean_path = parsed.path.rstrip('/')
