@@ -227,9 +227,33 @@ export const BACKEND = BACKEND_URL;
 
 // ── Auth: who's logged in (served by Next.js, not the Python backend) ──
 
+/**
+ * Soft-redirect to /login when the user's session is gone. Used by
+ * fetchCurrentUser (the only call that can return 401) so an expired
+ * cookie mid-session shows the login page instead of a silently broken UI.
+ *
+ * Uses a window-scoped guard so a burst of failing calls (e.g. several
+ * components fetching /api/me on mount) only triggers ONE redirect.
+ */
+function redirectToLoginOnce() {
+  if (typeof window === "undefined") return;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const w = window as any;
+  if (w.__vionna_redirecting_to_login) return;
+  if (window.location.pathname === "/login") return;
+  w.__vionna_redirecting_to_login = true;
+  // Preserve where we were so the user can resume after re-login
+  const ret = encodeURIComponent(window.location.pathname + window.location.search);
+  window.location.href = `/login?return=${ret}`;
+}
+
 export async function fetchCurrentUser(): Promise<{ email: string | null }> {
   try {
     const res = await fetch("/api/me", { credentials: "include", cache: "no-store" });
+    if (res.status === 401) {
+      redirectToLoginOnce();
+      return { email: null };
+    }
     if (!res.ok) return { email: null };
     return (await res.json()) as { email: string | null };
   } catch {

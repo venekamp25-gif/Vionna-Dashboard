@@ -5,9 +5,17 @@ import { StoreKey } from "./store";
 import { draftsApi, fetchCurrentUser } from "./api";
 
 /**
- * localStorage key for the auto-saved draft. Bump the suffix when the ProductData
- * shape changes in a non-backward-compatible way so stale drafts get discarded.
- * Used as an offline fallback when server-side drafts are unreachable.
+ * Current ProductData schema version. Bump this any time we make a
+ * non-backward-compatible change to ProductData (e.g. dropping a field,
+ * renaming, changing key types). Drafts with a lower schema_version are
+ * discarded on load rather than crashed against.
+ */
+const PRODUCT_DATA_SCHEMA_VERSION = 2;
+
+/**
+ * localStorage key for the auto-saved draft. Used as an offline fallback when
+ * server-side drafts are unreachable. The schema_version is embedded inside the
+ * payload (not in the key) so we can detect+drop stale shapes gracefully.
  */
 const DRAFT_STORAGE_KEY = "vionna-dashboard:active-draft-v1";
 
@@ -247,6 +255,11 @@ const ProductContext = createContext<ProductContextType>({
   flushDraft: () => {},
 });
 
+/** Stamp the current schema version onto a payload before writing it. */
+function withSchemaVersion(d: ProductData): ProductData & { _schema_version: number } {
+  return { ...d, _schema_version: PRODUCT_DATA_SCHEMA_VERSION };
+}
+
 /** Build a StoreContent snapshot from the current top-level mirror fields. */
 function snapshotActive(prev: ProductData): StoreContent {
   const colorLabels: Record<string, string> = {};
@@ -268,10 +281,19 @@ function snapshotActive(prev: ProductData): StoreContent {
  * older drafts wouldn't have known about. Without this a draft saved before
  * we added e.g. `keywordsByStore` would crash on first `data.keywordsByStore[s]`
  * access.
+ *
+ * Returns `null` when the draft is from a future schema version we don't
+ * understand — caller treats null as "no draft" and starts fresh.
  */
-function stripInternalKeys(d: ProductData & { _saved_at?: string }): ProductData {
-  const { _saved_at, ...rest } = d;
+function stripInternalKeys(
+  d: ProductData & { _saved_at?: string; _schema_version?: number }
+): ProductData | null {
+  const { _saved_at, _schema_version, ...rest } = d;
   void _saved_at;
+  // Reject drafts from a FUTURE schema we don't understand (after a rollback).
+  if (typeof _schema_version === "number" && _schema_version > PRODUCT_DATA_SCHEMA_VERSION) {
+    return null;
+  }
   const merged: ProductData = {
     ...DEFAULT_DATA,
     ...(rest as ProductData),
@@ -359,12 +381,17 @@ export function ProductProvider({ children }: { children: ReactNode }) {
           if (cancelled) return;
           const serverDraft = r.draft;
           if (serverDraft && isDraftWorthSaving(serverDraft)) {
-            savedDraftRef.current = stripInternalKeys(serverDraft);
-            setDraftSource("server");
-            setDraftSavedAt(r.saved_at ?? serverDraft._saved_at ?? null);
-            setHasSavedDraft(true);
-            hasMountedRef.current = true;
-            return;
+            const restored = stripInternalKeys(serverDraft);
+            if (restored) {
+              savedDraftRef.current = restored;
+              setDraftSource("server");
+              setDraftSavedAt(r.saved_at ?? serverDraft._saved_at ?? null);
+              setHasSavedDraft(true);
+              hasMountedRef.current = true;
+              return;
+            }
+            // Future-schema draft — drop it silently.
+            void draftsApi.clear(owner);
           }
         } catch {
           // Server unreachable — drop to localStorage
@@ -375,11 +402,16 @@ export function ProductProvider({ children }: { children: ReactNode }) {
       try {
         const raw = window.localStorage.getItem(DRAFT_STORAGE_KEY);
         if (raw) {
-          const parsed = JSON.parse(raw) as ProductData;
+          const parsed = JSON.parse(raw) as ProductData & { _schema_version?: number };
           if (isDraftWorthSaving(parsed)) {
-            savedDraftRef.current = parsed;
-            setDraftSource("local");
-            setHasSavedDraft(true);
+            const restored = stripInternalKeys(parsed);
+            if (restored) {
+              savedDraftRef.current = restored;
+              setDraftSource("local");
+              setHasSavedDraft(true);
+            } else {
+              window.localStorage.removeItem(DRAFT_STORAGE_KEY);
+            }
           }
         }
       } catch {
@@ -398,7 +430,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     const id = setTimeout(() => {
       try {
         if (isDraftWorthSaving(data)) {
-          window.localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(data));
+          window.localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(withSchemaVersion(data)));
         } else {
           window.localStorage.removeItem(DRAFT_STORAGE_KEY);
         }
@@ -426,7 +458,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     if (!isDraftWorthSaving(data)) return;
     const id = setTimeout(() => {
       draftsApi
-        .save(owner, data)
+        .save(owner, withSchemaVersion(data))
         .catch(() => {
           // Network issues — localStorage already has the data
         });
@@ -449,7 +481,7 @@ export function ProductProvider({ children }: { children: ReactNode }) {
           (process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/+$/, "") ||
             "http://localhost:5000") +
           `/api/drafts?owner=${encodeURIComponent(owner)}`;
-        const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+        const blob = new Blob([JSON.stringify(withSchemaVersion(data))], { type: "application/json" });
         navigator.sendBeacon(url, blob);
       } catch {
         // Best effort; localStorage still has the data anyway.
@@ -499,11 +531,12 @@ export function ProductProvider({ children }: { children: ReactNode }) {
     const current = dataRef.current;
     if (!isDraftWorthSaving(current)) return;
     // localStorage is synchronous and bulletproof — write there first
+    const versioned = withSchemaVersion(current);
     try {
-      window.localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(current));
+      window.localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(versioned));
     } catch {}
     // Server is fire-and-forget — debounced effect can race; that's fine.
-    void draftsApi.save(owner, current).catch(() => {});
+    void draftsApi.save(owner, versioned).catch(() => {});
   }, [hasSavedDraft]);
 
   const patch = useCallback(

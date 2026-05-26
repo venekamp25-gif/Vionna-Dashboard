@@ -377,7 +377,27 @@ export function ReviewStep() {
           )}
         </div>
         <div className="flex gap-2">
-          <Button variant="secondary" onClick={() => setStep(1)} disabled={publishing}>
+          <Button
+            variant="secondary"
+            onClick={() => {
+              // Warn before tossing in-progress work (NB photos / pool selections).
+              const hasNbWork =
+                Object.values(data.nbResults).some((arr) => (arr ?? []).some((r) => r.url)) ||
+                Object.values(data.nbResultsPerColor).some((arr) => (arr ?? []).some((r) => r.url));
+              const hasPool = data.publishPool.length > 0;
+              if ((hasNbWork || hasPool) &&
+                  !confirm(
+                    "You have generated photos that haven't been published yet. " +
+                    "Going back to Input will keep the current product loaded, " +
+                    "but you'll lose your progress if you start a new scrape. " +
+                    "Continue?"
+                  )) {
+                return;
+              }
+              setStep(1);
+            }}
+            disabled={publishing}
+          >
             ← New product
           </Button>
           <Button variant="publish" onClick={publish} disabled={publishing}>

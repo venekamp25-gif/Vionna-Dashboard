@@ -5,6 +5,7 @@ import { useToneReferences, ToneReferences } from "@/lib/toneReference";
 import { StoreKey, STORE_CONFIG } from "@/lib/store";
 import { Button } from "@/components/ui/Button";
 import { api } from "@/lib/api";
+import { useProduct } from "@/lib/product";
 
 interface Props {
   open: boolean;
@@ -19,10 +20,23 @@ interface Props {
  */
 export function SettingsModal({ open, onClose }: Props) {
   const { refs, update } = useToneReferences();
+  const { clearDraft } = useProduct();
   const [draft, setDraft] = useState<ToneReferences>({ dk: [], fr: [] });
   const [activeTab, setActiveTab] = useState<StoreKey>("dk");
   const [fetching, setFetching] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
+
+  const handleResetDraft = () => {
+    if (!confirm(
+      "Discard the current product and wipe the saved draft (both in this browser AND on the cloud)? " +
+      "This cannot be undone."
+    )) return;
+    clearDraft();
+    // Soft reload so the in-memory state resets too
+    if (typeof window !== "undefined") {
+      window.location.reload();
+    }
+  };
 
   // Sales-channel backfill state
   type ChannelResult = Awaited<ReturnType<typeof api.backfillSalesChannels>>;
@@ -285,6 +299,22 @@ export function SettingsModal({ open, onClose }: Props) {
                 );
               })}
             </div>
+          </div>
+
+          {/* ── Reset draft (escape hatch) ─────────────────────────── */}
+          <div className="mt-6 pt-6 border-t border-border">
+            <div className="text-[14px] font-semibold text-text mb-1">
+              Reset draft
+            </div>
+            <p className="text-[12px] text-text-faint mb-3 leading-relaxed">
+              Use this if the dashboard is stuck on a broken product state —
+              clears the auto-saved draft from both your browser AND the cloud,
+              then reloads the page. Won&apos;t affect anything already published to
+              Shopify.
+            </p>
+            <Button variant="secondary" size="sm" onClick={handleResetDraft}>
+              ✕ Discard current draft &amp; reload
+            </Button>
           </div>
         </div>
 
