@@ -409,6 +409,58 @@ def _looks_like_shopify_json(data):
     return isinstance(p, dict) and ('options' in p or 'variants' in p or 'images' in p)
 
 
+class _PrivateShopError(Exception):
+    """Raised when a Shopify store is password-protected, in maintenance
+    mode, or otherwise gating its storefront. Caught by /api/scrape so we
+    can return a friendly 'this shop is private' message."""
+    pass
+
+
+def _detect_private_shop(response_text):
+    """Return True if the response text looks like a Shopify password /
+    coming-soon / private storefront page."""
+    head = (response_text or '')[:8000].lower()
+    return (
+        'password_required' in head or
+        'enter store password' in head or
+        ('shop is in development mode' in head and 'shopify' in head) or
+        'password-page' in head
+    )
+
+
+def _scrape_response_too_large(r, max_bytes=5_000_000):
+    """If the upstream sends Content-Length > 5MB, refuse to read it."""
+    cl = r.headers.get('Content-Length')
+    if cl and cl.isdigit() and int(cl) > max_bytes:
+        return int(cl)
+    return 0
+
+
+def _map_higgsfield_error(raw):
+    """Translate Higgsfield's raw error output into a user-actionable message.
+    The CLI / API doesn't have a stable error-code scheme, so we string-match
+    on the most common failure modes we've seen. Falls back to a trimmed raw
+    string when nothing matches."""
+    if not raw:
+        return 'Higgsfield returned no output.'
+    low = raw.lower()
+    if 'insufficient' in low and ('credit' in low or 'balance' in low):
+        return 'Higgsfield account is out of credits. Top up at higgsfield.ai or wait for the daily quota to reset.'
+    if 'quota' in low and ('exceed' in low or 'exhaust' in low or 'limit' in low):
+        return 'Higgsfield quota exceeded for this plan. Top up or wait for the reset.'
+    if 'rate limit' in low or 'too many request' in low or '429' in low:
+        return 'Higgsfield rate limit reached — wait a few seconds and click Retry.'
+    if 'unauthor' in low or 'invalid token' in low or 'expired' in low and 'session' in low:
+        return 'Higgsfield session expired — run `hf auth login` on the server.'
+    if 'timeout' in low or 'timed out' in low:
+        return 'Higgsfield timed out (took too long). Try with fewer reference images or click Retry.'
+    if 'image' in low and ('too large' in low or 'invalid' in low or 'unsupported' in low):
+        return 'A reference image was rejected (probably too large or unsupported format). Try a different ref.'
+    if 'network' in low or 'connection' in low:
+        return 'Higgsfield network error — server-side connectivity issue. Click Retry.'
+    return raw[:200]
+
+
 def _sane_image_url(u):
     """Reject image URLs that would break downstream (Higgsfield refuses SVG /
     animated GIF, sprite-sheets are tiny icons, etc.). Belt-and-suspenders
@@ -757,16 +809,62 @@ def scrape():
     # Strip tracking query params / fragments — Shopify needs a clean /products/handle URL
     parsed = urllib.parse.urlparse(raw)
     clean_path = parsed.path.rstrip('/')
+    # Normalisation A: collection-prefixed URLs (Shopify allows both
+    # /products/x AND /collections/foo/products/x). The .json endpoint only
+    # exists under /products/x — strip any collection prefix here.
+    clean_path = re.sub(r'^/collections/[^/]+/products/', '/products/', clean_path)
     json_path = clean_path if clean_path.endswith('.json') else clean_path + '.json'
     html_path = clean_path[:-5] if clean_path.endswith('.json') else clean_path
     scheme   = parsed.scheme or 'https'
     json_url = urllib.parse.urlunparse((scheme, parsed.netloc, json_path, '', '', ''))
     html_url = urllib.parse.urlunparse((scheme, parsed.netloc, html_path, '', '', ''))
 
+    # Locale-prefix fallback: many international stores use /<locale>/products/<handle>
+    # (e.g. /en-us/products/x, /fr/products/y). Some shops 404 the .json under
+    # the locale prefix but accept it without — keep a fallback URL ready.
+    locale_match = re.match(r'^/([a-z]{2}(?:-[a-z]{2})?)(/products/.+)$', clean_path, re.I)
+    json_url_nolocale = None
+    html_url_nolocale = None
+    if locale_match:
+        nolocale_path = locale_match.group(2)
+        nolocale_json = nolocale_path if nolocale_path.endswith('.json') else nolocale_path + '.json'
+        nolocale_html = nolocale_path[:-5] if nolocale_path.endswith('.json') else nolocale_path
+        json_url_nolocale = urllib.parse.urlunparse((scheme, parsed.netloc, nolocale_json, '', '', ''))
+        html_url_nolocale = urllib.parse.urlunparse((scheme, parsed.netloc, nolocale_html, '', '', ''))
+
     base = None
     fallback_html = None
     try:
-        r = _scrape_get(json_url, timeout=10)
+        r = _scrape_get(json_url, timeout=20)
+        # Locale-prefix fallback: if the prefixed URL 404'd, retry without it.
+        if r.status_code == 404 and json_url_nolocale:
+            print(f"[scrape] .json 404 with locale — retrying without prefix: {json_url_nolocale}")
+            r2 = _scrape_get(json_url_nolocale, timeout=20)
+            if r2.status_code != 404:
+                r = r2
+                # Update the URLs we'll use going forward
+                json_url = json_url_nolocale
+                html_url = html_url_nolocale or html_url
+        # Password-protected / private storefront detect — Shopify returns 401
+        # OR a 200 OK with a password-prompt HTML body. Catch both.
+        if r.status_code in (401, 403):
+            return jsonify({
+                'error': 'This Shopify store appears to require authentication or is private. We can only scrape public storefronts.',
+                'url_tried': json_url,
+            }), 400
+        if r.status_code == 200 and _detect_private_shop(r.text or ''):
+            return jsonify({
+                'error': 'This shop is password-protected or in development mode (Shopify "coming soon" / "enter password" gate). Ask the shop owner for storefront access.',
+                'url_tried': json_url,
+            }), 400
+        # Response-size cap: don't try to parse multi-MB JSON dumps (slow +
+        # memory risk). Real Shopify product.json is typically <500KB.
+        too_big = _scrape_response_too_large(r, max_bytes=5_000_000)
+        if too_big:
+            return jsonify({
+                'error': f'Upstream response is too large ({too_big} bytes). This URL probably is not a single Shopify product page.',
+                'url_tried': json_url,
+            }), 400
         if r.status_code == 404:
             # Some Shopify Plus stores disable the public .json endpoint (e.g.
             # SKIMS). Fall back to scraping the embedded JSON-LD ProductGroup
@@ -825,6 +923,15 @@ def scrape():
     # code below works uniformly regardless of how the upstream shop models
     # colour.
     base = _ensure_color_option(base)
+
+    # Sanity check: products with no variants are typically hidden / sold-out /
+    # discontinued. Generation would produce something useless. Bail with a
+    # clear message instead.
+    if not base.get('variants'):
+        return jsonify({
+            'error': 'This product has no variants — it may be hidden, sold-out, or discontinued in this store. Try another URL.',
+            'url_tried': json_url,
+        }), 400
 
     # Detect the "one-product-per-colour" pattern (Billy J etc.) and merge sibling
     # colour-products into the result so the dashboard sees ONE multi-colour product.
@@ -1567,7 +1674,9 @@ def history():
 # --- Publish helpers (shared by /api/publish and the granular per-variant endpoints) ---
 
 def _publish_to_html(text):
-    """Convert plain-text description to body_html (lists when '•' or '-')."""
+    """Convert plain-text description to body_html (lists when '•' or '-').
+    Truncates the output if it would exceed Shopify's 65535-char body_html
+    cap so the publish call doesn't get rejected with a cryptic 422."""
     lines  = (text or '').strip().splitlines()
     html   = []
     bullets = []
@@ -1586,7 +1695,13 @@ def _publish_to_html(text):
             flush_bullets()
             html.append(f'<p>{stripped}</p>')
     flush_bullets()
-    return '\n'.join(html)
+    body = '\n'.join(html)
+    # Shopify hard-caps body_html at 65535 chars; truncate at 60_000 to give
+    # ourselves headroom for theme-wrapper tags and keep the closing </p>.
+    if len(body) > 60_000:
+        print(f"[publish] body_html too long ({len(body)} chars), truncating")
+        body = body[:60_000].rsplit('</p>', 1)[0] + '</p><p><em>(truncated)</em></p>'
+    return body
 
 
 def _publish_strip_diacritics(text):
@@ -2488,7 +2603,9 @@ def higgsfield_generate():
                     errors.append(stderr_i[:200] or 'Empty output')
 
         if not all_urls:
-            return jsonify({'error': '; '.join(errors[:2]) or 'No images received from Higgsfield',
+            raw_err = '; '.join(errors[:2]) or 'No images received from Higgsfield'
+            return jsonify({'error': _map_higgsfield_error(raw_err),
+                            'raw_error': raw_err,
                             'cmd': base_cmd}), 500
 
         # Filter by original URL set (exact + without query params)
@@ -2505,9 +2622,9 @@ def higgsfield_generate():
         return jsonify({'urls': all_urls, 'prompt_used': prompt})
 
     except subprocess.TimeoutExpired:
-        return jsonify({'error': 'Higgsfield timeout — please try again'}), 504
+        return jsonify({'error': _map_higgsfield_error('timeout')}), 504
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': _map_higgsfield_error(str(e)), 'raw_error': str(e)}), 500
     finally:
         if tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
