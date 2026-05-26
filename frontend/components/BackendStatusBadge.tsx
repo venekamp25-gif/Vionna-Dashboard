@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api, BackendStatus } from "@/lib/api";
+import { HealthCheckModal } from "./HealthCheckModal";
 
 type ConnState = "checking" | "ok" | "fail";
 
@@ -9,6 +10,7 @@ export function BackendStatusBadge() {
   const [state, setState] = useState<ConnState>("checking");
   const [status, setStatus] = useState<BackendStatus | null>(null);
   const [err, setErr] = useState<string>("");
+  const [healthOpen, setHealthOpen] = useState(false);
 
   useEffect(() => {
     api
@@ -17,24 +19,40 @@ export function BackendStatusBadge() {
       .catch((e) => { setErr(String(e.message ?? e)); setState("fail"); });
   }, []);
 
+  // Shared wrapper button — clicking the badge opens the full health-check
+  // modal so the user can see WHY a subsystem is degraded without diving
+  // into DevTools.
+  const wrap = (content: React.ReactNode, tooltip: string) => (
+    <>
+      <button
+        type="button"
+        onClick={() => setHealthOpen(true)}
+        className="text-[11px] flex items-center gap-1.5 cursor-pointer hover:opacity-80 transition-opacity"
+        title={`${tooltip}\n(click for full diagnostic)`}
+      >
+        {content}
+      </button>
+      <HealthCheckModal open={healthOpen} onClose={() => setHealthOpen(false)} />
+    </>
+  );
+
   if (state === "checking") {
-    return (
-      <span className="text-[11px] text-text-faint flex items-center gap-1.5">
+    return wrap(
+      <span className="text-text-faint flex items-center gap-1.5">
         <span className="w-1.5 h-1.5 rounded-full bg-text-faint animate-pulse" />
         Connecting…
-      </span>
+      </span>,
+      "Checking backend connection"
     );
   }
 
   if (state === "fail") {
-    return (
-      <span
-        className="text-[11px] text-danger flex items-center gap-1.5"
-        title={err || "Backend not reachable. Is start.bat running?"}
-      >
+    return wrap(
+      <span className="text-danger flex items-center gap-1.5">
         <span className="w-1.5 h-1.5 rounded-full bg-danger" />
         Backend offline
-      </span>
+      </span>,
+      err || "Backend not reachable"
     );
   }
 
@@ -43,14 +61,13 @@ export function BackendStatusBadge() {
   if (status?.dk) parts.push("DK ✓"); else parts.push("DK ⚠");
   if (status?.fr) parts.push("FR ✓"); else parts.push("FR ⚠");
   if (status?.anthropic) parts.push("Claude ✓"); else parts.push("Claude ⚠");
+  const anyDegraded = !status?.dk || !status?.fr || !status?.anthropic;
 
-  return (
-    <span
-      className="text-[11px] text-accent flex items-center gap-1.5"
-      title="Backend connection OK"
-    >
-      <span className="w-1.5 h-1.5 rounded-full bg-accent" />
+  return wrap(
+    <span className={`flex items-center gap-1.5 ${anyDegraded ? "text-warning" : "text-accent"}`}>
+      <span className={`w-1.5 h-1.5 rounded-full ${anyDegraded ? "bg-warning" : "bg-accent"}`} />
       {parts.join(" · ")}
-    </span>
+    </span>,
+    anyDegraded ? "Some subsystems are degraded — click for details" : "Backend connection OK"
   );
 }
