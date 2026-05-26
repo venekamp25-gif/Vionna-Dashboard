@@ -78,6 +78,7 @@ export function NanoBananaSteps() {
 
     const slots: (NbResult | null)[] = Array(TOTAL_VARIANTS).fill(null);
 
+    const slotErrors: (string | undefined)[] = Array(TOTAL_VARIANTS).fill(undefined);
     const calls = Array.from({ length: TOTAL_VARIANTS }, async (_, i) => {
       try {
         const res = await higgsfieldQueue.run(() => api.higgsfield({
@@ -89,26 +90,35 @@ export function NanoBananaSteps() {
         const url = res.urls?.[0];
         if (!url) throw new Error(res.error ?? "No image returned");
         slots[i] = { url, selected: false };
-      } catch {
+        slotErrors[i] = undefined;
+      } catch (e) {
         slots[i] = null;
+        slotErrors[i] = e instanceof Error ? e.message : String(e);
       } finally {
         setProgress((p) => ({ ...p, [stepNum]: (p[stepNum] ?? 0) + 1 }));
-        const partial = slots.map((s) => s ?? { url: "", selected: false });
+        const partial = slots.map((s, idx) =>
+          s ?? { url: "", selected: false, error: slotErrors[idx] }
+        );
         setData((prev) => ({ ...prev, nbResults: { ...prev.nbResults, [stepNum]: partial } }));
       }
     });
 
     await Promise.allSettled(calls);
 
-    const finalResults = slots.filter((s): s is NbResult => s !== null);
+    // Keep failed slots visible with their error so the user can see what
+    // went wrong and hit Retry per-tile.
+    const finalResults = slots.map((s, i) =>
+      s ?? ({ url: "", selected: false, error: slotErrors[i] || "Generation failed" })
+    );
     setData((prev) => ({ ...prev, nbResults: { ...prev.nbResults, [stepNum]: finalResults } }));
 
-    if (finalResults.length === 0) {
+    const successCount = finalResults.filter((r) => r.url).length;
+    if (successCount === 0) {
       setStepErrors((e) => ({ ...e, [stepNum]: "All variants failed. Check Higgsfield + try again." }));
     } else {
       notify(
         `Step ${stepNum} ready`,
-        `${finalResults.length} variants generated — back to review.`,
+        `${successCount} variants generated — back to review.`,
         `nb-step-${stepNum}`
       );
     }
@@ -150,8 +160,16 @@ export function NanoBananaSteps() {
         const next = cur.map((r, i) => (i === slotIndex ? { url, selected: false } : r));
         return { ...prev, nbResults: { ...prev.nbResults, [stepNum]: next } };
       });
-    } catch {
-      // Leave placeholder empty; user can retry
+    } catch (e) {
+      // Mark the slot as failed so the ErrorTile + Retry button appear
+      const msg = e instanceof Error ? e.message : String(e);
+      setData((prev) => {
+        const cur = prev.nbResults[stepNum] ?? [];
+        const next = cur.map((r, i) =>
+          i === slotIndex ? { url: "", selected: false, error: msg } : r
+        );
+        return { ...prev, nbResults: { ...prev.nbResults, [stepNum]: next } };
+      });
     }
   };
 
@@ -228,6 +246,7 @@ export function NanoBananaSteps() {
 
     // Fire one Higgsfield call per step-format in parallel
     const slots: (NbResult | null)[] = new Array(stepFavourites.length).fill(null);
+    const slotErrors: (string | undefined)[] = new Array(stepFavourites.length).fill(undefined);
 
     const calls = stepFavourites.map(async ({ step, ref }, i) => {
       try {
@@ -241,10 +260,14 @@ export function NanoBananaSteps() {
         const url = res.urls?.[0];
         if (!url) throw new Error(res.error ?? "No image returned");
         slots[i] = { url, selected: false };
-      } catch {
+        slotErrors[i] = undefined;
+      } catch (e) {
         slots[i] = null;
+        slotErrors[i] = e instanceof Error ? e.message : String(e);
       } finally {
-        const partial = slots.map((s) => s ?? { url: "", selected: false });
+        const partial = slots.map((s, idx) =>
+          s ?? { url: "", selected: false, error: slotErrors[idx] }
+        );
         setData((prev) => ({
           ...prev,
           nbResultsPerColor: { ...prev.nbResultsPerColor, [color]: partial },
@@ -254,18 +277,22 @@ export function NanoBananaSteps() {
 
     await Promise.allSettled(calls);
 
-    const finalResults = slots.filter((s): s is NbResult => s !== null);
+    // Keep failed slots visible (with their error) so the user can retry per-tile
+    const finalResults = slots.map((s, i) =>
+      s ?? ({ url: "", selected: false, error: slotErrors[i] || "Generation failed" })
+    );
     setData((prev) => ({
       ...prev,
       nbResultsPerColor: { ...prev.nbResultsPerColor, [color]: finalResults },
     }));
 
-    if (finalResults.length > 0) {
-      notify(`${color} variants ready`, `${finalResults.length} of ${stepFavourites.length} formats generated.`, `nb-color-${color}`);
+    const successCount = finalResults.filter((r) => r.url).length;
+    if (successCount > 0) {
+      notify(`${color} variants ready`, `${successCount} of ${stepFavourites.length} formats generated.`, `nb-color-${color}`);
     }
     flushDraft();
 
-    if (finalResults.length === 0) {
+    if (successCount === 0) {
       alert(`All formats failed for ${color}. Check Higgsfield and try again.`);
     }
     setRunningColors((m) => ({ ...m, [color]: false }));
@@ -310,8 +337,16 @@ export function NanoBananaSteps() {
         const next = current.map((r, i) => (i === slotIndex ? { url, selected: false } : r));
         return { ...prev, nbResultsPerColor: { ...prev.nbResultsPerColor, [color]: next } };
       });
-    } catch {
-      // Leave placeholder so user can retry
+    } catch (e) {
+      // Mark this slot as failed so the ErrorTile + Retry button render
+      const msg = e instanceof Error ? e.message : String(e);
+      setData((prev) => {
+        const current = prev.nbResultsPerColor[color] ?? [];
+        const next = current.map((r, i) =>
+          i === slotIndex ? { url: "", selected: false, error: msg } : r
+        );
+        return { ...prev, nbResultsPerColor: { ...prev.nbResultsPerColor, [color]: next } };
+      });
     }
   };
 
@@ -444,7 +479,7 @@ export function NanoBananaSteps() {
             {(isRunning || done) && (
               <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
                 {(isRunning && results.length === 0
-                  ? Array.from({ length: TOTAL_VARIANTS }, () => ({ url: "", selected: false }))
+                  ? (Array.from({ length: TOTAL_VARIANTS }, () => ({ url: "", selected: false })) as NbResult[])
                   : results
                 ).map((r, i) =>
                   r.url ? (
@@ -458,6 +493,13 @@ export function NanoBananaSteps() {
                       onZoom={() => setZoomUrl(r.url)}
                       onPin={() => togglePin(r.url)}
                       onRegenerate={() => regenerateSlot(n, i)}
+                    />
+                  ) : r.error && !isRunning ? (
+                    <ErrorTile
+                      key={i}
+                      label={`Variant ${i + 1}`}
+                      error={r.error}
+                      onRetry={() => regenerateSlot(n, i)}
                     />
                   ) : (
                     <div
@@ -647,6 +689,13 @@ function Step5({ onGenerate, onGenerateAll, onRegenerateSlot, runningColors, tog
                           onPin={() => togglePin(r.url)}
                           onRegenerate={() => onRegenerateSlot(canonical, i)}
                         />
+                      ) : r.error && !isRunning ? (
+                        <ErrorTile
+                          key={i}
+                          label={`${displayLabel} ${i + 1}`}
+                          error={r.error}
+                          onRetry={() => onRegenerateSlot(canonical, i)}
+                        />
                       ) : (
                         <div
                           key={i}
@@ -773,6 +822,45 @@ function ColorRefPicker({ color, label }: { color: string; label?: string }) {
           </button>
         ))}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Tile shown in place of a failed-generation slot. Displays the upstream
+ * error so the user can tell why (rate-limit / quota / bad ref image / etc.)
+ * and offers a Retry button that re-runs just this one slot.
+ */
+function ErrorTile({
+  label,
+  error,
+  onRetry,
+}: {
+  label: string;
+  error: string;
+  onRetry: () => void;
+}) {
+  // Short-form for the inline display; full message in the title attribute.
+  const short = error.length > 60 ? error.slice(0, 60) + "…" : error;
+  return (
+    <div
+      className="aspect-[3/4] rounded-[10px] border-2 border-danger/40 bg-danger/5 flex flex-col items-center justify-center gap-2 px-3 text-center"
+      title={error}
+    >
+      <span className="text-danger text-2xl leading-none">✕</span>
+      <span className="text-[10px] font-semibold tracking-wider uppercase text-danger">
+        {label}
+      </span>
+      <span className="text-[10px] text-text-faint leading-tight break-words line-clamp-3">
+        {short}
+      </span>
+      <button
+        type="button"
+        onClick={onRetry}
+        className="mt-1 text-[10px] font-semibold tracking-wider uppercase px-2.5 py-1 rounded-md bg-accent text-on-accent hover:bg-accent-hover active:scale-95"
+      >
+        ↻ Retry
+      </button>
     </div>
   );
 }

@@ -63,6 +63,11 @@ export interface NbResult {
   url: string;
   selected: boolean;
   pinned?: boolean;
+  /** Error message from the most recent generation attempt for this slot.
+   *  Only set when the slot has no url AND a generation has actually been
+   *  attempted (i.e. distinct from an "I'm still loading" placeholder).
+   *  Surfaced as a red overlay on the tile + a Retry button. */
+  error?: string;
 }
 
 export interface PoolPhoto {
