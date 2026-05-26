@@ -1,4 +1,4 @@
-import os, sys, json, re, hashlib, urllib.parse, subprocess, tempfile, shutil, platform, unicodedata, datetime
+import os, sys, json, re, hashlib, urllib.parse, subprocess, tempfile, shutil, platform, unicodedata, datetime, time
 from flask import Flask, request, redirect, session, jsonify, send_from_directory
 from flask_cors import CORS
 import requests as req
@@ -333,17 +333,96 @@ _SCRAPE_UA_PRIMARY  = 'VionnaProductDashboard/1.0 (+https://vionna-dashboard.net
 _SCRAPE_UA_FALLBACK = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
 
-def _scrape_get(url, timeout=10):
-    """GET a competitor URL with UA fallback. Returns the requests.Response.
-    Raises on the LAST attempt's failure so callers can inspect r.status_code /
-    r.text just like before."""
-    r = req.get(url, timeout=timeout, headers={'User-Agent': _SCRAPE_UA_PRIMARY,
-                                                'Accept': 'application/json, text/html;q=0.9, */*;q=0.5'})
-    if r.status_code == 403:
-        # Some shops do the opposite: they ONLY accept browser UAs and 403 us.
-        r = req.get(url, timeout=timeout, headers={'User-Agent': _SCRAPE_UA_FALLBACK,
-                                                    'Accept': 'application/json, text/html;q=0.9, */*;q=0.5'})
-    return r
+def _scrape_get(url, timeout=10, _retries_remaining=2):
+    """GET a competitor URL with UA-fallback AND retry-on-transient.
+
+    Retries (up to 2 extra attempts with 1s + 3s backoff) on:
+      - Connection errors / read timeouts
+      - 429 Too Many Requests (respects Retry-After header)
+      - 5xx server errors (transient outages, deploys, restarts)
+
+    The UA fallback runs INSIDE the final-attempt path: try primary UA, if 403
+    try Mozilla. We don't retry 403 — that's an auth/scope decision by the
+    upstream, not a transient flake.
+    """
+    delays_left = [1, 3]  # seconds before each retry; popped front-first
+    headers_primary  = {'User-Agent': _SCRAPE_UA_PRIMARY,
+                        'Accept': 'application/json, text/html;q=0.9, */*;q=0.5'}
+    headers_fallback = {'User-Agent': _SCRAPE_UA_FALLBACK,
+                        'Accept': 'application/json, text/html;q=0.9, */*;q=0.5'}
+
+    last_exc = None
+    while True:
+        try:
+            r = req.get(url, timeout=timeout, headers=headers_primary)
+            if r.status_code == 403:
+                # Upstream actively rejected our identifier — try a browser UA.
+                r = req.get(url, timeout=timeout, headers=headers_fallback)
+            # Transient: retry
+            if r.status_code == 429:
+                wait_s = 5
+                try:
+                    wait_s = int(r.headers.get('Retry-After', '5'))
+                except Exception:
+                    pass
+                if delays_left:
+                    print(f"[scrape] 429 rate-limit on {url}, sleeping {wait_s}s then retrying")
+                    time.sleep(min(wait_s, 30))
+                    delays_left.pop(0)
+                    continue
+            if 500 <= r.status_code < 600 and delays_left:
+                d = delays_left.pop(0)
+                print(f"[scrape] {r.status_code} on {url}, retrying in {d}s")
+                time.sleep(d)
+                continue
+            return r
+        except (req.exceptions.ConnectionError, req.exceptions.Timeout) as e:
+            last_exc = e
+            if not delays_left:
+                raise
+            d = delays_left.pop(0)
+            print(f"[scrape] transient {type(e).__name__} on {url}, retrying in {d}s")
+            time.sleep(d)
+
+
+def _extract_first_url(text):
+    """Pull the first valid http(s):// URL out of arbitrary user text.
+
+    Catches the common patterns where the input field gets polluted with
+    extra text or another URL — e.g. dubble-paste, or 'Look at this https://...
+    it's nice'. If no URL is found, returns the original text trimmed so
+    downstream code can still produce its usual error."""
+    if not text:
+        return ''
+    m = re.search(r"https?://[^\s\"'<>]+", text)
+    return m.group(0).rstrip('.,;)') if m else text.strip()
+
+
+def _looks_like_shopify_json(data):
+    """Return True if `data` is the .json shape we expect from a Shopify
+    storefront product endpoint. Used to detect non-Shopify URLs early so we
+    can give a clear 'not a Shopify product' error instead of cryptic
+    KeyErrors deeper in the pipeline."""
+    if not isinstance(data, dict):
+        return False
+    p = data.get('product')
+    return isinstance(p, dict) and ('options' in p or 'variants' in p or 'images' in p)
+
+
+def _sane_image_url(u):
+    """Reject image URLs that would break downstream (Higgsfield refuses SVG /
+    animated GIF, sprite-sheets are tiny icons, etc.). Belt-and-suspenders
+    around the merge / scrape image lists."""
+    if not isinstance(u, str):
+        return False
+    if not u.startswith(('http://', 'https://')):
+        return False
+    lower = u.lower().split('?', 1)[0]
+    if lower.endswith(('.svg', '.gif')):
+        return False
+    if '/icons/' in lower or '/sprites/' in lower:
+        return False
+    return True
 
 
 def _scrape_slugify(text):
@@ -536,6 +615,8 @@ def _scrape_product_from_html(scheme, netloc, handle, html_text=None):
             if isinstance(v, dict):
                 _add_img(v.get('image'))
 
+    # Drop URLs that Higgsfield can't handle (SVG / GIF / sprites / non-https)
+    img_urls = [u for u in img_urls if _sane_image_url(u)]
     images = []
     for i, u in enumerate(img_urls, start=1):
         images.append({
@@ -646,7 +727,9 @@ def _merge_sibling_color_products(base, siblings):
                 if vid not in merged_vids:
                     merged_vids.append(vid)
             new_img['variant_ids'] = merged_vids
-            all_images.append(new_img)
+            # Skip URLs that downstream tools refuse (SVG / GIF / sprites)
+            if _sane_image_url(new_img.get('src')):
+                all_images.append(new_img)
 
     # Build the merged product (keep base's title/handle/etc as identity)
     merged = dict(base)
@@ -661,14 +744,16 @@ def _merge_sibling_color_products(base, siblings):
 
 @app.route('/api/scrape', methods=['POST'])
 def scrape():
-    raw = (request.json.get('url') or '').strip()
-    # Defensive: if the user accidentally pasted the URL twice (e.g. Ctrl+V
-    # into a field that already contained the URL), strip everything from the
-    # SECOND http(s):// onward. Otherwise urlparse mashes both into one path
-    # and we end up requesting "/products/<handle>https://..." which 404s.
-    second = raw.find('http', 1)
-    if second > 0:
-        raw = raw[:second].rstrip()
+    raw_input = (request.json.get('url') or '').strip()
+    # Defensive: pluck the FIRST http(s):// URL out of arbitrary user text.
+    # Catches dubble-paste, surrounding chatter ("Look at this <url> nice eh?"),
+    # leading whitespace, etc. Falls back to the raw text if no URL is found.
+    raw = _extract_first_url(raw_input)
+    if not raw or not raw.startswith(('http://', 'https://')):
+        return jsonify({
+            'error': 'Please paste a full product URL starting with https://.',
+            'url_tried': raw_input,
+        }), 400
     # Strip tracking query params / fragments — Shopify needs a clean /products/handle URL
     parsed = urllib.parse.urlparse(raw)
     clean_path = parsed.path.rstrip('/')
@@ -704,8 +789,32 @@ def scrape():
                 }), 500
         else:
             r.raise_for_status()
-            base_data = r.json()
-            base = base_data.get('product') or {}
+            # Some shops 200 OK with HTML for unknown product paths (no
+            # Shopify-style .json). Detect that early so we don't crash deeper.
+            try:
+                base_data = r.json()
+            except Exception:
+                base_data = None
+            if not _looks_like_shopify_json(base_data):
+                # Try the HTML fallback before giving up — covers SKIMS-style
+                # Plus stores that strip the .json endpoint.
+                print(f"[scrape] .json response wasn't Shopify-shaped — trying HTML fallback")
+                try:
+                    html_r = _scrape_get(html_url, timeout=10)
+                    html_r.raise_for_status()
+                    fallback_html = html_r.text
+                    handle_from_path = clean_path[:-5] if clean_path.endswith('.json') else clean_path
+                    handle_from_path = handle_from_path.rsplit('/', 1)[-1]
+                    base = _scrape_product_from_html(scheme, parsed.netloc, handle_from_path, html_text=fallback_html)
+                except Exception:
+                    base = None
+                if not base:
+                    return jsonify({
+                        'error': 'This URL does not look like a Shopify product. The dashboard only supports Shopify stores.',
+                        'url_tried': json_url,
+                    }), 400
+            else:
+                base = base_data.get('product') or {}
     except Exception as e:
         return jsonify({'error': str(e), 'url_tried': json_url}), 500
     if base is None:
