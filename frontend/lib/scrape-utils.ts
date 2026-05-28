@@ -38,7 +38,11 @@ export function extractColors(product: ScrapedProduct["product"]): string[] {
   }
 
   if (colorOpt?.values?.length && !colorOpt.values.every(isSize)) {
-    return colorOpt.values.slice(0, 6);
+    // Cap at 30 — shops like Ever-Pretty / bridesmaid-dress vendors routinely
+    // have 15-25 colours per product. The user can still remove any they don't
+    // want from the chip list in Review. Going beyond 30 has practical UX
+    // limits (NB Step 5 would do 30 × 4 = 120 generations per product).
+    return colorOpt.values.slice(0, 30);
   }
 
   // Fallback: derive from handle (skip generic clothing words).
