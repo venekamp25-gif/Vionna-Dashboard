@@ -235,11 +235,57 @@ export function GenerateStep() {
 
     return (
       <>
-        <div className="max-w-xl mx-auto">
+        <div className="max-w-2xl mx-auto">
           <div className="bg-bg-elev border border-danger/40 rounded-2xl px-8 py-10 flex flex-col items-center gap-4 text-center">
             <div className="w-12 h-12 rounded-full bg-danger/20 text-danger text-2xl flex items-center justify-center">!</div>
             <h2 className="text-[15px] font-semibold text-text">Could not generate product</h2>
             <p className="text-[13px] text-text-dim">{error}</p>
+
+            {/* When the failure looks like an anti-bot block, walk the user
+                through the manual-paste workaround right here on the screen
+                so they don't have to read a separate manual. */}
+            {looksLikeBlock && (
+              <div className="w-full mt-4 text-left bg-bg-elev-2 border border-border rounded-[12px] p-5">
+                <div className="text-[13px] font-semibold text-text mb-2 flex items-center gap-2">
+                  💡 Workaround: paste the product JSON manually (about 30 seconds)
+                </div>
+                <p className="text-[12px] text-text-dim mb-3 leading-relaxed">
+                  This shop is blocking our scraper, but it works fine from your
+                  own browser. Open the product&apos;s JSON URL in a new tab, copy the
+                  whole page, paste it back here, and the dashboard will continue
+                  as if it had scraped automatically.
+                </p>
+                <ol className="text-[12px] text-text-dim leading-relaxed list-decimal list-inside space-y-1 mb-4">
+                  <li>
+                    Click <strong className="text-text">&ldquo;Paste JSON manually&rdquo;</strong> below.
+                    A modal opens with the right URL pre-filled.
+                  </li>
+                  <li>
+                    In that modal click <strong className="text-text">&ldquo;Open ↗&rdquo;</strong> — a new
+                    browser tab opens with the product&apos;s JSON (a long wall of
+                    text starting with <code className="bg-bg-elev px-1 rounded text-[11px]">{"{\"product\":{"}</code>).
+                  </li>
+                  <li>
+                    In that new tab press <strong className="text-text">Ctrl + A</strong> to select
+                    everything, then <strong className="text-text">Ctrl + C</strong> to copy.
+                  </li>
+                  <li>
+                    Come back to the modal and paste (<strong className="text-text">Ctrl + V</strong>)
+                    into the big text area, then click{" "}
+                    <strong className="text-text">&ldquo;Use this JSON →&rdquo;</strong>.
+                  </li>
+                </ol>
+                <div className="text-[11px] text-text-faint border-t border-border pt-3 leading-relaxed">
+                  ⚠ <strong className="text-text-dim">Multi-colour heads-up:</strong> manual paste
+                  captures one colour at a time. For shops where each colour is a
+                  separate product page (Billy J, SKIMS, meshki), repeat this for
+                  every colour OR publish each colour as its own import. Most
+                  Cloudflare-blocked shops you&apos;ll hit only have one colour per
+                  URL anyway.
+                </div>
+              </div>
+            )}
+
             <div className="flex gap-2 mt-2 flex-wrap justify-center">
               <Button variant="secondary" size="sm" onClick={() => setStep(1)}>
                 ← Back to Input
@@ -251,12 +297,6 @@ export function GenerateStep() {
                 ⌨ Paste JSON manually
               </Button>
             </div>
-            {looksLikeBlock && (
-              <p className="text-[11px] text-text-faint mt-1 max-w-sm leading-relaxed">
-                Tip: when a shop blocks our scraper you can still fetch the
-                product from your own browser and paste the result back.
-              </p>
-            )}
           </div>
         </div>
         <ManualPasteModal
