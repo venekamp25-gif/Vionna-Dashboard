@@ -428,6 +428,30 @@ def _detect_private_shop(response_text):
     )
 
 
+def _detect_cdn_bot_block(response_text, headers):
+    """Return True if the 401/403 response looks like a generic CDN bot
+    block (Cloudflare / Akamai / DataDome / Imperva) rather than a real
+    Shopify password page. Different actionable message — the user can't
+    'just enter the password', they need to either try a different URL or
+    the shop owner needs to whitelist us."""
+    head = (response_text or '')[:8000].lower()
+    server = (headers.get('Server') or '').lower()
+    via = (headers.get('CF-RAY') or headers.get('cf-ray') or '')
+    cf_indicators = (
+        'cloudflare' in server or
+        'cloudflare' in head or
+        'cf-ray' in head or
+        bool(via) or
+        'akamai' in server or
+        'datadome' in head or
+        'imperva' in head or
+        'attention required' in head or
+        'just a moment' in head or
+        'challenge-form' in head
+    )
+    return cf_indicators
+
+
 def _scrape_response_too_large(r, max_bytes=5_000_000):
     """If the upstream sends Content-Length > 5MB, refuse to read it."""
     cl = r.headers.get('Content-Length')
@@ -845,11 +869,26 @@ def scrape():
                 # Update the URLs we'll use going forward
                 json_url = json_url_nolocale
                 html_url = html_url_nolocale or html_url
-        # Password-protected / private storefront detect — Shopify returns 401
-        # OR a 200 OK with a password-prompt HTML body. Catch both.
+        # Auth-rejection branch — Shopify returns 401 for real password pages
+        # and various CDNs (Cloudflare / DataDome / Akamai) return 401/403
+        # when they detect us as a bot. These need DIFFERENT user-facing
+        # messages so the user knows whether to ask for the password or to
+        # just try a different URL / wait it out.
         if r.status_code in (401, 403):
+            body = r.text or ''
+            if _detect_private_shop(body):
+                return jsonify({
+                    'error': 'This shop is password-protected or in development mode (Shopify "coming soon" gate). Ask the shop owner for storefront access.',
+                    'url_tried': json_url,
+                }), 400
+            if _detect_cdn_bot_block(body, r.headers):
+                return jsonify({
+                    'error': "This shop's anti-bot protection (Cloudflare or similar) is blocking our scraper. Try a different product from this shop, or ask the shop owner to whitelist us.",
+                    'url_tried': json_url,
+                }), 400
+            # Unknown 401/403 — generic message
             return jsonify({
-                'error': 'This Shopify store appears to require authentication or is private. We can only scrape public storefronts.',
+                'error': f'Upstream returned {r.status_code}. The shop may be private, geo-restricted, or temporarily blocking us.',
                 'url_tried': json_url,
             }), 400
         if r.status_code == 200 and _detect_private_shop(r.text or ''):
