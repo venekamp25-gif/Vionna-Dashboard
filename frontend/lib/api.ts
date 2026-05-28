@@ -122,6 +122,18 @@ export const api = {
   scrape: (url: string) =>
     call<ScrapedProduct>("/api/scrape", { method: "POST", body: { url } }),
 
+  /**
+   * Manual-paste fallback for shops whose Cloudflare / WAF blocks our scraper.
+   * The user opens /products/<handle>.json in their own browser, copies the JSON,
+   * and pastes it here. Same product shape as /api/scrape — minus sibling-discovery
+   * (which would need the HTML page).
+   */
+  scrapeManual: (rawJson: string) =>
+    call<ScrapedProduct & { source?: string }>(
+      "/api/scrape_manual",
+      { method: "POST", body: { json: rawJson } }
+    ),
+
   names: (store: "dk" | "fr") =>
     call<NamesResponse>("/api/names", { method: "POST", body: { store } }),
 

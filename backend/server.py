@@ -1013,6 +1013,55 @@ def scrape():
     return jsonify({'product': base})
 
 
+@app.route('/api/scrape_manual', methods=['POST'])
+def scrape_manual():
+    """Escape hatch for shops whose Cloudflare / WAF blocks our datacentre IP.
+
+    The user manually fetches the /products/<handle>.json URL from their own
+    browser (which works because it's coming from a residential IP), pastes the
+    resulting JSON here, and we validate + normalise it the same way the
+    automatic scrape path does — so the dashboard sees the same shape no matter
+    which path the data came in through.
+
+    Limitations vs the automatic scrape:
+      - No sibling-discovery. Multi-colour Billy-J-style shops need one paste
+        per colour, OR the user accepts publishing each colour separately.
+      - No HTML JSON-LD fallback (we don't have the HTML page).
+    """
+    payload = request.json or {}
+    raw_json = payload.get('json') or ''
+    if not isinstance(raw_json, str) or not raw_json.strip():
+        return jsonify({'error': 'Paste the product JSON in the `json` field of the request body.'}), 400
+    try:
+        parsed = json.loads(raw_json)
+    except Exception as e:
+        return jsonify({
+            'error': f'That does not look like valid JSON ({e}). Make sure you copied the FULL response from the .json URL.',
+        }), 400
+    # Accept both the wrapped { "product": {...} } and the unwrapped { ... } forms
+    if isinstance(parsed, dict) and 'product' in parsed:
+        base = parsed.get('product') or {}
+    elif isinstance(parsed, dict) and ('options' in parsed or 'variants' in parsed):
+        base = parsed
+    else:
+        return jsonify({
+            'error': 'The pasted JSON does not look like a Shopify product. It should start with {"product":{...}}.',
+        }), 400
+    if not _looks_like_shopify_json({'product': base}):
+        return jsonify({
+            'error': 'The pasted JSON is missing the expected Shopify fields (options / variants / images).',
+        }), 400
+
+    # Apply the same normalisation as the automatic path so downstream code
+    # behaves identically.
+    base = _ensure_color_option(base)
+    if not base.get('variants'):
+        return jsonify({
+            'error': 'This product has no variants — likely sold-out, hidden, or discontinued.',
+        }), 400
+    return jsonify({'product': base, 'source': 'manual-paste'})
+
+
 # --- Debug: inspect siblings setup for a given product name ---
 @app.route('/api/debug_siblings')
 def debug_siblings():

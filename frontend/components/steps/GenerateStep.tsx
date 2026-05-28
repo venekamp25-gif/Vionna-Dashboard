@@ -6,8 +6,9 @@ import { Button } from "@/components/ui/Button";
 import { useStep } from "@/lib/step";
 import { useProduct, StoreContent } from "@/lib/product";
 import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
-import { api } from "@/lib/api";
+import { api, ScrapedProduct } from "@/lib/api";
 import { notify } from "@/lib/notifications";
+import { ManualPasteModal } from "./ManualPasteModal";
 import {
   extractColors,
   extractVariantsByColor,
@@ -48,24 +49,22 @@ export function GenerateStep() {
   const [stage, setStage] = useState<Stage>("scraping");
   const [subStage, setSubStage] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
+  const [manualPasteOpen, setManualPasteOpen] = useState(false);
   const started = useRef(false);
 
-  useEffect(() => {
-    if (started.current) return;
-    started.current = true;
-
-    (async () => {
-      try {
-        const selectedStores = data.selectedStores.length
-          ? data.selectedStores
-          : (["dk"] as StoreKey[]);
-        const primary = selectedStores[0];
-
-        // ── 1. Scrape competitor product (ONCE — shared across stores) ──
-        setStage("scraping");
-        const scraped = await api.scrape(data.competitorUrl);
-        if (scraped.error) throw new Error(scraped.error);
-        const product = scraped.product;
+  /**
+   * Process a scraped (or manually-pasted) product through Generate. Extracted
+   * so the manual-paste fallback can call into the same flow as the automatic
+   * scrape — once the product is in hand the rest of Generate is identical.
+   */
+  const processProduct = async (product: NonNullable<ScrapedProduct["product"]>) => {
+    setError(null);
+    setStage("scraping");
+    try {
+      const selectedStores = data.selectedStores.length
+        ? data.selectedStores
+        : (["dk"] as StoreKey[]);
+      const primary = selectedStores[0];
 
         const competitor = {
           title: product?.title ?? "Unknown product",
@@ -200,10 +199,26 @@ export function GenerateStep() {
         // scraped data + Claude-generated copy.
         setTimeout(() => flushDraft(), 0);
         setTimeout(() => setStep(3), 500);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      started.current = false; // allow retry
+    }
+  };
+
+  // Initial fire: scrape the competitor URL and feed it through processProduct.
+  useEffect(() => {
+    if (started.current) return;
+    started.current = true;
+    (async () => {
+      try {
+        const scraped = await api.scrape(data.competitorUrl);
+        if (scraped.error || !scraped.product) throw new Error(scraped.error || "Scrape failed");
+        await processProduct(scraped.product);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         setError(msg);
-        started.current = false; // allow retry
+        started.current = false;
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -212,22 +227,49 @@ export function GenerateStep() {
   const currentLabel = STAGE_LABELS[stage];
 
   if (error) {
+    // Detect errors that are "the scraper got blocked" rather than "the
+    // user did something wrong" so we can offer the manual-paste escape hatch.
+    const looksLikeBlock =
+      /cloudflare|anti-bot|blocking|cdn|geo-restrict|authentication|private|preventing|forbidden/i.test(error) ||
+      error.startsWith("API /api/scrape");
+
     return (
-      <div className="max-w-xl mx-auto">
-        <div className="bg-bg-elev border border-danger/40 rounded-2xl px-8 py-10 flex flex-col items-center gap-4 text-center">
-          <div className="w-12 h-12 rounded-full bg-danger/20 text-danger text-2xl flex items-center justify-center">!</div>
-          <h2 className="text-[15px] font-semibold text-text">Could not generate product</h2>
-          <p className="text-[13px] text-text-dim">{error}</p>
-          <div className="flex gap-2 mt-2">
-            <Button variant="secondary" size="sm" onClick={() => setStep(1)}>
-              ← Back to Input
-            </Button>
-            <Button variant="primary" size="sm" onClick={() => location.reload()}>
-              ↻ Try again
-            </Button>
+      <>
+        <div className="max-w-xl mx-auto">
+          <div className="bg-bg-elev border border-danger/40 rounded-2xl px-8 py-10 flex flex-col items-center gap-4 text-center">
+            <div className="w-12 h-12 rounded-full bg-danger/20 text-danger text-2xl flex items-center justify-center">!</div>
+            <h2 className="text-[15px] font-semibold text-text">Could not generate product</h2>
+            <p className="text-[13px] text-text-dim">{error}</p>
+            <div className="flex gap-2 mt-2 flex-wrap justify-center">
+              <Button variant="secondary" size="sm" onClick={() => setStep(1)}>
+                ← Back to Input
+              </Button>
+              <Button variant="secondary" size="sm" onClick={() => location.reload()}>
+                ↻ Try again
+              </Button>
+              <Button variant="primary" size="sm" onClick={() => setManualPasteOpen(true)}>
+                ⌨ Paste JSON manually
+              </Button>
+            </div>
+            {looksLikeBlock && (
+              <p className="text-[11px] text-text-faint mt-1 max-w-sm leading-relaxed">
+                Tip: when a shop blocks our scraper you can still fetch the
+                product from your own browser and paste the result back.
+              </p>
+            )}
           </div>
         </div>
-      </div>
+        <ManualPasteModal
+          open={manualPasteOpen}
+          originalUrl={data.competitorUrl}
+          onClose={() => setManualPasteOpen(false)}
+          onSuccess={(product) => {
+            setManualPasteOpen(false);
+            // Re-run the flow with the manually-pasted product
+            void processProduct(product);
+          }}
+        />
+      </>
     );
   }
 
