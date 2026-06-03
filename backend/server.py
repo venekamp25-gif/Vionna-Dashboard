@@ -2947,10 +2947,14 @@ NANO_BANANA_PROMPTS = {
         "from this photo. Then, I want you to place the {product_type} on a realistic woman "
         "model. It should be completely unnoticeable that it's an AI-generated model — "
         "it must look fully natural and real."),
-    2: ("I've uploaded a photo of a woman wearing a {product_type}. I want you to use only "
-        "the background from this image. After that, please generate a female model where her "
-        "entire face is clearly visible. Make sure to replicate all details of the {product_type} "
-        "accurately. Pay special attention to the design elements that must be visible in the result."),
+    2: ("I've uploaded a photo of OUR model wearing a {product_type}. Keep the SAME model — same "
+        "face, hair, skin tone and body — and the SAME background, lighting and styling. Keep every "
+        "detail of the {product_type} (cut, colour, fabric, design elements) identical to the "
+        "reference. Generate a new detailed shot where her ENTIRE FACE is clearly visible and the "
+        "product's design details are prominent. CRITICAL: the model must be in a clearly DIFFERENT "
+        "POSE than in the reference image — change her stance, arm position, body angle and head "
+        "orientation so the result is visibly a different photo, NOT a copy of the reference. Same "
+        "model, same outfit, same setting — new pose."),
     3: ("I've added a photo of a woman wearing a {product_type}. This is our model, and we do "
         "not want the background, model, or product to be changed. Now, we want to see the back "
         "view of the same product, on the same model, with the same background. Please generate "
