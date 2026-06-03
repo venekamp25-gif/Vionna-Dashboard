@@ -41,9 +41,14 @@ const EXTRA_COLOR: Record<Store, Record<string, string>> = {
     "espresso": "Espresso", "caramel": "Karamel", "chocolate": "Chokolade", "denim": "Denim",
     "lime": "Lime", "turquoise": "Turkis", "aqua": "Aqua", "magenta": "Magenta",
     "fuchsia": "Fuchsia", "maroon": "Maroon", "sapphire": "Safir", "ice": "Is", "dusty": "Støvet",
+    "clay": "Ler", "lemon": "Citrongul", "orchid": "Orkidé", "eucalyptus": "Eukalyptus",
+    "indigo": "Indigo", "cobalt": "Koboltblå", "pistachio": "Pistacie", "powder": "Pudder",
     // irregular multi-word shades (matched whole, not via the pattern engine)
     "slate grey": "Skifergrå", "slate gray": "Skifergrå", "off white": "Råhvid",
     "off-white": "Råhvid", "navy blue": "Navy", "dark navy": "Mørk Navy",
+    "army green": "Armygrøn", "armygreen": "Armygrøn", "wine red": "Vinrød",
+    "rust brown": "Rustbrun", "powder blue": "Pudderblå", "powder pink": "Pudderrosa",
+    "mint green": "Mintgrøn", "olive green": "Olivengrøn", "sage green": "Salviegrøn",
   },
   fr: {
     "cherry": "Cerise", "slate": "Ardoise", "coral": "Corail", "emerald": "Émeraude",
@@ -52,9 +57,14 @@ const EXTRA_COLOR: Record<Store, Record<string, string>> = {
     "espresso": "Espresso", "caramel": "Caramel", "chocolate": "Chocolat", "denim": "Denim",
     "lime": "Citron vert", "turquoise": "Turquoise", "aqua": "Aqua", "magenta": "Magenta",
     "fuchsia": "Fuchsia", "maroon": "Marron", "sapphire": "Saphir", "ice": "Glace", "dusty": "Poudré",
+    "clay": "Argile", "lemon": "Citron", "orchid": "Orchidée", "eucalyptus": "Eucalyptus",
+    "indigo": "Indigo", "cobalt": "Bleu cobalt", "pistachio": "Pistache", "powder": "Poudre",
     // irregular multi-word shades (matched whole, not via the pattern engine)
     "slate grey": "Gris Ardoise", "slate gray": "Gris Ardoise", "off white": "Blanc cassé",
     "off-white": "Blanc cassé", "navy blue": "Marine", "dark navy": "Marine foncé",
+    "army green": "Vert armée", "armygreen": "Vert armée", "wine red": "Rouge bordeaux",
+    "rust brown": "Brun rouille", "powder blue": "Bleu poudré", "powder pink": "Rose poudré",
+    "mint green": "Vert menthe", "olive green": "Vert olive", "sage green": "Vert sauge",
   },
 };
 
@@ -69,7 +79,7 @@ const PATTERN: Record<Store, Record<string, string>> = {
     "sparkle": "Glimmer", "sparkly": "Glimmer", "glitter": "Glimmer", "shimmer": "Glimmer",
     "metallic": "Metallic", "satin": "Satin", "velvet": "Velour", "lace": "Blonde",
     "leopard": "Leopard", "animal": "Dyreprint", "snake": "Slangeprint", "zebra": "Zebra",
-    "tie dye": "Tie-Dye", "ombre": "Ombré",
+    "tie dye": "Tie-Dye", "ombre": "Ombré", "print": "Print", "printed": "Print",
   },
   fr: {
     "stripe": "Rayé", "striped": "Rayé", "stripes": "Rayé",
@@ -80,7 +90,7 @@ const PATTERN: Record<Store, Record<string, string>> = {
     "sparkle": "Pailleté", "sparkly": "Pailleté", "glitter": "Pailleté", "shimmer": "Pailleté",
     "metallic": "Métallisé", "satin": "Satiné", "velvet": "Velours", "lace": "Dentelle",
     "leopard": "Léopard", "animal": "Imprimé Animal", "snake": "Python", "zebra": "Zèbre",
-    "tie dye": "Tie-Dye", "ombre": "Ombré",
+    "tie dye": "Tie-Dye", "ombre": "Ombré", "print": "Imprimé", "printed": "Imprimé",
   },
 };
 
@@ -167,6 +177,16 @@ export function translateColor(color: string, store: Store): string {
   // 1 & 2: exact whole-string match
   if (COLOR_TRANSLATIONS[store][lower]) return COLOR_TRANSLATIONS[store][lower];
   if (EXTRA_COLOR[store][lower]) return EXTRA_COLOR[store][lower];
+
+  // Multi-colour "A/B" (or "A / B") — translate each side independently and
+  // rejoin. Only commit if at least one side actually changed.
+  if (raw.includes("/")) {
+    const parts = raw.split("/").map((s) => s.trim()).filter(Boolean);
+    if (parts.length >= 2) {
+      const tr = parts.map((p) => translateColor(p, store));
+      if (tr.some((t, i) => t !== parts[i])) return tr.join("/");
+    }
+  }
 
   // Tokens for compound handling
   const tokens = lower.split(/[\s/&-]+/).filter(Boolean);
