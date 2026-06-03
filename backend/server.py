@@ -467,6 +467,57 @@ def _scrape_response_too_large(r, max_bytes=5_000_000):
     return 0
 
 
+# E-commerce platform fingerprints. When a scrape fails we sniff the HTML to
+# tell the user WHICH non-Shopify platform they hit, instead of a generic
+# "not a Shopify product". Order matters — more specific markers first.
+_PLATFORM_MARKERS = [
+    ('Centra',        ['centra', 'data-centra', 'centraproduct', 'window.centra']),
+    ('WooCommerce',   ['woocommerce', 'wp-content/plugins/woocommerce', 'wc-block', 'is-woocommerce']),
+    ('BigCommerce',   ['bigcommerce', 'cdn11.bigcommerce.com', '/stencil/']),
+    ('Magento',       ['mage/cookies', 'data-mage-init', 'magento_', '/static/version']),
+    ('Salesforce Commerce Cloud', ['demandware', 'dwfrm_', 'dw.ac', 'sfcc']),
+    ('Wix',           ['_wixcssimports', 'wix.com', 'static.wixstatic', 'wixapps']),
+    ('Squarespace',   ['squarespace', 'static1.squarespace', 'sqs-block']),
+    ('PrestaShop',    ['prestashop', 'data-prestashop']),
+]
+
+
+def _detect_platform(html_text):
+    """Return a non-Shopify platform name if the HTML carries its fingerprint,
+    else None. Used to give a precise 'this is a WooCommerce/Centra store, we
+    only support Shopify' message instead of a confusing parse error."""
+    if not html_text:
+        return None
+    head = html_text[:50000].lower()
+    # If it's obviously Shopify, don't misfire.
+    if 'cdn.shopify.com' in head or 'shopify.shop' in head or 'x-shopify' in head:
+        return None
+    for name, markers in _PLATFORM_MARKERS:
+        if any(mk in head for mk in markers):
+            return name
+    return None
+
+
+def _strip_color_from_title(title, color):
+    """Strip a trailing ' - Color' / ' | Color' / ' Color' from a product
+    title so we can compare the 'base name' of sibling products that share a
+    name but differ only by colour. Returns the lowercased base name."""
+    t = (title or '').strip()
+    if not t:
+        return ''
+    # Cut at the last ' - ' or ' | ' separator (most shops use one of these)
+    for sep in (' - ', ' | ', ' / ', ' – '):
+        if sep in t:
+            t = t.rsplit(sep, 1)[0]
+            break
+    else:
+        # No separator — strip a trailing colour word if present
+        c = (color or '').strip()
+        if c and t.lower().endswith(c.lower()):
+            t = t[: -len(c)].strip()
+    return re.sub(r'\s+', ' ', t).strip().lower()
+
+
 def _map_higgsfield_error(raw):
     """Translate Higgsfield's raw error output into a user-actionable message.
     The CLI / API doesn't have a stable error-code scheme, so we string-match
@@ -515,15 +566,26 @@ def _scrape_slugify(text):
     return re.sub(r'[^a-z0-9]+', '-', ascii_text.lower()).strip('-')
 
 
-def _find_siblings_via_catalog(scheme, netloc, base_prefix, base_handle, max_pages=5):
+def _find_siblings_via_catalog(scheme, netloc, base_prefix, base_handle,
+                               base_title=None, base_color=None,
+                               base_product_type=None, max_pages=5):
     """Fallback sibling discovery for shops that don't embed colour-swatch
     URLs in the product page HTML (Babyboo / shops with JavaScript-driven
-    pickers). Walks /products.json?page=N (cap 5 pages = 1250 products) and
-    returns every handle that starts with `<base_prefix>-` minus the base.
+    pickers). Walks /products.json?page=N (cap 5 pages = 1250 products).
 
-    Slower than the HTML route — only call this when HTML returned nothing."""
-    if not base_prefix:
+    Matches a candidate as a sibling when EITHER:
+      (a) handle starts with `<base_prefix>-`  — primary, high precision; OR
+      (b) its colour-stripped title equals the base's colour-stripped title
+          AND product_type matches  — catches siblings with mismatched
+          handles (e.g. base 'fenella-maxi-dress-ivory' but black variant
+          lives at 'fenella-blk-2024'). The product_type guard keeps this
+          from matching unrelated products that happen to share a name.
+
+    Slower than the HTML route — only called when HTML returned nothing."""
+    if not base_prefix and not base_title:
         return []
+    base_title_norm = _strip_color_from_title(base_title, base_color) if base_title else ''
+    base_type_norm  = (base_product_type or '').strip().lower()
     found = []
     seen = set()
     for page in range(1, max_pages + 1):
@@ -543,13 +605,23 @@ def _find_siblings_via_catalog(scheme, netloc, base_prefix, base_handle, max_pag
             break
         for p in prods:
             h = (p.get('handle') or '').lower()
-            if h == base_handle or not h.startswith(base_prefix + '-'):
+            if not h or h == base_handle or h in seen:
                 continue
-            if h in seen:
-                continue
-            seen.add(h)
-            found.append(h)
-        # Bail early if we already have plenty
+            match = False
+            # (a) handle-prefix match
+            if base_prefix and h.startswith(base_prefix + '-'):
+                match = True
+            # (b) title-similarity match (mismatched-handle siblings)
+            elif base_title_norm:
+                cand_title_norm = _strip_color_from_title(p.get('title'), None)
+                if cand_title_norm and cand_title_norm == base_title_norm:
+                    cand_type = (p.get('product_type') or '').strip().lower()
+                    # product_type guard — only when both sides declare one
+                    if not base_type_norm or not cand_type or cand_type == base_type_norm:
+                        match = True
+            if match:
+                seen.add(h)
+                found.append(h)
         if len(found) >= 20:
             break
     return sorted(found)
@@ -905,6 +977,7 @@ def scrape():
 
     base = None
     fallback_html = None
+    scrape_path = 'json'   # diagnostics: which path produced the product
     try:
         r = _scrape_get(json_url, timeout=20)
         # Locale-prefix fallback: if the prefixed URL 404'd, retry without it.
@@ -966,7 +1039,16 @@ def scrape():
             path_no_json = clean_path[:-5] if clean_path.endswith('.json') else clean_path
             handle_from_path = path_no_json.rsplit('/', 1)[-1]
             base = _scrape_product_from_html(scheme, parsed.netloc, handle_from_path, html_text=fallback_html)
+            scrape_path = 'html-jsonld'
             if not base:
+                # Maybe it's not Shopify at all — fingerprint the platform for
+                # a precise message.
+                platform = _detect_platform(fallback_html)
+                if platform:
+                    return jsonify({
+                        'error': f'This looks like a {platform} store, not Shopify. The dashboard currently only supports Shopify storefronts.',
+                        'url_tried': json_url,
+                    }), 400
                 return jsonify({
                     'error': 'Could not extract product data from HTML (no JSON-LD ProductGroup found).',
                     'url_tried': json_url,
@@ -990,9 +1072,18 @@ def scrape():
                     handle_from_path = clean_path[:-5] if clean_path.endswith('.json') else clean_path
                     handle_from_path = handle_from_path.rsplit('/', 1)[-1]
                     base = _scrape_product_from_html(scheme, parsed.netloc, handle_from_path, html_text=fallback_html)
+                    if base:
+                        scrape_path = 'html-jsonld'
                 except Exception:
                     base = None
                 if not base:
+                    # Fingerprint the platform so the user knows WHY it failed.
+                    platform = _detect_platform(fallback_html or '')
+                    if platform:
+                        return jsonify({
+                            'error': f'This looks like a {platform} store, not Shopify. The dashboard currently only supports Shopify storefronts.',
+                            'url_tried': json_url,
+                        }), 400
                     return jsonify({
                         'error': 'This URL does not look like a Shopify product. The dashboard only supports Shopify stores.',
                         'url_tried': json_url,
@@ -1044,6 +1135,8 @@ def scrape():
                         html_text = ''
                 sibling_handles = _find_color_sibling_handles(html_text or '', base_handle, color_slug)
 
+                siblings_method = 'html-anchor' if sibling_handles else None
+
                 # Catalog fallback for shops whose colour pickers don't put
                 # direct /products/<sibling> links in the HTML (Babyboo et al.).
                 if not sibling_handles:
@@ -1052,24 +1145,42 @@ def scrape():
                         if len(base_prefix) >= 3:
                             print(f"[scrape] HTML found no siblings — trying catalog fallback for prefix '{base_prefix}'")
                             sibling_handles = _find_siblings_via_catalog(
-                                scheme, parsed.netloc, base_prefix, base_handle
+                                scheme, parsed.netloc, base_prefix, base_handle,
+                                base_title=base.get('title'),
+                                base_color=color_values[0] if color_values else None,
+                                base_product_type=base.get('product_type'),
                             )
                             if sibling_handles:
+                                siblings_method = 'catalog'
                                 print(f"[scrape] Catalog fallback found {len(sibling_handles)} siblings")
 
                 if sibling_handles:
                     print(f"[scrape] Found {len(sibling_handles)} sibling colour-products for '{base_handle}'")
                     sibs = []
-                    for sh in sibling_handles[:15]:   # cap to avoid runaway fetches
+                    for sh in sibling_handles[:25]:   # cap to avoid runaway fetches
                         sib_product = _fetch_product_json(scheme, parsed.netloc, sh)
                         if sib_product:
                             sibs.append(sib_product)
                     if sibs:
                         merged = _merge_sibling_color_products(base, sibs)
+                        merged['_debug'] = {
+                            'path': scrape_path,
+                            'siblings_method': siblings_method,
+                            'siblings_found': len(sibs) + 1,
+                            'colors': (merged.get('options') or [{}])[0].get('values', []),
+                        }
                         return jsonify({'product': merged})
     except Exception as e:
         print(f"[scrape] sibling-merge step failed (continuing with base only): {e}")
 
+    # No siblings merged — return the single product, with diagnostics so a
+    # "only saw 1 colour" bug report tells us exactly which path ran.
+    base['_debug'] = {
+        'path': scrape_path,
+        'siblings_method': None,
+        'siblings_found': 1,
+        'colors': (base.get('options') or [{}])[0].get('values', []),
+    }
     return jsonify({'product': base})
 
 
