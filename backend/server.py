@@ -2153,6 +2153,27 @@ def _publish_make_handle(p_name, color):
     return f'{_publish_slug(p_name)}-{_publish_slug(color)}'.strip('-')
 
 
+def _find_product_by_handle(store, handle, hdrs):
+    """Return {'id': int} for an existing product at `handle`, else None.
+    Used as an idempotency guard so re-running a publish (retry / double-click)
+    doesn't create Shopify-suffixed duplicate products. Uses the REST handle
+    filter which returns an exact (not prefix) match."""
+    if not handle:
+        return None
+    try:
+        r = req.get(
+            shopify_url(store, f'products.json?handle={urllib.parse.quote(handle)}&fields=id,handle&status=any'),
+            headers=hdrs, timeout=15,
+        )
+        if r.status_code == 200:
+            for p in (r.json().get('products') or []):
+                if (p.get('handle') or '') == handle:
+                    return {'id': p.get('id')}
+    except Exception as e:
+        print(f"[publish] handle-existence check failed for {handle}: {e}")
+    return None
+
+
 def _publish_normalize_price(store, price_raw):
     """Strip currency suffix + apply per-store psychological suffix (.95 DK / .99 FR)."""
     raw = (price_raw or '0.00').replace(',', '.').replace(' DKK', '').replace(' EUR', '').strip()
@@ -2380,12 +2401,31 @@ def _publish_one_variant(
     """
     size_option_name = 'Størrelse' if store == 'dk' else 'Taille'
 
+    product_handle = _publish_make_handle(product_name, color)
+
+    # IDEMPOTENCY GUARD: if a product already exists at this exact handle, the
+    # publish has already created this colour (e.g. the user hit "Retry
+    # publish" after a partial failure, double-clicked, or two tabs raced).
+    # Re-creating would make Shopify auto-suffix the handle (jasmine-X-1) and
+    # leave duplicate products — exactly the Jasmine mess we just cleaned up.
+    # Reuse the existing product instead of creating a duplicate.
+    existing = _find_product_by_handle(store, product_handle, hdrs)
+    if existing:
+        eid = existing.get('id')
+        shop_domain = tokens.get(store, {}).get('shop', '')
+        print(f"[publish] Color '{color}' handle='{product_handle}' already exists (id={eid}) — reusing, skipping create")
+        return {
+            'product_id':      eid,
+            'product_url':     f'https://{shop_domain}/admin/products/{eid}' if shop_domain else '',
+            'metafield_errors': [],
+            'reused':          True,
+        }
+
     # Download + base64-attach images (reliable) instead of passing src URLs
     # that Shopify fetches async (which silently failed — cf. Inga DK got 0
     # images because the Higgsfield URL was unreachable when Shopify tried).
     img_payload = _build_image_payload(images, max_images=10)
 
-    product_handle = _publish_make_handle(product_name, color)
     product_payload = {
         'product': {
             'title':        product_name,
