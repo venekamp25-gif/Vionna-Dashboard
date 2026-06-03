@@ -120,6 +120,21 @@ BUG_REPORTS_PATH      = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 BUG_SCREENSHOTS_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bug_screenshots')
 os.makedirs(BUG_SCREENSHOTS_DIR, exist_ok=True)
 
+# Slack webhook for bug-report pings. Stored in a gitignored file (the repo is
+# public, so the secret can't live in code/env-in-repo). Set once via
+# POST /api/config/slack_webhook. Falls back to the SLACK_WEBHOOK_URL env var.
+SLACK_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'slack_config.json')
+
+def _slack_webhook_url():
+    env = os.getenv('SLACK_WEBHOOK_URL')
+    if env:
+        return env.strip()
+    try:
+        with open(SLACK_CONFIG_PATH, encoding='utf-8') as f:
+            return (json.load(f).get('bug_webhook') or '').strip() or None
+    except Exception:
+        return None
+
 # Scopes the dashboard needs from Shopify. After changing this list, every
 # already-authorised store needs to re-grant — visit /auth/dk and /auth/fr
 # once to issue a fresh token with the new scopes. publications scopes are
@@ -1723,7 +1738,69 @@ def bug_reports_create():
         return jsonify({'error': f'Could not save bug report: {ex}'}), 500
 
     print(f"[bugs] #{bug_id} reported by {entry['reporter_email']}: {title!r}")
+    # Best-effort Slack ping so the CEO knows a bug came in.
+    try:
+        _post_bug_to_slack(entry)
+    except Exception as ex:
+        print(f"[bugs] slack notify failed: {ex}")
     return jsonify({'success': True, 'id': bug_id})
+
+
+def _post_bug_to_slack(entry):
+    """Post a new bug report to Slack via the configured incoming webhook.
+    No-op when no webhook is configured. Never raises to the caller path."""
+    url = _slack_webhook_url()
+    if not url:
+        return
+    bug_id = entry.get('id', '?')
+    shop_base = os.getenv('PUBLIC_BASE_URL', 'https://188-166-11-177.nip.io').rstrip('/')
+    sshot = f"{shop_base}/api/bug_reports/{bug_id}/screenshot" if entry.get('screenshot_filename') else None
+    fields = [
+        {'type': 'mrkdwn', 'text': f"*Reporter:*\n{entry.get('reporter_email') or 'unknown'}"},
+        {'type': 'mrkdwn', 'text': f"*Store:*\n{(entry.get('store') or '—').upper()}"},
+        {'type': 'mrkdwn', 'text': f"*Page:*\n{entry.get('page_url') or '—'}"},
+        {'type': 'mrkdwn', 'text': f"*ID:*\n#{bug_id}"},
+    ]
+    blocks = [
+        {'type': 'header', 'text': {'type': 'plain_text', 'text': f'🐛 New bug #{bug_id}', 'emoji': True}},
+        {'type': 'section', 'text': {'type': 'mrkdwn', 'text': f"*{entry.get('title','(no title)')}*"}},
+        {'type': 'section', 'fields': fields},
+    ]
+    desc = (entry.get('description') or '').strip()
+    if desc:
+        snip = desc[:600].replace('\n', '\n>')
+        blocks.append({'type': 'section', 'text': {'type': 'mrkdwn', 'text': f">{snip}"}})
+    if sshot:
+        blocks.append({'type': 'section',
+                       'text': {'type': 'mrkdwn', 'text': f"<{sshot}|📎 View screenshot>"},
+                       'accessory': {'type': 'image', 'image_url': sshot, 'alt_text': 'screenshot'}})
+    blocks.append({'type': 'context', 'elements': [
+        {'type': 'mrkdwn', 'text': "Open Claude Code and say *“work the bug queue”* to fix."}]})
+    req.post(url, json={'text': f"🐛 New bug #{bug_id}: {entry.get('title','')}", 'blocks': blocks}, timeout=10)
+
+
+@app.route('/api/config/slack_webhook', methods=['POST'])
+def config_slack_webhook():
+    """Store the Slack incoming-webhook URL for bug pings (gitignored file).
+
+    Write-once: refuses to overwrite an existing config (so a drive-by caller
+    can't redirect bug notifications after setup). To replace it, delete
+    slack_config.json on the server first. Validates the URL is a Slack
+    incoming webhook."""
+    data = request.json or {}
+    url = (data.get('url') or '').strip()
+    if not url.startswith('https://hooks.slack.com/services/'):
+        return jsonify({'error': 'Provide a valid Slack incoming-webhook URL (https://hooks.slack.com/services/...).'}), 400
+    if os.path.exists(SLACK_CONFIG_PATH) and not data.get('force'):
+        return jsonify({'error': 'Already configured (write-once). Pass force=true only if you intend to replace it.'}), 409
+    try:
+        tmp = SLACK_CONFIG_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({'bug_webhook': url}, f)
+        os.replace(tmp, SLACK_CONFIG_PATH)
+    except Exception as ex:
+        return jsonify({'error': f'Could not save: {ex}'}), 500
+    return jsonify({'success': True, 'configured': True})
 
 
 @app.route('/api/bug_reports', methods=['GET'])

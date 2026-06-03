@@ -3,6 +3,12 @@
 backend/.env
 tokens.json
 backend/tokens.json
+slack_config.json
+backend/slack_config.json
+bug_reports.jsonl
+backend/bug_reports.jsonl
+backend/bug_screenshots/
+backend/drafts/
 __pycache__/
 *.pyc
 *.pyo

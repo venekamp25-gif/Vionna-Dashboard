@@ -80,23 +80,8 @@ export function ReportBugModal({ open, onClose }: Props) {
       });
       if (!res.success || res.error) throw new Error(res.error ?? "Unknown error");
       setSubmitted(res.id ?? 0);
-      // Fire a Slack notification (best-effort — never blocks the success UI).
-      void fetch("/api/notify-bug", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          id: res.id,
-          title: title.trim(),
-          description: description.trim(),
-          reporter_email: reporterEmail || undefined,
-          store,
-          page_url:
-            typeof window !== "undefined"
-              ? window.location.pathname + window.location.search
-              : "",
-          has_screenshot: !!screenshot,
-        }),
-      }).catch(() => {});
+      // Slack notification is fired server-side by the droplet on save
+      // (single source of truth) — nothing to do here.
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
