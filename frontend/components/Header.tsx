@@ -8,10 +8,12 @@ import { BackendStatusBadge } from "./BackendStatusBadge";
 import { LogoutButton } from "./LogoutButton";
 import { SettingsModal } from "./SettingsModal";
 import { HistoryModal } from "./HistoryModal";
+import { ReportBugModal } from "./ReportBugModal";
 
 export function Header() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [historyOpen, setHistoryOpen]   = useState(false);
+  const [bugOpen, setBugOpen]           = useState(false);
 
   return (
     <>
@@ -20,6 +22,15 @@ export function Header() {
         <div className="flex items-center gap-3">
           <BackendStatusBadge />
           <StoreToggle />
+          <button
+            type="button"
+            onClick={() => setBugOpen(true)}
+            title="Report a bug"
+            aria-label="Report a bug"
+            className="w-9 h-9 flex items-center justify-center rounded-md bg-bg-elev-2 text-text-dim hover:text-warning hover:border-warning border border-border transition-colors text-[14px]"
+          >
+            🐛
+          </button>
           <button
             type="button"
             onClick={() => setHistoryOpen(true)}
@@ -44,6 +55,7 @@ export function Header() {
       </header>
       <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
       <HistoryModal open={historyOpen} onClose={() => setHistoryOpen(false)} />
+      <ReportBugModal open={bugOpen} onClose={() => setBugOpen(false)} />
     </>
   );
 }

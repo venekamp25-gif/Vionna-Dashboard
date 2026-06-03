@@ -184,6 +184,19 @@ export const api = {
     siblings_handle: string;
   }) => call<PublishStartStoreResponse>("/api/publish/start_store", { method: "POST", body: params }),
 
+  reportBug: (params: {
+    title: string;
+    description: string;
+    page_url?: string;
+    reporter_email?: string;
+    store?: "dk" | "fr";
+    screenshot?: string;   // data URL
+  }) =>
+    call<{ success: boolean; id?: number; error?: string }>("/api/bug_reports", {
+      method: "POST",
+      body: params,
+    }),
+
   backfillSalesChannels: (store: "dk" | "fr") =>
     call<{
       store: string;

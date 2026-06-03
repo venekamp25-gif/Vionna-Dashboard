@@ -113,6 +113,13 @@ HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'publish
 DRAFTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drafts')
 os.makedirs(DRAFTS_DIR, exist_ok=True)
 
+# Bug-report intake. Employees use the "Report a bug" button in the header;
+# entries get appended to a JSONL queue + (if attached) a screenshot saved
+# alongside. The CEO's Claude Code session reads the queue on session start.
+BUG_REPORTS_PATH      = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bug_reports.jsonl')
+BUG_SCREENSHOTS_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bug_screenshots')
+os.makedirs(BUG_SCREENSHOTS_DIR, exist_ok=True)
+
 # Scopes the dashboard needs from Shopify. After changing this list, every
 # already-authorised store needs to re-grant — visit /auth/dk and /auth/fr
 # once to issue a fresh token with the new scopes. publications scopes are
@@ -1431,6 +1438,175 @@ def drafts_clear():
         except Exception as e:
             return jsonify({'error': f'Could not clear draft: {e}'}), 500
     return jsonify({'success': True})
+
+
+# --- Bug-report intake (queued for CEO's Claude Code session) ---
+
+import base64 as _b64
+
+def _next_bug_id():
+    """Find the highest ID currently in bug_reports.jsonl and return +1."""
+    if not os.path.exists(BUG_REPORTS_PATH):
+        return 1
+    highest = 0
+    try:
+        with open(BUG_REPORTS_PATH, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                    if isinstance(e, dict) and isinstance(e.get('id'), int):
+                        highest = max(highest, e['id'])
+                except Exception:
+                    pass
+    except Exception:
+        return 1
+    return highest + 1
+
+
+def _load_bug_reports(status_filter=None):
+    """Read bug_reports.jsonl as a list. Filters out resolved entries when
+    status_filter='open'. Latest-first ordering."""
+    if not os.path.exists(BUG_REPORTS_PATH):
+        return []
+    out = []
+    try:
+        with open(BUG_REPORTS_PATH, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(e, dict):
+                    continue
+                if status_filter and e.get('status') != status_filter:
+                    continue
+                out.append(e)
+    except Exception as ex:
+        print(f"[bugs] load failed: {ex}")
+    out.sort(key=lambda e: e.get('id', 0), reverse=True)
+    return out
+
+
+def _rewrite_bug_reports(entries):
+    """Atomically replace bug_reports.jsonl with `entries`. Used by status
+    updates since we can't easily edit a single line in JSONL in place."""
+    tmp = BUG_REPORTS_PATH + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        # Write oldest first so append-only semantics still hold visually
+        for e in sorted(entries, key=lambda x: x.get('id', 0)):
+            f.write(json.dumps(e, ensure_ascii=False) + '\n')
+    os.replace(tmp, BUG_REPORTS_PATH)
+
+
+@app.route('/api/bug_reports', methods=['POST'])
+def bug_reports_create():
+    """Submit a new bug report. Body:
+        {
+          "title":         "short summary",
+          "description":   "detailed explanation",
+          "page_url":      "/review",          # optional, where user was
+          "reporter_email":"user@example.com", # optional but useful
+          "store":         "dk" | "fr",        # optional
+          "screenshot":    "data:image/png;base64,..."  # optional
+        }
+    """
+    data  = request.json or {}
+    title = (data.get('title') or '').strip()[:200]
+    desc  = (data.get('description') or '').strip()[:5000]
+    if not title:
+        return jsonify({'error': 'title is required'}), 400
+
+    bug_id = _next_bug_id()
+
+    # Persist screenshot if attached (data URL → file on disk).
+    screenshot_filename = None
+    sshot = data.get('screenshot') or ''
+    if sshot and sshot.startswith('data:image/') and ';base64,' in sshot:
+        try:
+            header, payload = sshot.split(';base64,', 1)
+            ext = 'png'
+            if 'jpeg' in header or 'jpg' in header:
+                ext = 'jpg'
+            elif 'webp' in header:
+                ext = 'webp'
+            decoded = _b64.b64decode(payload)
+            if len(decoded) > 5_000_000:  # 5MB
+                print(f"[bugs] dropping oversized screenshot ({len(decoded)} bytes)")
+            else:
+                fname = f'bug_{bug_id}.{ext}'
+                with open(os.path.join(BUG_SCREENSHOTS_DIR, fname), 'wb') as f:
+                    f.write(decoded)
+                screenshot_filename = fname
+        except Exception as ex:
+            print(f"[bugs] screenshot save failed: {ex}")
+
+    entry = {
+        'id':             bug_id,
+        'created_at':     datetime.datetime.utcnow().isoformat() + 'Z',
+        'reporter_email': (data.get('reporter_email') or '').strip()[:120] or None,
+        'store':          (data.get('store') or '').strip()[:8] or None,
+        'page_url':       (data.get('page_url') or '').strip()[:500] or None,
+        'title':          title,
+        'description':    desc,
+        'screenshot_filename': screenshot_filename,
+        'status':         'open',
+        'resolved_at':    None,
+    }
+    try:
+        with open(BUG_REPORTS_PATH, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    except Exception as ex:
+        return jsonify({'error': f'Could not save bug report: {ex}'}), 500
+
+    print(f"[bugs] #{bug_id} reported by {entry['reporter_email']}: {title!r}")
+    return jsonify({'success': True, 'id': bug_id})
+
+
+@app.route('/api/bug_reports', methods=['GET'])
+def bug_reports_list():
+    """List bug reports. Default: open only. Pass ?status=all to see resolved too."""
+    status = request.args.get('status', 'open')
+    entries = _load_bug_reports(status_filter=None if status == 'all' else 'open')
+    # Hide screenshot path from list-level response — the GET-by-ID returns it
+    return jsonify({
+        'open_count':  sum(1 for e in entries if e.get('status') == 'open'),
+        'total_count': len(entries),
+        'entries':     entries,
+    })
+
+
+@app.route('/api/bug_reports/<int:bug_id>/resolve', methods=['POST'])
+def bug_reports_resolve(bug_id):
+    """Mark a single bug as resolved."""
+    entries = _load_bug_reports()
+    found = False
+    for e in entries:
+        if e.get('id') == bug_id:
+            e['status'] = 'resolved'
+            e['resolved_at'] = datetime.datetime.utcnow().isoformat() + 'Z'
+            found = True
+            break
+    if not found:
+        return jsonify({'error': f'bug #{bug_id} not found'}), 404
+    try:
+        _rewrite_bug_reports(entries)
+    except Exception as ex:
+        return jsonify({'error': f'Could not update: {ex}'}), 500
+    return jsonify({'success': True, 'id': bug_id})
+
+
+@app.route('/api/bug_reports/<int:bug_id>/screenshot', methods=['GET'])
+def bug_reports_screenshot(bug_id):
+    """Serve a bug's screenshot image, if any was attached."""
+    entries = _load_bug_reports()
+    entry = next((e for e in entries if e.get('id') == bug_id), None)
+    if not entry or not entry.get('screenshot_filename'):
+        return jsonify({'error': 'no screenshot'}), 404
+    fname = entry['screenshot_filename']
+    # Sanity check the filename matches our pattern
+    if not re.match(r'^bug_\d+\.(png|jpg|webp)$', fname):
+        return jsonify({'error': 'invalid screenshot reference'}), 400
+    return send_from_directory(BUG_SCREENSHOTS_DIR, fname)
 
 
 # --- Recent product descriptions (used as tone references in Settings) ---
