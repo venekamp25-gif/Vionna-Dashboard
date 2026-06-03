@@ -7,13 +7,40 @@
 const BACKEND_URL =
   process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/+$/, "") || "http://localhost:5000";
 
+// Short-lived token for the droplet's mutation endpoints (publish / backfill).
+// Minted server-side by /api/droplet-token so the secret never reaches the
+// browser. Cached and reused across a publish run (which fires many per-variant
+// calls) and refreshed well before the 5-minute server-side expiry.
+let _dropletToken: { value: string; expiresAt: number } | null = null;
+
+async function getDropletToken(): Promise<string | null> {
+  const now = Date.now();
+  if (_dropletToken && _dropletToken.expiresAt > now + 30_000) return _dropletToken.value;
+  try {
+    const res = await fetch("/api/droplet-token", { credentials: "include" });
+    if (!res.ok) return null;
+    const { token } = (await res.json()) as { token?: string };
+    if (!token) return null;
+    _dropletToken = { value: token, expiresAt: now + 4 * 60_000 }; // refresh before the 5-min expiry
+    return token;
+  } catch {
+    return null;
+  }
+}
+
 async function call<T>(
   path: string,
-  init?: { method?: "GET" | "POST"; body?: unknown; signal?: AbortSignal }
+  init?: { method?: "GET" | "POST"; body?: unknown; signal?: AbortSignal; authed?: boolean }
 ): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (init?.body) headers["Content-Type"] = "application/json";
+  if (init?.authed) {
+    const token = await getDropletToken();
+    if (token) headers["X-Droplet-Token"] = token;
+  }
   const res = await fetch(`${BACKEND_URL}${path}`, {
     method: init?.method ?? "GET",
-    headers: init?.body ? { "Content-Type": "application/json" } : undefined,
+    headers: Object.keys(headers).length ? headers : undefined,
     body: init?.body ? JSON.stringify(init.body) : undefined,
     credentials: "include",
     signal: init?.signal,
@@ -176,13 +203,13 @@ export const api = {
     siblings_handle: string;
     images?: string[];
     images_by_color?: Record<string, string[]>;
-  }) => call<PublishResponse>("/api/publish", { method: "POST", body: params }),
+  }) => call<PublishResponse>("/api/publish", { method: "POST", body: params, authed: true }),
 
   publishStartStore: (params: {
     store: "dk" | "fr";
     product_name: string;
     siblings_handle: string;
-  }) => call<PublishStartStoreResponse>("/api/publish/start_store", { method: "POST", body: params }),
+  }) => call<PublishStartStoreResponse>("/api/publish/start_store", { method: "POST", body: params, authed: true }),
 
   reportBug: (params: {
     title: string;
@@ -209,7 +236,7 @@ export const api = {
       samples_published?: { id: number; title: string; status: string }[];
       error?: string;
       available_publications?: string[];
-    }>(`/api/backfill_sales_channels?store=${store}`, { method: "POST" }),
+    }>(`/api/backfill_sales_channels?store=${store}`, { method: "POST", authed: true }),
 
   recentDescriptions: (params: { store: "dk" | "fr"; limit?: number }) => {
     const qs = new URLSearchParams();
@@ -245,7 +272,7 @@ export const api = {
     images: string[];
     collection_id?: number | null;
     actual_handle: string;
-  }) => call<PublishCreateVariantResponse>("/api/publish/create_variant", { method: "POST", body: params }),
+  }) => call<PublishCreateVariantResponse>("/api/publish/create_variant", { method: "POST", body: params, authed: true }),
 };
 
 export const BACKEND = BACKEND_URL;

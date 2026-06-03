@@ -1,4 +1,5 @@
-import os, sys, json, re, hashlib, urllib.parse, subprocess, tempfile, shutil, platform, unicodedata, datetime, time
+import os, sys, json, re, hashlib, hmac, base64, urllib.parse, subprocess, tempfile, shutil, platform, unicodedata, datetime, time
+from functools import wraps
 from flask import Flask, request, redirect, session, jsonify, send_from_directory
 from flask_cors import CORS
 import requests as req
@@ -23,7 +24,8 @@ _allowed_origins = [
     'http://127.0.0.1:3000',
     os.environ.get('FRONTEND_URL', ''),
 ]
-CORS(app, resources={r'/api/*': {'origins': [o for o in _allowed_origins if o]}}, supports_credentials=True)
+CORS(app, resources={r'/api/*': {'origins': [o for o in _allowed_origins if o]}}, supports_credentials=True,
+     allow_headers=['Content-Type', 'X-Droplet-Token'])
 
 @app.errorhandler(Exception)
 def handle_error(e):
@@ -179,6 +181,51 @@ def shopify_headers(store_key):
 def shopify_url(store_key, path):
     shop = tokens.get(store_key, {}).get('shop') or STORES.get(store_key)
     return f"https://{shop}/admin/api/{API_VERSION}/{path}"
+
+
+# --- Mutation gate (short-lived signed token) ---
+# The mutation endpoints (publish / backfill) write to the LIVE stores, so they
+# can't be left open on the public droplet URL. The Next.js frontend mints a
+# short-lived HS256 token server-side — the secret never reaches the browser —
+# and the browser sends it as the `X-Droplet-Token` header. We verify it here
+# using only the standard library (hmac/hashlib/base64), so no new pip dependency
+# is introduced and the self-updater (which only pulls server.py + version.txt)
+# keeps working. When DROPLET_TOKEN_SECRET is unset the gate is OPEN, so the first
+# deploy never breaks; set the SAME secret on the droplet AND on Netlify to
+# activate it (set Netlify first, then the droplet — see CLAUDE.md).
+DROPLET_TOKEN_SECRET = os.getenv('DROPLET_TOKEN_SECRET')
+
+def _b64url_decode(seg):
+    return base64.urlsafe_b64decode(seg + '=' * (-len(seg) % 4))
+
+def _verify_droplet_token(token):
+    """Return the decoded payload for a valid, unexpired HS256 token, else None."""
+    if not token or token.count('.') != 2 or not DROPLET_TOKEN_SECRET:
+        return None
+    header_b64, payload_b64, sig_b64 = token.split('.')
+    signing_input = f'{header_b64}.{payload_b64}'.encode()
+    try:
+        expected = hmac.new(DROPLET_TOKEN_SECRET.encode(), signing_input, hashlib.sha256).digest()
+        if not hmac.compare_digest(expected, _b64url_decode(sig_b64)):
+            return None
+        payload = json.loads(_b64url_decode(payload_b64))
+    except Exception:
+        return None
+    exp = payload.get('exp')
+    if exp is not None and time.time() > float(exp):
+        return None
+    return payload
+
+def require_droplet_token(f):
+    """Gate a route behind a valid frontend-minted token (no-op until the secret
+    is configured, so deploys are safe before the env var is set everywhere)."""
+    @wraps(f)
+    def _wrapped(*args, **kwargs):
+        if DROPLET_TOKEN_SECRET:
+            if not _verify_droplet_token(request.headers.get('X-Droplet-Token', '')):
+                return jsonify({'error': 'Unauthorized — missing, invalid or expired session token'}), 401
+        return f(*args, **kwargs)
+    return _wrapped
 
 
 # --- Static files ---
@@ -1389,6 +1436,7 @@ def debug_metafields():
 # --- Backfill: ensure every existing product is on Online Store + Facebook + Google ---
 
 @app.route('/api/backfill_sales_channels', methods=['POST'])
+@require_droplet_token
 def backfill_sales_channels():
     """Walk every product in a store and (re-)publish it to the three default
     sales channels. Idempotent — products already on a channel are silently
@@ -2631,6 +2679,7 @@ def _publish_one_variant(
 # --- Granular publish endpoints (for live per-variant progress in the dashboard) ---
 
 @app.route('/api/publish/start_store', methods=['POST'])
+@require_droplet_token
 def publish_start_store():
     """Step 1 of granular publish: create-or-reuse the siblings collection.
     Returns the collection_id + actual_handle so the frontend can pass them
@@ -2665,6 +2714,7 @@ def publish_start_store():
 
 
 @app.route('/api/publish/create_variant', methods=['POST'])
+@require_droplet_token
 def publish_create_variant():
     """Step 2 of granular publish: create ONE colour-variant product."""
     data = request.json or {}
@@ -2724,6 +2774,7 @@ def publish_create_variant():
 
 # --- Publish to Shopify ---
 @app.route('/api/publish', methods=['POST'])
+@require_droplet_token
 def publish():
     data      = request.json
     store     = data.get('store', 'dk')
