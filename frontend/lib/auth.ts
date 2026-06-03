@@ -10,6 +10,16 @@ const SECRET = new TextEncoder().encode(
 );
 const SESSION_DURATION_SEC = 7 * 24 * 60 * 60;   // 7 days
 
+// Separate secret for the short-lived tokens the browser sends to the Python
+// droplet on mutation calls (publish / backfill). Signed here on the server so
+// the secret never reaches the browser; the droplet verifies it with the SAME
+// DROPLET_TOKEN_SECRET. Kept distinct from AUTH_SECRET so a leak of one doesn't
+// compromise the other.
+const DROPLET_TOKEN_SECRET = new TextEncoder().encode(
+  process.env.DROPLET_TOKEN_SECRET || "dev-only-droplet-secret-change-in-prod-please-32-chars-min"
+);
+const DROPLET_TOKEN_DURATION_SEC = 5 * 60;       // 5 minutes — long enough for one publish run
+
 export const COOKIE_NAME = "vionna_session";
 
 export interface SessionPayload {
@@ -24,6 +34,18 @@ export async function createSession(email: string): Promise<string> {
     .setIssuedAt()
     .setExpirationTime(`${SESSION_DURATION_SEC}s`)
     .sign(SECRET);
+}
+
+/**
+ * Mint a short-lived token the browser sends to the Python droplet on mutation
+ * calls. Standard HS256 JWT so the droplet can verify it with stdlib (no PyJWT).
+ */
+export async function createDropletToken(email: string): Promise<string> {
+  return await new SignJWT({ email, scope: "mutations" })
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt()
+    .setExpirationTime(`${DROPLET_TOKEN_DURATION_SEC}s`)
+    .sign(DROPLET_TOKEN_SECRET);
 }
 
 export async function verifySession(token: string | undefined): Promise<SessionPayload | null> {
