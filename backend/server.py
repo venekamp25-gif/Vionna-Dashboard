@@ -2386,6 +2386,35 @@ def _build_image_payload(urls, max_images=10):
     return out
 
 
+def _attach_images_one_by_one(store, prod_id, img_payload, hdrs):
+    """Upload product images ONE PER REQUEST.
+
+    Bundling many base64-encoded images into the single product-create POST
+    blows past Shopify's request-size limit (413 Payload Too Large — 4 photos
+    × a few MB each × 33% base64 overhead). So we create the product imageless
+    and add each image via its own POST /products/{id}/images.json, which keeps
+    every request small. Returns the list of created Shopify image objects (in
+    upload order) so the caller can assign the first one to the variants.
+    """
+    created = []
+    for i, img in enumerate(img_payload):
+        try:
+            r = req.post(
+                shopify_url(store, f'products/{prod_id}/images.json'),
+                headers=hdrs, json={'image': img}, timeout=60,
+            )
+            if r.status_code in (200, 201):
+                created.append(r.json().get('image'))
+            else:
+                # If a base64 attachment was rejected, try Shopify's own fetch
+                # via src as a last resort (we don't have the src here unless it
+                # was the fallback shape, so just log).
+                print(f"[publish] image {i+1} upload failed {r.status_code}: {r.text[:160]}")
+        except Exception as e:
+            print(f"[publish] image {i+1} upload error: {e}")
+    return created
+
+
 def _publish_one_variant(
     *,
     store, product_name, color, sizes,
@@ -2421,11 +2450,12 @@ def _publish_one_variant(
             'reused':          True,
         }
 
-    # Download + base64-attach images (reliable) instead of passing src URLs
-    # that Shopify fetches async (which silently failed — cf. Inga DK got 0
-    # images because the Higgsfield URL was unreachable when Shopify tried).
+    # Download + base64-encode images (reliable — no dependency on Shopify
+    # async-fetching the Higgsfield URL later). Uploaded SEPARATELY below to
+    # avoid 413 Payload Too Large from bundling them into the create request.
     img_payload = _build_image_payload(images, max_images=10)
 
+    # Create the product WITHOUT images first.
     product_payload = {
         'product': {
             'title':        product_name,
@@ -2444,10 +2474,9 @@ def _publish_one_variant(
                 for size in sizes
             ],
             'options': [{'name': size_option_name, 'values': sizes}],
-            'images':  img_payload,
         }
     }
-    print(f"[publish] Color '{color}' handle='{product_handle}' images={len(img_payload)}")
+    print(f"[publish] Color '{color}' handle='{product_handle}' images={len(img_payload)} (uploaded separately)")
 
     prod_res = req.post(f"{base}products.json", headers=hdrs, json=product_payload)
     if prod_res.status_code not in (200, 201):
@@ -2456,6 +2485,9 @@ def _publish_one_variant(
 
     prod_data = prod_res.json()['product']
     prod_id   = prod_data['id']
+
+    # Upload images one at a time (avoids the 413 from bundling base64 bytes).
+    uploaded_images = _attach_images_one_by_one(store, prod_id, img_payload, hdrs)
 
     # --- Metafields ---
     metafields = [
@@ -2486,16 +2518,16 @@ def _publish_one_variant(
                 mf_errors.append(f"{mf['key']} (both types failed): {mf_res2.text[:120]}")
 
     # --- Assign first image to all variants ---
-    prod_images   = prod_data.get('images', [])
     prod_variants = prod_data.get('variants', [])
-    if prod_images and prod_variants:
-        first_image_id = prod_images[0]['id']
-        for variant in prod_variants:
-            req.put(
-                shopify_url(store, f'variants/{variant["id"]}.json'),
-                headers=hdrs,
-                json={'variant': {'id': variant['id'], 'image_id': first_image_id}}
-            )
+    if uploaded_images and prod_variants:
+        first_image_id = (uploaded_images[0] or {}).get('id')
+        if first_image_id:
+            for variant in prod_variants:
+                req.put(
+                    shopify_url(store, f'variants/{variant["id"]}.json'),
+                    headers=hdrs,
+                    json={'variant': {'id': variant['id'], 'image_id': first_image_id}}
+                )
 
     # --- Add to siblings collection ---
     if collection_id:
@@ -2818,7 +2850,7 @@ def publish():
                 'options': [
                     {'name': size_option_name, 'values': sizes},
                 ],
-                'images': img_payload,
+                # Images uploaded separately below to avoid 413 Payload Too Large.
             }
         }
         print(f"[publish] Product handle: '{product_handle}' | Sample SKU: '{make_sku(product_name, color, sizes[0] if sizes else 'M')}'")
@@ -2828,6 +2860,9 @@ def publish():
             prod_data  = prod_res.json()['product']
             prod_id    = prod_data['id']
             created.append(prod_id)
+            # Upload images one at a time (avoids the 413 from bundling base64)
+            uploaded_images = _attach_images_one_by_one(store, prod_id, img_payload, hdrs)
+            prod_data['images'] = uploaded_images or prod_data.get('images', [])
 
             # --- Metafields via separate POST ---
             # Namespace+key MUST match the metafield definitions configured in the Shopify store.
@@ -2867,7 +2902,7 @@ def publish():
                         mf_errors.append(f"{mf['key']} ({mf['type']} + {alt_type} both failed): {mf_res2.text[:120]}")
 
             # --- Assign first product image to all variants ---
-            prod_images  = prod_data.get('images', [])
+            prod_images  = [im for im in (prod_data.get('images') or []) if im and im.get('id')]
             prod_variants = prod_data.get('variants', [])
             if prod_images and prod_variants:
                 first_image_id = prod_images[0]['id']
