@@ -2555,6 +2555,22 @@ def _publish_one_variant(
     """
     size_option_name = 'Størrelse' if store == 'dk' else 'Taille'
 
+    # GUARD: an empty colour is the root of the duplicate + empty-cutline mess.
+    # _publish_make_handle(name, "") collapses to a name-only handle, so EVERY
+    # colourless variant of a product collides on the same handle — Shopify then
+    # either auto-suffixes (-1/-2, the fake "duplicates") or the idempotency
+    # guard reuses the first one and silently drops the rest. It also leaves an
+    # empty theme.cutline (no colour swatch). Refuse instead of creating junk.
+    color = (color or '').strip()
+    if not color:
+        return {
+            'error': ('No colour set for this variant. Publishing it would create '
+                      'an empty cutline and a name-only handle that collides with '
+                      'the product\'s other colours (the cause of the duplicate '
+                      'listings). Set a colour for this variant and retry.'),
+            'metafield_errors': [],
+        }
+
     product_handle = _publish_make_handle(product_name, color)
 
     # IDEMPOTENCY GUARD: if a product already exists at this exact handle, the
