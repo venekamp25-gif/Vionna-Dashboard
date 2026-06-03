@@ -2323,6 +2323,48 @@ def _ensure_siblings_collection(store, product_name, siblings_handle, hdrs, base
     return collection_id, returned_handle, False
 
 
+def _build_image_payload(urls, max_images=10):
+    """Build Shopify product-image dicts from a list of URLs.
+
+    CRITICAL RELIABILITY FIX: instead of passing {'src': url} and trusting
+    Shopify to asynchronously fetch it later, we download the bytes HERE
+    (while the source URL is definitely alive — Higgsfield output URLs can
+    expire or rate-limit Shopify's fetcher) and send them as a base64
+    {'attachment': ...}. Shopify then stores the bytes synchronously, so an
+    image can never silently fail to attach the way {'src': ...} does.
+
+    Falls back to {'src': url} for any image we couldn't download, so a
+    transient download error still has a chance via Shopify's own fetch.
+    """
+    seen = set()
+    out = []
+    for url in urls:
+        if not isinstance(url, str) or not url.startswith('http'):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        if len(out) >= max_images:
+            break
+        try:
+            r = _scrape_get(url, timeout=20)
+            r.raise_for_status()
+            content = r.content
+            if not content or len(content) > 20_000_000:   # 20MB sanity cap
+                raise ValueError(f'empty or oversized image ({len(content) if content else 0} bytes)')
+            b64 = _b64.b64encode(content).decode('ascii')
+            # Derive a filename so Shopify keeps a sensible extension
+            path = urllib.parse.urlparse(url).path
+            fname = os.path.basename(path) or 'image.jpg'
+            if '.' not in fname:
+                fname += '.jpg'
+            out.append({'attachment': b64, 'filename': fname})
+        except Exception as e:
+            print(f"[publish] image download failed ({url[:80]}): {e} — falling back to src")
+            out.append({'src': url})
+    return out
+
+
 def _publish_one_variant(
     *,
     store, product_name, color, sizes,
@@ -2338,10 +2380,10 @@ def _publish_one_variant(
     """
     size_option_name = 'Størrelse' if store == 'dk' else 'Taille'
 
-    # Dedupe images while preserving order, drop non-http
-    seen_imgs = set()
-    deduped = [u for u in images if u.startswith('http') and not (u in seen_imgs or seen_imgs.add(u))]
-    img_payload = [{'src': img} for img in deduped[:10]]
+    # Download + base64-attach images (reliable) instead of passing src URLs
+    # that Shopify fetches async (which silently failed — cf. Inga DK got 0
+    # images because the Higgsfield URL was unreachable when Shopify tried).
+    img_payload = _build_image_payload(images, max_images=10)
 
     product_handle = _publish_make_handle(product_name, color)
     product_payload = {
@@ -2710,7 +2752,8 @@ def publish():
         # Deduplicate while preserving order
         seen_imgs = set()
         all_imgs = [u for u in all_imgs if not (u in seen_imgs or seen_imgs.add(u))]
-        img_payload = [{'src': img} for img in all_imgs[:10] if img.startswith('http')]
+        # Download + base64-attach (reliable) instead of {'src': url} async fetch
+        img_payload = _build_image_payload(all_imgs, max_images=10)
         primary_tag = ' (PRIMARY)' if color == primary_color else ''
         print(f"[publish] Color '{color}'{primary_tag}: {len(shared_images) if color == primary_color else 0} shared + {len(color_specific)} color-specific = {len(img_payload)} total images")
 
