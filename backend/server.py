@@ -515,6 +515,46 @@ def _scrape_slugify(text):
     return re.sub(r'[^a-z0-9]+', '-', ascii_text.lower()).strip('-')
 
 
+def _find_siblings_via_catalog(scheme, netloc, base_prefix, base_handle, max_pages=5):
+    """Fallback sibling discovery for shops that don't embed colour-swatch
+    URLs in the product page HTML (Babyboo / shops with JavaScript-driven
+    pickers). Walks /products.json?page=N (cap 5 pages = 1250 products) and
+    returns every handle that starts with `<base_prefix>-` minus the base.
+
+    Slower than the HTML route — only call this when HTML returned nothing."""
+    if not base_prefix:
+        return []
+    found = []
+    seen = set()
+    for page in range(1, max_pages + 1):
+        try:
+            r = _scrape_get(
+                f'{scheme}://{netloc}/products.json?limit=250&page={page}',
+                timeout=15,
+            )
+            if r.status_code != 200:
+                break
+            data = r.json()
+        except Exception as e:
+            print(f"[scrape] catalog fallback page {page} failed: {e}")
+            break
+        prods = data.get('products') or []
+        if not prods:
+            break
+        for p in prods:
+            h = (p.get('handle') or '').lower()
+            if h == base_handle or not h.startswith(base_prefix + '-'):
+                continue
+            if h in seen:
+                continue
+            seen.add(h)
+            found.append(h)
+        # Bail early if we already have plenty
+        if len(found) >= 20:
+            break
+    return sorted(found)
+
+
 def _find_color_sibling_handles(html_text, base_handle, color_slug):
     """Find sibling colour-products linked from the storefront page HTML.
 
@@ -1003,6 +1043,19 @@ def scrape():
                         print(f"[scrape] HTML fetch for siblings failed: {e}")
                         html_text = ''
                 sibling_handles = _find_color_sibling_handles(html_text or '', base_handle, color_slug)
+
+                # Catalog fallback for shops whose colour pickers don't put
+                # direct /products/<sibling> links in the HTML (Babyboo et al.).
+                if not sibling_handles:
+                    if base_handle.endswith('-' + color_slug):
+                        base_prefix = base_handle[:-(len(color_slug) + 1)]
+                        if len(base_prefix) >= 3:
+                            print(f"[scrape] HTML found no siblings — trying catalog fallback for prefix '{base_prefix}'")
+                            sibling_handles = _find_siblings_via_catalog(
+                                scheme, parsed.netloc, base_prefix, base_handle
+                            )
+                            if sibling_handles:
+                                print(f"[scrape] Catalog fallback found {len(sibling_handles)} siblings")
 
                 if sibling_handles:
                     print(f"[scrape] Found {len(sibling_handles)} sibling colour-products for '{base_handle}'")
