@@ -13,17 +13,29 @@ const BACKEND_URL =
 // calls) and refreshed well before the 5-minute server-side expiry.
 let _dropletToken: { value: string; expiresAt: number } | null = null;
 
-async function getDropletToken(): Promise<string | null> {
+// Friendly message shown when the droplet rejects the session token even after a
+// fresh re-mint — almost always a stale tab or a logged-out/expired session.
+const SESSION_EXPIRED_MESSAGE =
+  "Your session has expired or this page is out of date. Please refresh the page (Ctrl+Shift+R), log in again if needed, and try publishing once more.";
+
+async function getDropletToken(force = false): Promise<string | null> {
   const now = Date.now();
-  if (_dropletToken && _dropletToken.expiresAt > now + 30_000) return _dropletToken.value;
+  if (!force && _dropletToken && _dropletToken.expiresAt > now + 30_000) return _dropletToken.value;
   try {
     const res = await fetch("/api/droplet-token", { credentials: "include" });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      _dropletToken = null;
+      return null;
+    }
     const { token } = (await res.json()) as { token?: string };
-    if (!token) return null;
+    if (!token) {
+      _dropletToken = null;
+      return null;
+    }
     _dropletToken = { value: token, expiresAt: now + 4 * 60_000 }; // refresh before the 5-min expiry
     return token;
   } catch {
+    _dropletToken = null;
     return null;
   }
 }
@@ -32,19 +44,36 @@ async function call<T>(
   path: string,
   init?: { method?: "GET" | "POST"; body?: unknown; signal?: AbortSignal; authed?: boolean }
 ): Promise<T> {
-  const headers: Record<string, string> = {};
-  if (init?.body) headers["Content-Type"] = "application/json";
-  if (init?.authed) {
-    const token = await getDropletToken();
+  const fetchOnce = (token: string | null) => {
+    const headers: Record<string, string> = {};
+    if (init?.body) headers["Content-Type"] = "application/json";
     if (token) headers["X-Droplet-Token"] = token;
+    return fetch(`${BACKEND_URL}${path}`, {
+      method: init?.method ?? "GET",
+      headers: Object.keys(headers).length ? headers : undefined,
+      body: init?.body ? JSON.stringify(init.body) : undefined,
+      credentials: "include",
+      signal: init?.signal,
+    });
+  };
+
+  let res: Response;
+  if (init?.authed) {
+    res = await fetchOnce(await getDropletToken());
+    // A 401 means the gate rejected the token (missing/expired/stale cache).
+    // Re-mint a fresh token once and retry before surfacing an error — this
+    // transparently recovers an expired session token mid-publish.
+    if (res.status === 401) {
+      const fresh = await getDropletToken(true);
+      if (fresh) res = await fetchOnce(fresh);
+    }
+    if (res.status === 401) {
+      throw new Error(SESSION_EXPIRED_MESSAGE);
+    }
+  } else {
+    res = await fetchOnce(null);
   }
-  const res = await fetch(`${BACKEND_URL}${path}`, {
-    method: init?.method ?? "GET",
-    headers: Object.keys(headers).length ? headers : undefined,
-    body: init?.body ? JSON.stringify(init.body) : undefined,
-    credentials: "include",
-    signal: init?.signal,
-  });
+
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`API ${path} → ${res.status}: ${text.slice(0, 200)}`);
