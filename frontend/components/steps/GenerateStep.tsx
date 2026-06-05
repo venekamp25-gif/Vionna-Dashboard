@@ -117,6 +117,7 @@ export function GenerateStep() {
         const defaultPriceByStore: Record<StoreKey, string> = {
           dk: "349,00 DKK",
           fr: "49,00 EUR",
+          fi: "49,00 EUR",
         };
 
         const toneRefs = loadToneReferences();

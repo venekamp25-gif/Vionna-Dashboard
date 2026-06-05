@@ -85,6 +85,7 @@ async function call<T>(
 export interface BackendStatus {
   dk: boolean;
   fr: boolean;
+  fi: boolean;
   anthropic: boolean;
 }
 
@@ -153,7 +154,7 @@ export interface PublishStartStoreResponse {
 
 export interface HistoryEntry {
   timestamp: string;            // ISO UTC
-  store: "dk" | "fr";
+  store: "dk" | "fr" | "fi";
   product_name: string;
   color: string;
   product_id?: number | null;
@@ -190,11 +191,11 @@ export const api = {
       { method: "POST", body: { json: rawJson } }
     ),
 
-  names: (store: "dk" | "fr") =>
+  names: (store: "dk" | "fr" | "fi") =>
     call<NamesResponse>("/api/names", { method: "POST", body: { store } }),
 
   generate: (params: {
-    store: "dk" | "fr";
+    store: "dk" | "fr" | "fi";
     product_name: string;
     product_title: string;
     keywords: string[];
@@ -220,7 +221,7 @@ export const api = {
   }) => call<HiggsfieldResponse>("/api/higgsfield", { method: "POST", body: params }),
 
   publish: (params: {
-    store: "dk" | "fr";
+    store: "dk" | "fr" | "fi";
     product_name: string;
     description: string;
     meta_description: string;
@@ -235,7 +236,7 @@ export const api = {
   }) => call<PublishResponse>("/api/publish", { method: "POST", body: params, authed: true }),
 
   publishStartStore: (params: {
-    store: "dk" | "fr";
+    store: "dk" | "fr" | "fi";
     product_name: string;
     siblings_handle: string;
   }) => call<PublishStartStoreResponse>("/api/publish/start_store", { method: "POST", body: params, authed: true }),
@@ -245,7 +246,7 @@ export const api = {
     description: string;
     page_url?: string;
     reporter_email?: string;
-    store?: "dk" | "fr";
+    store?: "dk" | "fr" | "fi";
     screenshot?: string;   // data URL
   }) =>
     call<{ success: boolean; id?: number; error?: string }>("/api/bug_reports", {
@@ -253,7 +254,7 @@ export const api = {
       body: params,
     }),
 
-  backfillSalesChannels: (store: "dk" | "fr") =>
+  backfillSalesChannels: (store: "dk" | "fr" | "fi") =>
     call<{
       store: string;
       targets: string[];
@@ -267,18 +268,18 @@ export const api = {
       available_publications?: string[];
     }>(`/api/backfill_sales_channels?store=${store}`, { method: "POST", authed: true }),
 
-  recentDescriptions: (params: { store: "dk" | "fr"; limit?: number }) => {
+  recentDescriptions: (params: { store: "dk" | "fr" | "fi"; limit?: number }) => {
     const qs = new URLSearchParams();
     qs.set("store", params.store);
     if (params.limit) qs.set("limit", String(params.limit));
     return call<{
-      store: "dk" | "fr";
+      store: "dk" | "fr" | "fi";
       items: { title: string; handle: string; created_at: string; description: string }[];
       error?: string;
     }>(`/api/recent_descriptions?${qs.toString()}`);
   },
 
-  history: (params?: { limit?: number; store?: "dk" | "fr"; product?: string }) => {
+  history: (params?: { limit?: number; store?: "dk" | "fr" | "fi"; product?: string }) => {
     const qs = new URLSearchParams();
     if (params?.limit) qs.set("limit", String(params.limit));
     if (params?.store) qs.set("store", params.store);
@@ -288,7 +289,7 @@ export const api = {
   },
 
   publishCreateVariant: (params: {
-    store: "dk" | "fr";
+    store: "dk" | "fr" | "fi";
     product_name: string;
     color: string;
     sizes?: string[];

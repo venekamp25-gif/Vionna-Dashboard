@@ -94,7 +94,7 @@ export function ReviewStep() {
       cutline: string;
       price: string;
       colorLabels: Record<string, string>;
-    }> = { dk: data.contentByStore.dk, fr: data.contentByStore.fr };
+    }> = { ...data.contentByStore };
     snapshotByStore[data.activeViewStore] = {
       description: data.description,
       metaDescription: data.metaDescription,

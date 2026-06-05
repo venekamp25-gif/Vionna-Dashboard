@@ -11,7 +11,7 @@ import { loadToneReferences } from "@/lib/toneReference";
 export function GeneratedContentCard() {
   const { data, patch } = useProduct();
   const { store } = useStore();
-  const langFlag = store === "dk" ? "🇩🇰" : "🇫🇷";
+  const langFlag = { dk: "🇩🇰", fr: "🇫🇷", fi: "🇫🇮" }[store];
   const language = STORE_CONFIG[store].language;
 
   const metaCount = data.metaDescription.length;

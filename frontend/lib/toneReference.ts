@@ -16,9 +16,10 @@ const TONE_KEY = "vionna-dashboard:tone-reference-v1";
 export interface ToneReferences {
   dk: string[];
   fr: string[];
+  fi: string[];
 }
 
-const EMPTY: ToneReferences = { dk: [], fr: [] };
+const EMPTY: ToneReferences = { dk: [], fr: [], fi: [] };
 
 export function loadToneReferences(): ToneReferences {
   if (typeof window === "undefined") return EMPTY;
@@ -29,6 +30,7 @@ export function loadToneReferences(): ToneReferences {
     return {
       dk: Array.isArray(parsed.dk) ? parsed.dk.filter(Boolean) : [],
       fr: Array.isArray(parsed.fr) ? parsed.fr.filter(Boolean) : [],
+      fi: Array.isArray(parsed.fi) ? parsed.fi.filter(Boolean) : [],
     };
   } catch {
     return EMPTY;

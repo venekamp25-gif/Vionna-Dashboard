@@ -2,12 +2,17 @@
 
 import { createContext, useContext, useState, ReactNode } from "react";
 
-export type StoreKey = "dk" | "fr";
+export type StoreKey = "dk" | "fr" | "fi";
 
 export const STORE_CONFIG: Record<StoreKey, { label: string; language: string; currency: string }> = {
   dk: { label: "Vionna DK", language: "Danish",  currency: "DKK" },
   fr: { label: "Vionna FR", language: "French",  currency: "EUR" },
+  fi: { label: "Vionna FI", language: "Finnish", currency: "EUR" },
 };
+
+// Canonical store order — import this everywhere instead of hardcoding ["dk","fr"].
+// Adding a store here + to STORE_CONFIG + to the colour maps is most of the work.
+export const STORE_KEYS: StoreKey[] = ["dk", "fr", "fi"];
 
 const StoreContext = createContext<{ store: StoreKey; setStore: (s: StoreKey) => void }>({
   store: "dk",

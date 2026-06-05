@@ -18,7 +18,7 @@ import { api } from "./api";
  */
 export function useUsedNames() {
   const { data } = useProduct();
-  const [byStore, setByStore] = useState<Record<StoreKey, string[]>>({ dk: [], fr: [] });
+  const [byStore, setByStore] = useState<Record<StoreKey, string[]>>({ dk: [], fr: [], fi: [] });
   const [loading, setLoading] = useState(true);
 
   const key = data.selectedStores.join(",");
@@ -37,7 +37,7 @@ export function useUsedNames() {
     )
       .then((pairs) => {
         if (cancelled) return;
-        const next: Record<StoreKey, string[]> = { dk: [], fr: [] };
+        const next: Record<StoreKey, string[]> = { dk: [], fr: [], fi: [] };
         for (const [s, names] of pairs) next[s] = names;
         setByStore(next);
       })

@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { api, HistoryEntry } from "@/lib/api";
-import { StoreKey, STORE_CONFIG } from "@/lib/store";
+import { StoreKey, STORE_CONFIG, STORE_KEYS } from "@/lib/store";
 
 interface Props {
   open: boolean;
@@ -77,7 +77,7 @@ export function HistoryModal({ open, onClose }: Props) {
 
         <div className="px-6 py-3 border-b border-border flex items-center gap-3 flex-wrap">
           <div className="inline-flex bg-bg-elev-2 rounded-lg p-[3px] gap-[2px]">
-            {(["all", "dk", "fr"] as StoreFilter[]).map((s) => {
+            {(["all", ...STORE_KEYS] as StoreFilter[]).map((s) => {
               const active = s === storeFilter;
               return (
                 <button

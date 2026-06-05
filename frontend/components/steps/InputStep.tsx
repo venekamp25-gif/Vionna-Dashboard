@@ -5,9 +5,9 @@ import { Button } from "@/components/ui/Button";
 import { Field, Label, Input, Textarea } from "@/components/ui/Field";
 import { useProduct } from "@/lib/product";
 import { useStep } from "@/lib/step";
-import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
+import { useStore, StoreKey, STORE_CONFIG, STORE_KEYS } from "@/lib/store";
 
-const ALL_STORES: StoreKey[] = ["dk", "fr"];
+const ALL_STORES: StoreKey[] = STORE_KEYS;
 
 function formatRelative(iso: string): string {
   try {
@@ -43,9 +43,20 @@ function FlagFR() {
   );
 }
 
+function FlagFI() {
+  return (
+    <svg className="w-5 h-3.5 rounded-sm shadow-sm" viewBox="0 0 28 20" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <rect width="28" height="20" fill="#fff" />
+      <rect x="8" width="4" height="20" fill="#003580" />
+      <rect y="8" width="28" height="4" fill="#003580" />
+    </svg>
+  );
+}
+
 const FLAGS: Record<StoreKey, React.ReactNode> = {
   dk: <FlagDK />,
   fr: <FlagFR />,
+  fi: <FlagFI />,
 };
 
 export function InputStep() {
@@ -102,7 +113,7 @@ export function InputStep() {
     // so the Danish copy isn't seeded by French keywords (and vice versa).
     const parse = (raw: string) =>
       raw.split("\n").map((k) => k.trim()).filter(Boolean);
-    const parsedByStore: Record<StoreKey, string[]> = { dk: [], fr: [] };
+    const parsedByStore: Record<StoreKey, string[]> = { dk: [], fr: [], fi: [] };
     for (const s of ALL_STORES) {
       parsedByStore[s] = parse(data.keywordsByStore[s] ?? "");
     }

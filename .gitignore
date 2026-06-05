@@ -3,6 +3,11 @@
 backend/.env
 tokens.json
 backend/tokens.json
+publish_history.jsonl
+backend/publish_history.jsonl
+
+# Local FI-clone scratch (one-off scripts, reports — read tokens.json, keep local)
+clone_dk_to_fi/
 slack_config.json
 backend/slack_config.json
 bug_reports.jsonl

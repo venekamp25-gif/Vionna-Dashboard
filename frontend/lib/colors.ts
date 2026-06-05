@@ -1,5 +1,5 @@
-/** English color name → localised Danish / French translation. */
-export const COLOR_TRANSLATIONS: Record<"dk" | "fr", Record<string, string>> = {
+/** English color name → localised Danish / French / Finnish translation. */
+export const COLOR_TRANSLATIONS: Record<"dk" | "fr" | "fi", Record<string, string>> = {
   dk: {
     "black": "Sort", "white": "Hvid", "cream": "Creme", "ivory": "Elfenben",
     "beige": "Beige", "red": "Rød", "blue": "Blå", "navy": "Navy", "light blue": "Lyseblå",
@@ -28,9 +28,23 @@ export const COLOR_TRANSLATIONS: Record<"dk" | "fr", Record<string, string>> = {
     "mint": "Menthe", "teal": "Sarcelle", "burgundy": "Bordeaux", "wine": "Vin",
     "leopard": "Léopard", "floral": "Floral", "stripe": "Rayé",
   },
+  fi: {
+    "black": "Musta", "white": "Valkoinen", "cream": "Kerma", "ivory": "Norsunluu",
+    "beige": "Beige", "red": "Punainen", "blue": "Sininen", "navy": "Laivastonsininen", "light blue": "Vaaleansininen",
+    "green": "Vihreä", "olive": "Oliivi", "sage": "Salvianvihreä", "forest green": "Metsänvihreä",
+    "pink": "Pinkki", "hot pink": "Pinkki", "blush": "Roosa", "rose": "Roosa",
+    "purple": "Violetti", "lilac": "Lila", "mauve": "Malva", "violet": "Violetti",
+    "brown": "Ruskea", "camel": "Kamelinruskea", "tan": "Vaaleanruskea", "chocolate": "Suklaa",
+    "grey": "Harmaa", "gray": "Harmaa", "light grey": "Vaaleanharmaa", "charcoal": "Antrasiitti",
+    "orange": "Oranssi", "rust": "Ruoste", "terracotta": "Terrakotta",
+    "yellow": "Keltainen", "mustard": "Sinappi", "gold": "Kulta", "silver": "Hopea",
+    "nude": "Nude", "sand": "Hiekka", "stone": "Kivi", "champagne": "Samppanja",
+    "mint": "Minttu", "teal": "Petroli", "burgundy": "Viininpunainen", "wine": "Viininpunainen",
+    "leopard": "Leopardi", "floral": "Kukkakuvio", "stripe": "Raidallinen",
+  },
 };
 
-type Store = "dk" | "fr";
+type Store = "dk" | "fr" | "fi";
 
 /** Extra single-word colour words beyond the base table (shades competitors use). */
 const EXTRA_COLOR: Record<Store, Record<string, string>> = {
@@ -66,6 +80,22 @@ const EXTRA_COLOR: Record<Store, Record<string, string>> = {
     "rust brown": "Brun rouille", "powder blue": "Bleu poudré", "powder pink": "Rose poudré",
     "mint green": "Vert menthe", "olive green": "Vert olive", "sage green": "Vert sauge",
   },
+  fi: {
+    "cherry": "Kirsikka", "slate": "Liuske", "coral": "Koralli", "emerald": "Smaragdi",
+    "burgundy": "Viininpunainen", "apricot": "Aprikoosi", "peach": "Persikka", "lavender": "Laventeli",
+    "khaki": "Khaki", "ecru": "Ecru", "taupe": "Taupe", "plum": "Luumu", "berry": "Marja",
+    "espresso": "Espresso", "caramel": "Karamelli", "chocolate": "Suklaa", "denim": "Denim",
+    "lime": "Limetti", "turquoise": "Turkoosi", "aqua": "Akva", "magenta": "Magenta",
+    "fuchsia": "Fuksia", "maroon": "Kastanjanruskea", "sapphire": "Safiiri", "ice": "Jää", "dusty": "Pölyinen",
+    "clay": "Savi", "lemon": "Sitruuna", "orchid": "Orkidea", "eucalyptus": "Eukalyptus",
+    "indigo": "Indigo", "cobalt": "Koboltinsininen", "pistachio": "Pistaasi", "powder": "Puuteri",
+    // irregular multi-word shades (matched whole, not via the pattern engine)
+    "slate grey": "Liuskeenharmaa", "slate gray": "Liuskeenharmaa", "off white": "Luonnonvalkoinen",
+    "off-white": "Luonnonvalkoinen", "navy blue": "Laivastonsininen", "dark navy": "Tumma laivastonsininen",
+    "army green": "Armeijanvihreä", "armygreen": "Armeijanvihreä", "wine red": "Viininpunainen",
+    "rust brown": "Ruosteenruskea", "powder blue": "Puuterinsininen", "powder pink": "Puuterinpinkki",
+    "mint green": "Mintunvihreä", "olive green": "Oliivinvihreä", "sage green": "Salvianvihreä",
+  },
 };
 
 /** Pattern / finish words that follow a colour ("Green Stripe" → "Grøn Stribet"). */
@@ -91,6 +121,17 @@ const PATTERN: Record<Store, Record<string, string>> = {
     "metallic": "Métallisé", "satin": "Satiné", "velvet": "Velours", "lace": "Dentelle",
     "leopard": "Léopard", "animal": "Imprimé Animal", "snake": "Python", "zebra": "Zèbre",
     "tie dye": "Tie-Dye", "ombre": "Ombré", "print": "Imprimé", "printed": "Imprimé",
+  },
+  fi: {
+    "stripe": "Raidallinen", "striped": "Raidallinen", "stripes": "Raidallinen",
+    "pinstripe": "Liituraita", "pinstriped": "Liituraita",
+    "polka dot": "Pilkullinen", "polkadot": "Pilkullinen", "polka": "Pilkullinen", "dot": "Pilkullinen", "dots": "Pilkullinen",
+    "floral": "Kukkakuvio", "flower": "Kukkakuvio", "flowers": "Kukkakuvio",
+    "check": "Ruudullinen", "checked": "Ruudullinen", "checks": "Ruudullinen", "plaid": "Ruudullinen", "gingham": "Ruudullinen",
+    "sparkle": "Kimallus", "sparkly": "Kimallus", "glitter": "Kimallus", "shimmer": "Kimallus",
+    "metallic": "Metallinen", "satin": "Satiini", "velvet": "Sametti", "lace": "Pitsi",
+    "leopard": "Leopardi", "animal": "Eläinkuosi", "snake": "Käärmekuosi", "zebra": "Seepra",
+    "tie dye": "Tie-Dye", "ombre": "Liukuväri", "print": "Kuosi", "printed": "Painettu",
   },
 };
 
@@ -140,6 +181,20 @@ function translateColorWord(words: string[], store: Store): string | null {
       if (!p) return null;
       // dark/light glue onto the colour (Mørkebrun); others stay as two words
       if (mod === "dark" || mod === "light" || mod === "ice" || mod === "icy") {
+        return p + base.toLowerCase();
+      }
+      return `${p} ${base}`;
+    } else if (store === "fi") {
+      // Finnish: modifier as compound prefix — Tummanruskea, Vaaleansininen
+      const PREFIX_FI: Record<string, string> = {
+        dark: "Tumman", light: "Vaalean", deep: "Syvän", bright: "Kirkkaan", pale: "Haalean",
+        soft: "Pehmeä", dusty: "Pölyinen", muted: "Vaimea", hot: "Kuuma", baby: "Vauvan",
+        royal: "Kuninkaallinen", burnt: "Poltettu", ice: "Jää", icy: "Jäinen",
+      };
+      const p = PREFIX_FI[mod];
+      if (!p) return null;
+      // dark/light/deep/bright/pale glue onto the colour (Tummanruskea); others stay two words
+      if (["dark", "light", "deep", "bright", "pale"].includes(mod)) {
         return p + base.toLowerCase();
       }
       return `${p} ${base}`;

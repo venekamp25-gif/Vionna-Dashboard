@@ -23,9 +23,20 @@ function FlagFR() {
   );
 }
 
+function FlagFI() {
+  return (
+    <svg className="w-5 h-3.5 rounded-sm shadow-sm" viewBox="0 0 28 20" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <rect width="28" height="20" fill="#fff" />
+      <rect x="8" width="4" height="20" fill="#003580" />
+      <rect y="8" width="28" height="4" fill="#003580" />
+    </svg>
+  );
+}
+
 const FLAGS: Record<StoreKey, React.ReactNode> = {
   dk: <FlagDK />,
   fr: <FlagFR />,
+  fi: <FlagFI />,
 };
 
 interface Props {

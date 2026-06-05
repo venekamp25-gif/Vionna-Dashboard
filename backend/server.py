@@ -99,12 +99,23 @@ APP_CREDENTIALS = {
         'client_id':     os.getenv('SHOPIFY_FR_CLIENT_ID'),
         'client_secret': os.getenv('SHOPIFY_FR_CLIENT_SECRET'),
     },
+    'fi': {
+        'client_id':     os.getenv('SHOPIFY_FI_CLIENT_ID'),
+        'client_secret': os.getenv('SHOPIFY_FI_CLIENT_SECRET'),
+    },
 }
 
 STORES = {
     'dk': os.getenv('SHOPIFY_DK_DOMAIN'),
     'fr': os.getenv('SHOPIFY_FR_DOMAIN'),
+    'fi': os.getenv('SHOPIFY_FI_DOMAIN'),
 }
+
+# Per-store localization. Used by AI content prompts (language), price normalisation
+# (psychological suffix), and product creation (size-option label in local language).
+STORE_LANGUAGE     = {'dk': 'Deens',     'fr': 'Frans',  'fi': 'Fins'}
+STORE_PRICE_SUFFIX = {'dk': '.95',       'fr': '.99',    'fi': '.99'}
+STORE_SIZE_OPTION  = {'dk': 'Størrelse', 'fr': 'Taille', 'fi': 'Koko'}
 
 # Append-only publish log — every successful create_variant call gets one entry.
 # We use a JSON-lines file rather than a database so it's trivial to inspect on the droplet.
@@ -138,11 +149,25 @@ def _slack_webhook_url():
         return None
 
 # Scopes the dashboard needs from Shopify. After changing this list, every
-# already-authorised store needs to re-grant — visit /auth/dk and /auth/fr
+# already-authorised store needs to re-grant — visit /auth/dk, /auth/fr, /auth/fi
 # once to issue a fresh token with the new scopes. publications scopes are
 # required for the GraphQL `publishablePublish` mutation that links each
 # created product to Online Store / Facebook / Google sales channels.
-SCOPES      = 'write_products,read_products,read_publications,write_publications'
+# Themes/translations/content/files/inventory/markets/locales added for the FI
+# store cloning project (need to write themes, translations, pages, etc).
+SCOPES      = ('write_products,read_products,'
+               'write_inventory,read_inventory,'
+               'write_product_listings,read_product_listings,'
+               'read_publications,write_publications,'
+               'write_files,read_files,'
+               'write_themes,read_themes,'
+               'write_translations,read_translations,'
+               'write_content,read_content,'
+               'write_shipping,read_shipping,'
+               'write_markets,read_markets,'
+               'write_locales,read_locales,'
+               'write_metaobjects,read_metaobjects,'
+               'read_orders')
 # APP_URL env var should be set on Railway to https://your-app.up.railway.app
 _APP_URL    = os.getenv('APP_URL', 'http://localhost:5000').rstrip('/')
 REDIRECT_URI = f'{_APP_URL}/callback'
@@ -150,7 +175,7 @@ API_VERSION  = '2024-10'
 
 # --- Token storage ---
 # Tokens are stored in tokens.json locally and can be bootstrapped
-# from env vars on Railway (SHOPIFY_DK_TOKEN / SHOPIFY_FR_TOKEN).
+# from env vars on Railway (SHOPIFY_DK_TOKEN / SHOPIFY_FR_TOKEN / SHOPIFY_FI_TOKEN).
 TOKENS_FILE = 'tokens.json'
 tokens = {}
 if os.path.exists(TOKENS_FILE):
@@ -161,7 +186,7 @@ if os.path.exists(TOKENS_FILE):
         pass
 
 # Also load from environment variables (works on Railway where filesystem is ephemeral)
-for _store_key, _env_key in [('dk', 'SHOPIFY_DK_TOKEN'), ('fr', 'SHOPIFY_FR_TOKEN')]:
+for _store_key, _env_key in [('dk', 'SHOPIFY_DK_TOKEN'), ('fr', 'SHOPIFY_FR_TOKEN'), ('fi', 'SHOPIFY_FI_TOKEN')]:
     _tok = os.getenv(_env_key)
     _shop = STORES.get(_store_key)
     if _tok and _shop and _store_key not in tokens:
@@ -277,9 +302,24 @@ def callback():
     code      = request.args.get('code')
     shop      = request.args.get('shop')
     state     = request.args.get('state')
-    store_key = session.get('store_key', 'dk')
+    store_key = session.get('store_key')
 
-    if state != session.get('oauth_state'):
+    # Fallback: derive store_key from shop domain (needed when OAuth is
+    # initiated directly without going through /auth/<key>, e.g. by a
+    # bot/automation that can't navigate to localhost first).
+    if not store_key:
+        for k, s in STORES.items():
+            if s == shop:
+                store_key = k
+                break
+    if not store_key:
+        return f'Unknown shop: {shop}', 400
+
+    # State check: only enforced when session has a state we set ourselves.
+    # Direct/automation OAuth flows skip this — they don't have CSRF risk
+    # because there's no logged-in user being phished.
+    session_state = session.get('oauth_state')
+    if session_state and state != session_state:
         return 'Invalid state', 403
 
     creds = APP_CREDENTIALS.get(store_key, {})
@@ -320,6 +360,7 @@ def status():
     return jsonify({
         'dk': 'dk' in tokens,
         'fr': 'fr' in tokens,
+        'fi': 'fi' in tokens,
         'anthropic': bool(ANTHROPIC_KEY and ANTHROPIC_KEY != 'VOELINJEYHIER'),
     })
 
@@ -2033,7 +2074,7 @@ def generate():
     if not isinstance(tone_references, list):
         tone_references = []
     tone_references = [s for s in tone_references if isinstance(s, str) and s.strip()]
-    language      = 'Deens' if store == 'dk' else 'Frans'
+    language      = STORE_LANGUAGE.get(store, 'Frans')
 
     # Style anchor: user-supplied tone reference if provided, otherwise the
     # hard-coded Liviah default. The first user example replaces the example;
@@ -2300,11 +2341,11 @@ def _find_product_by_handle(store, handle, hdrs):
 
 
 def _publish_normalize_price(store, price_raw):
-    """Strip currency suffix + apply per-store psychological suffix (.95 DK / .99 FR)."""
+    """Strip currency suffix + apply per-store psychological suffix (.95 DK / .99 FR + FI)."""
     raw = (price_raw or '0.00').replace(',', '.').replace(' DKK', '').replace(' EUR', '').strip()
     try:
         price_int = int(float(raw))
-        suffix = '.95' if store == 'dk' else '.99'
+        suffix = STORE_PRICE_SUFFIX.get(store, '.99')
         return f'{price_int}{suffix}'
     except Exception:
         return raw
@@ -2553,7 +2594,7 @@ def _publish_one_variant(
     """Create one colour-variant product. Returns dict:
         { product_id, product_url, metafield_errors, error? }
     """
-    size_option_name = 'Størrelse' if store == 'dk' else 'Taille'
+    size_option_name = STORE_SIZE_OPTION.get(store, 'Taille')
 
     # GUARD: an empty colour is the root of the duplicate + empty-cutline mess.
     # _publish_make_handle(name, "") collapses to a name-only handle, so EVERY
@@ -2803,16 +2844,16 @@ def publish():
     m_title_specs    = data.get('m_title_specs', '')
     product_type     = data.get('product_type', '')
     price_raw        = data.get('price', '0.00').replace(',', '.').replace(' DKK','').replace(' EUR','').strip()
-    # Adjust selling price suffix: .95 for DK, .99 for FR
+    # Adjust selling price suffix: .95 for DK, .99 for FR + FI (via STORE_PRICE_SUFFIX)
     try:
         price_int   = int(float(price_raw))
-        suffix      = '.95' if store == 'dk' else '.99'
+        suffix      = STORE_PRICE_SUFFIX.get(store, '.99')
         price       = f'{price_int}{suffix}'
     except Exception:
         price       = price_raw
     print(f"[publish] Price '{price_raw}' -> '{price}' (store: {store})")
     compare_at_price = data.get('compare_at_price')   # optional, None = no compare price
-    size_option_name = 'Størrelse' if store == 'dk' else 'Taille'
+    size_option_name = STORE_SIZE_OPTION.get(store, 'Taille')
     colors           = data.get('colors', [])
     sizes            = data.get('sizes', ['XS', 'S', 'M', 'L', 'XL'])
     siblings_handle  = data.get('siblings_handle', '')

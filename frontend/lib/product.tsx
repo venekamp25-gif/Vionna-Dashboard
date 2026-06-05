@@ -94,6 +94,7 @@ export interface StoreContent {
 const DEFAULT_PRICE_BY_STORE: Record<StoreKey, string> = {
   dk: "349,00 DKK",
   fr: "49,00 EUR",
+  fi: "49,00 EUR",
 };
 
 const EMPTY_STORE_CONTENT: StoreContent = {
@@ -180,8 +181,9 @@ export interface ProductData {
 const DEFAULT_DATA: ProductData = {
   competitorUrl: "",
   keywords: "",
-  keywordsByStore: { dk: "", fr: "" },
-  // Default to both stores ticked — most imports go to DK + FR at the same time.
+  keywordsByStore: { dk: "", fr: "", fi: "" },
+  // Default to DK + FR ticked. FI is available to select but left off by default
+  // until its droplet token is live (flip to include "fi" for full 3-store default).
   selectedStores: ["dk", "fr"],
   activeViewStore: "dk",
   competitor: null,
@@ -197,10 +199,11 @@ const DEFAULT_DATA: ProductData = {
   cutline: "",
   siblingsHandle: "",
   parsedKeywords: [],
-  parsedKeywordsByStore: { dk: [], fr: [] },
+  parsedKeywordsByStore: { dk: [], fr: [], fi: [] },
   contentByStore: {
     dk: { ...EMPTY_STORE_CONTENT, price: DEFAULT_PRICE_BY_STORE.dk },
     fr: { ...EMPTY_STORE_CONTENT, price: DEFAULT_PRICE_BY_STORE.fr },
+    fi: { ...EMPTY_STORE_CONTENT, price: DEFAULT_PRICE_BY_STORE.fi },
   },
   competitorImages: [],
   competitorVariantsByColor: {},

@@ -26,7 +26,17 @@ function FlagFR() {
   );
 }
 
-const FLAGS: Record<StoreKey, React.ReactNode> = { dk: <FlagDK />, fr: <FlagFR /> };
+function FlagFI() {
+  return (
+    <svg className="w-5 h-3.5 rounded-sm shadow-sm" viewBox="0 0 28 20" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <rect width="28" height="20" fill="#fff" />
+      <rect x="8" width="4" height="20" fill="#003580" />
+      <rect y="8" width="28" height="4" fill="#003580" />
+    </svg>
+  );
+}
+
+const FLAGS: Record<StoreKey, React.ReactNode> = { dk: <FlagDK />, fr: <FlagFR />, fi: <FlagFI /> };
 
 export function PublishStep() {
   const { data, setData, clearDraft } = useProduct();
@@ -70,6 +80,7 @@ export function PublishStep() {
       contentByStore: {
         dk: { description: "", metaDescription: "", mTitleSpecs: "", cutline: "", price: "349,00 DKK", colorLabels: {} },
         fr: { description: "", metaDescription: "", mTitleSpecs: "", cutline: "", price: "49,00 EUR", colorLabels: {} },
+        fi: { description: "", metaDescription: "", mTitleSpecs: "", cutline: "", price: "49,00 EUR", colorLabels: {} },
       },
       // Re-roll the background reference so each new product gets a different
       // model setup — keeps the catalogue from all looking the same.

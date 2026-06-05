@@ -1,29 +1,10 @@
 "use client";
 
-import { useStore, StoreKey } from "@/lib/store";
+import { useStore, StoreKey, STORE_KEYS, STORE_CONFIG } from "@/lib/store";
 import { useProduct } from "@/lib/product";
+import { STORE_FLAGS } from "@/components/storeFlags";
 
-const ALL_STORES: StoreKey[] = ["dk", "fr"];
-
-function FlagDK() {
-  return (
-    <svg className="w-7 h-5 rounded-sm shadow-sm" viewBox="0 0 28 20" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-      <rect width="28" height="20" fill="#C8102E" />
-      <rect x="9" width="3" height="20" fill="#fff" />
-      <rect y="8.5" width="28" height="3" fill="#fff" />
-    </svg>
-  );
-}
-
-function FlagFR() {
-  return (
-    <svg className="w-7 h-5 rounded-sm shadow-sm" viewBox="0 0 28 20" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-      <rect width="9.33" height="20" fill="#002395" />
-      <rect x="9.33" width="9.33" height="20" fill="#fff" />
-      <rect x="18.66" width="9.34" height="20" fill="#ED2939" />
-    </svg>
-  );
-}
+const ALL_STORES: StoreKey[] = STORE_KEYS;
 
 export function StoreToggle() {
   const { store, setStore } = useStore();
@@ -67,7 +48,7 @@ export function StoreToggle() {
     return (
       <div className="inline-flex items-center justify-center bg-bg-elev-2 rounded-lg p-[3px]">
         <div className="flex items-center justify-center px-3.5 py-1.5 rounded-md bg-accent shadow-sm">
-          {onlyStore === "dk" ? <FlagDK /> : <FlagFR />}
+          {STORE_FLAGS[onlyStore]}
         </div>
       </div>
     );
@@ -76,8 +57,8 @@ export function StoreToggle() {
   return (
     <div className="inline-flex bg-bg-elev-2 rounded-lg p-[3px] gap-[2px]">
       {visible.map((s) => (
-        <Button key={s} value={s} title={s === "dk" ? "Vionna DK" : "Vionna FR"}>
-          {s === "dk" ? <FlagDK /> : <FlagFR />}
+        <Button key={s} value={s} title={STORE_CONFIG[s].label}>
+          {STORE_FLAGS[s]}
         </Button>
       ))}
     </div>

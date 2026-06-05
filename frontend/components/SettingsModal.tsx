@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useToneReferences, ToneReferences } from "@/lib/toneReference";
-import { StoreKey, STORE_CONFIG } from "@/lib/store";
+import { StoreKey, STORE_CONFIG, STORE_KEYS } from "@/lib/store";
 import { Button } from "@/components/ui/Button";
 import { api } from "@/lib/api";
 import { useProduct } from "@/lib/product";
@@ -21,7 +21,7 @@ interface Props {
 export function SettingsModal({ open, onClose }: Props) {
   const { refs, update } = useToneReferences();
   const { clearDraft } = useProduct();
-  const [draft, setDraft] = useState<ToneReferences>({ dk: [], fr: [] });
+  const [draft, setDraft] = useState<ToneReferences>({ dk: [], fr: [], fi: [] });
   const [activeTab, setActiveTab] = useState<StoreKey>("dk");
   const [fetching, setFetching] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -66,7 +66,7 @@ export function SettingsModal({ open, onClose }: Props) {
   // Re-sync the local draft each time the modal opens (so cancel works)
   useEffect(() => {
     if (open) {
-      setDraft({ dk: [...refs.dk], fr: [...refs.fr] });
+      setDraft({ dk: [...refs.dk], fr: [...refs.fr], fi: [...refs.fi] });
     }
   }, [open, refs]);
 
@@ -111,6 +111,7 @@ export function SettingsModal({ open, onClose }: Props) {
     const cleaned: ToneReferences = {
       dk: draft.dk.map((s) => s.trim()).filter(Boolean),
       fr: draft.fr.map((s) => s.trim()).filter(Boolean),
+      fi: draft.fi.map((s) => s.trim()).filter(Boolean),
     };
     update(cleaned);
     onClose();
@@ -142,9 +143,9 @@ export function SettingsModal({ open, onClose }: Props) {
         </div>
 
         <div className="px-6 py-5">
-          {/* Tabs DK / FR */}
+          {/* Tabs per store */}
           <div className="inline-flex bg-bg-elev-2 rounded-lg p-[3px] gap-[2px] mb-4">
-            {(["dk", "fr"] as StoreKey[]).map((s) => {
+            {STORE_KEYS.map((s) => {
               const active = s === activeTab;
               return (
                 <button
@@ -245,7 +246,7 @@ export function SettingsModal({ open, onClose }: Props) {
               re-confirmed.
             </p>
             <div className="flex flex-wrap gap-2">
-              {(["dk", "fr"] as StoreKey[]).map((s) => {
+              {STORE_KEYS.map((s) => {
                 const busy = backfillBusy === s;
                 const result = backfillResult[s];
                 return (
