@@ -182,9 +182,9 @@ const DEFAULT_DATA: ProductData = {
   competitorUrl: "",
   keywords: "",
   keywordsByStore: { dk: "", fr: "", fi: "" },
-  // Default to DK + FR ticked. FI is available to select but left off by default
-  // until its droplet token is live (flip to include "fi" for full 3-store default).
-  selectedStores: ["dk", "fr"],
+  // FI token is live on the droplet (verified) → default to all three stores,
+  // full parity with DK/FR. Employees can untick FI per-import if needed.
+  selectedStores: ["dk", "fr", "fi"],
   activeViewStore: "dk",
   competitor: null,
   name: "",
