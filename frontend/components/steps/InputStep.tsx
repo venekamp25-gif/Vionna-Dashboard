@@ -319,7 +319,7 @@ export function InputStep() {
         )}
 
         <Button onClick={onSubmit} disabled={!canSubmit || checking}>
-          {checking ? "Bron-store controleren…" : "Import & Generate →"}
+          {checking ? "Checking source store…" : "Import & Generate →"}
         </Button>
       </Card>
 
@@ -338,29 +338,29 @@ export function InputStep() {
               <div className="flex-1">
                 <h3 className="text-[15px] font-semibold text-text">
                   {shippingWarn.label === "Eigen voorraad"
-                    ? "Bron lijkt géén dropshipper"
-                    : "Levertijd kon niet bepaald worden"}
+                    ? "Source doesn't look like a dropshipper"
+                    : "Couldn't determine delivery time"}
                 </h3>
                 <p className="text-[13px] text-text-dim mt-1.5 leading-relaxed">
                   {shippingWarn.label === "Eigen voorraad" ? (
                     <>
-                      Deze store heeft een <strong>snelle levertijd
-                      {shippingWarn.detail ? ` (${shippingWarn.detail})` : ""}</strong> — onder 5
-                      werkdagen, dus waarschijnlijk <strong>eigen voorraad</strong> en geen dropshipper.
+                      This store has <strong>fast delivery
+                      {shippingWarn.detail ? ` (${shippingWarn.detail})` : ""}</strong> — under 5
+                      business days, so it&apos;s likely <strong>own stock</strong>, not a dropshipper.
                     </>
                   ) : (
                     <>
-                      Kon de levertijd van deze store <strong>niet vinden</strong> (geen leesbare
-                      verzendinformatie op de site). Mogelijk geen dropshipper.
+                      Couldn&apos;t find this store&apos;s delivery time (no readable shipping
+                      info on the site) — it may not be a dropshipper.
                     </>
                   )}
                 </p>
-                <p className="text-[12px] text-text-faint mt-2">Toch importeren?</p>
+                <p className="text-[12px] text-text-faint mt-2">Import anyway?</p>
               </div>
             </div>
             <div className="flex items-center justify-end gap-2 mt-5">
               <Button variant="secondary" size="sm" onClick={() => setShippingWarn(null)}>
-                Annuleren
+                Cancel
               </Button>
               <Button
                 variant="primary"
@@ -370,7 +370,7 @@ export function InputStep() {
                   proceed();
                 }}
               >
-                Toch doorgaan →
+                Continue anyway →
               </Button>
             </div>
           </div>
