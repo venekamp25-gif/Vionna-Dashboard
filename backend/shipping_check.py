@@ -545,6 +545,15 @@ def _classify_text(text: str) -> str:
     if deliv_max == 0:
         return "Onbekend"
 
+    # Anti-double-count (dashboard tweak): if a processing time was found via its
+    # trigger AND the fallback scan just re-found that SAME span (no separate
+    # delivery window exists in the text), don't add it to itself. With only a
+    # processing time and no real delivery estimate, the total delivery is
+    # genuinely unknown -> 'Onbekend' (so the import step warns rather than
+    # silently labelling it a dropshipper off a doubled number).
+    if proc_hi > 0 and (deliv_lo, deliv_max) == (proc_lo, proc_hi):
+        return "Onbekend"
+
     # In fallback, if processing was found via trigger, add it on top.
     total_lo = deliv_lo + proc_lo
     total_hi = deliv_max + proc_hi
