@@ -40,6 +40,15 @@ async function getDropletToken(force = false): Promise<string | null> {
   }
 }
 
+// Transient backend hiccups — the ~2-3s window while the droplet restarts after a
+// self-update, or a brief nip.io DNS blip — surface as a thrown network error
+// ("Failed to fetch") or a 502/503/504. For idempotent reads (GET) we retry a
+// couple of times with a short backoff so the user doesn't see a spurious
+// failure. POSTs are NEVER retried on a network error: a half-completed publish
+// must not be silently repeated (would risk duplicate products).
+const TRANSIENT_READ_RETRIES = 2; // extra attempts on top of the first, GET only
+const isTransientStatus = (s: number) => s === 502 || s === 503 || s === 504;
+
 async function call<T>(
   path: string,
   init?: { method?: "GET" | "POST"; body?: unknown; signal?: AbortSignal; authed?: boolean }
@@ -57,21 +66,44 @@ async function call<T>(
     });
   };
 
+  const isRead = (init?.method ?? "GET") === "GET";
+
+  // Runs fetchOnce, transparently retrying transient failures for reads only.
+  const fetchResilient = async (token: string | null): Promise<Response> => {
+    const maxExtra = isRead ? TRANSIENT_READ_RETRIES : 0;
+    let lastErr: unknown;
+    for (let attempt = 0; attempt <= maxExtra; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 400 * attempt));
+      try {
+        const r = await fetchOnce(token);
+        if (isRead && isTransientStatus(r.status)) {
+          lastErr = new Error(`HTTP ${r.status}`);
+          continue; // server briefly unavailable (e.g. restarting) — retry
+        }
+        return r;
+      } catch (e) {
+        if (init?.signal?.aborted) throw e; // caller cancelled — never retry
+        lastErr = e; // network error ("Failed to fetch") — retry (reads only)
+      }
+    }
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+  };
+
   let res: Response;
   if (init?.authed) {
-    res = await fetchOnce(await getDropletToken());
+    res = await fetchResilient(await getDropletToken());
     // A 401 means the gate rejected the token (missing/expired/stale cache).
     // Re-mint a fresh token once and retry before surfacing an error — this
     // transparently recovers an expired session token mid-publish.
     if (res.status === 401) {
       const fresh = await getDropletToken(true);
-      if (fresh) res = await fetchOnce(fresh);
+      if (fresh) res = await fetchResilient(fresh);
     }
     if (res.status === 401) {
       throw new Error(SESSION_EXPIRED_MESSAGE);
     }
   } else {
-    res = await fetchOnce(null);
+    res = await fetchResilient(null);
   }
 
   if (!res.ok) {
