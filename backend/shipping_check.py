@@ -86,6 +86,17 @@ _RETURN_NEG = ("retour", "return", "refund", "garantie", "guarantee", "warranty"
                "widerruf", "ångerrätt", "retur", "money back", "money-back",
                "exchange", "ruilen", "umtausch", "échange")
 
+# Processing-context words: a duration sitting next to one of these inside a
+# delivery section is the order-processing time, not the transit time — skip it
+# when isolating the delivery range (so a "prepare within 3 days ... ships in 5-9
+# days" policy yields delivery=5-9, not 3).
+_PROC_CONTEXT_WORDS = (
+    "verwerk", "verpak", "wij verpakken", "process", "processing", "handling",
+    "preparation", "we pack", "shipping out", "dispatch", "dispatched", "bearbeit",
+    "förbereder", "förbereda", "forbereder", "packar", "att packa", "bearbeta",
+    "behandling", "handläggn", "handlaggn", "pakker", "afsendes",
+)
+
 # ── Duration parsing (idea 1+4: unit-aware — biz days / calendar days / weeks / hours) ──
 _WEEK = r"weken|weke|weeks|week|wochen|woche|semaines|semaine|veckor|vecka|uger|uge|uke"
 _HOUR = r"uren|uur|hours|hour|stunden|stunde|heures|heure|timmar|timer|timen"
@@ -123,14 +134,17 @@ PROCESSING_TRIGGER_RE = re.compile(
     r"wij\s+verpakken|we\s+verpakken|verzenden\s+uw\s+bestelling|"
     r"verzonden\s+binnen|verzenden\s+binnen|"
     r"order\s+processing|processing\s+time|preparation\s+time|"
-    r"we\s+pack|we\s+process|shipped?\s+out|shipping\s+out|"
-    r"dispatched?\s+within|dispatch\s+time|handling\s+time|"
+    r"we\s+pack|we\s+process|ship(?:ped)?\s+out|shipping\s+out|"
+    r"dispatch(?:ed)?\s+within|dispatch\s+time|handling\s+time|"
     r"bearbeitungszeit|bearbeitung\s+der\s+bestellung|"
     r"versand\s+innerhalb|wir\s+versenden\s+innerhalb|"
     r"traitement\s+de\s+la\s+commande|temps\s+de\s+pr[eé]paration|"
     r"exp[eé]dition\s+sous|"
     r"vi\s+packar|packas\s+inom|skickas\s+inom\s+\d|"
-    r"vi\s+pakker|afsendes\s+inden"
+    r"vi\s+pakker|afsendes\s+inden|"
+    # Swedish/Danish processing (added from real stores)
+    r"handl[äa]ggningstid\w*|behandlings?tid\w*|att\s+bearbeta|bearbeta\s+\w*\s*best|"
+    r"f[öo]rbereder|f[öo]rbereda|forbereder"
     r")",
     re.IGNORECASE,
 )
@@ -139,6 +153,7 @@ DELIVERY_TRIGGER_RE = re.compile(
     r"(?:gemiddelde\s+levertijd|leveringstijd|levertijd|"
     r"delivery\s+time|shipping\s+time|estimated\s+delivery|delivery\s+takes|"
     r"average\s+delivery|transit\s+time|arrives?\s+(?:in|within)|"
+    r"delivery\s+(?:in|within)|ships?\s+in|ber[äa]knad\s+leverans|standardleverans|"
     r"leveranstid|leveringstid|fragttid|lieferzeit|"
     r"delai\s+de\s+livraison|d[eé]lai\s+de\s+livraison|"
     r"durchschnittliche\s+lieferzeit)",
@@ -293,7 +308,9 @@ def _jsonld_shipping_days(html: str) -> tuple:
 
 # ── Regex parsing (idea 1+4) ──
 def _find_range_near_trigger(text: str, trigger_re: re.Pattern, window: int = 170) -> tuple:
-    """First duration right after each trigger; across triggers take the largest range."""
+    """First duration right after each trigger; across triggers take the largest range.
+    Used for the PROCESSING side (the first/closest number after the trigger is the
+    right one there)."""
     best_lo, best_hi = 0, 0
     for trig in trigger_re.finditer(text):
         seg = text[trig.start(): trig.end() + window]
@@ -305,6 +322,29 @@ def _find_range_near_trigger(text: str, trigger_re: re.Pattern, window: int = 17
             continue
         if hi > best_hi:
             best_lo, best_hi = lo, hi
+    return best_lo, best_hi
+
+
+def _find_delivery_range(text: str, window: int = 350) -> tuple:
+    """Delivery side: scan a WIDE window after each delivery trigger, look at ALL
+    durations, skip any sitting in a processing- or return-context (±80 chars),
+    and take the LARGEST remaining range. Fixes section-header policies where the
+    first number after "leveranstid" is actually the processing time."""
+    best_lo, best_hi = 0, 0
+    for trig in DELIVERY_TRIGGER_RE.finditer(text):
+        seg = text[trig.start(): trig.end() + window]
+        for m in _DUR_RE.finditer(seg):
+            ls = max(0, m.start() - 80); le = m.end() + 80
+            local_ctx = seg[ls:le]
+            if any(n in local_ctx for n in _RETURN_NEG):
+                continue
+            if any(p in local_ctx for p in _PROC_CONTEXT_WORDS):
+                continue
+            lo, hi = _dur_days(m)
+            if not (1 <= lo <= 90 and 1 <= hi <= 90):
+                continue
+            if hi > best_hi:
+                best_lo, best_hi = lo, hi
     return best_lo, best_hi
 
 
@@ -333,7 +373,7 @@ def _parse_shipping(text: str) -> dict:
     text = text.lower()  # context/return-word checks are plain substring matches
 
     proc = _find_range_near_trigger(text, PROCESSING_TRIGGER_RE)
-    deliv = _find_range_near_trigger(text, DELIVERY_TRIGGER_RE)
+    deliv = _find_delivery_range(text)
 
     if deliv[1] > 0:
         lo = (proc[0] if proc[1] > 0 else 0) + deliv[0]
@@ -560,7 +600,10 @@ def classify_detailed(product_url: str, skip_browser: bool = True) -> dict:
 
 def _classify_detailed(domain: str, product_url: str, skip_browser: bool) -> dict:
     collected = ""
-    pages = ([product_url] if product_url else []) + [f"https://{domain}{p}" for p in POLICY_PATHS]
+    # Policy pages first (authoritative on delivery time); the product page — whose
+    # marketing copy can contradict the policy fine print — is the fallback. JSON-LD
+    # on any page still wins when present.
+    pages = [f"https://{domain}{p}" for p in POLICY_PATHS] + ([product_url] if product_url else [])
     for url in pages:
         html = _fetch_html(url)
         if not html:
