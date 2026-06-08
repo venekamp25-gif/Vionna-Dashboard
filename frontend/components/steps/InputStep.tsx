@@ -11,6 +11,16 @@ import { api } from "@/lib/api";
 
 const ALL_STORES: StoreKey[] = STORE_KEYS;
 
+// How the dropshipper verdict was reached — shown as a small footnote in the warning.
+const SHIPPING_SOURCE_LABEL: Record<string, string> = {
+  structured: "the store's structured shipping data",
+  policy: "the store's shipping policy",
+  "policy-js": "the store's shipping policy",
+  llm: "AI reading the policy text",
+  "llm-sonnet": "AI reading the policy text",
+  vision: "AI reading a policy screenshot",
+};
+
 function formatRelative(iso: string): string {
   try {
     const then = new Date(iso).getTime();
@@ -72,7 +82,9 @@ export function InputStep() {
   // Dropshipper check at import: classify the source store's shipping policy and
   // warn before importing if it's NOT a confirmed dropshipper.
   const [checking, setChecking] = useState(false);
-  const [shippingWarn, setShippingWarn] = useState<{ label: string; detail: string } | null>(null);
+  const [shippingWarn, setShippingWarn] = useState<
+    { label: string; detail: string; source: string; confidence: string } | null
+  >(null);
 
   // For multi-store: at least one store's keywords must be set.
   // For single-store: that store's keywords field is the one to check.
@@ -150,11 +162,11 @@ export function InputStep() {
       if (res.label === "Dropshipper") {
         proceed();
       } else {
-        setShippingWarn({ label: res.label, detail: res.detail || "" });
+        setShippingWarn({ label: res.label, detail: res.detail || "", source: res.source, confidence: res.confidence });
       }
     } catch {
       // Classifier unreachable → treat as 'unknown' so the user is still warned.
-      setShippingWarn({ label: "Onbekend", detail: "" });
+      setShippingWarn({ label: "Onbekend", detail: "", source: "none", confidence: "none" });
     } finally {
       setChecking(false);
     }
@@ -355,6 +367,12 @@ export function InputStep() {
                     </>
                   )}
                 </p>
+                {shippingWarn.source !== "none" && (
+                  <p className="text-[11px] text-text-faint mt-2 italic">
+                    Based on {SHIPPING_SOURCE_LABEL[shippingWarn.source] ?? "the shipping policy"}
+                    {shippingWarn.confidence === "low" ? " — low confidence, worth a quick check." : "."}
+                  </p>
+                )}
                 <p className="text-[12px] text-text-faint mt-2">Import anyway?</p>
               </div>
             </div>

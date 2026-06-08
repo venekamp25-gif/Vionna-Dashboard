@@ -211,9 +211,13 @@ export const api = {
   /** Classify the source store of a product URL (dropshipper / own-stock / unknown)
    *  by parsing its shipping policy. Used to warn at the import step. */
   classifyShipping: (url: string) =>
-    call<{ label: "Dropshipper" | "Eigen voorraad" | "Onbekend"; detail: string; raw: string; error?: string }>(
-      `/api/classify_shipping?url=${encodeURIComponent(url)}`
-    ),
+    call<{
+      label: "Dropshipper" | "Eigen voorraad" | "Onbekend";
+      detail: string;                                   // "7-14d"
+      source: "structured" | "policy" | "policy-js" | "llm" | "llm-sonnet" | "vision" | "none";
+      confidence: "high" | "medium" | "low" | "none";
+      error?: string;
+    }>(`/api/classify_shipping?url=${encodeURIComponent(url)}`),
 
   scrape: (url: string) =>
     call<ScrapedProduct>("/api/scrape", { method: "POST", body: { url } }),

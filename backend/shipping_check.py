@@ -1,19 +1,29 @@
-"""Check a Shopify store's shipping policy to classify as dropshipper or own-stock.
+"""Classify a Shopify store's shipping policy as dropshipper / own-stock / unknown.
 
-Strategy:
-1. Try common policy URLs (Shopify default + custom pages)
-2. Parse text for delivery-time ranges in NL/EN/DE/FR/SE/DA
-3. If max range >= 5 days  -> 'Dropshipper'
-   If max range  < 5 days  -> 'Eigen voorraad'
-   If no range found       -> 'Onbekend'
+Accuracy layers (in order, first confident hit wins):
+1. Schema.org JSON-LD `shippingDetails` (handlingTime + transitTime) — structured, high precision
+2. Regex over policy text: processing-time + delivery-time, unit-aware
+   (business days / calendar days / WEEKS / HOURS), summed; ignores return windows
+3. (browser render — skipped in fast mode)
+4. Text-LLM (Haiku) — few-shot; used to corroborate borderline/low-confidence
+   regex results, with a Sonnet tiebreaker on disagreement
+5. Vision-LLM (skipped in fast mode)
+
+Total delivery >= 5 days  -> 'Dropshipper'
+Total delivery  < 5 days  -> 'Eigen voorraad'
+no info found             -> 'Onbekend'
+
+classify_detailed() returns {label, lo, hi, detail, source, confidence}.
+check_shipping() keeps the legacy 'Label (X-Yd)' string API.
 """
 import os
 import re
 import sys
+import json as _json
 from urllib.parse import urlparse
 import requests
 
-_CACHE: dict[str, str] = {}
+_CACHE: dict = {}
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 POLICY_PATHS = (
@@ -36,7 +46,6 @@ POLICY_PATHS = (
     "/pages/leverans",
     "/pages/faq",
     "/pages/algemene-voorwaarden",
-    # Extra paths
     "/pages/track-my-order",
     "/pages/order-tracking",
     "/pages/track-order",
@@ -59,57 +68,68 @@ POLICY_PATHS = (
     "/pages/livraison-et-retours",
 )
 
-# Words that mark a section about delivery/shipping time
-SHIPPING_CONTEXT_TERMS = (
-    "leveranstid", "leveringstid", "verzendtijd", "shipping time", "delivery time",
-    "fragttid", "lieferzeit", "delai de livraison", "délai de livraison",
-    "levertijd", "leveringstijd", "verzendbeleid", "verzending nederland",
-    "shipping & delivery", "shipping and delivery", "shipping policy",
+_SHIPPING_WORDS = ("verzend", "shipping", "delivery", "levering", "livraison",
+                   "versand", "fragt", "leverans", "lieferzeit", "leveringstid")
+
+_URL_SHIPPING_HINTS = ("shipping", "verzend", "deliver", "lever", "fragt", "leverans",
+                       "livraison", "versand", "expedition", "expédition")
+
+SHIPPING_CONTEXT_NEAR = (
+    "shipping", "delivery", "verzend", "levering", "leveranstid", "leveringstid",
+    "fragt", "frakt", "leverans", "lieferzeit", "livraison", "versand",
+    "verzendtijd", "levertijd", "verzendbeleid", "deliver", "arrive", "bezorg",
 )
 
-# Within a shipping-context section we accept broader day terms
-_GENERIC_DAY_TERMS = (
-    r"werkdagen|werkdage|werktage|werktagen|"
-    r"vardagar|arbetsdagar|"
-    r"hverdage|hverdager|"
-    r"jours\s*ouvr\w*|"
-    r"business\s*days|"
-    r"dagen|dagar|dage|tage|days"
-)
-DELIVERY_PATTERNS_SECTION = (
-    rf"(\d{{1,2}})\s*[-–to/till bis]{{1,5}}\s*(\d{{1,2}})\s*(?:{_GENERIC_DAY_TERMS})",
+# Return/warranty words that must NOT be near a number we treat as delivery time
+_RETURN_NEG = ("retour", "return", "refund", "garantie", "guarantee", "warranty",
+               "tilbagebetaling", "terugbetaling", "remboursement", "rückgabe",
+               "widerruf", "ångerrätt", "retur", "money back", "money-back",
+               "exchange", "ruilen", "umtausch", "échange")
+
+# ── Duration parsing (idea 1+4: unit-aware — biz days / calendar days / weeks / hours) ──
+_WEEK = r"weken|weke|weeks|week|wochen|woche|semaines|semaine|veckor|vecka|uger|uge|uke"
+_HOUR = r"uren|uur|hours|hour|stunden|stunde|heures|heure|timmar|timer|timen"
+_DAY  = (r"werkdagen|werkdage|werktagen|werktage|vardagar|arbetsdagar|arbejdsdage|"
+         r"hverdage|hverdager|jours\s*ouvr\w*|business\s*days|werkdag|"
+         r"dagen|dagar|dage|tage|jours|jour|days|day|dag")
+_SEP = r"(?:[-–—/]|t/m|tot\s+en\s+met|tot|to|till|bis)"
+_DUR_RE = re.compile(
+    rf"(\d{{1,2}})(?:\s*{_SEP}\s*(\d{{1,2}}))?\s*(?P<unit>{_WEEK}|{_HOUR}|{_DAY})",
+    re.IGNORECASE,
 )
 
-_BUSINESS_DAY_TERMS = (
-    r"werkdagen|werkdage|werktage|werktagen|"
-    r"vardagar|arbetsdagar|"
-    r"hverdage|hverdager|"
-    r"jours\s*ouvr\w*|"
-    r"business\s*days"
-)
-DELIVERY_PATTERNS = (
-    rf"(\d{{1,2}})\s*[-–to/till bis]{{1,5}}\s*(\d{{1,2}})\s*(?:{_BUSINESS_DAY_TERMS})",
-)
 
+def _to_days(lo: int, hi: int, unit: str) -> tuple[int, int]:
+    """Normalise a (lo, hi, unit) duration to a day-range."""
+    u = (unit or "").lower()
+    if re.match(rf"(?:{_WEEK})$", u):
+        return lo * 7, hi * 7
+    if re.match(rf"(?:{_HOUR})$", u):
+        return max(1, round(lo / 24)), max(1, round(hi / 24))
+    return lo, hi
+
+
+def _dur_days(m: re.Match) -> tuple[int, int]:
+    lo = int(m.group(1))
+    hi = int(m.group(2)) if m.group(2) else lo
+    lo, hi = _to_days(lo, hi, m.group("unit"))
+    return tuple(sorted((lo, hi)))
+
+
+# Order processing vs delivery triggers (which sentence the number belongs to)
 PROCESSING_TRIGGER_RE = re.compile(
     r"(?:"
-    # Dutch
     r"verwerk\w*|verwerkings?tijd|"
     r"wij\s+verpakken|we\s+verpakken|verzenden\s+uw\s+bestelling|"
     r"verzonden\s+binnen|verzenden\s+binnen|"
-    # English
     r"order\s+processing|processing\s+time|preparation\s+time|"
     r"we\s+pack|we\s+process|shipped?\s+out|shipping\s+out|"
-    r"dispatched?\s+within|dispatch\s+time|"
-    # German
+    r"dispatched?\s+within|dispatch\s+time|handling\s+time|"
     r"bearbeitungszeit|bearbeitung\s+der\s+bestellung|"
     r"versand\s+innerhalb|wir\s+versenden\s+innerhalb|"
-    # French
     r"traitement\s+de\s+la\s+commande|temps\s+de\s+pr[eé]paration|"
     r"exp[eé]dition\s+sous|"
-    # Swedish (avoid 'vi skickar' alone — ambiguous; require 'packar' or 'skickas inom')
     r"vi\s+packar|packas\s+inom|skickas\s+inom\s+\d|"
-    # Danish
     r"vi\s+pakker|afsendes\s+inden"
     r")",
     re.IGNORECASE,
@@ -117,53 +137,25 @@ PROCESSING_TRIGGER_RE = re.compile(
 
 DELIVERY_TRIGGER_RE = re.compile(
     r"(?:gemiddelde\s+levertijd|leveringstijd|levertijd|"
-    r"delivery\s+time|shipping\s+time|estimated\s+delivery|"
-    r"average\s+delivery|transit\s+time|"
+    r"delivery\s+time|shipping\s+time|estimated\s+delivery|delivery\s+takes|"
+    r"average\s+delivery|transit\s+time|arrives?\s+(?:in|within)|"
     r"leveranstid|leveringstid|fragttid|lieferzeit|"
     r"delai\s+de\s+livraison|d[eé]lai\s+de\s+livraison|"
     r"durchschnittliche\s+lieferzeit)",
     re.IGNORECASE,
 )
 
-# Single-or-range day count
-_DAY_COUNT_PATTERN = rf"(\d{{1,2}})(?:\s*[-–to/till bis]{{1,5}}\s*(\d{{1,2}}))?\s*(?:{_BUSINESS_DAY_TERMS})"
-
 
 def _get_domain(product_url: str) -> str:
     if not product_url:
         return ""
-    parsed = urlparse(product_url)
-    return parsed.netloc.lower()
+    return urlparse(product_url).netloc.lower()
 
 
-def check_shipping(product_url: str, skip_browser: bool = False) -> str:
-    """Returns: 'Dropshipper (X-Yd)', 'Eigen voorraad (X-Yd)', 'Onbekend', or ''.
-
-    skip_browser=True skips the Playwright + vision layers (no headless Chromium) —
-    used by the live dashboard import check where speed matters and Playwright
-    isn't installed. Keeps HTTP paths + sitemap + product page + text-LLM."""
-    domain = _get_domain(product_url)
-    if not domain:
-        return ""
-    cache_key = f"{domain}|{int(skip_browser)}"
-    if cache_key in _CACHE:
-        return _CACHE[cache_key]
-    result = _classify(domain, product_url, skip_browser=skip_browser)
-    _CACHE[cache_key] = result
-    return result
-
-
-_SHIPPING_WORDS = ("verzend", "shipping", "delivery", "levering", "livraison",
-                   "versand", "fragt", "leverans", "lieferzeit", "leveringstid")
-
-_URL_SHIPPING_HINTS = ("shipping", "verzend", "deliver", "lever", "fragt", "leverans",
-                       "livraison", "versand", "expedition", "expédition")
-
-
-def _discover_shipping_urls(domain: str) -> list[str]:
+# ── Fetching (kept from the original) ──
+def _discover_shipping_urls(domain: str) -> list:
     """Discover non-standard shipping pages via sitemap + homepage links."""
     discovered = []
-
     for sm in ("/sitemap.xml", "/sitemap_pages_1.xml", "/pages-sitemap.xml"):
         try:
             r = requests.get(f"https://{domain}{sm}", headers={"User-Agent": _UA}, timeout=6)
@@ -172,17 +164,14 @@ def _discover_shipping_urls(domain: str) -> list[str]:
         if r.status_code != 200:
             continue
         for m in re.finditer(r"<loc>([^<]+)</loc>", r.text):
-            url = m.group(1)
-            low = url.lower()
+            url = m.group(1); low = url.lower()
             if any(h in low for h in _URL_SHIPPING_HINTS) and ("/pages/" in low or "/policies/" in low):
                 discovered.append(url)
-
     try:
         r = requests.get(f"https://{domain}/", headers={"User-Agent": _UA}, timeout=8)
         if r.status_code == 200:
             for m in re.finditer(r'href="([^"]+)"', r.text):
-                href = m.group(1)
-                low = href.lower()
+                href = m.group(1); low = href.lower()
                 if any(h in low for h in _URL_SHIPPING_HINTS) and ("/pages/" in low or "/policies/" in low):
                     if href.startswith("/"):
                         href = f"https://{domain}{href}"
@@ -191,44 +180,28 @@ def _discover_shipping_urls(domain: str) -> list[str]:
                     discovered.append(href)
     except Exception:
         pass
-
-    seen = set()
-    unique = []
+    seen, unique = set(), []
     for u in discovered:
         if u not in seen:
-            seen.add(u)
-            unique.append(u)
+            seen.add(u); unique.append(u)
     return unique[:10]
 
 
-def _fetch_url_text(url: str) -> str:
+def _fetch_html(url: str) -> str:
+    """Raw HTML (for JSON-LD + text). '' on failure."""
     try:
         r = requests.get(url, headers={"User-Agent": _UA}, timeout=8, allow_redirects=True)
     except Exception:
         return ""
-    if r.status_code != 200 or len(r.text) < 500:
+    if r.status_code != 200 or len(r.text) < 300:
         return ""
-    plain = re.sub(r"<[^>]+>", " ", r.text)
-    plain = re.sub(r"\s+", " ", plain).lower()
-    if any(w in plain for w in _SHIPPING_WORDS):
-        return plain
-    return ""
+    return r.text
 
 
-def _fetch_policy_text(domain: str) -> str:
-    for path in POLICY_PATHS:
-        url = f"https://{domain}{path}"
-        try:
-            r = requests.get(url, headers={"User-Agent": _UA}, timeout=8, allow_redirects=True)
-        except Exception:
-            continue
-        if r.status_code != 200 or len(r.text) < 500:
-            continue
-        plain = re.sub(r"<[^>]+>", " ", r.text)
-        plain = re.sub(r"\s+", " ", plain).lower()
-        if any(w in plain for w in _SHIPPING_WORDS):
-            return plain
-    return ""
+def _html_to_text(html: str) -> str:
+    plain = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.I | re.S)
+    plain = re.sub(r"<[^>]+>", " ", plain)
+    return re.sub(r"\s+", " ", plain).lower()
 
 
 def _fetch_policy_text_via_browser(domain: str) -> str:
@@ -263,79 +236,196 @@ def _fetch_policy_text_via_browser(domain: str) -> str:
     return ""
 
 
-SHIPPING_CONTEXT_NEAR = (
-    "shipping", "delivery", "verzend", "levering", "leveranstid", "leveringstid",
-    "fragt", "frakt", "leverans", "lieferzeit", "livraison", "versand",
-    "verzendtijd", "levertijd", "verzendbeleid",
-)
+# ── JSON-LD shippingDetails (idea 2) ──
+def _walk(o):
+    if isinstance(o, dict):
+        yield o
+        for v in o.values():
+            yield from _walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from _walk(v)
 
 
-def _classify(domain: str, product_url: str = "", skip_browser: bool = False) -> str:
-    collected_text = ""
-
-    # 1) Standard Shopify policy paths via requests
-    text = _fetch_policy_text(domain)
-    if text:
-        collected_text = text
-        result = _classify_text(text)
-        if result != "Onbekend":
-            return result
-
-    # 2) Sitemap / homepage-discovered custom paths
-    for url in _discover_shipping_urls(domain):
-        t = _fetch_url_text(url)
-        if t:
-            collected_text = collected_text or t
-            r = _classify_text(t)
-            if r != "Onbekend":
-                return r
-
-    # 3) Product page itself often embeds shipping info in description
-    if product_url:
-        t = _fetch_url_text(product_url)
-        if t:
-            collected_text = collected_text or t
-            r = _classify_text(t)
-            if r != "Onbekend":
-                return r
-
-    # 4) Render with Playwright (catches JS-only policies) — skipped in fast mode
-    if not skip_browser:
-        text2 = _fetch_policy_text_via_browser(domain)
-        if text2:
-            collected_text = collected_text or text2
-            result = _classify_text(text2)
-            if result != "Onbekend":
-                return result
-
-    # 5) LLM extraction on whatever text we have
-    if collected_text:
-        llm_result = _classify_via_llm(collected_text, domain)
-        if llm_result and llm_result != "Onbekend":
-            return llm_result
-
-    # 6) Vision LLM — screenshot the policy page and let Claude read the image — skipped in fast mode
-    if not skip_browser:
-        vision_result = _classify_via_vision(domain)
-        if vision_result and vision_result != "Onbekend":
-            return vision_result
-
-    return "Onbekend"
+def _qv_days(q) -> tuple:
+    """Schema.org QuantitativeValue -> (lo, hi) days, or None."""
+    if not isinstance(q, dict):
+        return None
+    mn, mx, val = q.get("minValue"), q.get("maxValue"), q.get("value")
+    try:
+        lo = int(float(mn if mn is not None else (val if val is not None else mx)))
+        hi = int(float(mx if mx is not None else (val if val is not None else mn)))
+    except (TypeError, ValueError):
+        return None
+    unit = str(q.get("unitCode") or "DAY").upper()
+    if unit in ("WEE", "WK", "WEEK"):
+        lo, hi = lo * 7, hi * 7
+    elif unit in ("HUR", "H", "HOUR"):
+        lo, hi = max(1, round(lo / 24)), max(1, round(hi / 24))
+    return tuple(sorted((lo, hi)))
 
 
-def check_shipping_with_ad_copy(product_url: str, ad_copy: str, store_name: str, product_title: str) -> str:
-    """Run normal shipping check; if Onbekend, fall back to ad-copy LLM analysis."""
-    result = check_shipping(product_url)
-    if result and result != "Onbekend":
-        return result
-    ad_result = _classify_via_ad_copy(ad_copy, store_name, product_title)
-    if ad_result and ad_result != "Onbekend":
-        return ad_result
-    return result or "Onbekend"
+def _jsonld_shipping_days(html: str) -> tuple:
+    """Find handlingTime + transitTime in any JSON-LD shippingDetails. -> (lo,hi) or None."""
+    best = None
+    for m in re.finditer(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', html, re.I | re.S):
+        raw = m.group(1).strip()
+        try:
+            data = _json.loads(raw)
+        except Exception:
+            continue
+        for node in _walk(data):
+            if not isinstance(node, dict):
+                continue
+            ht = _qv_days(node.get("handlingTime"))
+            tt = _qv_days(node.get("transitTime"))
+            dt = node.get("deliveryTime")
+            if isinstance(dt, dict):
+                ht = ht or _qv_days(dt.get("handlingTime"))
+                tt = tt or _qv_days(dt.get("transitTime"))
+            if ht or tt:
+                lo = (ht[0] if ht else 0) + (tt[0] if tt else 0)
+                hi = (ht[1] if ht else 0) + (tt[1] if tt else 0)
+                if hi > 0 and (best is None or hi > best[1]):
+                    best = (lo, hi)
+    return best
 
 
+# ── Regex parsing (idea 1+4) ──
+def _find_range_near_trigger(text: str, trigger_re: re.Pattern, window: int = 170) -> tuple:
+    """First duration right after each trigger; across triggers take the largest range."""
+    best_lo, best_hi = 0, 0
+    for trig in trigger_re.finditer(text):
+        seg = text[trig.start(): trig.end() + window]
+        m = _DUR_RE.search(seg)
+        if not m:
+            continue
+        lo, hi = _dur_days(m)
+        if not (1 <= lo <= 90 and 1 <= hi <= 90):
+            continue
+        if hi > best_hi:
+            best_lo, best_hi = lo, hi
+    return best_lo, best_hi
+
+
+def _scan_all_durations(text: str) -> tuple:
+    """Whole-text scan for durations in a shipping context, excluding return windows."""
+    best_lo, best_hi = 0, 0
+    for m in _DUR_RE.finditer(text):
+        s = max(0, m.start() - 220); e = m.end() + 220
+        ctx = text[s:e]
+        if not any(w in ctx for w in SHIPPING_CONTEXT_NEAR):
+            continue
+        if any(n in ctx for n in _RETURN_NEG):
+            continue
+        lo, hi = _dur_days(m)
+        if not (1 <= lo <= 90 and 1 <= hi <= 90):
+            continue
+        if hi > best_hi:
+            best_lo, best_hi = lo, hi
+    return best_lo, best_hi
+
+
+def _parse_shipping(text: str) -> dict:
+    """Regex classify. -> {label, lo, hi, confidence, borderline}."""
+    if not text:
+        return {"label": "Onbekend", "lo": 0, "hi": 0, "confidence": "none", "borderline": False}
+    text = text.lower()  # context/return-word checks are plain substring matches
+
+    proc = _find_range_near_trigger(text, PROCESSING_TRIGGER_RE)
+    deliv = _find_range_near_trigger(text, DELIVERY_TRIGGER_RE)
+
+    if deliv[1] > 0:
+        lo = (proc[0] if proc[1] > 0 else 0) + deliv[0]
+        hi = (proc[1] if proc[1] > 0 else 0) + deliv[1]
+        confidence = "high"
+    else:
+        scan = _scan_all_durations(text)
+        if scan[1] == 0:
+            return {"label": "Onbekend", "lo": 0, "hi": 0, "confidence": "none", "borderline": False}
+        # anti-double-count: scan just re-found the processing span, no real delivery
+        if proc[1] > 0 and scan == proc:
+            return {"label": "Onbekend", "lo": 0, "hi": 0, "confidence": "none", "borderline": False}
+        lo = scan[0] + proc[0]
+        hi = scan[1] + proc[1]
+        confidence = "medium"
+
+    label = "Dropshipper" if hi >= 5 else "Eigen voorraad"
+    borderline = 4 <= hi <= 6
+    return {"label": label, "lo": lo, "hi": hi, "confidence": confidence, "borderline": borderline}
+
+
+def _parse_label_string(s: str) -> dict:
+    """Parse an LLM/vision 'Dropshipper (X-Yd)' reply -> dict or None."""
+    if not s:
+        return None
+    s = s.strip()
+    if s.startswith("Onbekend"):
+        return {"label": "Onbekend", "lo": 0, "hi": 0}
+    label = "Dropshipper" if s.startswith("Dropshipper") else ("Eigen voorraad" if s.startswith("Eigen voorraad") else None)
+    if not label:
+        return None
+    m = re.search(r"(\d+)\s*-\s*(\d+)", s)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+    else:
+        m2 = re.search(r"(\d+)", s)
+        lo = hi = int(m2.group(1)) if m2 else 0
+    return {"label": label, "lo": lo, "hi": hi}
+
+
+# ── LLM (idea 3: few-shot + model-selectable) ──
+def _classify_via_llm(text: str, domain: str, model: str = "claude-haiku-4-5") -> dict:
+    """Ask Claude to extract total delivery days from messy policy text. -> dict or None."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    try:
+        import anthropic
+    except Exception:
+        return None
+
+    if len(text) > 9000:
+        idx = -1
+        for kw in ("verzend", "shipping", "delivery", "levering", "lieferzeit",
+                   "fragt", "leverans", "livraison", "verzendtijd", "leveringstid"):
+            i = text.find(kw)
+            if i != -1:
+                idx = i; break
+        text = text[max(0, idx - 500): idx + 6000] if idx >= 0 else text[:7000]
+
+    prompt = (
+        "Read text from a webshop's shipping/delivery policy and determine the TOTAL number "
+        "of days from order placement to arrival, INCLUDING any separate order-processing / "
+        "handling time. Convert weeks to days (1 week = 7 days) and hours to days. IGNORE "
+        "return/refund/warranty windows.\n\n"
+        "Examples:\n"
+        "  'Verwerkingstijd 1-2 dagen. Levertijd 3-5 werkdagen.' -> Dropshipper (4-7d)\n"
+        "  'Levering binnen 2-4 weken' -> Dropshipper (14-28d)\n"
+        "  'Order ships within 24-48 hours' -> Eigen voorraad (1-2d)\n"
+        "  'Bezorging de volgende werkdag' -> Eigen voorraad (1-1d)\n"
+        "  'Je kunt binnen 30 dagen retourneren' (only a return window) -> Onbekend\n\n"
+        f"Domain: {domain}\nPolicy text:\n---\n{text}\n---\n\n"
+        "Reply on ONE line with EXACTLY one of:\n"
+        "  Dropshipper (X-Yd)        -- total delivery time is 5 or more days\n"
+        "  Eigen voorraad (X-Yd)     -- total delivery time is less than 5 days\n"
+        "  Onbekend                  -- no clear delivery time\n"
+        "X = min, Y = max whole days. Example: 'Dropshipper (7-14d)'."
+    )
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model=model, max_tokens=60,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return _parse_label_string((msg.content[0].text or "").strip())
+    except Exception as e:
+        print(f"  ! LLM error ({model}) for {domain}: {e}")
+        return None
+
+
+# ── Vision + ad-copy (kept; used only in full mode / WinningHunter) ──
 def _fetch_screenshot(domain: str) -> bytes:
-    """Take a Playwright screenshot of the most likely policy page."""
     try:
         from playwright.sync_api import sync_playwright
     except Exception:
@@ -365,53 +455,41 @@ def _fetch_screenshot(domain: str) -> bytes:
 
 
 def _classify_via_vision(domain: str) -> str:
-    """Last-ditch: screenshot the policy page and let Claude vision read it."""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return ""
     try:
-        import anthropic
-        import base64
+        import anthropic, base64
     except Exception:
         return ""
-
     img = _fetch_screenshot(domain)
     if not img or len(img) < 5000:
         return ""
-
     img_b64 = base64.standard_b64encode(img).decode()
     prompt = (
-        "Screenshot of an e-commerce store's policy/shipping page. "
-        "Determine TOTAL business days from order to arrival, INCLUDING any processing time.\n\n"
-        "Respond on ONE line with EXACTLY one of:\n"
-        "  Dropshipper (X-Yd)        -- total delivery >= 5 business days\n"
-        "  Eigen voorraad (X-Yd)     -- total delivery < 5 business days\n"
-        "  Onbekend                  -- no delivery info visible\n\n"
-        "Example: 'Dropshipper (7-14d)'."
+        "Screenshot of a webshop's policy/shipping page. Determine TOTAL days from order to "
+        "arrival, INCLUDING processing time (convert weeks->days).\n"
+        "Respond on ONE line: 'Dropshipper (X-Yd)' (total >=5), 'Eigen voorraad (X-Yd)' (<5), "
+        "or 'Onbekend'."
     )
     try:
         client = anthropic.Anthropic(api_key=api_key)
         msg = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=60,
+            model="claude-haiku-4-5", max_tokens=60,
             messages=[{"role": "user", "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
                 {"type": "text", "text": prompt},
             ]}],
         )
-        reply = (msg.content[0].text or "").strip()
-        for prefix in ("Dropshipper", "Eigen voorraad"):
-            if reply.startswith(prefix) and "(" in reply and "d)" in reply:
-                return reply.splitlines()[0].strip()
-        if reply.startswith("Onbekend"):
-            return "Onbekend"
+        reply = (msg.content[0].text or "").strip().splitlines()[0] if msg.content else ""
+        parsed = _parse_label_string(reply)
+        return reply if parsed else ""
     except Exception as e:
         print(f"  ! Vision LLM error for {domain}: {e}")
     return ""
 
 
 def _classify_via_ad_copy(ad_copy: str, store_name: str, product_title: str) -> str:
-    """Analyze the Facebook ad copy itself — dropshippers often telegraph long delivery times."""
     if not ad_copy or len(ad_copy.strip()) < 30:
         return ""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -421,207 +499,150 @@ def _classify_via_ad_copy(ad_copy: str, store_name: str, product_title: str) -> 
         import anthropic
     except Exception:
         return ""
-
     prompt = (
         f"Facebook ad copy from store '{store_name}' for product '{product_title}'.\n\n"
         f"Ad copy:\n---\n{ad_copy[:1500]}\n---\n\n"
-        "Based ONLY on what the ad says about shipping/delivery (if anything), decide:\n"
-        "  Dropshipper (X-Yd)     -- ad mentions long delivery (>= 5 business days), OR\n"
-        "                            uses dropshipper-classic phrases like 'ships in 7-14 days', 'limited time worldwide shipping', 'order today, arrives in X weeks'\n"
-        "  Eigen voorraad (X-Yd)  -- ad explicitly mentions fast/local/next-day shipping\n"
-        "  Onbekend               -- ad says nothing about shipping/delivery\n\n"
-        "Respond on ONE line, EXACT format. Example: 'Dropshipper (7-14d)' or 'Onbekend'."
+        "Based ONLY on what the ad says about shipping/delivery, decide:\n"
+        "  Dropshipper (X-Yd)     -- long delivery (>=5 days) or phrases like 'ships in 7-14 days'\n"
+        "  Eigen voorraad (X-Yd)  -- explicitly fast/local/next-day shipping\n"
+        "  Onbekend               -- nothing about shipping\n"
+        "Respond on ONE line. Example: 'Dropshipper (7-14d)' or 'Onbekend'."
     )
     try:
         client = anthropic.Anthropic(api_key=api_key)
-        msg = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=50,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        msg = client.messages.create(model="claude-haiku-4-5", max_tokens=50,
+                                     messages=[{"role": "user", "content": prompt}])
         reply = (msg.content[0].text or "").strip()
-        for prefix in ("Dropshipper", "Eigen voorraad"):
-            if reply.startswith(prefix) and "(" in reply and "d)" in reply:
-                return reply.splitlines()[0].strip()
-        if reply.startswith("Onbekend"):
-            return "Onbekend"
+        return reply if _parse_label_string(reply) else ""
     except Exception as e:
         print(f"  ! Ad-copy LLM error: {e}")
     return ""
 
 
-def _classify_via_llm(text: str, domain: str) -> str:
-    """Ask Claude to extract total delivery time from messy policy text."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        return ""
-    try:
-        import anthropic
-    except Exception:
-        return ""
-
-    if len(text) > 9000:
-        idx = -1
-        for kw in ("verzend", "shipping", "delivery", "levering", "lieferzeit",
-                   "fragt", "leverans", "livraison", "verzendtijd", "leveringstid"):
-            i = text.find(kw)
-            if i != -1:
-                idx = i
-                break
-        if idx >= 0:
-            text = text[max(0, idx - 500): idx + 6000]
-        else:
-            text = text[:7000]
-
-    prompt = (
-        "You will read text from an e-commerce store's shipping/delivery policy and decide the "
-        "TOTAL number of business days between order placement and arrival, INCLUDING any "
-        "order processing/handling time mentioned separately.\n\n"
-        f"Domain: {domain}\n\n"
-        "Policy text:\n---\n"
-        f"{text}\n---\n\n"
-        "Respond on ONE line with EXACTLY one of these formats:\n"
-        "  Dropshipper (X-Yd)        -- if total delivery time is 5 or more business days\n"
-        "  Eigen voorraad (X-Yd)     -- if total delivery time is less than 5 business days\n"
-        "  Onbekend                  -- if no clear delivery time mentioned\n\n"
-        "X = min days, Y = max days (whole numbers). Example: 'Dropshipper (7-14d)'."
-    )
-
-    try:
-        client = anthropic.Anthropic(api_key=api_key)
-        msg = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=60,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        reply = (msg.content[0].text or "").strip()
-        for prefix in ("Dropshipper", "Eigen voorraad"):
-            if reply.startswith(prefix) and "(" in reply and "d)" in reply:
-                return reply.splitlines()[0].strip()
-        if reply.startswith("Onbekend"):
-            return "Onbekend"
-    except Exception as e:
-        print(f"  ! LLM error for {domain}: {e}")
-    return ""
+# ── Orchestration ──
+def _res(label, lo, hi, source, confidence) -> dict:
+    return {"label": label, "lo": lo, "hi": hi,
+            "detail": (f"{lo}-{hi}d" if hi > 0 else ""),
+            "source": source, "confidence": confidence}
 
 
-def _classify_text(text: str) -> str:
-    if not text:
-        return "Onbekend"
-
-    # Preferred path: explicit processing window + explicit delivery window.
-    proc_lo, proc_hi = _find_processing_range(text)
-    deliv_lo, deliv_hi = _find_delivery_range(text)
-
-    # If we got at least a delivery section, use proc+delivery.
-    if deliv_hi > 0:
-        total_lo = (proc_lo if proc_hi > 0 else 0) + deliv_lo
-        total_hi = (proc_hi if proc_hi > 0 else 0) + deliv_hi
-        label = "Dropshipper" if total_hi >= 5 else "Eigen voorraad"
-        return f"{label} ({total_lo}-{total_hi}d)"
-
-    # Fallback: scan whole text for business-day ranges (works when there's only one).
-    deliv_lo, deliv_max = _scan_ranges(text, DELIVERY_PATTERNS)
-    if deliv_max == 0:
-        for pat in DELIVERY_PATTERNS_SECTION:
-            for m in re.finditer(pat, text, re.IGNORECASE):
-                start = max(0, m.start() - 250)
-                end = m.end() + 250
-                context = text[start:end].lower()
-                if not any(w in context for w in SHIPPING_CONTEXT_NEAR):
-                    continue
-                if any(neg in context for neg in ("retour", "return", "refund", "garantie", "garantee", "warranty", "tilbagebetaling")):
-                    continue
-                try:
-                    lo = int(m.group(1))
-                    hi_str = m.group(2) if m.lastindex and m.lastindex >= 2 else None
-                    hi = int(hi_str) if hi_str else lo
-                    if 1 <= lo <= 60 and 1 <= hi <= 60:
-                        lo, hi = sorted([lo, hi])
-                        if hi > deliv_max:
-                            deliv_max, deliv_lo = hi, lo
-                except (ValueError, IndexError):
-                    continue
-    if deliv_max == 0:
-        return "Onbekend"
-
-    # Anti-double-count (dashboard tweak): if a processing time was found via its
-    # trigger AND the fallback scan just re-found that SAME span (no separate
-    # delivery window exists in the text), don't add it to itself. With only a
-    # processing time and no real delivery estimate, the total delivery is
-    # genuinely unknown -> 'Onbekend' (so the import step warns rather than
-    # silently labelling it a dropshipper off a doubled number).
-    if proc_hi > 0 and (deliv_lo, deliv_max) == (proc_lo, proc_hi):
-        return "Onbekend"
-
-    # In fallback, if processing was found via trigger, add it on top.
-    total_lo = deliv_lo + proc_lo
-    total_hi = deliv_max + proc_hi
-    label = "Dropshipper" if total_hi >= 5 else "Eigen voorraad"
-    return f"{label} ({total_lo}-{total_hi}d)"
+def _maybe_llm_verify(p: dict, text: str, domain: str, source: str) -> dict:
+    """Trust confident, non-borderline regex. Otherwise corroborate with Haiku;
+    on disagreement escalate to a Sonnet tiebreaker (idea 3b + 5)."""
+    res = _res(p["label"], p["lo"], p["hi"], source, p["confidence"])
+    if not (p.get("borderline") or p["confidence"] in ("low", "medium")):
+        return res
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return res
+    llm = _classify_via_llm(text, domain)
+    if not llm or llm["label"] == "Onbekend":
+        return res
+    if llm["label"] == p["label"]:
+        return _res(p["label"], p["lo"], p["hi"], source, "high")  # corroborated
+    son = _classify_via_llm(text, domain, model="claude-sonnet-4-5")
+    if son and son["label"] != "Onbekend":
+        return _res(son["label"], son["lo"], son["hi"], "llm-sonnet", "high")
+    return _res(p["label"], p["lo"], p["hi"], source, "low")
 
 
-def _find_range_near_trigger(text: str, trigger_re: re.Pattern, window: int = 150) -> tuple[int, int]:
-    """For each trigger, take the FIRST day count right after it (closest);
-    across multiple triggers take the largest range. Avoids picking up unrelated numbers later in the text."""
-    best_lo, best_hi = 0, 0
-    for trig in trigger_re.finditer(text):
-        section = text[trig.start(): trig.end() + window]
-        m = re.search(_DAY_COUNT_PATTERN, section, re.IGNORECASE)
-        if not m:
+def classify_detailed(product_url: str, skip_browser: bool = True) -> dict:
+    """Full structured classification. -> {label, lo, hi, detail, source, confidence}."""
+    domain = _get_domain(product_url)
+    if not domain:
+        return _res("Onbekend", 0, 0, "none", "none")
+    cache_key = f"D|{domain}|{int(skip_browser)}"
+    if cache_key in _CACHE:
+        return _CACHE[cache_key]
+    res = _classify_detailed(domain, product_url, skip_browser)
+    _CACHE[cache_key] = res
+    return res
+
+
+def _classify_detailed(domain: str, product_url: str, skip_browser: bool) -> dict:
+    collected = ""
+    pages = ([product_url] if product_url else []) + [f"https://{domain}{p}" for p in POLICY_PATHS]
+    for url in pages:
+        html = _fetch_html(url)
+        if not html:
             continue
-        try:
-            lo = int(m.group(1))
-            hi_str = m.group(2)
-            hi = int(hi_str) if hi_str else lo
-            if not (1 <= lo <= 60 and 1 <= hi <= 60):
-                continue
-            lo, hi = sorted([lo, hi])
-            if hi > best_hi:
-                best_lo, best_hi = lo, hi
-        except (ValueError, IndexError):
+        j = _jsonld_shipping_days(html)   # idea 2 — high precision
+        if j and j[1] > 0:
+            lo, hi = j
+            return _res("Dropshipper" if hi >= 5 else "Eigen voorraad", lo, hi, "structured", "high")
+        plain = _html_to_text(html)
+        if not any(w in plain for w in _SHIPPING_WORDS):
             continue
-    return best_lo, best_hi
+        if not collected:
+            collected = plain
+        p = _parse_shipping(plain)
+        if p["label"] != "Onbekend":
+            return _maybe_llm_verify(p, plain, domain, "policy")
+
+    for url in _discover_shipping_urls(domain):
+        html = _fetch_html(url)
+        if not html:
+            continue
+        j = _jsonld_shipping_days(html)
+        if j and j[1] > 0:
+            lo, hi = j
+            return _res("Dropshipper" if hi >= 5 else "Eigen voorraad", lo, hi, "structured", "high")
+        plain = _html_to_text(html)
+        if not any(w in plain for w in _SHIPPING_WORDS):
+            continue
+        if not collected:
+            collected = plain
+        p = _parse_shipping(plain)
+        if p["label"] != "Onbekend":
+            return _maybe_llm_verify(p, plain, domain, "policy")
+
+    if not skip_browser:
+        t = _fetch_policy_text_via_browser(domain)
+        if t:
+            if not collected:
+                collected = t
+            p = _parse_shipping(t)
+            if p["label"] != "Onbekend":
+                return _maybe_llm_verify(p, t, domain, "policy-js")
+
+    # LLM on whatever text we have (regex found nothing definitive)
+    if collected:
+        llm = _classify_via_llm(collected, domain)
+        if llm and llm["label"] != "Onbekend":
+            return _res(llm["label"], llm["lo"], llm["hi"], "llm", "medium")
+
+    if not skip_browser:
+        pv = _parse_label_string(_classify_via_vision(domain))
+        if pv and pv["label"] != "Onbekend":
+            return _res(pv["label"], pv["lo"], pv["hi"], "vision", "medium")
+
+    return _res("Onbekend", 0, 0, "none", "none")
 
 
-def _find_processing_range(text: str) -> tuple[int, int]:
-    return _find_range_near_trigger(text, PROCESSING_TRIGGER_RE)
+def check_shipping(product_url: str, skip_browser: bool = False) -> str:
+    """Legacy string API: 'Dropshipper (X-Yd)' / 'Eigen voorraad (X-Yd)' / 'Onbekend' / ''."""
+    if not _get_domain(product_url):
+        return ""
+    d = classify_detailed(product_url, skip_browser=skip_browser)
+    if d["label"] == "Onbekend":
+        return "Onbekend"
+    return f"{d['label']} ({d['detail']})" if d["detail"] else d["label"]
 
 
-def _find_delivery_range(text: str) -> tuple[int, int]:
-    return _find_range_near_trigger(text, DELIVERY_TRIGGER_RE)
-
-
-def _scan_ranges(text: str, patterns: tuple) -> tuple[int, int]:
-    best_lo, best_max = 0, 0
-    for pat in patterns:
-        for m in re.finditer(pat, text, re.IGNORECASE):
-            try:
-                lo = int(m.group(1))
-                hi_str = m.group(2) if m.lastindex and m.lastindex >= 2 else None
-                hi = int(hi_str) if hi_str else lo
-                if not (1 <= lo <= 60 and 1 <= hi <= 60):
-                    continue
-                lo, hi = sorted([lo, hi])
-                if hi > best_max:
-                    best_max, best_lo = hi, lo
-            except (ValueError, IndexError):
-                continue
-    return best_lo, best_max
+def check_shipping_with_ad_copy(product_url: str, ad_copy: str, store_name: str, product_title: str) -> str:
+    result = check_shipping(product_url)
+    if result and result != "Onbekend":
+        return result
+    ad_result = _classify_via_ad_copy(ad_copy, store_name, product_title)
+    if ad_result and _parse_label_string(ad_result) and not ad_result.startswith("Onbekend"):
+        return ad_result
+    return result or "Onbekend"
 
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    test_urls = [
-        "https://www.belysningsproffsen.se/products/solcellsdriven-utomhuslampa",
-        "https://www.florabel.se/products/floratulip-led-light",
-        "https://www.ristal.se/products/lysdroppe",
-        "https://lumiere-design.de/products/fadio",
-        "https://www.monah.shop/products/lampe",
-        "https://laluna.amsterdam/products/dames-shorts",
-    ]
-    for u in test_urls:
-        result = check_shipping(u)
-        domain = _get_domain(u)
-        s = f"{domain:40} -> {result}".encode("ascii", "replace").decode("ascii")
-        print(s)
+    for u in (
+        "https://vionna-clothing.dk/",
+        "https://vionna-clothing.fr/",
+    ):
+        d = classify_detailed(u, skip_browser=True)
+        print(f"{_get_domain(u):34} -> {d['label']} ({d['detail']}) [src={d['source']} conf={d['confidence']}]")

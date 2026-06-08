@@ -371,25 +371,20 @@ def classify_shipping():
     unknown, by parsing its shipping policy. Used at the import step to warn when
     the source isn't a dropshipper. Fast mode: HTTP paths + text-LLM, no browser.
 
-    Returns: { label: 'Dropshipper'|'Eigen voorraad'|'Onbekend', detail: 'X-Yd', raw }"""
+    Returns: { label, detail: 'X-Yd', source, confidence }. source ∈ structured/
+    policy/llm/llm-sonnet/vision/none; confidence ∈ high/medium/low/none."""
     url = (request.args.get('url') or '').strip()
     if not url:
-        return jsonify({'label': 'Onbekend', 'detail': '', 'raw': ''})
+        return jsonify({'label': 'Onbekend', 'detail': '', 'source': 'none', 'confidence': 'none'})
     try:
-        from shipping_check import check_shipping
-        raw = (check_shipping(url, skip_browser=True) or 'Onbekend').strip()
+        from shipping_check import classify_detailed
+        d = classify_detailed(url, skip_browser=True)
     except Exception as e:
         print(f"[classify_shipping] error for {url}: {e}")
         # Treat failures as 'Onbekend' so the import step can still warn (per user choice)
-        return jsonify({'label': 'Onbekend', 'detail': '', 'raw': '', 'error': str(e)[:200]})
-    label = 'Onbekend'
-    if raw.startswith('Dropshipper'):
-        label = 'Dropshipper'
-    elif raw.startswith('Eigen voorraad'):
-        label = 'Eigen voorraad'
-    m = re.search(r'\(([^)]+)\)', raw)
-    detail = m.group(1) if m else ''
-    return jsonify({'label': label, 'detail': detail, 'raw': raw})
+        return jsonify({'label': 'Onbekend', 'detail': '', 'source': 'none', 'confidence': 'none', 'error': str(e)[:200]})
+    return jsonify({'label': d['label'], 'detail': d['detail'],
+                    'source': d['source'], 'confidence': d['confidence']})
 
 
 # --- Scrape competitor product (server-side, geen CORS) ---
