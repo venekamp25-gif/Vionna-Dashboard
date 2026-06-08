@@ -365,6 +365,33 @@ def status():
     })
 
 
+@app.route('/api/classify_shipping')
+def classify_shipping():
+    """Classify the source store of a product URL as dropshipper / own-stock /
+    unknown, by parsing its shipping policy. Used at the import step to warn when
+    the source isn't a dropshipper. Fast mode: HTTP paths + text-LLM, no browser.
+
+    Returns: { label: 'Dropshipper'|'Eigen voorraad'|'Onbekend', detail: 'X-Yd', raw }"""
+    url = (request.args.get('url') or '').strip()
+    if not url:
+        return jsonify({'label': 'Onbekend', 'detail': '', 'raw': ''})
+    try:
+        from shipping_check import check_shipping
+        raw = (check_shipping(url, skip_browser=True) or 'Onbekend').strip()
+    except Exception as e:
+        print(f"[classify_shipping] error for {url}: {e}")
+        # Treat failures as 'Onbekend' so the import step can still warn (per user choice)
+        return jsonify({'label': 'Onbekend', 'detail': '', 'raw': '', 'error': str(e)[:200]})
+    label = 'Onbekend'
+    if raw.startswith('Dropshipper'):
+        label = 'Dropshipper'
+    elif raw.startswith('Eigen voorraad'):
+        label = 'Eigen voorraad'
+    m = re.search(r'\(([^)]+)\)', raw)
+    detail = m.group(1) if m else ''
+    return jsonify({'label': label, 'detail': detail, 'raw': raw})
+
+
 # --- Scrape competitor product (server-side, geen CORS) ---
 _COLOR_OPT_RE = re.compile(r'colou?r|kleur|farve|couleur|colore', re.I)
 _SIZE_OPT_RE  = re.compile(r'size|maat|taille|størrelse|talla', re.I)

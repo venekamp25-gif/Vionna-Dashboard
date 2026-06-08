@@ -208,6 +208,13 @@ export interface PublishCreateVariantResponse {
 export const api = {
   status: () => call<BackendStatus>("/api/status"),
 
+  /** Classify the source store of a product URL (dropshipper / own-stock / unknown)
+   *  by parsing its shipping policy. Used to warn at the import step. */
+  classifyShipping: (url: string) =>
+    call<{ label: "Dropshipper" | "Eigen voorraad" | "Onbekend"; detail: string; raw: string; error?: string }>(
+      `/api/classify_shipping?url=${encodeURIComponent(url)}`
+    ),
+
   scrape: (url: string) =>
     call<ScrapedProduct>("/api/scrape", { method: "POST", body: { url } }),
 

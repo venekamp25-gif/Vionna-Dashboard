@@ -1,11 +1,13 @@
 "use client";
 
+import { useState } from "react";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Field, Label, Input, Textarea } from "@/components/ui/Field";
 import { useProduct } from "@/lib/product";
 import { useStep } from "@/lib/step";
 import { useStore, StoreKey, STORE_CONFIG, STORE_KEYS } from "@/lib/store";
+import { api } from "@/lib/api";
 
 const ALL_STORES: StoreKey[] = STORE_KEYS;
 
@@ -67,6 +69,11 @@ export function InputStep() {
   const { setStep } = useStep();
   const { setStore } = useStore();
 
+  // Dropshipper check at import: classify the source store's shipping policy and
+  // warn before importing if it's NOT a confirmed dropshipper.
+  const [checking, setChecking] = useState(false);
+  const [shippingWarn, setShippingWarn] = useState<{ label: string; detail: string } | null>(null);
+
   // For multi-store: at least one store's keywords must be set.
   // For single-store: that store's keywords field is the one to check.
   // (Both end up parsed at Generate time; empty keywords just means Claude
@@ -105,8 +112,8 @@ export function InputStep() {
     });
   };
 
-  const onSubmit = () => {
-    if (!canSubmit) return;
+  // The actual import: parse keywords, set primary store, advance to scrape/generate.
+  const proceed = () => {
     const primary = data.selectedStores[0];
 
     // Parse per-store keywords. Each store sends its OWN array to /api/generate
@@ -131,6 +138,26 @@ export function InputStep() {
       activeViewStore: primary,
     });
     setStep(2);
+  };
+
+  // Gate: classify the source store first. Dropshipper → import straight through.
+  // Eigen voorraad / Onbekend → warn (with which case) and let the user decide.
+  const onSubmit = async () => {
+    if (!canSubmit || checking) return;
+    setChecking(true);
+    try {
+      const res = await api.classifyShipping(data.competitorUrl.trim());
+      if (res.label === "Dropshipper") {
+        proceed();
+      } else {
+        setShippingWarn({ label: res.label, detail: res.detail || "" });
+      }
+    } catch {
+      // Classifier unreachable → treat as 'unknown' so the user is still warned.
+      setShippingWarn({ label: "Onbekend", detail: "" });
+    } finally {
+      setChecking(false);
+    }
   };
 
   // If a draft was auto-saved in a previous session and the user lands here with
@@ -291,10 +318,64 @@ export function InputStep() {
           </>
         )}
 
-        <Button onClick={onSubmit} disabled={!canSubmit}>
-          Import &amp; Generate →
+        <Button onClick={onSubmit} disabled={!canSubmit || checking}>
+          {checking ? "Bron-store controleren…" : "Import & Generate →"}
         </Button>
       </Card>
+
+      {/* Dropshipper warning — shown when the source store is NOT a confirmed dropshipper */}
+      {shippingWarn && (
+        <div
+          className="fixed inset-0 z-[70] bg-black/50 backdrop-blur-sm flex items-center justify-center px-4"
+          onClick={() => setShippingWarn(null)}
+        >
+          <div
+            className="w-full max-w-md bg-bg-elev border border-border rounded-2xl shadow-2xl p-6"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start gap-3">
+              <div className="text-2xl leading-none mt-0.5">⚠️</div>
+              <div className="flex-1">
+                <h3 className="text-[15px] font-semibold text-text">
+                  {shippingWarn.label === "Eigen voorraad"
+                    ? "Bron lijkt géén dropshipper"
+                    : "Levertijd kon niet bepaald worden"}
+                </h3>
+                <p className="text-[13px] text-text-dim mt-1.5 leading-relaxed">
+                  {shippingWarn.label === "Eigen voorraad" ? (
+                    <>
+                      Deze store heeft een <strong>snelle levertijd
+                      {shippingWarn.detail ? ` (${shippingWarn.detail})` : ""}</strong> — onder 5
+                      werkdagen, dus waarschijnlijk <strong>eigen voorraad</strong> en geen dropshipper.
+                    </>
+                  ) : (
+                    <>
+                      Kon de levertijd van deze store <strong>niet vinden</strong> (geen leesbare
+                      verzendinformatie op de site). Mogelijk geen dropshipper.
+                    </>
+                  )}
+                </p>
+                <p className="text-[12px] text-text-faint mt-2">Toch importeren?</p>
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-2 mt-5">
+              <Button variant="secondary" size="sm" onClick={() => setShippingWarn(null)}>
+                Annuleren
+              </Button>
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={() => {
+                  setShippingWarn(null);
+                  proceed();
+                }}
+              >
+                Toch doorgaan →
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
