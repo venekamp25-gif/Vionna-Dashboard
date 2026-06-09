@@ -7,6 +7,11 @@
 const BACKEND_URL =
   process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/+$/, "") || "http://localhost:5000";
 
+/** OAuth start URL for connecting / re-authorising a store's Shopify token (#8). */
+export function backendAuthUrl(store: string): string {
+  return `${BACKEND_URL}/auth/${store}`;
+}
+
 // Short-lived token for the droplet's mutation endpoints (publish / backfill).
 // Minted server-side by /api/droplet-token so the secret never reaches the
 // browser. Cached and reused across a publish run (which fires many per-variant
@@ -230,6 +235,27 @@ export const api = {
       }[];
       error?: string;
     }>("/api/verify_products", { method: "POST", body: { store, product_ids } }),
+
+  /** System health for the admin panel (#7): version, per-store auth, keys, backups. */
+  health: () =>
+    call<{
+      version: string;
+      stores: Record<"dk" | "fr" | "fi", boolean>;
+      anthropic: boolean;
+      higgsfield_cli: boolean;
+      backups: { count: number; last: string };
+    }>("/api/health"),
+
+  /** Trigger an on-demand local backup snapshot (#9). */
+  backupNow: () =>
+    call<{ success: boolean; path: string }>("/api/backup_now", { method: "POST", authed: true }),
+
+  /** Download an off-droplet data backup (publish history + bug reports) (#9). */
+  exportData: () =>
+    call<{ exported_at: string; publish_history: unknown[]; bug_reports: unknown[] }>(
+      "/api/export_data",
+      { authed: true }
+    ),
 
   scrape: (url: string) =>
     call<ScrapedProduct>("/api/scrape", { method: "POST", body: { url } }),

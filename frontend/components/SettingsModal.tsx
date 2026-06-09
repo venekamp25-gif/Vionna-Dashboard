@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useToneReferences, ToneReferences } from "@/lib/toneReference";
 import { StoreKey, STORE_CONFIG, STORE_KEYS } from "@/lib/store";
 import { Button } from "@/components/ui/Button";
-import { api } from "@/lib/api";
+import { api, backendAuthUrl } from "@/lib/api";
 import { useProduct } from "@/lib/product";
 
 interface Props {
@@ -63,10 +63,52 @@ export function SettingsModal({ open, onClose }: Props) {
     }
   };
 
+  // ── System health + backups (#7/#8/#9) ──
+  const [health, setHealth] = useState<Awaited<ReturnType<typeof api.health>> | null>(null);
+  const [sysBusy, setSysBusy] = useState<"backup" | "export" | null>(null);
+  const [sysMsg, setSysMsg] = useState<string | null>(null);
+
+  const refreshHealth = () => {
+    void api.health().then(setHealth).catch(() => setHealth(null));
+  };
+
+  const runBackupNow = async () => {
+    setSysBusy("backup"); setSysMsg(null);
+    try {
+      const r = await api.backupNow();
+      setSysMsg(r.success ? "✓ Backup snapshot created." : "✕ Backup failed.");
+      refreshHealth();
+    } catch (e) {
+      setSysMsg(`✕ ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setSysBusy(null);
+    }
+  };
+
+  const downloadBackup = async () => {
+    setSysBusy("export"); setSysMsg(null);
+    try {
+      const data = await api.exportData();
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `vionna-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setSysMsg("✓ Backup downloaded.");
+    } catch (e) {
+      setSysMsg(`✕ ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setSysBusy(null);
+    }
+  };
+
   // Re-sync the local draft each time the modal opens (so cancel works)
   useEffect(() => {
     if (open) {
       setDraft({ dk: [...refs.dk], fr: [...refs.fr], fi: [...refs.fi] });
+      refreshHealth();
     }
   }, [open, refs]);
 
@@ -299,6 +341,73 @@ export function SettingsModal({ open, onClose }: Props) {
                   </div>
                 );
               })}
+            </div>
+          </div>
+
+          {/* ── System & backups (#7/#8/#9) ───────────────────────── */}
+          <div className="mt-8 pt-6 border-t border-border">
+            <div className="text-[14px] font-semibold text-text mb-1">System &amp; backups</div>
+            {health ? (
+              <div className="text-[12px] text-text-dim space-y-2 mb-3">
+                <div>
+                  Backend <strong>v{health.version}</strong> · Anthropic{" "}
+                  <span className={health.anthropic ? "text-accent" : "text-danger"}>
+                    {health.anthropic ? "✓" : "✕"}
+                  </span>{" "}
+                  · Higgsfield CLI{" "}
+                  <span className={health.higgsfield_cli ? "text-accent" : "text-warning"}>
+                    {health.higgsfield_cli ? "✓" : "✕"}
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {STORE_KEYS.map((s) => (
+                    <span
+                      key={s}
+                      className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-bg-elev-2 border border-border"
+                    >
+                      <span className="text-text-dim">{STORE_CONFIG[s].label}:</span>
+                      {health.stores[s] ? (
+                        <>
+                          <span className="text-accent">✓ connected</span>
+                          <a
+                            href={backendAuthUrl(s)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-text-faint underline hover:text-text"
+                          >
+                            re-auth
+                          </a>
+                        </>
+                      ) : (
+                        <a
+                          href={backendAuthUrl(s)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-warning underline hover:text-text"
+                        >
+                          ✕ connect →
+                        </a>
+                      )}
+                    </span>
+                  ))}
+                </div>
+                <div>
+                  Backups: <strong>{health.backups.count}</strong> daily snapshot
+                  {health.backups.count === 1 ? "" : "s"}
+                  {health.backups.last ? ` · latest ${health.backups.last}` : ""}.
+                </div>
+              </div>
+            ) : (
+              <div className="text-[12px] text-text-faint mb-3">Loading status…</div>
+            )}
+            <div className="flex flex-wrap items-center gap-2">
+              <Button variant="secondary" size="sm" disabled={sysBusy !== null} onClick={runBackupNow}>
+                {sysBusy === "backup" ? "⟳ Backing up…" : "↻ Run backup now"}
+              </Button>
+              <Button variant="secondary" size="sm" disabled={sysBusy !== null} onClick={downloadBackup}>
+                {sysBusy === "export" ? "⟳ Preparing…" : "⬇ Download data backup"}
+              </Button>
+              {sysMsg && <span className="text-[11px] text-text-faint">{sysMsg}</span>}
             </div>
           </div>
 
