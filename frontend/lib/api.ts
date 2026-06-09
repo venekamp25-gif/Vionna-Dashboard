@@ -236,6 +236,19 @@ export const api = {
       error?: string;
     }>("/api/verify_products", { method: "POST", body: { store, product_ids } }),
 
+  /** Catalogue audit (#2): scan a store for missing cutlines / images, duplicate
+   *  products, and active-but-off-channel products. */
+  auditCatalog: (store: "dk" | "fr" | "fi") =>
+    call<{
+      store: string;
+      total: number;
+      missing_cutline: { count: number; samples: string[] };
+      no_images: { count: number; samples: string[] };
+      not_on_channels: { count: number; samples: string[] };
+      duplicates: { count: number; groups: { base: string; handles: string[] }[] };
+      error?: string;
+    }>(`/api/audit?store=${store}`),
+
   /** System health for the admin panel (#7): version, per-store auth, keys, backups. */
   health: () =>
     call<{

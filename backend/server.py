@@ -534,6 +534,69 @@ def verify_products():
     return jsonify({'products': out})
 
 
+@app.route('/api/audit')
+def audit_catalog():
+    """Catalog-audit (#2): scan every product of a store and flag missing cutlines,
+    missing images, duplicate products (same base-handle X + X-1/X-2), and active
+    products not on any sales channel. Returns counts + sample handles per issue."""
+    store = request.args.get('store', 'dk')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()} store.'}), 401
+    hdrs = shopify_headers(store)
+    products, cursor = [], None
+    try:
+        while True:
+            after = f', after:"{cursor}"' if cursor else ''
+            q = ('{ products(first:200%s){ pageInfo{hasNextPage endCursor} edges{ node{ '
+                 'id title handle status featuredImage{url} '
+                 'cutline: metafield(namespace:"theme",key:"cutline"){value} '
+                 'resourcePublicationsCount(onlyPublished:true){count} } } } }' % after)
+            r = req.post(shopify_url(store, 'graphql.json'), headers=hdrs, json={'query': q}, timeout=45)
+            conn = (r.json().get('data') or {}).get('products') or {}
+            for e in conn.get('edges', []):
+                n = e['node']
+                products.append({
+                    'handle': n.get('handle', ''),
+                    'title': n.get('title', ''),
+                    'status': n.get('status', ''),
+                    'has_image': bool((n.get('featuredImage') or {}).get('url')),
+                    'cutline': ((n.get('cutline') or {}) or {}).get('value') or '',
+                    'channels': ((n.get('resourcePublicationsCount') or {}) or {}).get('count') or 0,
+                })
+            page = conn.get('pageInfo') or {}
+            if not page.get('hasNextPage'):
+                break
+            cursor = page.get('endCursor')
+    except Exception as e:
+        print(f"[audit] error for {store}: {e}")
+        return jsonify({'error': str(e)[:200]}), 500
+
+    missing_cutline = [p for p in products if not p['cutline'].strip()]
+    no_images       = [p for p in products if not p['has_image']]
+    not_on_channels = [p for p in products if p['status'] == 'ACTIVE' and p['channels'] == 0]
+
+    base = {}
+    for p in products:
+        b = re.sub(r'-\d+$', '', p['handle'])
+        base.setdefault(b, []).append(p['handle'])
+    dup_groups = [{'base': b, 'handles': sorted(hs)}
+                  for b, hs in base.items()
+                  if len(hs) > 1 and all(re.fullmatch(re.escape(b) + r'(-\d+)?', h) for h in hs)]
+    dup_extra = sum(len(g['handles']) - 1 for g in dup_groups)
+
+    def _summ(rows, n=20):
+        return {'count': len(rows), 'samples': [r['handle'] for r in rows[:n]]}
+
+    return jsonify({
+        'store': store,
+        'total': len(products),
+        'missing_cutline': _summ(missing_cutline),
+        'no_images': _summ(no_images),
+        'not_on_channels': _summ(not_on_channels),
+        'duplicates': {'count': dup_extra, 'groups': dup_groups[:20]},
+    })
+
+
 @app.route('/api/backup_now', methods=['POST'])
 @require_droplet_token
 def backup_now():

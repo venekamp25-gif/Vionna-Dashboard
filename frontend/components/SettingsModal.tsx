@@ -63,6 +63,34 @@ export function SettingsModal({ open, onClose }: Props) {
     }
   };
 
+  // ── Catalogue audit (#2) ──
+  const [auditBusy, setAuditBusy] = useState<StoreKey | null>(null);
+  const [auditResult, setAuditResult] = useState<
+    Partial<Record<StoreKey, Awaited<ReturnType<typeof api.auditCatalog>>>>
+  >({});
+
+  const runAudit = async (store: StoreKey) => {
+    setAuditBusy(store);
+    try {
+      const res = await api.auditCatalog(store);
+      setAuditResult((r) => ({ ...r, [store]: res }));
+    } catch (e) {
+      setAuditResult((r) => ({
+        ...r,
+        [store]: {
+          store, total: 0,
+          missing_cutline: { count: 0, samples: [] },
+          no_images: { count: 0, samples: [] },
+          not_on_channels: { count: 0, samples: [] },
+          duplicates: { count: 0, groups: [] },
+          error: e instanceof Error ? e.message : String(e),
+        },
+      }));
+    } finally {
+      setAuditBusy(null);
+    }
+  };
+
   // ── System health + backups (#7/#8/#9) ──
   const [health, setHealth] = useState<Awaited<ReturnType<typeof api.health>> | null>(null);
   const [sysBusy, setSysBusy] = useState<"backup" | "export" | null>(null);
@@ -344,6 +372,46 @@ export function SettingsModal({ open, onClose }: Props) {
             </div>
           </div>
 
+          {/* ── Catalogue audit (#2) ──────────────────────────────── */}
+          <div className="mt-8 pt-6 border-t border-border">
+            <div className="text-[14px] font-semibold text-text mb-1">Catalogue audit</div>
+            <p className="text-[12px] text-text-faint mb-3 leading-relaxed">
+              Scan a store for products missing a colour swatch (cutline) or image,
+              duplicate listings, and active products not on every sales channel.
+              Read-only — nothing is changed.
+            </p>
+            <div className="flex flex-col gap-2.5">
+              {STORE_KEYS.map((s) => {
+                const busy = auditBusy === s;
+                const res = auditResult[s];
+                return (
+                  <div key={s} className="flex flex-col gap-1.5">
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      disabled={auditBusy !== null}
+                      onClick={() => runAudit(s)}
+                    >
+                      {busy ? `⟳ Scanning ${STORE_CONFIG[s].label}…` : `🔍 Scan ${STORE_CONFIG[s].label}`}
+                    </Button>
+                    {res &&
+                      (res.error ? (
+                        <span className="text-[11px] text-danger">✕ {res.error}</span>
+                      ) : (
+                        <div className="text-[11px] leading-relaxed pl-1 flex flex-wrap gap-x-3 gap-y-0.5">
+                          <span className="text-text-faint">{res.total} products</span>
+                          <AuditStat label="missing cutline" n={res.missing_cutline.count} samples={res.missing_cutline.samples} />
+                          <AuditStat label="no image" n={res.no_images.count} samples={res.no_images.samples} />
+                          <AuditStat label="duplicate" n={res.duplicates.count} samples={res.duplicates.groups.map((g) => g.base)} />
+                          <AuditStat label="off-channel" n={res.not_on_channels.count} samples={res.not_on_channels.samples} />
+                        </div>
+                      ))}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
           {/* ── System & backups (#7/#8/#9) ───────────────────────── */}
           <div className="mt-8 pt-6 border-t border-border">
             <div className="text-[14px] font-semibold text-text mb-1">System &amp; backups</div>
@@ -438,5 +506,19 @@ export function SettingsModal({ open, onClose }: Props) {
         </div>
       </div>
     </div>
+  );
+}
+
+/** One audit metric: green "✓ 0 label" when clean, amber "⚠ N label" when not.
+ *  Sample handles shown on hover. */
+function AuditStat({ label, n, samples }: { label: string; n: number; samples: string[] }) {
+  const ok = n === 0;
+  return (
+    <span
+      className={ok ? "text-accent" : "text-warning"}
+      title={!ok && samples.length ? `e.g. ${samples.slice(0, 12).join(", ")}` : undefined}
+    >
+      {ok ? "✓" : "⚠"} {n} {label}
+    </span>
   );
 }
