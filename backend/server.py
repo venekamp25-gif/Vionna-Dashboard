@@ -401,7 +401,15 @@ def verify_products():
     if not ids:
         return jsonify({'products': []})
     hdrs = shopify_headers(store)
-    gids = [f'gid://shopify/Product/{str(i).rsplit("/", 1)[-1]}' for i in ids]
+    # Coerce each id to digits only (ids come from the client) — prevents a crafted
+    # value from breaking the GraphQL string, and drops malformed ids cleanly.
+    gids = []
+    for i in ids:
+        num = re.sub(r'\D', '', str(i).rsplit('/', 1)[-1])
+        if num:
+            gids.append(f'gid://shopify/Product/{num}')
+    if not gids:
+        return jsonify({'products': []})
 
     out = []
     # GraphQL nodes() caps at ~250; chunk to be safe

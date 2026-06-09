@@ -161,9 +161,9 @@ function StoreResultCard({
   getColorLabel,
   onJump,
 }: CardProps) {
-  const verifyIssues = (verification ?? []).filter((p) => p.issues.length > 0);
+  const verifyIssues = (verification ?? []).filter((p) => (p.issues ?? []).length > 0);
   const verifyFails = (verification ?? []).some((p) =>
-    p.issues.some((i) => i.level === "fail")
+    (p.issues ?? []).some((i) => i.level === "fail")
   );
   return (
     <div className="bg-bg-elev border border-accent/30 rounded-2xl p-8 shadow-lg">
@@ -275,7 +275,7 @@ function StoreResultCard({
                 {verifyIssues.map((p) => (
                   <li key={p.id}>
                     <span className="text-text font-medium">{p.title}</span> —{" "}
-                    {p.issues.map((iss) => iss.msg).join(", ")}
+                    {(p.issues ?? []).map((iss) => iss.msg).join(", ")}
                   </li>
                 ))}
               </ul>

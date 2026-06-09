@@ -103,7 +103,7 @@ _HOUR = r"uren|uur|hours|hour|stunden|stunde|heures|heure|timmar|timer|timen"
 _DAY  = (r"werkdagen|werkdage|werktagen|werktage|vardagar|arbetsdagar|arbejdsdage|"
          r"hverdage|hverdager|jours\s*ouvr\w*|business\s*days|werkdag|"
          r"dagen|dagar|dage|tage|jours|jour|days|day|dag")
-_SEP = r"(?:[-–—/]|t/m|tot\s+en\s+met|tot|to|till|bis)"
+_SEP = r"(?:[-–—]|t/m|tot\s+en\s+met|tot|to|till|bis)"  # no bare '/' (kills "24/7 days")
 _DUR_RE = re.compile(
     rf"(\d{{1,2}})(?:\s*{_SEP}\s*(\d{{1,2}}))?\s*(?P<unit>{_WEEK}|{_HOUR}|{_DAY})",
     re.IGNORECASE,
@@ -252,14 +252,16 @@ def _fetch_policy_text_via_browser(domain: str) -> str:
 
 
 # ── JSON-LD shippingDetails (idea 2) ──
-def _walk(o):
+def _walk(o, _depth=0):
+    if _depth > 40:   # JSON-LD shippingDetails is shallow; cap to avoid RecursionError on hostile/bloated data
+        return
     if isinstance(o, dict):
         yield o
         for v in o.values():
-            yield from _walk(v)
+            yield from _walk(v, _depth + 1)
     elif isinstance(o, list):
         for v in o:
-            yield from _walk(v)
+            yield from _walk(v, _depth + 1)
 
 
 def _qv_days(q) -> tuple:
@@ -287,22 +289,24 @@ def _jsonld_shipping_days(html: str) -> tuple:
         raw = m.group(1).strip()
         try:
             data = _json.loads(raw)
+            for node in _walk(data):
+                if not isinstance(node, dict):
+                    continue
+                ht = _qv_days(node.get("handlingTime"))
+                tt = _qv_days(node.get("transitTime"))
+                dt = node.get("deliveryTime")
+                if isinstance(dt, dict):
+                    ht = ht or _qv_days(dt.get("handlingTime"))
+                    tt = tt or _qv_days(dt.get("transitTime"))
+                # Require transitTime: handlingTime alone is just processing, not the
+                # total delivery — trusting it would mislabel a dropshipper as own-stock.
+                if tt:
+                    lo = (ht[0] if ht else 0) + tt[0]
+                    hi = (ht[1] if ht else 0) + tt[1]
+                    if hi > 0 and (best is None or hi > best[1]):
+                        best = (lo, hi)
         except Exception:
             continue
-        for node in _walk(data):
-            if not isinstance(node, dict):
-                continue
-            ht = _qv_days(node.get("handlingTime"))
-            tt = _qv_days(node.get("transitTime"))
-            dt = node.get("deliveryTime")
-            if isinstance(dt, dict):
-                ht = ht or _qv_days(dt.get("handlingTime"))
-                tt = tt or _qv_days(dt.get("transitTime"))
-            if ht or tt:
-                lo = (ht[0] if ht else 0) + (tt[0] if tt else 0)
-                hi = (ht[1] if ht else 0) + (tt[1] if tt else 0)
-                if hi > 0 and (best is None or hi > best[1]):
-                    best = (lo, hi)
     return best
 
 
@@ -376,8 +380,12 @@ def _parse_shipping(text: str) -> dict:
     deliv = _find_delivery_range(text)
 
     if deliv[1] > 0:
-        lo = (proc[0] if proc[1] > 0 else 0) + deliv[0]
-        hi = (proc[1] if proc[1] > 0 else 0) + deliv[1]
+        # Add processing on top of delivery — UNLESS proc is the exact same span as
+        # delivery (same number matched by both a proc and a delivery trigger), which
+        # would double-count it (e.g. "levertijd 3-5 … verzonden binnen 3-5").
+        add_proc = proc[1] > 0 and proc != deliv
+        lo = (proc[0] if add_proc else 0) + deliv[0]
+        hi = (proc[1] if add_proc else 0) + deliv[1]
         confidence = "high"
     else:
         scan = _scan_all_durations(text)
