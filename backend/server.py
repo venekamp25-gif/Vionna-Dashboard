@@ -133,6 +133,55 @@ BUG_REPORTS_PATH      = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 BUG_SCREENSHOTS_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bug_screenshots')
 os.makedirs(BUG_SCREENSHOTS_DIR, exist_ok=True)
 
+# --- Automatic local backups (#9) ---
+# The droplet's data files (publish history, bug reports, drafts) live only on
+# the droplet. A daily in-process thread snapshots them to backups/<date>/ with
+# 14-day rotation — protects against accidental deletion / a bad write. (For
+# off-droplet safety, the dashboard also offers a manual data export, and these
+# could be shipped off-box via a cron later.) Runs in-process so it deploys with
+# a plain `git pull` — no extra systemd unit needed.
+_BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+BACKUP_DIR   = os.path.join(_BASE_DIR, 'backups')
+_BACKUP_KEEP = 14
+
+
+def _run_backup():
+    """Snapshot the data files into backups/<YYYY-MM-DD>/. Returns the dir or None."""
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        day  = time.strftime('%Y-%m-%d')
+        dest = os.path.join(BACKUP_DIR, day)
+        os.makedirs(dest, exist_ok=True)
+        for fname in ('publish_history.jsonl', 'bug_reports.jsonl'):
+            src = os.path.join(_BASE_DIR, fname)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(dest, fname))
+        if os.path.isdir(DRAFTS_DIR):
+            shutil.copytree(DRAFTS_DIR, os.path.join(dest, 'drafts'), dirs_exist_ok=True)
+        # Rotation: keep only the most recent _BACKUP_KEEP day-folders.
+        days = sorted(d for d in os.listdir(BACKUP_DIR)
+                      if os.path.isdir(os.path.join(BACKUP_DIR, d)))
+        for old in days[:-_BACKUP_KEEP]:
+            shutil.rmtree(os.path.join(BACKUP_DIR, old), ignore_errors=True)
+        return dest
+    except Exception as e:
+        print(f"[backup] error: {e}")
+        return None
+
+
+def _backup_loop():
+    while True:
+        _run_backup()
+        time.sleep(24 * 3600)
+
+
+# Start the daily backup thread once (a snapshot runs immediately on boot too).
+try:
+    import threading as _threading
+    _threading.Thread(target=_backup_loop, daemon=True, name='daily-backup').start()
+except Exception as _e:
+    print(f"[backup] could not start backup thread: {_e}")
+
 # Slack webhook for bug-report pings. Stored in a gitignored file (the repo is
 # public, so the secret can't live in code/env-in-repo). Set once via
 # POST /api/config/slack_webhook. Falls back to the SLACK_WEBHOOK_URL env var.
@@ -365,6 +414,30 @@ def status():
     })
 
 
+@app.route('/api/health')
+def health():
+    """System health for the admin panel (#7): version, per-store auth, Anthropic,
+    Higgsfield CLI, and backup status. Non-sensitive (booleans + counts) — ungated."""
+    try:
+        with open(os.path.join(_BASE_DIR, 'version.txt')) as f:
+            ver = f.read().strip()
+    except Exception:
+        ver = '?'
+    last_backup, n_backups = '', 0
+    if os.path.isdir(BACKUP_DIR):
+        days = sorted(d for d in os.listdir(BACKUP_DIR)
+                      if os.path.isdir(os.path.join(BACKUP_DIR, d)))
+        n_backups = len(days)
+        last_backup = days[-1] if days else ''
+    return jsonify({
+        'version': ver,
+        'stores': {k: (k in tokens) for k in ('dk', 'fr', 'fi')},
+        'anthropic': bool(ANTHROPIC_KEY and ANTHROPIC_KEY != 'VOELINJEYHIER'),
+        'higgsfield_cli': bool(HIGGSFIELD_EXE),
+        'backups': {'count': n_backups, 'last': last_backup},
+    })
+
+
 @app.route('/api/classify_shipping')
 def classify_shipping():
     """Classify the source store of a product URL as dropshipper / own-stock /
@@ -459,6 +532,38 @@ def verify_products():
                 'issues': issues,
             })
     return jsonify({'products': out})
+
+
+@app.route('/api/backup_now', methods=['POST'])
+@require_droplet_token
+def backup_now():
+    """Trigger an on-demand local backup snapshot (#9)."""
+    dest = _run_backup()
+    return jsonify({'success': bool(dest), 'path': dest or ''})
+
+
+@app.route('/api/export_data')
+@require_droplet_token
+def export_data():
+    """Download an off-droplet backup: publish history + bug reports as one JSON.
+    Gated — contains reporter emails. The dashboard fetches this and saves a file."""
+    def _read_jsonl(p):
+        out = []
+        if os.path.exists(p):
+            with open(p, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            out.append(json.loads(line))
+                        except Exception:
+                            pass
+        return out
+    return jsonify({
+        'exported_at': datetime.datetime.utcnow().isoformat() + 'Z',
+        'publish_history': _read_jsonl(HISTORY_PATH),
+        'bug_reports': _read_jsonl(BUG_REPORTS_PATH),
+    })
 
 
 # --- Scrape competitor product (server-side, geen CORS) ---
