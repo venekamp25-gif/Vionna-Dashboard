@@ -45,11 +45,24 @@ export interface CompetitorInfo {
   price: string;
 }
 
+export interface ProductVerify {
+  id: string;
+  title: string;
+  status: string;
+  images: number;
+  cutline: string;
+  channels: number;
+  variants: number;
+  issues: { level: "warn" | "fail"; msg: string }[];
+}
+
 export interface PublishResult {
   productsCreated: number;
   productUrls: string[];
   collectionUrl: string | null;
   metafieldErrors: string[];
+  productIds?: number[];          // Shopify product ids of the created variants
+  verification?: ProductVerify[]; // post-publish re-check (images/cutline/channels)
 }
 
 export interface CompetitorImage {

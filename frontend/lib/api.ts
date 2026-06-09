@@ -219,6 +219,18 @@ export const api = {
       error?: string;
     }>(`/api/classify_shipping?url=${encodeURIComponent(url)}`),
 
+  /** Post-publish verification: re-read created products and confirm images /
+   *  cutline / sales channels / variants. Also used by the catalog-audit panel. */
+  verifyProducts: (store: "dk" | "fr" | "fi", product_ids: (number | string)[]) =>
+    call<{
+      products: {
+        id: string; title: string; status: string;
+        images: number; cutline: string; channels: number; variants: number;
+        issues: { level: "warn" | "fail"; msg: string }[];
+      }[];
+      error?: string;
+    }>("/api/verify_products", { method: "POST", body: { store, product_ids } }),
+
   scrape: (url: string) =>
     call<ScrapedProduct>("/api/scrape", { method: "POST", body: { url } }),
 

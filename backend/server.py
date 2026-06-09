@@ -387,6 +387,72 @@ def classify_shipping():
                     'source': d['source'], 'confidence': d['confidence']})
 
 
+@app.route('/api/verify_products', methods=['POST'])
+def verify_products():
+    """Post-publish verification: re-read freshly created products and confirm
+    images attached / cutline set / on sales channels / variants present.
+    Body: { store, product_ids: [..] }. Returns per-product checks + issues.
+    Also reused by the catalog-audit panel."""
+    data = request.json or {}
+    store = data.get('store', 'dk')
+    ids = data.get('product_ids') or []
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()} store.'}), 401
+    if not ids:
+        return jsonify({'products': []})
+    hdrs = shopify_headers(store)
+    gids = [f'gid://shopify/Product/{str(i).rsplit("/", 1)[-1]}' for i in ids]
+
+    out = []
+    # GraphQL nodes() caps at ~250; chunk to be safe
+    for i in range(0, len(gids), 100):
+        chunk = gids[i:i + 100]
+        id_list = ', '.join(f'"{g}"' for g in chunk)
+        query = (
+            '{ nodes(ids: [%s]) { ... on Product { '
+            'id title status '
+            'images(first: 30) { nodes { id } } '
+            'cutline: metafield(namespace:"theme", key:"cutline") { value } '
+            'siblings: metafield(namespace:"theme", key:"siblings") { value } '
+            'resourcePublicationsCount(onlyPublished: true) { count } '
+            'variantsCount { count } } } }' % id_list
+        )
+        try:
+            r = req.post(shopify_url(store, 'graphql.json'), headers=hdrs, json={'query': query}, timeout=30)
+            nodes = (r.json().get('data') or {}).get('nodes') or []
+        except Exception as e:
+            print(f"[verify_products] error: {e}")
+            nodes = []
+        for n in nodes:
+            if not n:
+                continue
+            n_images   = len((n.get('images') or {}).get('nodes') or [])
+            cutline_val = ((n.get('cutline') or {}) or {}).get('value') or ''
+            siblings_v  = ((n.get('siblings') or {}) or {}).get('value') or ''
+            channels    = ((n.get('resourcePublicationsCount') or {}) or {}).get('count') or 0
+            variants    = ((n.get('variantsCount') or {}) or {}).get('count') or 0
+            issues = []
+            if n_images == 0:
+                issues.append({'level': 'fail', 'msg': 'No images attached'})
+            if not cutline_val.strip():
+                issues.append({'level': 'warn', 'msg': 'No cutline (colour swatch)'})
+            if not siblings_v.strip():
+                issues.append({'level': 'warn', 'msg': 'Siblings link missing'})
+            if channels == 0:
+                issues.append({'level': 'warn', 'msg': 'Not on any sales channel'})
+            if variants == 0:
+                issues.append({'level': 'fail', 'msg': 'No variants'})
+            out.append({
+                'id': n.get('id', '').rsplit('/', 1)[-1],
+                'title': n.get('title', ''),
+                'status': n.get('status', ''),
+                'images': n_images, 'cutline': cutline_val,
+                'channels': channels, 'variants': variants,
+                'issues': issues,
+            })
+    return jsonify({'products': out})
+
+
 # --- Scrape competitor product (server-side, geen CORS) ---
 _COLOR_OPT_RE = re.compile(r'colou?r|kleur|farve|couleur|colore', re.I)
 _SIZE_OPT_RE  = re.compile(r'size|maat|taille|størrelse|talla', re.I)

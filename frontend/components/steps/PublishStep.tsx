@@ -2,7 +2,7 @@
 
 import { AnimatedCheckmark } from "@/components/ui/AnimatedCheckmark";
 import { Button } from "@/components/ui/Button";
-import { useProduct, colorLabelFor, pickRandomBgReferenceUrl } from "@/lib/product";
+import { useProduct, colorLabelFor, pickRandomBgReferenceUrl, ProductVerify } from "@/lib/product";
 import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
 import { useStep } from "@/lib/step";
 
@@ -115,6 +115,7 @@ export function PublishStep() {
             firstProductUrl={firstProductUrl}
             productsCreated={result.productsCreated}
             metafieldErrors={result.metafieldErrors}
+            verification={result.verification}
             getColorLabel={(canonical) => colorLabelFor(data, canonical, store)}
             onJump={() => setStore(store)}
           />
@@ -141,6 +142,7 @@ interface CardProps {
   firstProductUrl?: string;
   productsCreated: number;
   metafieldErrors: string[];
+  verification?: ProductVerify[];
   getColorLabel: (canonical: string) => string;
   onJump: () => void;
 }
@@ -155,9 +157,14 @@ function StoreResultCard({
   firstProductUrl,
   productsCreated,
   metafieldErrors,
+  verification,
   getColorLabel,
   onJump,
 }: CardProps) {
+  const verifyIssues = (verification ?? []).filter((p) => p.issues.length > 0);
+  const verifyFails = (verification ?? []).some((p) =>
+    p.issues.some((i) => i.level === "fail")
+  );
   return (
     <div className="bg-bg-elev border border-accent/30 rounded-2xl p-8 shadow-lg">
       <div className="flex items-start gap-4 mb-6">
@@ -239,6 +246,41 @@ function StoreResultCard({
               ))}
             </ul>
           </div>
+        </div>
+      )}
+
+      {verification && verification.length > 0 && (
+        <div className="mt-6 pl-[72px]">
+          <div className="text-[11px] uppercase tracking-wider text-text-faint mb-2">
+            Post-publish check
+          </div>
+          {verifyIssues.length === 0 ? (
+            <div className="px-3 py-2.5 rounded-md bg-accent/10 border border-accent/30 text-[12px] text-accent">
+              ✓ All {verification.length} {verification.length === 1 ? "product" : "products"} verified —
+              images, colour swatch, sales channels &amp; variants all present.
+            </div>
+          ) : (
+            <div
+              className={[
+                "px-3 py-2.5 rounded-md border text-[12px]",
+                verifyFails
+                  ? "bg-danger/10 border-danger/40 text-danger"
+                  : "bg-warning/15 border-warning/40 text-warning",
+              ].join(" ")}
+            >
+              <strong>
+                {verifyIssues.length} {verifyIssues.length === 1 ? "product" : "products"} to double-check:
+              </strong>
+              <ul className="list-disc list-inside mt-1 space-y-0.5 ml-2">
+                {verifyIssues.map((p) => (
+                  <li key={p.id}>
+                    <span className="text-text font-medium">{p.title}</span> —{" "}
+                    {p.issues.map((iss) => iss.msg).join(", ")}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
       )}
     </div>

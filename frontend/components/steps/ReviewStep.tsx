@@ -170,6 +170,7 @@ export function ReviewStep() {
 
         // 2️⃣ Create one product per colour, in order
         const productUrls: string[] = [];
+        const productIds: number[] = [];
         const allMetafieldErrors: string[] = [];
         const primaryCanonical = data.canonicalColors[0] ?? null;
 
@@ -214,6 +215,7 @@ export function ReviewStep() {
           }
 
           if (variantRes.product_url) productUrls.push(variantRes.product_url);
+          if (variantRes.product_id) productIds.push(variantRes.product_id);
           if (variantRes.metafield_errors?.length)
             allMetafieldErrors.push(...variantRes.metafield_errors);
 
@@ -239,6 +241,7 @@ export function ReviewStep() {
           productUrls,
           collectionUrl: startRes.collection_url ?? null,
           metafieldErrors: allMetafieldErrors,
+          productIds,
         };
         resultsByStore[store] = storeResult;
         lastResult = storeResult;
@@ -252,6 +255,20 @@ export function ReviewStep() {
           publishResultsByStore: { ...resultsByStore },
           publishResult: lastResult,
         }));
+
+        // Post-publish verification — re-read the created products and confirm
+        // images / cutline / channels / variants. Best-effort + informational:
+        // never blocks the success flow if it errors.
+        if (productIds.length) {
+          try {
+            const v = await api.verifyProducts(store, productIds);
+            storeResult.verification = v.products;
+            resultsByStore[store] = { ...storeResult };
+            setData((prev) => ({ ...prev, publishResultsByStore: { ...resultsByStore } }));
+          } catch {
+            /* verification is informational — ignore failures */
+          }
+        }
       }
 
       // All stores published successfully — drop the auto-saved draft
