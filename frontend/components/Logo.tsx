@@ -22,9 +22,9 @@ export function Logo({ withText = true, size = 28 }: { withText?: boolean; size?
       </svg>
       {withText && (
         <div className="flex flex-col leading-none">
-          <span className="text-[16px] font-bold tracking-[0.18em] text-text">VIONNA</span>
+          <span className="text-[16px] font-bold tracking-[0.18em] text-text">FASHION</span>
           <span className="text-[10px] font-medium tracking-[0.12em] text-text-faint uppercase mt-[3px]">
-            Product Dashboard
+            Listing Dashboard
           </span>
         </div>
       )}

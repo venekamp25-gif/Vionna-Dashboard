@@ -386,7 +386,7 @@ export function ReviewStep() {
                 {targetStores.length === 1
                   ? `1 store (${STORE_CONFIG[targetStores[0]].label})`
                   : `${targetStores.length} stores (${targetStores
-                      .map((s) => STORE_CONFIG[s].label.replace("Vionna ", ""))
+                      .map((s) => STORE_CONFIG[s].label.replace("Store ", ""))
                       .join(" + ")})`}
                 .
               </span>
@@ -421,7 +421,7 @@ export function ReviewStep() {
             {publishing
               ? "Publishing…"
               : targetStores.length === 1
-              ? `Publish to ${STORE_CONFIG[targetStores[0]].label.replace("Vionna ", "")} →`
+              ? `Publish to ${STORE_CONFIG[targetStores[0]].label.replace("Store ", "")} →`
               : `Publish to ${targetStores.length} stores →`}
           </Button>
         </div>
