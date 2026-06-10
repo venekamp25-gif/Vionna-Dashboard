@@ -60,8 +60,9 @@ export function BackendStatusBadge() {
   const parts: string[] = [];
   if (status?.dk) parts.push("DK ✓"); else parts.push("DK ⚠");
   if (status?.fr) parts.push("FR ✓"); else parts.push("FR ⚠");
+  if (status?.fi) parts.push("FI ✓"); else parts.push("FI ⚠");
   if (status?.anthropic) parts.push("Claude ✓"); else parts.push("Claude ⚠");
-  const anyDegraded = !status?.dk || !status?.fr || !status?.anthropic;
+  const anyDegraded = !status?.dk || !status?.fr || !status?.fi || !status?.anthropic;
 
   return wrap(
     <span className={`flex items-center gap-1.5 ${anyDegraded ? "text-warning" : "text-accent"}`}>

@@ -34,6 +34,7 @@ export function HealthCheckModal({ open, onClose }: Props) {
       { name: "Logged in", description: "Next.js session valid", status: "checking" },
       { name: "Store DK", description: "Shopify token + scopes", status: "checking" },
       { name: "Store FR", description: "Shopify token + scopes", status: "checking" },
+      { name: "Store FI", description: "Shopify token + scopes", status: "checking" },
       { name: "Claude (Anthropic)", description: "Content generation API key", status: "checking" },
     ];
     setChecks(initial);
@@ -46,12 +47,14 @@ export function HealthCheckModal({ open, onClose }: Props) {
       setChecks((cur) => updateCheck(cur, "Backend", "ok", "Reachable + responding"));
       setChecks((cur) => updateCheck(cur, "Store DK", s.dk ? "ok" : "fail", s.dk ? "Token loaded" : "No token — re-auth needed"));
       setChecks((cur) => updateCheck(cur, "Store FR", s.fr ? "ok" : "fail", s.fr ? "Token loaded" : "No token — re-auth needed"));
+      setChecks((cur) => updateCheck(cur, "Store FI", s.fi ? "ok" : "fail", s.fi ? "Token loaded" : "No token — re-auth needed"));
       setChecks((cur) => updateCheck(cur, "Claude (Anthropic)", s.anthropic ? "ok" : "fail", s.anthropic ? "API key configured" : "ANTHROPIC_API_KEY missing"));
     } catch (e) {
       setChecks((cur) => updateCheck(cur, "Backend", "fail", e instanceof Error ? e.message : String(e)));
       // If backend is down everything else is unknown
       setChecks((cur) => updateCheck(cur, "Store DK", "warn", "Skipped — backend unreachable"));
       setChecks((cur) => updateCheck(cur, "Store FR", "warn", "Skipped — backend unreachable"));
+      setChecks((cur) => updateCheck(cur, "Store FI", "warn", "Skipped — backend unreachable"));
       setChecks((cur) => updateCheck(cur, "Claude (Anthropic)", "warn", "Skipped — backend unreachable"));
     }
 
