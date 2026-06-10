@@ -22,6 +22,8 @@ app.secret_key = os.environ.get('SECRET_KEY') or os.urandom(24)
 _allowed_origins = [
     'http://localhost:3000',
     'http://127.0.0.1:3000',
+    'https://fashion-listing-dashboard.netlify.app',  # current public URL
+    'https://vionna-dashboard.netlify.app',           # legacy — keep until the old name is freed
     os.environ.get('FRONTEND_URL', ''),
 ]
 CORS(app, resources={r'/api/*': {'origins': [o for o in _allowed_origins if o]}}, supports_credentials=True,
@@ -703,7 +705,7 @@ def _ensure_color_option(product):
 # and only fall back to Mozilla if the first try returns a 403 (some other
 # stores might preferentially serve Mozilla — covers both cases without
 # burning two requests on the happy path).
-_SCRAPE_UA_PRIMARY  = 'VionnaProductDashboard/1.0 (+https://vionna-dashboard.netlify.app)'
+_SCRAPE_UA_PRIMARY  = 'FashionListingDashboard/1.0 (+https://fashion-listing-dashboard.netlify.app)'
 _SCRAPE_UA_FALLBACK = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
 
