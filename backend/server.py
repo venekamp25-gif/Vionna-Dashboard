@@ -2050,6 +2050,20 @@ def bug_reports_create():
     if not title:
         return jsonify({'error': 'title is required'}), 400
 
+    # Optional import-context snapshot (competitor URL, detected colours/sizes,
+    # etc.) captured by the dashboard. Lets the dev reproduce import bugs like
+    # "only one colour showed up" without the reporter pasting the URL by hand.
+    # Bounded defensively — it's client-supplied and lands in an append-only log.
+    diagnostics = data.get('diagnostics')
+    if isinstance(diagnostics, dict):
+        try:
+            if len(json.dumps(diagnostics, ensure_ascii=False)) > 4000:
+                diagnostics = {'note': 'diagnostics too large — dropped'}
+        except Exception:
+            diagnostics = None
+    else:
+        diagnostics = None
+
     bug_id = _next_bug_id()
 
     # Persist screenshot if attached (data URL → file on disk).
@@ -2082,6 +2096,7 @@ def bug_reports_create():
         'page_url':       (data.get('page_url') or '').strip()[:500] or None,
         'title':          title,
         'description':    desc,
+        'diagnostics':    diagnostics,
         'screenshot_filename': screenshot_filename,
         'status':         'open',
         'resolved_at':    None,
@@ -2125,6 +2140,20 @@ def _post_bug_to_slack(entry):
     if desc:
         snip = desc[:600].replace('\n', '\n>')
         blocks.append({'type': 'section', 'text': {'type': 'mrkdwn', 'text': f">{snip}"}})
+    # Import context — the competitor URL + what the scrape detected. Makes
+    # "wrong variants on import" reports reproducible straight from Slack.
+    diag = entry.get('diagnostics')
+    if isinstance(diag, dict):
+        lines = []
+        if diag.get('competitor_url'):
+            lines.append(f"*Competitor URL:* {diag['competitor_url']}")
+        if diag.get('color_count') is not None:
+            colors = ', '.join(diag.get('detected_colors') or []) or '—'
+            lines.append(f"*Detected colours ({diag.get('color_count')}):* {colors}")
+        if diag.get('sizes'):
+            lines.append(f"*Sizes:* {', '.join(diag['sizes'])}")
+        if lines:
+            blocks.append({'type': 'section', 'text': {'type': 'mrkdwn', 'text': '\n'.join(lines)}})
     if sshot:
         blocks.append({'type': 'section',
                        'text': {'type': 'mrkdwn', 'text': f"<{sshot}|📎 View screenshot>"},
