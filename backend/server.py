@@ -22,6 +22,8 @@ app.secret_key = os.environ.get('SECRET_KEY') or os.urandom(24)
 _allowed_origins = [
     'http://localhost:3000',
     'http://127.0.0.1:3000',
+    'https://fashion-listing-dashboard.netlify.app',  # current public URL
+    'https://vionna-dashboard.netlify.app',           # legacy — keep until the old name is freed
     os.environ.get('FRONTEND_URL', ''),
 ]
 CORS(app, resources={r'/api/*': {'origins': [o for o in _allowed_origins if o]}}, supports_credentials=True,
@@ -132,6 +134,55 @@ os.makedirs(DRAFTS_DIR, exist_ok=True)
 BUG_REPORTS_PATH      = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bug_reports.jsonl')
 BUG_SCREENSHOTS_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bug_screenshots')
 os.makedirs(BUG_SCREENSHOTS_DIR, exist_ok=True)
+
+# --- Automatic local backups (#9) ---
+# The droplet's data files (publish history, bug reports, drafts) live only on
+# the droplet. A daily in-process thread snapshots them to backups/<date>/ with
+# 14-day rotation — protects against accidental deletion / a bad write. (For
+# off-droplet safety, the dashboard also offers a manual data export, and these
+# could be shipped off-box via a cron later.) Runs in-process so it deploys with
+# a plain `git pull` — no extra systemd unit needed.
+_BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+BACKUP_DIR   = os.path.join(_BASE_DIR, 'backups')
+_BACKUP_KEEP = 14
+
+
+def _run_backup():
+    """Snapshot the data files into backups/<YYYY-MM-DD>/. Returns the dir or None."""
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        day  = time.strftime('%Y-%m-%d')
+        dest = os.path.join(BACKUP_DIR, day)
+        os.makedirs(dest, exist_ok=True)
+        for fname in ('publish_history.jsonl', 'bug_reports.jsonl'):
+            src = os.path.join(_BASE_DIR, fname)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(dest, fname))
+        if os.path.isdir(DRAFTS_DIR):
+            shutil.copytree(DRAFTS_DIR, os.path.join(dest, 'drafts'), dirs_exist_ok=True)
+        # Rotation: keep only the most recent _BACKUP_KEEP day-folders.
+        days = sorted(d for d in os.listdir(BACKUP_DIR)
+                      if os.path.isdir(os.path.join(BACKUP_DIR, d)))
+        for old in days[:-_BACKUP_KEEP]:
+            shutil.rmtree(os.path.join(BACKUP_DIR, old), ignore_errors=True)
+        return dest
+    except Exception as e:
+        print(f"[backup] error: {e}")
+        return None
+
+
+def _backup_loop():
+    while True:
+        _run_backup()
+        time.sleep(24 * 3600)
+
+
+# Start the daily backup thread once (a snapshot runs immediately on boot too).
+try:
+    import threading as _threading
+    _threading.Thread(target=_backup_loop, daemon=True, name='daily-backup').start()
+except Exception as _e:
+    print(f"[backup] could not start backup thread: {_e}")
 
 # Slack webhook for bug-report pings. Stored in a gitignored file (the repo is
 # public, so the secret can't live in code/env-in-repo). Set once via
@@ -365,6 +416,221 @@ def status():
     })
 
 
+@app.route('/api/health')
+def health():
+    """System health for the admin panel (#7): version, per-store auth, Anthropic,
+    Higgsfield CLI, and backup status. Non-sensitive (booleans + counts) — ungated."""
+    try:
+        with open(os.path.join(_BASE_DIR, 'version.txt')) as f:
+            ver = f.read().strip()
+    except Exception:
+        ver = '?'
+    last_backup, n_backups = '', 0
+    if os.path.isdir(BACKUP_DIR):
+        days = sorted(d for d in os.listdir(BACKUP_DIR)
+                      if os.path.isdir(os.path.join(BACKUP_DIR, d)))
+        n_backups = len(days)
+        last_backup = days[-1] if days else ''
+    return jsonify({
+        'version': ver,
+        'stores': {k: (k in tokens) for k in ('dk', 'fr', 'fi')},
+        'anthropic': bool(ANTHROPIC_KEY and ANTHROPIC_KEY != 'VOELINJEYHIER'),
+        'higgsfield_cli': bool(HIGGSFIELD_EXE),
+        'backups': {'count': n_backups, 'last': last_backup},
+    })
+
+
+@app.route('/api/classify_shipping')
+def classify_shipping():
+    """Classify the source store of a product URL as dropshipper / own-stock /
+    unknown, by parsing its shipping policy. Used at the import step to warn when
+    the source isn't a dropshipper. Fast mode: HTTP paths + text-LLM, no browser.
+
+    Returns: { label, detail: 'X-Yd', source, confidence }. source ∈ structured/
+    policy/llm/llm-sonnet/vision/none; confidence ∈ high/medium/low/none."""
+    url = (request.args.get('url') or '').strip()
+    if not url:
+        return jsonify({'label': 'Onbekend', 'detail': '', 'source': 'none', 'confidence': 'none'})
+    try:
+        from shipping_check import classify_detailed
+        d = classify_detailed(url, skip_browser=True)
+    except Exception as e:
+        print(f"[classify_shipping] error for {url}: {e}")
+        # Treat failures as 'Onbekend' so the import step can still warn (per user choice)
+        return jsonify({'label': 'Onbekend', 'detail': '', 'source': 'none', 'confidence': 'none', 'error': str(e)[:200]})
+    return jsonify({'label': d['label'], 'detail': d['detail'],
+                    'source': d['source'], 'confidence': d['confidence']})
+
+
+@app.route('/api/verify_products', methods=['POST'])
+def verify_products():
+    """Post-publish verification: re-read freshly created products and confirm
+    images attached / cutline set / on sales channels / variants present.
+    Body: { store, product_ids: [..] }. Returns per-product checks + issues.
+    Also reused by the catalog-audit panel."""
+    data = request.json or {}
+    store = data.get('store', 'dk')
+    ids = data.get('product_ids') or []
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()} store.'}), 401
+    if not ids:
+        return jsonify({'products': []})
+    hdrs = shopify_headers(store)
+    # Coerce each id to digits only (ids come from the client) — prevents a crafted
+    # value from breaking the GraphQL string, and drops malformed ids cleanly.
+    gids = []
+    for i in ids:
+        num = re.sub(r'\D', '', str(i).rsplit('/', 1)[-1])
+        if num:
+            gids.append(f'gid://shopify/Product/{num}')
+    if not gids:
+        return jsonify({'products': []})
+
+    out = []
+    # GraphQL nodes() caps at ~250; chunk to be safe
+    for i in range(0, len(gids), 100):
+        chunk = gids[i:i + 100]
+        id_list = ', '.join(f'"{g}"' for g in chunk)
+        query = (
+            '{ nodes(ids: [%s]) { ... on Product { '
+            'id title status '
+            'images(first: 30) { nodes { id } } '
+            'cutline: metafield(namespace:"theme", key:"cutline") { value } '
+            'siblings: metafield(namespace:"theme", key:"siblings") { value } '
+            'resourcePublicationsCount(onlyPublished: true) { count } '
+            'variantsCount { count } } } }' % id_list
+        )
+        try:
+            r = req.post(shopify_url(store, 'graphql.json'), headers=hdrs, json={'query': query}, timeout=30)
+            nodes = (r.json().get('data') or {}).get('nodes') or []
+        except Exception as e:
+            print(f"[verify_products] error: {e}")
+            nodes = []
+        for n in nodes:
+            if not n:
+                continue
+            n_images   = len((n.get('images') or {}).get('nodes') or [])
+            cutline_val = ((n.get('cutline') or {}) or {}).get('value') or ''
+            siblings_v  = ((n.get('siblings') or {}) or {}).get('value') or ''
+            channels    = ((n.get('resourcePublicationsCount') or {}) or {}).get('count') or 0
+            variants    = ((n.get('variantsCount') or {}) or {}).get('count') or 0
+            issues = []
+            if n_images == 0:
+                issues.append({'level': 'fail', 'msg': 'No images attached'})
+            if not cutline_val.strip():
+                issues.append({'level': 'warn', 'msg': 'No cutline (colour swatch)'})
+            if not siblings_v.strip():
+                issues.append({'level': 'warn', 'msg': 'Siblings link missing'})
+            if channels == 0:
+                issues.append({'level': 'warn', 'msg': 'Not on any sales channel'})
+            if variants == 0:
+                issues.append({'level': 'fail', 'msg': 'No variants'})
+            out.append({
+                'id': n.get('id', '').rsplit('/', 1)[-1],
+                'title': n.get('title', ''),
+                'status': n.get('status', ''),
+                'images': n_images, 'cutline': cutline_val,
+                'channels': channels, 'variants': variants,
+                'issues': issues,
+            })
+    return jsonify({'products': out})
+
+
+@app.route('/api/audit')
+def audit_catalog():
+    """Catalog-audit (#2): scan every product of a store and flag missing cutlines,
+    missing images, duplicate products (same base-handle X + X-1/X-2), and active
+    products not on any sales channel. Returns counts + sample handles per issue."""
+    store = request.args.get('store', 'dk')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()} store.'}), 401
+    hdrs = shopify_headers(store)
+    products, cursor = [], None
+    try:
+        while True:
+            after = f', after:"{cursor}"' if cursor else ''
+            q = ('{ products(first:200%s){ pageInfo{hasNextPage endCursor} edges{ node{ '
+                 'id title handle status featuredImage{url} '
+                 'cutline: metafield(namespace:"theme",key:"cutline"){value} '
+                 'resourcePublicationsCount(onlyPublished:true){count} } } } }' % after)
+            r = req.post(shopify_url(store, 'graphql.json'), headers=hdrs, json={'query': q}, timeout=45)
+            conn = (r.json().get('data') or {}).get('products') or {}
+            for e in conn.get('edges', []):
+                n = e['node']
+                products.append({
+                    'handle': n.get('handle', ''),
+                    'title': n.get('title', ''),
+                    'status': n.get('status', ''),
+                    'has_image': bool((n.get('featuredImage') or {}).get('url')),
+                    'cutline': ((n.get('cutline') or {}) or {}).get('value') or '',
+                    'channels': ((n.get('resourcePublicationsCount') or {}) or {}).get('count') or 0,
+                })
+            page = conn.get('pageInfo') or {}
+            if not page.get('hasNextPage'):
+                break
+            cursor = page.get('endCursor')
+    except Exception as e:
+        print(f"[audit] error for {store}: {e}")
+        return jsonify({'error': str(e)[:200]}), 500
+
+    missing_cutline = [p for p in products if not p['cutline'].strip()]
+    no_images       = [p for p in products if not p['has_image']]
+    not_on_channels = [p for p in products if p['status'] == 'ACTIVE' and p['channels'] == 0]
+
+    base = {}
+    for p in products:
+        b = re.sub(r'-\d+$', '', p['handle'])
+        base.setdefault(b, []).append(p['handle'])
+    dup_groups = [{'base': b, 'handles': sorted(hs)}
+                  for b, hs in base.items()
+                  if len(hs) > 1 and all(re.fullmatch(re.escape(b) + r'(-\d+)?', h) for h in hs)]
+    dup_extra = sum(len(g['handles']) - 1 for g in dup_groups)
+
+    def _summ(rows, n=20):
+        return {'count': len(rows), 'samples': [r['handle'] for r in rows[:n]]}
+
+    return jsonify({
+        'store': store,
+        'total': len(products),
+        'missing_cutline': _summ(missing_cutline),
+        'no_images': _summ(no_images),
+        'not_on_channels': _summ(not_on_channels),
+        'duplicates': {'count': dup_extra, 'groups': dup_groups[:20]},
+    })
+
+
+@app.route('/api/backup_now', methods=['POST'])
+@require_droplet_token
+def backup_now():
+    """Trigger an on-demand local backup snapshot (#9)."""
+    dest = _run_backup()
+    return jsonify({'success': bool(dest), 'path': dest or ''})
+
+
+@app.route('/api/export_data')
+@require_droplet_token
+def export_data():
+    """Download an off-droplet backup: publish history + bug reports as one JSON.
+    Gated — contains reporter emails. The dashboard fetches this and saves a file."""
+    def _read_jsonl(p):
+        out = []
+        if os.path.exists(p):
+            with open(p, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            out.append(json.loads(line))
+                        except Exception:
+                            pass
+        return out
+    return jsonify({
+        'exported_at': datetime.datetime.utcnow().isoformat() + 'Z',
+        'publish_history': _read_jsonl(HISTORY_PATH),
+        'bug_reports': _read_jsonl(BUG_REPORTS_PATH),
+    })
+
+
 # --- Scrape competitor product (server-side, geen CORS) ---
 _COLOR_OPT_RE = re.compile(r'colou?r|kleur|farve|couleur|colore', re.I)
 _SIZE_OPT_RE  = re.compile(r'size|maat|taille|størrelse|talla', re.I)
@@ -439,7 +705,7 @@ def _ensure_color_option(product):
 # and only fall back to Mozilla if the first try returns a 403 (some other
 # stores might preferentially serve Mozilla — covers both cases without
 # burning two requests on the happy path).
-_SCRAPE_UA_PRIMARY  = 'VionnaProductDashboard/1.0 (+https://vionna-dashboard.netlify.app)'
+_SCRAPE_UA_PRIMARY  = 'FashionListingDashboard/1.0 (+https://fashion-listing-dashboard.netlify.app)'
 _SCRAPE_UA_FALLBACK = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
 

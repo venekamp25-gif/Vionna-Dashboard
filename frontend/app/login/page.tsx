@@ -48,7 +48,7 @@ export default function LoginPage() {
 
         <h1 className="text-[18px] font-bold text-text text-center mb-1">Sign in</h1>
         <p className="text-[12px] text-text-faint text-center mb-6">
-          Internal dashboard — Vionna staff only.
+          Internal dashboard — staff only.
         </p>
 
         <div className="mb-4">

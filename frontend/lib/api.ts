@@ -7,6 +7,11 @@
 const BACKEND_URL =
   process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/+$/, "") || "http://localhost:5000";
 
+/** OAuth start URL for connecting / re-authorising a store's Shopify token (#8). */
+export function backendAuthUrl(store: string): string {
+  return `${BACKEND_URL}/auth/${store}`;
+}
+
 // Short-lived token for the droplet's mutation endpoints (publish / backfill).
 // Minted server-side by /api/droplet-token so the secret never reaches the
 // browser. Cached and reused across a publish run (which fires many per-variant
@@ -207,6 +212,63 @@ export interface PublishCreateVariantResponse {
 // ── Public API ──
 export const api = {
   status: () => call<BackendStatus>("/api/status"),
+
+  /** Classify the source store of a product URL (dropshipper / own-stock / unknown)
+   *  by parsing its shipping policy. Used to warn at the import step. */
+  classifyShipping: (url: string) =>
+    call<{
+      label: "Dropshipper" | "Eigen voorraad" | "Onbekend";
+      detail: string;                                   // "7-14d"
+      source: "structured" | "policy" | "policy-js" | "llm" | "llm-sonnet" | "vision" | "none";
+      confidence: "high" | "medium" | "low" | "none";
+      error?: string;
+    }>(`/api/classify_shipping?url=${encodeURIComponent(url)}`),
+
+  /** Post-publish verification: re-read created products and confirm images /
+   *  cutline / sales channels / variants. Also used by the catalog-audit panel. */
+  verifyProducts: (store: "dk" | "fr" | "fi", product_ids: (number | string)[]) =>
+    call<{
+      products: {
+        id: string; title: string; status: string;
+        images: number; cutline: string; channels: number; variants: number;
+        issues: { level: "warn" | "fail"; msg: string }[];
+      }[];
+      error?: string;
+    }>("/api/verify_products", { method: "POST", body: { store, product_ids } }),
+
+  /** Catalogue audit (#2): scan a store for missing cutlines / images, duplicate
+   *  products, and active-but-off-channel products. */
+  auditCatalog: (store: "dk" | "fr" | "fi") =>
+    call<{
+      store: string;
+      total: number;
+      missing_cutline: { count: number; samples: string[] };
+      no_images: { count: number; samples: string[] };
+      not_on_channels: { count: number; samples: string[] };
+      duplicates: { count: number; groups: { base: string; handles: string[] }[] };
+      error?: string;
+    }>(`/api/audit?store=${store}`),
+
+  /** System health for the admin panel (#7): version, per-store auth, keys, backups. */
+  health: () =>
+    call<{
+      version: string;
+      stores: Record<"dk" | "fr" | "fi", boolean>;
+      anthropic: boolean;
+      higgsfield_cli: boolean;
+      backups: { count: number; last: string };
+    }>("/api/health"),
+
+  /** Trigger an on-demand local backup snapshot (#9). */
+  backupNow: () =>
+    call<{ success: boolean; path: string }>("/api/backup_now", { method: "POST", authed: true }),
+
+  /** Download an off-droplet data backup (publish history + bug reports) (#9). */
+  exportData: () =>
+    call<{ exported_at: string; publish_history: unknown[]; bug_reports: unknown[] }>(
+      "/api/export_data",
+      { authed: true }
+    ),
 
   scrape: (url: string) =>
     call<ScrapedProduct>("/api/scrape", { method: "POST", body: { url } }),

@@ -81,5 +81,5 @@ export function randomName(exclude: string[] = []): string {
     }
   }
   // Should be unreachable for any realistic catalogue size
-  return `Vionna ${Date.now()}`;
+  return `Fashion ${Date.now()}`;
 }

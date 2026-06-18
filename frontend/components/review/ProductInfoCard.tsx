@@ -327,7 +327,7 @@ function NameStatusLine({
   }
   if (status === "taken") {
     const labels = takenInStores.map(
-      (s) => STORE_CONFIG[s].label.replace("Vionna ", "")
+      (s) => STORE_CONFIG[s].label.replace("Store ", "")
     );
     const where = labels.length === 0 ? "your store" : labels.join(" + ");
     return (

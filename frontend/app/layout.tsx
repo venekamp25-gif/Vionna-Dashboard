@@ -10,8 +10,8 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "Vionna · Product Dashboard",
-  description: "Internal product import & generation dashboard for Vionna DK & FR Shopify stores.",
+  title: "Fashion · Listing Dashboard",
+  description: "Internal product import & generation dashboard for the fashion Shopify stores.",
 };
 
 // Inline script to set theme BEFORE render — prevents flash of wrong theme

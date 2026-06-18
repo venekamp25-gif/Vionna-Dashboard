@@ -89,7 +89,7 @@ export function HistoryModal({ open, onClose }: Props) {
                     active ? "bg-accent text-on-accent shadow-sm" : "text-text-dim hover:text-text",
                   ].join(" ")}
                 >
-                  {s === "all" ? "All" : STORE_CONFIG[s as StoreKey].label.replace("Vionna ", "")}
+                  {s === "all" ? "All" : STORE_CONFIG[s as StoreKey].label.replace("Store ", "")}
                 </button>
               );
             })}

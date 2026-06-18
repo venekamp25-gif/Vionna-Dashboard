@@ -1,0 +1,38 @@
+name: CI
+
+# Runs on every push to main + PRs. Surfaces broken commits loudly (red X +
+# email) before they cause trouble. Note: the droplet auto-pulls main on a
+# timer, so this is a fast warning signal, not a hard deploy gate.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend-tests:
+    name: Backend tests (classifier)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test deps
+        run: pip install requests pytest
+      - name: Run pytest
+        run: python -m pytest backend/tests -q
+
+  frontend-types:
+    name: Frontend type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install deps
+        run: npm ci
+        working-directory: frontend
+      - name: Type-check
+        run: npx tsc --noEmit -p tsconfig.json
+        working-directory: frontend
