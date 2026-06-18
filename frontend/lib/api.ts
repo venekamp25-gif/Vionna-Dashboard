@@ -280,6 +280,15 @@ export const api = {
     reporter_email?: string;
     store?: "dk" | "fr" | "fi";
     screenshot?: string;   // data URL
+    /** Snapshot of the current import so import bugs are reproducible. */
+    diagnostics?: {
+      competitor_url: string | null;
+      detected_colors: string[];
+      color_count: number;
+      sizes: string[];
+      selected_stores: string[];
+      product_name: string | null;
+    };
   }) =>
     call<{ success: boolean; id?: number; error?: string }>("/api/bug_reports", {
       method: "POST",

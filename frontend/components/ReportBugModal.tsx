@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { api, fetchCurrentUser } from "@/lib/api";
 import { useStore } from "@/lib/store";
+import { useProduct } from "@/lib/product";
 
 interface Props {
   open: boolean;
@@ -21,6 +22,7 @@ interface Props {
  */
 export function ReportBugModal({ open, onClose }: Props) {
   const { store } = useStore();
+  const { data: product } = useProduct();
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [screenshot, setScreenshot] = useState<string | null>(null);
@@ -70,6 +72,18 @@ export function ReportBugModal({ open, onClose }: Props) {
     setError(null);
     setSubmitting(true);
     try {
+      // Auto-capture the current import context. Reporters (often non-technical)
+      // rarely paste the competitor URL, which makes import bugs like "only one
+      // colour showed up" impossible to reproduce. Snapshotting the URL + what
+      // the scrape actually detected lets the dev re-run the exact import.
+      const diagnostics = {
+        competitor_url:  product.competitorUrl || null,
+        detected_colors: product.canonicalColors,
+        color_count:     product.canonicalColors.length,
+        sizes:           product.sizes,
+        selected_stores: product.selectedStores,
+        product_name:    product.name || null,
+      };
       const res = await api.reportBug({
         title:           title.trim(),
         description:     description.trim(),
@@ -77,6 +91,7 @@ export function ReportBugModal({ open, onClose }: Props) {
         reporter_email:  reporterEmail || undefined,
         store,
         screenshot:      screenshot ?? undefined,
+        diagnostics,
       });
       if (!res.success || res.error) throw new Error(res.error ?? "Unknown error");
       setSubmitted(res.id ?? 0);
@@ -232,8 +247,9 @@ export function ReportBugModal({ open, onClose }: Props) {
               <div className="text-[11px] text-text-faint border-t border-border pt-3 leading-relaxed">
                 <strong className="text-text-dim">Automatically included:</strong>{" "}
                 your email ({reporterEmail || "(not logged in)"}), the active
-                store ({store.toUpperCase()}), and the page you were on. No
-                need to retype any of that.
+                store ({store.toUpperCase()}), the page you were on, and — if you
+                have a product loaded — the competitor URL and what was detected
+                (colours, sizes). No need to retype any of that.
               </div>
 
               {error && (
