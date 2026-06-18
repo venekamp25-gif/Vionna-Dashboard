@@ -9,6 +9,7 @@ import { StoreKey, STORE_CONFIG } from "@/lib/store";
 import { randomName } from "@/lib/names";
 import { slugify } from "@/lib/slug";
 import { useUsedNames } from "@/lib/useUsedNames";
+import { translateColor } from "@/lib/colors";
 
 const COLOR_DOTS: Record<string, string> = {
   // English canonical keys
@@ -157,6 +158,45 @@ export function ProductInfoCard() {
     }
   };
 
+  const [addingColor, setAddingColor] = useState(false);
+  const [addColorInput, setAddColorInput] = useState("");
+
+  const addColor = () => {
+    const raw = addColorInput.trim();
+    if (!raw) { setAddingColor(false); return; }
+    // Title-case the input so it becomes a canonical English key
+    const canonical = raw
+      .toLowerCase()
+      .split(/\s+/)
+      .map((w) => (w ? w.charAt(0).toUpperCase() + w.slice(1) : w))
+      .join(" ");
+    setData((prev) => {
+      if (prev.canonicalColors.includes(canonical)) return prev;
+      const newCanonical = [...prev.canonicalColors, canonical];
+      const newContent: Record<StoreKey, StoreContent> = { ...prev.contentByStore };
+      (Object.keys(newContent) as StoreKey[]).forEach((s) => {
+        const labels = { ...newContent[s].colorLabels, [canonical]: translateColor(canonical, s) };
+        newContent[s] = {
+          ...newContent[s],
+          colorLabels: labels,
+          cutline: newCanonical.map((c) => labels[c] ?? c).join(", "),
+        };
+      });
+      const newColors = newCanonical.map(
+        (c) => newContent[prev.activeViewStore].colorLabels[c] ?? c
+      );
+      return {
+        ...prev,
+        canonicalColors: newCanonical,
+        colors: newColors,
+        contentByStore: newContent,
+        cutline: newContent[prev.activeViewStore]?.cutline ?? "",
+      };
+    });
+    setAddColorInput("");
+    setAddingColor(false);
+  };
+
   /** Remove a colour by INDEX so we can clean up both canonical key + every store's label. */
   const removeColorAt = (index: number) => {
     setData((prev) => {
@@ -222,7 +262,7 @@ export function ProductInfoCard() {
 
       <Field>
         <Label>Colors (from competitor)</Label>
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap gap-2 items-center">
           {data.canonicalColors.map((canonical, i) => {
             const display = data.colors[i] ?? canonical;
             return (
@@ -236,8 +276,43 @@ export function ProductInfoCard() {
               </Chip>
             );
           })}
-          {data.canonicalColors.length === 0 && (
+          {data.canonicalColors.length === 0 && !addingColor && (
             <span className="text-[12px] text-text-faint">No colors detected</span>
+          )}
+          {addingColor ? (
+            <div className="flex items-center gap-1">
+              <input
+                autoFocus
+                type="text"
+                value={addColorInput}
+                onChange={(e) => setAddColorInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") addColor();
+                  if (e.key === "Escape") { setAddingColor(false); setAddColorInput(""); }
+                }}
+                placeholder="e.g. Black"
+                className="text-[12px] px-2 py-1 rounded-md border border-border bg-bg-elev h-7 w-28 focus:outline-none focus:border-accent focus:ring-2 focus:ring-[var(--accent-soft)]"
+              />
+              <button
+                onClick={addColor}
+                className="text-[11px] px-2 py-1 h-7 rounded-md bg-accent text-white hover:opacity-90 transition"
+              >
+                Add
+              </button>
+              <button
+                onClick={() => { setAddingColor(false); setAddColorInput(""); }}
+                className="text-[11px] px-1.5 py-1 h-7 rounded-md border border-border text-text-dim hover:border-border-hover transition"
+              >
+                ✕
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={() => setAddingColor(true)}
+              className="text-[11px] px-2 py-1 h-7 rounded-md border border-border text-text-dim hover:border-border-hover hover:text-text transition"
+            >
+              + Add
+            </button>
           )}
         </div>
       </Field>
