@@ -27,6 +27,10 @@ frontend/out/
 frontend/.env.local
 frontend/.env*.local
 
+# Shareable implementation guide — scrubbed of secrets, but keep it OUT of the
+# public repo so the full methodology + AI prompts aren't published. Share manually.
+IMPLEMENTATION_GUIDE.md
+
 # OS
 .DS_Store
 Thumbs.db
