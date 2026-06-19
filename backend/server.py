@@ -1,4 +1,4 @@
-import os, sys, json, re, hashlib, hmac, base64, urllib.parse, subprocess, tempfile, shutil, platform, unicodedata, datetime, time
+import os, sys, json, re, hashlib, hmac, base64, urllib.parse, subprocess, tempfile, shutil, platform, unicodedata, datetime, time, threading
 from functools import wraps
 from flask import Flask, request, redirect, session, jsonify, send_from_directory
 from flask_cors import CORS
@@ -1947,6 +1947,70 @@ def backfill_list_products():
     })
 
 
+# ── Shopify write throttle ───────────────────────────────────────────────
+# Shopify's REST Admin API allows ~2 requests/second (leaky bucket). The
+# keyword backfill writes a PUT + several metafield POSTs per colour-product,
+# across every colour of a dress — a 20-colour product fires ~100 calls
+# back-to-back, which blew past the cap and surfaced as HTTP 429
+# "Exceeded 2 calls per second for api client" (the "5/20 products failed"
+# report). We serialise Shopify calls to stay just under the cap, and retry on
+# a rate-limit response honouring Retry-After. The lock is global so concurrent
+# Flask request threads (e.g. "Save all" firing many rows) can't collectively
+# exceed the limit either.
+_SHOPIFY_THROTTLE_LOCK = threading.Lock()
+_shopify_last_call_at  = [0.0]      # monotonic time of the last call (guarded by the lock)
+_shopify_next_gap      = [0.0]      # required spacing before the NEXT call, set adaptively
+_SHOPIFY_MIN_INTERVAL  = 0.55       # spacing once the bucket is filling → ~1.8 req/s, under the 2/s cap
+
+
+def _shopify_call(method, url, hdrs, *, json=None, timeout=20, _max_retries=5):
+    """Throttled Shopify Admin REST call with rate-limit retry.
+
+    Shopify's REST bucket allows a burst (default 40) draining at ~2/s. We pace
+    adaptively off the `X-Shopify-Shop-Api-Call-Limit` ("used/capacity") header:
+    small batches use the burst at full speed, and we only space calls out once
+    the bucket is ~70% full — so big multi-colour dresses don't trip the 2/s cap.
+    Any rate-limit response (429, or a 4xx mentioning 'calls per second') is
+    retried honouring Retry-After. The lock is global so concurrent Flask request
+    threads (e.g. "Save all") share one budget. Returns the final Response so
+    callers keep their existing status-code handling."""
+    fn = getattr(req, method.lower())
+    resp = None
+    for attempt in range(_max_retries + 1):
+        # Hold the lock only long enough to honour the current spacing + claim the slot.
+        with _SHOPIFY_THROTTLE_LOCK:
+            gap = _shopify_next_gap[0]
+            if gap > 0:
+                wait = gap - (time.monotonic() - _shopify_last_call_at[0])
+                if wait > 0:
+                    time.sleep(wait)
+            _shopify_last_call_at[0] = time.monotonic()
+        kwargs = {'headers': hdrs, 'timeout': timeout}
+        if json is not None:
+            kwargs['json'] = json
+        resp = fn(url, **kwargs)
+        # Adaptive pacing for the next call, from the leaky-bucket header.
+        try:
+            used, cap = (int(x) for x in resp.headers.get('X-Shopify-Shop-Api-Call-Limit', '').split('/'))
+            _shopify_next_gap[0] = _SHOPIFY_MIN_INTERVAL if cap and used >= cap * 0.7 else 0.0
+        except Exception:
+            _shopify_next_gap[0] = _SHOPIFY_MIN_INTERVAL  # header missing/odd — pace defensively
+        rate_limited = resp.status_code == 429 or (
+            resp.status_code >= 400 and 'calls per second' in (resp.text or '').lower()
+        )
+        if not rate_limited or attempt >= _max_retries:
+            return resp
+        try:
+            wait_s = float(resp.headers.get('Retry-After', '') or 0)
+        except ValueError:
+            wait_s = 0.0
+        wait_s = wait_s or min(2.0 * (attempt + 1), 10.0)
+        print(f"[shopify] rate-limited ({resp.status_code}) on {method.upper()} {url} — "
+              f"retry {attempt + 1}/{_max_retries} after {wait_s}s")
+        time.sleep(wait_s)
+    return resp
+
+
 def _set_product_seo(store, prod_id, hdrs, *, description_html=None,
                      meta_description=None, m_title_specs=None):
     """Write SEO copy onto an EXISTING product. Only non-empty fields are written,
@@ -1960,8 +2024,8 @@ def _set_product_seo(store, prod_id, hdrs, *, description_html=None,
 
     if description_html:
         try:
-            r = req.put(shopify_url(store, f'products/{num}.json'), headers=hdrs,
-                        json={'product': {'id': int(num), 'body_html': description_html}}, timeout=20)
+            r = _shopify_call('put', shopify_url(store, f'products/{num}.json'), hdrs,
+                              json={'product': {'id': int(num), 'body_html': description_html}}, timeout=20)
             if r.status_code not in (200, 201):
                 errs.append(f'body_html ({r.status_code}): {r.text[:120]}')
         except Exception as e:
@@ -1976,12 +2040,12 @@ def _set_product_seo(store, prod_id, hdrs, *, description_html=None,
                            'value': m_title_specs, 'type': 'multi_line_text_field'})
     for mf in metafields:
         try:
-            mf_res = req.post(shopify_url(store, f'products/{num}/metafields.json'),
-                              headers=hdrs, json={'metafield': mf}, timeout=20)
+            mf_res = _shopify_call('post', shopify_url(store, f'products/{num}/metafields.json'),
+                                   hdrs, json={'metafield': mf}, timeout=20)
             if mf_res.status_code not in (200, 201):
                 alt = 'single_line_text_field' if mf['type'] == 'multi_line_text_field' else 'multi_line_text_field'
-                mf_res2 = req.post(shopify_url(store, f'products/{num}/metafields.json'),
-                                   headers=hdrs, json={'metafield': {**mf, 'type': alt}}, timeout=20)
+                mf_res2 = _shopify_call('post', shopify_url(store, f'products/{num}/metafields.json'),
+                                        hdrs, json={'metafield': {**mf, 'type': alt}}, timeout=20)
                 if mf_res2.status_code not in (200, 201):
                     errs.append(f"{mf['key']} (both types failed): {mf_res2.text[:120]}")
         except Exception as e:
@@ -1996,16 +2060,16 @@ def _set_backfill_marker(store, num, hdrs, on, stamp):
     if on:
         # POST is fine even if the metafield already exists (Shopify returns 422
         # 'taken' — already marked, which is exactly the state we want).
-        req.post(shopify_url(store, f'products/{num}/metafields.json'), headers=hdrs,
-                 json={'metafield': {'namespace': 'custom', 'key': 'keyword_backfilled',
-                                     'value': stamp, 'type': 'single_line_text_field'}}, timeout=15)
+        _shopify_call('post', shopify_url(store, f'products/{num}/metafields.json'), hdrs,
+                      json={'metafield': {'namespace': 'custom', 'key': 'keyword_backfilled',
+                                          'value': stamp, 'type': 'single_line_text_field'}}, timeout=15)
     else:
-        r = req.get(shopify_url(store, f'products/{num}/metafields.json?namespace=custom&key=keyword_backfilled'),
-                    headers=hdrs, timeout=15)
+        r = _shopify_call('get', shopify_url(store, f'products/{num}/metafields.json?namespace=custom&key=keyword_backfilled'),
+                          hdrs, timeout=15)
         for m in (r.json().get('metafields') or []):
             mid = m.get('id')
             if mid:
-                req.delete(shopify_url(store, f'products/{num}/metafields/{mid}.json'), headers=hdrs, timeout=15)
+                _shopify_call('delete', shopify_url(store, f'products/{num}/metafields/{mid}.json'), hdrs, timeout=15)
 
 
 @app.route('/api/backfill/apply', methods=['POST'])
