@@ -288,7 +288,7 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
   const counts = useMemo(() => {
     const vals = Object.values(rows);
     return {
-      dresses: groups.length,
+      products: groups.length,
       withKeywords: vals.filter((r) => parseKeywords(r.keywords).length > 0).length,
       generated: vals.filter((r) => r.status === "generated" || r.status === "saving").length,
       saved: vals.filter((r) => r.status === "saved").length,
@@ -311,7 +311,7 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
           <div>
             <h2 className="text-[16px] font-semibold text-text">🔑 Keyword backfill</h2>
             <p className="text-[11px] text-text-faint mt-0.5">
-              {counts.dresses} dress{counts.dresses === 1 ? "" : "es"} · {counts.saved} saved · regenerates description + meta + m_title_specs with your keywords
+              {counts.products} product{counts.products === 1 ? "" : "s"} · {counts.saved} saved · regenerates description + meta + m_title_specs with your keywords
             </p>
           </div>
           <button type="button" onClick={onClose} className="text-text-faint hover:text-text text-xl px-2">
@@ -371,7 +371,7 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
           <div className="px-6 py-3 border-b border-border bg-bg-elev-2">
             <p className="text-[12px] font-medium text-text mb-1">📋 Paste your keyword list</p>
             <p className="text-[11px] text-text-faint mb-2 leading-relaxed">
-              One line per dress. Paste straight from Google Sheets (column <strong>product name</strong> + column(s){" "}
+              One line per product. Paste straight from Google Sheets (column <strong>product name</strong> + column(s){" "}
               <strong>keywords</strong>), or use <code className="bg-bg-elev px-1 rounded">name | kw1, kw2</code> or{" "}
               <code className="bg-bg-elev px-1 rounded">name: kw1, kw2</code>. Matches on product name; a header row is skipped.
             </p>
@@ -523,7 +523,7 @@ function DressCard({
           // eslint-disable-next-line @next/next/no-img-element
           <img src={g.image} alt={g.product_name} className="w-12 h-16 object-cover rounded-md border border-border flex-shrink-0" />
         ) : (
-          <div className="w-12 h-16 rounded-md bg-bg-elev border border-border flex items-center justify-center text-text-faint text-[18px] flex-shrink-0">👗</div>
+          <div className="w-12 h-16 rounded-md bg-bg-elev border border-border flex items-center justify-center text-text-faint text-[18px] flex-shrink-0">🖼️</div>
         )}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
