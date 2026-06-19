@@ -9,11 +9,13 @@ import { LogoutButton } from "./LogoutButton";
 import { SettingsModal } from "./SettingsModal";
 import { HistoryModal } from "./HistoryModal";
 import { ReportBugModal } from "./ReportBugModal";
+import { KeywordBackfillModal } from "./KeywordBackfillModal";
 
 export function Header() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [historyOpen, setHistoryOpen]   = useState(false);
   const [bugOpen, setBugOpen]           = useState(false);
+  const [backfillOpen, setBackfillOpen] = useState(false);
 
   return (
     <>
@@ -30,6 +32,15 @@ export function Header() {
             className="w-9 h-9 flex items-center justify-center rounded-md bg-bg-elev-2 text-text-dim hover:text-warning hover:border-warning border border-border transition-colors text-[14px]"
           >
             🐛
+          </button>
+          <button
+            type="button"
+            onClick={() => setBackfillOpen(true)}
+            title="Keyword backfill — regenerate copy for already-listed products"
+            aria-label="Open keyword backfill"
+            className="w-9 h-9 flex items-center justify-center rounded-md bg-bg-elev-2 text-text-dim hover:text-accent hover:border-accent border border-border transition-colors text-[14px]"
+          >
+            🔑
           </button>
           <button
             type="button"
@@ -56,6 +67,7 @@ export function Header() {
       <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
       <HistoryModal open={historyOpen} onClose={() => setHistoryOpen(false)} />
       <ReportBugModal open={bugOpen} onClose={() => setBugOpen(false)} />
+      <KeywordBackfillModal open={backfillOpen} onClose={() => setBackfillOpen(false)} />
     </>
   );
 }

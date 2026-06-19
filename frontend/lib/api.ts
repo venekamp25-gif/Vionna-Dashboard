@@ -209,6 +209,44 @@ export interface PublishCreateVariantResponse {
   error?: string;
 }
 
+// ── Keyword / SEO backfill (regenerate copy for already-listed products) ──
+export interface BackfillColour {
+  id: string;
+  handle: string;
+  color: string;
+  status: string;
+}
+export interface BackfillGroup {
+  /** Grouping key (theme.siblings handle, or title). Stable id for one dress. */
+  key: string;
+  product_name: string;
+  image: string;
+  siblings_handle: string;
+  /** Every colour-product id of this dress — copy is written to all of them. */
+  product_ids: string[];
+  colours: BackfillColour[];
+  current: {
+    description_html: string;
+    description_text: string;
+    meta_description: string;
+    m_title_specs: string;
+  };
+}
+export interface BackfillListResponse {
+  store: "dk" | "fr" | "fi";
+  total_products: number;
+  total_dresses: number;
+  groups: BackfillGroup[];
+  error?: string;
+}
+export interface BackfillApplyResponse {
+  store: string;
+  applied: number;
+  failed: number;
+  results: { id: string; ok: boolean; errors: string[] }[];
+  error?: string;
+}
+
 // ── Public API ──
 export const api = {
   status: () => call<BackendStatus>("/api/status"),
@@ -406,6 +444,26 @@ export const api = {
     collection_id?: number | null;
     actual_handle: string;
   }) => call<PublishCreateVariantResponse>("/api/publish/create_variant", { method: "POST", body: params, authed: true }),
+
+  /** Keyword backfill: list a store's products grouped per dress, with current
+   *  SEO copy, so keywords can be filled in + copy regenerated for products that
+   *  were imported before keyword research. ACTIVE only unless includeDrafts. */
+  backfillProducts: (store: "dk" | "fr" | "fi", includeDrafts = false) =>
+    call<BackfillListResponse>(
+      `/api/backfill/products?store=${store}${includeDrafts ? "&include_drafts=1" : ""}`
+    ),
+
+  /** Write regenerated copy to every colour-product of one dress. Pass plain-text
+   *  `description` (converted to body_html server-side) OR raw `description_html`
+   *  (used to revert to the exact original body). Mutation-gated. */
+  backfillApply: (params: {
+    store: "dk" | "fr" | "fi";
+    product_ids: string[];
+    description?: string;
+    description_html?: string;
+    meta_description?: string;
+    m_title_specs?: string;
+  }) => call<BackfillApplyResponse>("/api/backfill/apply", { method: "POST", body: params, authed: true }),
 };
 
 export const BACKEND = BACKEND_URL;

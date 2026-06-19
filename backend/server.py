@@ -1829,6 +1829,203 @@ def backfill_sales_channels():
     })
 
 
+# --- Keyword / SEO backfill (regenerate copy for already-listed products) ---
+# Products listed via the dashboard before keyword research was done (e.g. FI,
+# which goes live without per-product keywords) need their description +
+# meta-description + m_title_specs regenerated WITH the right keywords. This is
+# the backfill counterpart to the import wizard: it operates on EXISTING products
+# instead of creating new ones. Colour-variants of one dress share the same copy,
+# so we group them (by the theme.siblings handle, falling back to the product
+# title) and regenerate ONCE per dress, then write to every colour-product.
+
+def _strip_html_to_text(html):
+    """Small HTML->text for previewing a product's current body. Turns block
+    closes into newlines and <li> into bullets, then drops the remaining tags."""
+    if not html:
+        return ''
+    t = re.sub(r'(?i)<li[^>]*>', '• ', html)
+    t = re.sub(r'(?i)</(p|div|li|ul|ol|h\d)>', '\n', t)
+    t = re.sub(r'(?i)<br\s*/?>', '\n', t)
+    t = re.sub(r'<[^>]+>', '', t)
+    t = re.sub(r'\n{3,}', '\n\n', t)
+    return t.strip()
+
+
+@app.route('/api/backfill/products')
+def backfill_list_products():
+    """List a store's products grouped per dress, with current SEO copy, for the
+    Keyword-backfill screen. ACTIVE only by default; pass include_drafts=1 to also
+    include drafts. Groups colour-variant products by their theme.siblings handle
+    (fallback: title) so keywords are entered once per dress, not per colour."""
+    store = request.args.get('store', 'dk')
+    include_drafts = request.args.get('include_drafts', '0') in ('1', 'true', 'yes')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()} store.'}), 401
+    hdrs = shopify_headers(store)
+
+    products, cursor = [], None
+    try:
+        while True:
+            after = f', after:"{cursor}"' if cursor else ''
+            q = ('{ products(first:200%s){ pageInfo{hasNextPage endCursor} edges{ node{ '
+                 'id title handle status featuredImage{url} descriptionHtml '
+                 'desc: metafield(namespace:"global",key:"description_tag"){value} '
+                 'mts: metafield(namespace:"custom",key:"m_title_specs_multi_line_text_"){value} '
+                 'sib: metafield(namespace:"theme",key:"siblings"){value} '
+                 'cut: metafield(namespace:"theme",key:"cutline"){value} } } } }' % after)
+            r = req.post(shopify_url(store, 'graphql.json'), headers=hdrs, json={'query': q}, timeout=45)
+            conn = (r.json().get('data') or {}).get('products') or {}
+            for e in conn.get('edges', []):
+                products.append(e['node'])
+            page = conn.get('pageInfo') or {}
+            if not page.get('hasNextPage'):
+                break
+            cursor = page.get('endCursor')
+    except Exception as e:
+        print(f"[backfill] list error for {store}: {e}")
+        return jsonify({'error': str(e)[:200]}), 500
+
+    groups, order = {}, []
+    for n in products:
+        status = (n.get('status') or '').upper()
+        if status == 'ARCHIVED':
+            continue
+        if status != 'ACTIVE' and not include_drafts:
+            continue
+        title = n.get('title') or ''
+        sib = ((n.get('sib') or {}) or {}).get('value') or ''
+        key = sib or title.lower() or (n.get('handle') or '')
+        pid = (n.get('id') or '').rsplit('/', 1)[-1]
+        feat = ((n.get('featuredImage') or {}) or {}).get('url') or ''
+        if key not in groups:
+            groups[key] = {
+                'key': key,
+                'product_name': title,
+                'image': feat,
+                'siblings_handle': sib,
+                'product_ids': [],
+                'colours': [],
+                'current': {
+                    'description_html': n.get('descriptionHtml') or '',
+                    'description_text': _strip_html_to_text(n.get('descriptionHtml') or ''),
+                    'meta_description': ((n.get('desc') or {}) or {}).get('value') or '',
+                    'm_title_specs': ((n.get('mts') or {}) or {}).get('value') or '',
+                },
+            }
+            order.append(key)
+        g = groups[key]
+        if pid:
+            g['product_ids'].append(pid)
+        g['colours'].append({
+            'id': pid,
+            'handle': n.get('handle') or '',
+            'color': ((n.get('cut') or {}) or {}).get('value') or '',
+            'status': status,
+        })
+        if not g['image'] and feat:
+            g['image'] = feat
+
+    out = [groups[k] for k in order]
+    out.sort(key=lambda g: (g['product_name'] or '').lower())
+    return jsonify({
+        'store': store,
+        'total_products': sum(len(g['product_ids']) for g in out),
+        'total_dresses': len(out),
+        'groups': out,
+    })
+
+
+def _set_product_seo(store, prod_id, hdrs, *, description_html=None,
+                     meta_description=None, m_title_specs=None):
+    """Write SEO copy onto an EXISTING product. Only non-empty fields are written,
+    so we never blank out a field the caller didn't regenerate. Mirrors the
+    metafield keys/types + type-retry used by publish. Returns a list of error
+    strings (empty = success)."""
+    errs = []
+    num = re.sub(r'\D', '', str(prod_id).rsplit('/', 1)[-1])
+    if not num:
+        return [f'invalid product id: {prod_id!r}']
+
+    if description_html:
+        try:
+            r = req.put(shopify_url(store, f'products/{num}.json'), headers=hdrs,
+                        json={'product': {'id': int(num), 'body_html': description_html}}, timeout=20)
+            if r.status_code not in (200, 201):
+                errs.append(f'body_html ({r.status_code}): {r.text[:120]}')
+        except Exception as e:
+            errs.append(f'body_html: {e}')
+
+    metafields = []
+    if meta_description:
+        metafields.append({'namespace': 'global', 'key': 'description_tag',
+                           'value': meta_description, 'type': 'single_line_text_field'})
+    if m_title_specs:
+        metafields.append({'namespace': 'custom', 'key': 'm_title_specs_multi_line_text_',
+                           'value': m_title_specs, 'type': 'multi_line_text_field'})
+    for mf in metafields:
+        try:
+            mf_res = req.post(shopify_url(store, f'products/{num}/metafields.json'),
+                              headers=hdrs, json={'metafield': mf}, timeout=20)
+            if mf_res.status_code not in (200, 201):
+                alt = 'single_line_text_field' if mf['type'] == 'multi_line_text_field' else 'multi_line_text_field'
+                mf_res2 = req.post(shopify_url(store, f'products/{num}/metafields.json'),
+                                   headers=hdrs, json={'metafield': {**mf, 'type': alt}}, timeout=20)
+                if mf_res2.status_code not in (200, 201):
+                    errs.append(f"{mf['key']} (both types failed): {mf_res2.text[:120]}")
+        except Exception as e:
+            errs.append(f"{mf['key']}: {e}")
+    return errs
+
+
+@app.route('/api/backfill/apply', methods=['POST'])
+@require_droplet_token
+def backfill_apply():
+    """Write regenerated copy to one dress's colour-products. Body:
+      { store, product_ids:[...], description, meta_description, m_title_specs,
+        description_html? }
+    `description` is plain text (as Claude returns it) and is converted to
+    body_html exactly like publish does; pass `description_html` instead to write
+    raw HTML verbatim (used by the UI's 'revert to original' to restore the exact
+    previous body). Only non-empty fields are written. Returns per-product results
+    so the UI can surface partial failures."""
+    data = request.json or {}
+    store = data.get('store', 'dk')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()} store.'}), 401
+    ids = data.get('product_ids') or []
+    if not ids:
+        return jsonify({'error': 'No product_ids given.'}), 400
+
+    description      = (data.get('description') or '').strip()
+    meta_description = (data.get('meta_description') or '').strip()
+    m_title_specs    = (data.get('m_title_specs') or '').strip()
+    html_override    = (data.get('description_html') or '').strip()
+    if not (description or meta_description or m_title_specs or html_override):
+        return jsonify({'error': 'Nothing to write - all fields are empty.'}), 400
+
+    hdrs = shopify_headers(store)
+    body_html = html_override or (_publish_to_html(description) if description else None)
+
+    results, applied = [], 0
+    for pid in ids:
+        errs = _set_product_seo(
+            store, pid, hdrs,
+            description_html=body_html,
+            meta_description=meta_description or None,
+            m_title_specs=m_title_specs or None,
+        )
+        ok = not errs
+        applied += 1 if ok else 0
+        results.append({'id': re.sub(r'\D', '', str(pid).rsplit('/', 1)[-1]), 'ok': ok, 'errors': errs})
+
+    return jsonify({
+        'store': store,
+        'applied': applied,
+        'failed': len(results) - applied,
+        'results': results,
+    })
+
+
 # --- Per-user draft storage ---
 
 def _sanitize_owner(raw):
