@@ -146,7 +146,7 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
     const row = rows[g.key];
     const kws = parseKeywords(row?.keywords ?? "");
     if (kws.length === 0) {
-      patchRow(g.key, { status: "error", err: "Vul eerst keywords in." });
+      patchRow(g.key, { status: "error", err: "Enter keywords first." });
       return;
     }
     patchRow(g.key, { status: "generating", err: undefined });
@@ -187,10 +187,10 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
       if (r.error) throw new Error(r.error);
       if (r.failed > 0) {
         const firstErr = r.results.find((x) => !x.ok)?.errors?.[0] ?? "unknown error";
-        throw new Error(`${r.failed}/${r.results.length} producten faalden: ${firstErr}`);
+        throw new Error(`${r.failed}/${r.results.length} products failed: ${firstErr}`);
       }
       patchRow(g.key, { status: "saved" });
-      notify(`${g.product_name} bijgewerkt`, `${r.applied} product(en) opgeslagen in Shopify ${store.toUpperCase()}.`, "backfill-saved");
+      notify(`${g.product_name} updated`, `${r.applied} product(s) saved to Shopify ${store.toUpperCase()}.`, "backfill-saved");
     } catch (e) {
       patchRow(g.key, { status: "error", err: e instanceof Error ? e.message : String(e) });
     }
@@ -210,7 +210,7 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
       });
       if (r.error) throw new Error(r.error);
       patchRow(g.key, { status: "generated" });
-      notify(`${g.product_name} teruggezet`, "De oude tekst is hersteld.", "backfill-revert");
+      notify(`${g.product_name} reverted`, "The original text has been restored.", "backfill-revert");
     } catch (e) {
       patchRow(g.key, { status: "error", err: e instanceof Error ? e.message : String(e) });
     }
@@ -311,7 +311,7 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
           <div>
             <h2 className="text-[16px] font-semibold text-text">🔑 Keyword backfill</h2>
             <p className="text-[11px] text-text-faint mt-0.5">
-              {counts.dresses} jurk{counts.dresses === 1 ? "" : "en"} · {counts.saved} opgeslagen · regenereert beschrijving + meta + m_title_specs met jouw keywords
+              {counts.dresses} dress{counts.dresses === 1 ? "" : "es"} · {counts.saved} saved · regenerates description + meta + m_title_specs with your keywords
             </p>
           </div>
           <button type="button" onClick={onClose} className="text-text-faint hover:text-text text-xl px-2">
@@ -341,13 +341,13 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
           </div>
           <label className="flex items-center gap-1.5 text-[11px] text-text-dim cursor-pointer select-none">
             <input type="checkbox" checked={includeDrafts} onChange={(e) => setIncludeDrafts(e.target.checked)} />
-            ook drafts
+            include drafts
           </label>
           <input
             type="text"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Zoek op productnaam…"
+            placeholder="Search by product name…"
             className="flex-1 min-w-[180px] bg-bg-elev-2 border border-border rounded-md px-3 py-1.5 text-[12px] text-text placeholder:text-text-faint focus:outline-none focus:border-accent"
           />
           <Button
@@ -356,24 +356,24 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
             onClick={() => setPasteOpen((v) => !v)}
             disabled={loading}
           >
-            📋 Lijst plakken
+            📋 Paste list
           </Button>
           <Button variant="secondary" size="sm" onClick={() => void runBulk("generate")} disabled={bulkBusy || loading}>
-            ✨ Genereer alle ({counts.withKeywords})
+            ✨ Generate all ({counts.withKeywords})
           </Button>
           <Button variant="primary" size="sm" onClick={() => void runBulk("save")} disabled={bulkBusy || loading || counts.generated === 0}>
-            ⬆ Sla alle op ({counts.generated})
+            ⬆ Save all ({counts.generated})
           </Button>
         </div>
 
         {/* Paste-list accelerator */}
         {pasteOpen && (
           <div className="px-6 py-3 border-b border-border bg-bg-elev-2">
-            <p className="text-[12px] font-medium text-text mb-1">📋 Plak je keyword-lijst</p>
+            <p className="text-[12px] font-medium text-text mb-1">📋 Paste your keyword list</p>
             <p className="text-[11px] text-text-faint mb-2 leading-relaxed">
-              Eén regel per jurk. Plak direct uit Google Sheets (kolom <strong>productnaam</strong> + kolom(men){" "}
-              <strong>keywords</strong>), of gebruik <code className="bg-bg-elev px-1 rounded">naam | kw1, kw2</code> of{" "}
-              <code className="bg-bg-elev px-1 rounded">naam: kw1, kw2</code>. Matcht op productnaam; een kopregel wordt overgeslagen.
+              One line per dress. Paste straight from Google Sheets (column <strong>product name</strong> + column(s){" "}
+              <strong>keywords</strong>), or use <code className="bg-bg-elev px-1 rounded">name | kw1, kw2</code> or{" "}
+              <code className="bg-bg-elev px-1 rounded">name: kw1, kw2</code>. Matches on product name; a header row is skipped.
             </p>
             <textarea
               value={pasteText}
@@ -384,7 +384,7 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
             />
             <div className="flex items-center gap-2 mt-2 flex-wrap">
               <Button variant="primary" size="sm" onClick={applyPaste} disabled={!pasteText.trim()}>
-                ↓ Velden invullen
+                ↓ Fill fields
               </Button>
               <Button
                 variant="ghost"
@@ -394,17 +394,17 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
                   setPasteResult(null);
                 }}
               >
-                Wissen
+                Clear
               </Button>
               {pasteResult && (
                 <span className="text-[11px] text-text-dim">
-                  <span className="text-accent">✓ {pasteResult.matched + pasteResult.fuzzy} ingevuld</span>
-                  {pasteResult.fuzzy > 0 && <span className="text-text-faint"> ({pasteResult.fuzzy} bij benadering)</span>}
+                  <span className="text-accent">✓ {pasteResult.matched + pasteResult.fuzzy} filled</span>
+                  {pasteResult.fuzzy > 0 && <span className="text-text-faint"> ({pasteResult.fuzzy} approximate)</span>}
                   {pasteResult.ambiguous.length > 0 && (
-                    <span className="text-warning"> · {pasteResult.ambiguous.length} dubbelzinnig</span>
+                    <span className="text-warning"> · {pasteResult.ambiguous.length} ambiguous</span>
                   )}
                   {pasteResult.unmatched.length > 0 && (
-                    <span className="text-danger"> · {pasteResult.unmatched.length} niet gevonden</span>
+                    <span className="text-danger"> · {pasteResult.unmatched.length} not found</span>
                   )}
                 </span>
               )}
@@ -413,13 +413,13 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
               <div className="mt-2 text-[11px] leading-relaxed">
                 {pasteResult.unmatched.length > 0 && (
                   <p className="text-text-faint">
-                    <span className="text-danger font-medium">Niet gevonden</span> (typ deze handmatig of corrigeer de naam):{" "}
+                    <span className="text-danger font-medium">Not found</span> (type these manually or fix the name):{" "}
                     {pasteResult.unmatched.join(" · ")}
                   </p>
                 )}
                 {pasteResult.ambiguous.map((a) => (
                   <p key={a.name} className="text-text-faint">
-                    <span className="text-warning font-medium">“{a.name}”</span> matcht meerdere: {a.candidates.join(", ")}
+                    <span className="text-warning font-medium">“{a.name}”</span> matches multiple: {a.candidates.join(", ")}
                   </p>
                 ))}
               </div>
@@ -432,17 +432,17 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
           {loading ? (
             <div className="flex flex-col items-center gap-3 py-12 text-text-faint">
               <Spinner size={32} />
-              <p className="text-[13px]">Producten laden uit Shopify {store.toUpperCase()}…</p>
+              <p className="text-[13px]">Loading products from Shopify {store.toUpperCase()}…</p>
             </div>
           ) : error ? (
             <p className="text-[13px] text-danger text-center py-10">
-              Kon producten niet laden: {error}
+              Could not load products: {error}
             </p>
           ) : filtered.length === 0 ? (
             <p className="text-[13px] text-text-faint text-center py-10">
               {groups.length === 0
-                ? `Geen ${includeDrafts ? "" : "actieve "}producten gevonden in ${store.toUpperCase()}.`
-                : "Geen producten matchen je zoekopdracht."}
+                ? `No ${includeDrafts ? "" : "active "}products found in ${store.toUpperCase()}.`
+                : "No products match your search."}
             </p>
           ) : (
             <div className="space-y-3">
@@ -454,7 +454,7 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
                   onKeywords={(v) =>
                     patchRow(g.key, {
                       keywords: v,
-                      // clear a stale "vul keywords in" error as soon as they type
+                      // clear a stale "enter keywords" error as soon as they type
                       ...(rows[g.key]?.status === "error" ? { status: "todo" as RowStatus, err: undefined } : {}),
                     })
                   }
@@ -471,10 +471,10 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
         {/* Footer */}
         <div className="flex items-center justify-between px-6 py-3 border-t border-border bg-bg-elev-2 rounded-b-2xl">
           <span className="text-[11px] text-text-faint">
-            Alleen {includeDrafts ? "actieve + draft" : "actieve"} producten · niets gaat live zonder dat jij op opslaan klikt.
+            {includeDrafts ? "Active + draft" : "Active"} products only · nothing goes live until you click save.
           </span>
           <Button variant="secondary" size="sm" onClick={onClose}>
-            Sluiten
+            Close
           </Button>
         </div>
       </div>
@@ -484,12 +484,12 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
 
 function StatusBadge({ status }: { status: RowStatus }) {
   const map: Record<RowStatus, { label: string; cls: string }> = {
-    todo:       { label: "Te doen",      cls: "bg-bg-elev text-text-faint" },
-    generating: { label: "Genereren…",   cls: "bg-accent/15 text-accent" },
-    generated:  { label: "Gegenereerd",  cls: "bg-accent/15 text-accent" },
-    saving:     { label: "Opslaan…",     cls: "bg-warning/15 text-warning" },
-    saved:      { label: "✓ Opgeslagen", cls: "bg-accent/20 text-accent" },
-    error:      { label: "Fout",         cls: "bg-danger/15 text-danger" },
+    todo:       { label: "To do",        cls: "bg-bg-elev text-text-faint" },
+    generating: { label: "Generating…",  cls: "bg-accent/15 text-accent" },
+    generated:  { label: "Generated",    cls: "bg-accent/15 text-accent" },
+    saving:     { label: "Saving…",      cls: "bg-warning/15 text-warning" },
+    saved:      { label: "✓ Saved",      cls: "bg-accent/20 text-accent" },
+    error:      { label: "Error",        cls: "bg-danger/15 text-danger" },
   };
   const m = map[status];
   return <span className={`text-[10px] font-semibold px-2 py-0.5 rounded ${m.cls}`}>{m.label}</span>;
@@ -527,10 +527,10 @@ function DressCard({
         )}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-[14px] font-semibold text-text">{g.product_name || "(naamloos)"}</span>
+            <span className="text-[14px] font-semibold text-text">{g.product_name || "(unnamed)"}</span>
             <StatusBadge status={status} />
             <span className="text-[10px] text-text-faint">
-              {g.product_ids.length} kleur{g.product_ids.length === 1 ? "" : "en"}
+              {g.product_ids.length} colour{g.product_ids.length === 1 ? "" : "s"}
             </span>
           </div>
           <div className="flex flex-wrap gap-1 mt-1">
@@ -549,11 +549,11 @@ function DressCard({
                 type="text"
                 value={row?.keywords ?? ""}
                 onChange={(e) => onKeywords(e.target.value)}
-                placeholder="bv. mekko, juhlamekko, pitkä mekko — komma-gescheiden"
+                placeholder="e.g. mekko, juhlamekko, pitkä mekko — comma-separated"
                 className="flex-1 bg-bg-elev border border-border rounded-md px-3 py-1.5 text-[12px] text-text placeholder:text-text-faint focus:outline-none focus:border-accent"
               />
               <Button variant="secondary" size="sm" onClick={onGenerate} disabled={busy || !(row?.keywords ?? "").trim()}>
-                {status === "generating" ? "✨…" : "✨ Genereer"}
+                {status === "generating" ? "✨…" : "✨ Generate"}
               </Button>
             </div>
           </div>
@@ -564,14 +564,14 @@ function DressCard({
           {showGen && row && (
             <div className="mt-3 space-y-3 border-t border-border pt-3">
               <ReviewField
-                label="Beschrijving"
+                label="Description"
                 current={g.current.description_text}
                 value={row.gen.description}
                 onChange={(v) => onGenField("description", v)}
                 rows={6}
               />
               <ReviewField
-                label="Meta-beschrijving (SEO)"
+                label="Meta description (SEO)"
                 current={g.current.meta_description}
                 value={row.gen.meta_description}
                 onChange={(v) => onGenField("meta_description", v)}
@@ -586,11 +586,11 @@ function DressCard({
               />
               <div className="flex items-center gap-2">
                 <Button variant="primary" size="sm" onClick={onSave} disabled={busy || !row.gen.description}>
-                  {status === "saving" ? "⬆…" : "⬆ Opslaan naar Shopify"}
+                  {status === "saving" ? "⬆…" : "⬆ Save to Shopify"}
                 </Button>
                 {status === "saved" && (
                   <button type="button" onClick={onRevert} className="text-[11px] text-text-faint hover:text-warning underline">
-                    ↶ Terugzetten naar origineel
+                    ↶ Revert to original
                   </button>
                 )}
               </div>
@@ -620,13 +620,13 @@ function ReviewField({
       <label className="text-[11px] font-medium text-text-dim">{label}</label>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mt-1">
         <div>
-          <div className="text-[10px] text-text-faint uppercase tracking-wider mb-0.5">Huidig</div>
+          <div className="text-[10px] text-text-faint uppercase tracking-wider mb-0.5">Current</div>
           <div className="text-[11px] text-text-faint bg-bg-elev border border-border rounded-md px-2.5 py-1.5 whitespace-pre-wrap max-h-32 overflow-y-auto">
-            {current || <span className="italic">— leeg —</span>}
+            {current || <span className="italic">— empty —</span>}
           </div>
         </div>
         <div>
-          <div className="text-[10px] text-accent uppercase tracking-wider mb-0.5">Nieuw</div>
+          <div className="text-[10px] text-accent uppercase tracking-wider mb-0.5">New</div>
           <textarea
             value={value}
             onChange={(e) => onChange(e.target.value)}
