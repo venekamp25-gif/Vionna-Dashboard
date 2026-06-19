@@ -33,6 +33,63 @@ function parseKeywords(raw: string): string[] {
     .filter(Boolean);
 }
 
+/** Normalize a product name for fuzzy matching: strip diacritics, lowercase,
+ *  drop punctuation, collapse whitespace. "Solène FR" -> "solene fr". */
+function normalizeName(s: string): string {
+  return (s || "")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+interface ParsedKeywordRow {
+  name: string;
+  keywords: string;
+}
+
+/** Parse a pasted keyword list into {name, keywords} rows. Accepts a tab-
+ *  separated paste straight from Google Sheets (first column = product name,
+ *  the rest = keywords), plus "name | keywords" and "name: keywords". A leading
+ *  header row ("product", "keywords", …) is detected and skipped. */
+function parseKeywordList(text: string): ParsedKeywordRow[] {
+  const out: ParsedKeywordRow[] = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    let parts: string[] | null = null;
+    if (line.includes("\t")) parts = line.split("\t");
+    else if (line.includes("|")) parts = line.split("|");
+    else {
+      const m = line.match(/^([^:]+):\s*(.+)$/);
+      if (m) parts = [m[1], m[2]];
+    }
+    if (!parts) continue;
+    parts = parts.map((p) => p.trim()).filter(Boolean);
+    if (parts.length < 2) continue; // need a name + at least one keyword
+    out.push({ name: parts[0], keywords: parts.slice(1).join(", ") });
+  }
+  // Drop a header row like "Product<TAB>Keywords".
+  if (out.length) {
+    const hn = out[0].name.toLowerCase();
+    if (
+      ["product", "products", "productnaam", "naam", "name", "jurk", "dress", "item"].includes(hn) ||
+      /keyword|trefwoord|zoekwoord/i.test(out[0].keywords)
+    ) {
+      out.shift();
+    }
+  }
+  return out;
+}
+
+interface PasteResult {
+  matched: number;
+  fuzzy: number;
+  ambiguous: { name: string; candidates: string[] }[];
+  unmatched: string[];
+}
+
 /**
  * Keyword backfill — regenerate copy for products that were imported BEFORE
  * keyword research was done (e.g. FI, which goes live without per-product
@@ -51,6 +108,9 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
   const [rows, setRows] = useState<Record<string, RowState>>({});
   const [search, setSearch] = useState("");
   const [bulkBusy, setBulkBusy] = useState(false);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteText, setPasteText] = useState("");
+  const [pasteResult, setPasteResult] = useState<PasteResult | null>(null);
 
   const load = async (s: StoreKey, drafts: boolean) => {
     setLoading(true);
@@ -169,6 +229,56 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
     setBulkBusy(false);
   };
 
+  // Auto-fill keyword fields from a pasted list (Google Sheets / "name | kw")
+  // by matching each row to a dress on its product name. Exact (normalized)
+  // match first, then a single-candidate "contains" fuzzy fallback.
+  const applyPaste = () => {
+    const parsed = parseKeywordList(pasteText);
+    const byNorm = new Map<string, BackfillGroup[]>();
+    for (const g of groups) {
+      const k = normalizeName(g.product_name);
+      if (!k) continue;
+      const arr = byNorm.get(k);
+      if (arr) arr.push(g);
+      else byNorm.set(k, [g]);
+    }
+
+    const fills: Record<string, string> = {};
+    const res: PasteResult = { matched: 0, fuzzy: 0, ambiguous: [], unmatched: [] };
+    for (const row of parsed) {
+      const n = normalizeName(row.name);
+      if (!n) continue;
+      let cands = byNorm.get(n) ?? [];
+      let isFuzzy = false;
+      if (cands.length === 0) {
+        cands = groups.filter((g) => {
+          const gn = normalizeName(g.product_name);
+          return gn.length >= 3 && n.length >= 3 && (gn.includes(n) || n.includes(gn));
+        });
+        isFuzzy = true;
+      }
+      if (cands.length === 1) {
+        fills[cands[0].key] = row.keywords;
+        if (isFuzzy) res.fuzzy += 1;
+        else res.matched += 1;
+      } else if (cands.length > 1) {
+        res.ambiguous.push({ name: row.name, candidates: cands.map((c) => c.product_name) });
+      } else {
+        res.unmatched.push(row.name);
+      }
+    }
+
+    setRows((prev) => {
+      const next = { ...prev };
+      for (const [key, kw] of Object.entries(fills)) {
+        // keywords changed → reset to "todo" + clear any stale generated copy
+        next[key] = { keywords: kw, status: "todo", gen: { ...EMPTY_GEN } };
+      }
+      return next;
+    });
+    setPasteResult(res);
+  };
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return groups;
@@ -240,6 +350,14 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
             placeholder="Zoek op productnaam…"
             className="flex-1 min-w-[180px] bg-bg-elev-2 border border-border rounded-md px-3 py-1.5 text-[12px] text-text placeholder:text-text-faint focus:outline-none focus:border-accent"
           />
+          <Button
+            variant={pasteOpen ? "primary" : "secondary"}
+            size="sm"
+            onClick={() => setPasteOpen((v) => !v)}
+            disabled={loading}
+          >
+            📋 Lijst plakken
+          </Button>
           <Button variant="secondary" size="sm" onClick={() => void runBulk("generate")} disabled={bulkBusy || loading}>
             ✨ Genereer alle ({counts.withKeywords})
           </Button>
@@ -247,6 +365,67 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
             ⬆ Sla alle op ({counts.generated})
           </Button>
         </div>
+
+        {/* Paste-list accelerator */}
+        {pasteOpen && (
+          <div className="px-6 py-3 border-b border-border bg-bg-elev-2">
+            <p className="text-[12px] font-medium text-text mb-1">📋 Plak je keyword-lijst</p>
+            <p className="text-[11px] text-text-faint mb-2 leading-relaxed">
+              Eén regel per jurk. Plak direct uit Google Sheets (kolom <strong>productnaam</strong> + kolom(men){" "}
+              <strong>keywords</strong>), of gebruik <code className="bg-bg-elev px-1 rounded">naam | kw1, kw2</code> of{" "}
+              <code className="bg-bg-elev px-1 rounded">naam: kw1, kw2</code>. Matcht op productnaam; een kopregel wordt overgeslagen.
+            </p>
+            <textarea
+              value={pasteText}
+              onChange={(e) => setPasteText(e.target.value)}
+              rows={5}
+              placeholder={"Liviah\tmekko, juhlamekko, pitkä mekko\nSolène\tbluse, pellavapaita, naisten paita"}
+              className="w-full text-[12px] font-mono text-text bg-bg-elev border border-border rounded-md px-2.5 py-1.5 focus:outline-none focus:border-accent resize-y"
+            />
+            <div className="flex items-center gap-2 mt-2 flex-wrap">
+              <Button variant="primary" size="sm" onClick={applyPaste} disabled={!pasteText.trim()}>
+                ↓ Velden invullen
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  setPasteText("");
+                  setPasteResult(null);
+                }}
+              >
+                Wissen
+              </Button>
+              {pasteResult && (
+                <span className="text-[11px] text-text-dim">
+                  <span className="text-accent">✓ {pasteResult.matched + pasteResult.fuzzy} ingevuld</span>
+                  {pasteResult.fuzzy > 0 && <span className="text-text-faint"> ({pasteResult.fuzzy} bij benadering)</span>}
+                  {pasteResult.ambiguous.length > 0 && (
+                    <span className="text-warning"> · {pasteResult.ambiguous.length} dubbelzinnig</span>
+                  )}
+                  {pasteResult.unmatched.length > 0 && (
+                    <span className="text-danger"> · {pasteResult.unmatched.length} niet gevonden</span>
+                  )}
+                </span>
+              )}
+            </div>
+            {pasteResult && (pasteResult.unmatched.length > 0 || pasteResult.ambiguous.length > 0) && (
+              <div className="mt-2 text-[11px] leading-relaxed">
+                {pasteResult.unmatched.length > 0 && (
+                  <p className="text-text-faint">
+                    <span className="text-danger font-medium">Niet gevonden</span> (typ deze handmatig of corrigeer de naam):{" "}
+                    {pasteResult.unmatched.join(" · ")}
+                  </p>
+                )}
+                {pasteResult.ambiguous.map((a) => (
+                  <p key={a.name} className="text-text-faint">
+                    <span className="text-warning font-medium">“{a.name}”</span> matcht meerdere: {a.candidates.join(", ")}
+                  </p>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Body */}
         <div className="px-6 py-4 max-h-[68vh] overflow-y-auto">
