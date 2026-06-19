@@ -112,6 +112,7 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
   const [pasteOpen, setPasteOpen] = useState(false);
   const [pasteText, setPasteText] = useState("");
   const [pasteResult, setPasteResult] = useState<PasteResult | null>(null);
+  const [toast, setToast] = useState<{ kind: "ok" | "err"; msg: string } | null>(null);
 
   const load = async (s: StoreKey, drafts: boolean) => {
     setLoading(true);
@@ -143,12 +144,22 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
   const patchRow = (key: string, patch: Partial<RowState>) =>
     setRows((prev) => ({ ...prev, [key]: { ...prev[key], ...patch } }));
 
-  const generateRow = async (g: BackfillGroup) => {
+  // In-app confirmation popup — always visible (the desktop notification is
+  // suppressed by the browser while the tab is focused, so Omar would otherwise
+  // see nothing while working in the modal).
+  const showToast = (kind: "ok" | "err", msg: string) => setToast({ kind, msg });
+  useEffect(() => {
+    if (!toast) return;
+    const id = window.setTimeout(() => setToast(null), 4500);
+    return () => window.clearTimeout(id);
+  }, [toast]);
+
+  const generateRow = async (g: BackfillGroup): Promise<boolean> => {
     const row = rows[g.key];
     const kws = parseKeywords(row?.keywords ?? "");
     if (kws.length === 0) {
       patchRow(g.key, { status: "error", err: "Enter keywords first." });
-      return;
+      return false;
     }
     patchRow(g.key, { status: "generating", err: undefined });
     try {
@@ -168,14 +179,16 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
           m_title_specs: gen.m_title_specs ?? "",
         },
       });
+      return true;
     } catch (e) {
       patchRow(g.key, { status: "error", err: e instanceof Error ? e.message : String(e) });
+      return false;
     }
   };
 
-  const saveRow = async (g: BackfillGroup) => {
+  const saveRow = async (g: BackfillGroup, quiet = false): Promise<boolean> => {
     const row = rows[g.key];
-    if (!row || !row.gen.description) return;
+    if (!row || !row.gen.description) return false;
     patchRow(g.key, { status: "saving", err: undefined });
     try {
       const r = await api.backfillApply({
@@ -191,9 +204,16 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
         throw new Error(`${r.failed}/${r.results.length} products failed: ${firstErr}`);
       }
       patchRow(g.key, { status: "saved" });
-      notify(`${g.product_name} updated`, `${r.applied} product(s) saved to Shopify ${store.toUpperCase()}.`, "backfill-saved");
+      if (!quiet) {
+        showToast("ok", `✓ ${g.product_name} saved to Shopify — ${r.applied} colour-product${r.applied === 1 ? "" : "s"} updated`);
+        notify(`${g.product_name} updated`, `${r.applied} product(s) saved to Shopify ${store.toUpperCase()}.`, "backfill-saved");
+      }
+      return true;
     } catch (e) {
-      patchRow(g.key, { status: "error", err: e instanceof Error ? e.message : String(e) });
+      const msg = e instanceof Error ? e.message : String(e);
+      patchRow(g.key, { status: "error", err: msg });
+      if (!quiet) showToast("err", `${g.product_name}: ${msg}`);
+      return false;
     }
   };
 
@@ -212,9 +232,12 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
       });
       if (r.error) throw new Error(r.error);
       patchRow(g.key, { status: "generated" });
+      showToast("ok", `↶ ${g.product_name} reverted to the original text`);
       notify(`${g.product_name} reverted`, "The original text has been restored.", "backfill-revert");
     } catch (e) {
-      patchRow(g.key, { status: "error", err: e instanceof Error ? e.message : String(e) });
+      const msg = e instanceof Error ? e.message : String(e);
+      patchRow(g.key, { status: "error", err: msg });
+      showToast("err", `${g.product_name}: ${msg}`);
     }
   };
 
@@ -227,8 +250,20 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
       if (which === "generate") return parseKeywords(r.keywords).length > 0 && (r.status === "todo" || r.status === "error");
       return r.status === "generated";
     });
-    await Promise.all(targets.map((g) => lim.run(() => (which === "generate" ? generateRow(g) : saveRow(g)))));
+    // quiet=true so each row doesn't fire its own toast — show ONE summary instead.
+    const oks = await Promise.all(
+      targets.map((g) => lim.run(() => (which === "generate" ? generateRow(g) : saveRow(g, true))))
+    );
     setBulkBusy(false);
+    const n = oks.filter(Boolean).length;
+    if (targets.length > 0) {
+      showToast(
+        n === targets.length ? "ok" : "err",
+        which === "save"
+          ? `✓ Saved ${n}/${targets.length} product${targets.length === 1 ? "" : "s"} to Shopify`
+          : `✨ Generated ${n}/${targets.length} product${targets.length === 1 ? "" : "s"}`
+      );
+    }
   };
 
   // Auto-fill keyword fields from a pasted list (Google Sheets / "name | kw")
@@ -304,10 +339,21 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
   if (!open) return null;
 
   return (
-    <div
-      className="fixed inset-0 z-[60] bg-black/50 backdrop-blur-sm flex items-start justify-center pt-12 px-4 overflow-y-auto"
-      onClick={onClose}
-    >
+    <>
+      {toast && (
+        <div
+          className={`fixed top-6 left-1/2 -translate-x-1/2 z-[70] px-4 py-2.5 rounded-lg shadow-2xl text-[13px] font-medium ${
+            toast.kind === "ok" ? "bg-accent text-on-accent" : "bg-danger text-white"
+          }`}
+          role="status"
+        >
+          {toast.msg}
+        </div>
+      )}
+      <div
+        className="fixed inset-0 z-[60] bg-black/50 backdrop-blur-sm flex items-start justify-center pt-12 px-4 overflow-y-auto"
+        onClick={onClose}
+      >
       <div
         className="w-full max-w-6xl bg-bg-elev border border-border rounded-2xl shadow-2xl mb-12"
         onClick={(e) => e.stopPropagation()}
@@ -442,6 +488,17 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
 
         {/* Body */}
         <div className="px-6 py-4 max-h-[68vh] overflow-y-auto">
+          {/* How-it-works legend so each step is self-explanatory */}
+          <div className="flex items-center flex-wrap gap-x-2 gap-y-1 text-[11px] text-text-faint mb-3 pb-3 border-b border-border">
+            <span className="font-medium text-text-dim">How it works:</span>
+            <span><strong className="text-text-dim">1.</strong> Enter keywords</span>
+            <span className="text-text-faint">→</span>
+            <span><strong className="text-text-dim">2.</strong> Generate (writes new Finnish text)</span>
+            <span className="text-text-faint">→</span>
+            <span><strong className="text-text-dim">3.</strong> Check current vs new</span>
+            <span className="text-text-faint">→</span>
+            <span><strong className="text-text-dim">4.</strong> Save to Shopify</span>
+          </div>
           {loading ? (
             <div className="flex flex-col items-center gap-3 py-12 text-text-faint">
               <Spinner size={32} />
@@ -491,21 +548,22 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
           </Button>
         </div>
       </div>
-    </div>
+      </div>
+    </>
   );
 }
 
 function StatusBadge({ status }: { status: RowStatus }) {
-  const map: Record<RowStatus, { label: string; cls: string }> = {
-    todo:       { label: "To do",        cls: "bg-bg-elev text-text-faint" },
-    generating: { label: "Generating…",  cls: "bg-accent/15 text-accent" },
-    generated:  { label: "Generated",    cls: "bg-accent/15 text-accent" },
-    saving:     { label: "Saving…",      cls: "bg-warning/15 text-warning" },
-    saved:      { label: "✓ Saved",      cls: "bg-accent/20 text-accent" },
-    error:      { label: "Error",        cls: "bg-danger/15 text-danger" },
+  const map: Record<RowStatus, { label: string; cls: string; hint: string }> = {
+    todo:       { label: "To do",        cls: "bg-bg-elev text-text-faint",  hint: "Not started yet — enter keywords and click Generate." },
+    generating: { label: "Generating…",  cls: "bg-accent/15 text-accent",    hint: "Claude is writing the new Finnish text…" },
+    generated:  { label: "Generated",    cls: "bg-accent/15 text-accent",    hint: "New text is ready — check it, then click Save to Shopify." },
+    saving:     { label: "Saving…",      cls: "bg-warning/15 text-warning",  hint: "Writing the text to Shopify…" },
+    saved:      { label: "✓ Saved",      cls: "bg-accent/20 text-accent",    hint: "Saved to Shopify." },
+    error:      { label: "Error",        cls: "bg-danger/15 text-danger",    hint: "Something went wrong — see the red message." },
   };
   const m = map[status];
-  return <span className={`text-[10px] font-semibold px-2 py-0.5 rounded ${m.cls}`}>{m.label}</span>;
+  return <span title={m.hint} className={`text-[10px] font-semibold px-2 py-0.5 rounded ${m.cls}`}>{m.label}</span>;
 }
 
 function DressCard({
