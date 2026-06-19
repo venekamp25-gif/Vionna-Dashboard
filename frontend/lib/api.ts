@@ -225,6 +225,10 @@ export interface BackfillGroup {
   /** Every colour-product id of this dress — copy is written to all of them. */
   product_ids: string[];
   colours: BackfillColour[];
+  /** True when every colour-product carries the custom.keyword_backfilled marker. */
+  handled: boolean;
+  /** Date the marker was set (when handled), e.g. "2026-06-19". */
+  backfilled_at?: string;
   current: {
     description_html: string;
     description_text: string;
@@ -463,6 +467,8 @@ export const api = {
     description_html?: string;
     meta_description?: string;
     m_title_specs?: string;
+    /** Tag the product as handled (default true). Pass false to un-mark, e.g. on revert. */
+    set_handled?: boolean;
   }) => call<BackfillApplyResponse>("/api/backfill/apply", { method: "POST", body: params, authed: true }),
 };
 

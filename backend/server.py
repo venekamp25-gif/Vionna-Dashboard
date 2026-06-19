@@ -1872,7 +1872,8 @@ def backfill_list_products():
                  'desc: metafield(namespace:"global",key:"description_tag"){value} '
                  'mts: metafield(namespace:"custom",key:"m_title_specs_multi_line_text_"){value} '
                  'sib: metafield(namespace:"theme",key:"siblings"){value} '
-                 'cut: metafield(namespace:"theme",key:"cutline"){value} } } } }' % after)
+                 'cut: metafield(namespace:"theme",key:"cutline"){value} '
+                 'bf: metafield(namespace:"custom",key:"keyword_backfilled"){value} } } } }' % after)
             r = req.post(shopify_url(store, 'graphql.json'), headers=hdrs, json={'query': q}, timeout=45)
             conn = (r.json().get('data') or {}).get('products') or {}
             for e in conn.get('edges', []):
@@ -1897,6 +1898,7 @@ def backfill_list_products():
         key = sib or title.lower() or (n.get('handle') or '')
         pid = (n.get('id') or '').rsplit('/', 1)[-1]
         feat = ((n.get('featuredImage') or {}) or {}).get('url') or ''
+        bf = ((n.get('bf') or {}) or {}).get('value') or ''
         if key not in groups:
             groups[key] = {
                 'key': key,
@@ -1905,6 +1907,8 @@ def backfill_list_products():
                 'siblings_handle': sib,
                 'product_ids': [],
                 'colours': [],
+                'backfilled_at': '',
+                '_n_handled': 0,
                 'current': {
                     'description_html': n.get('descriptionHtml') or '',
                     'description_text': _strip_html_to_text(n.get('descriptionHtml') or ''),
@@ -1924,8 +1928,16 @@ def backfill_list_products():
         })
         if not g['image'] and feat:
             g['image'] = feat
+        if bf:
+            g['_n_handled'] += 1
+            if not g['backfilled_at']:
+                g['backfilled_at'] = bf
 
     out = [groups[k] for k in order]
+    for g in out:
+        # "handled" = every colour-product of this product carries the backfill marker
+        g['handled'] = len(g['product_ids']) > 0 and g['_n_handled'] == len(g['product_ids'])
+        g.pop('_n_handled', None)
     out.sort(key=lambda g: (g['product_name'] or '').lower())
     return jsonify({
         'store': store,
@@ -1977,6 +1989,25 @@ def _set_product_seo(store, prod_id, hdrs, *, description_html=None,
     return errs
 
 
+def _set_backfill_marker(store, num, hdrs, on, stamp):
+    """Best-effort: tag/untag a product with custom.keyword_backfilled so the
+    backfill screen can hide already-done products by default. on=False removes
+    the tag (used by 'revert to original'). Never raises into the caller."""
+    if on:
+        # POST is fine even if the metafield already exists (Shopify returns 422
+        # 'taken' — already marked, which is exactly the state we want).
+        req.post(shopify_url(store, f'products/{num}/metafields.json'), headers=hdrs,
+                 json={'metafield': {'namespace': 'custom', 'key': 'keyword_backfilled',
+                                     'value': stamp, 'type': 'single_line_text_field'}}, timeout=15)
+    else:
+        r = req.get(shopify_url(store, f'products/{num}/metafields.json?namespace=custom&key=keyword_backfilled'),
+                    headers=hdrs, timeout=15)
+        for m in (r.json().get('metafields') or []):
+            mid = m.get('id')
+            if mid:
+                req.delete(shopify_url(store, f'products/{num}/metafields/{mid}.json'), headers=hdrs, timeout=15)
+
+
 @app.route('/api/backfill/apply', methods=['POST'])
 @require_droplet_token
 def backfill_apply():
@@ -2000,14 +2031,19 @@ def backfill_apply():
     meta_description = (data.get('meta_description') or '').strip()
     m_title_specs    = (data.get('m_title_specs') or '').strip()
     html_override    = (data.get('description_html') or '').strip()
+    # When True (default) a successful write tags the product as handled so the
+    # backfill screen hides it by default; False (used by 'revert') removes the tag.
+    set_handled      = bool(data.get('set_handled', True))
     if not (description or meta_description or m_title_specs or html_override):
         return jsonify({'error': 'Nothing to write - all fields are empty.'}), 400
 
     hdrs = shopify_headers(store)
     body_html = html_override or (_publish_to_html(description) if description else None)
+    stamp = datetime.datetime.utcnow().date().isoformat()
 
     results, applied = [], 0
     for pid in ids:
+        num = re.sub(r'\D', '', str(pid).rsplit('/', 1)[-1])
         errs = _set_product_seo(
             store, pid, hdrs,
             description_html=body_html,
@@ -2016,7 +2052,15 @@ def backfill_apply():
         )
         ok = not errs
         applied += 1 if ok else 0
-        results.append({'id': re.sub(r'\D', '', str(pid).rsplit('/', 1)[-1]), 'ok': ok, 'errors': errs})
+        if num:
+            try:
+                if not set_handled:
+                    _set_backfill_marker(store, num, hdrs, False, stamp)
+                elif ok:
+                    _set_backfill_marker(store, num, hdrs, True, stamp)
+            except Exception as e:
+                print(f"[backfill] marker write failed for {num}: {e}")  # best-effort, non-fatal
+        results.append({'id': num, 'ok': ok, 'errors': errs})
 
     return jsonify({
         'store': store,

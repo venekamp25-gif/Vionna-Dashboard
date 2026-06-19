@@ -102,6 +102,7 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
   const { store: globalStore } = useStore();
   const [store, setStore] = useState<StoreKey>(globalStore);
   const [includeDrafts, setIncludeDrafts] = useState(false);
+  const [showDone, setShowDone] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [groups, setGroups] = useState<BackfillGroup[]>([]);
@@ -207,6 +208,7 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
         description_html: g.current.description_html,
         meta_description: g.current.meta_description,
         m_title_specs: g.current.m_title_specs,
+        set_handled: false, // reverting un-marks it → reappears in the default view
       });
       if (r.error) throw new Error(r.error);
       patchRow(g.key, { status: "generated" });
@@ -281,14 +283,18 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    if (!q) return groups;
-    return groups.filter((g) => g.product_name.toLowerCase().includes(q));
-  }, [groups, search]);
+    return groups.filter((g) => {
+      if (!showDone && g.handled) return false; // hide already-done by default
+      if (q && !g.product_name.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [groups, search, showDone]);
 
   const counts = useMemo(() => {
     const vals = Object.values(rows);
     return {
       products: groups.length,
+      done: groups.filter((g) => g.handled).length,
       withKeywords: vals.filter((r) => parseKeywords(r.keywords).length > 0).length,
       generated: vals.filter((r) => r.status === "generated" || r.status === "saving").length,
       saved: vals.filter((r) => r.status === "saved").length,
@@ -311,7 +317,7 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
           <div>
             <h2 className="text-[16px] font-semibold text-text">🔑 Keyword backfill</h2>
             <p className="text-[11px] text-text-faint mt-0.5">
-              {counts.products} product{counts.products === 1 ? "" : "s"} · {counts.saved} saved · regenerates description + meta + m_title_specs with your keywords
+              {filtered.length} shown · {counts.done} already done · {counts.saved} saved this session · regenerates description + meta + m_title_specs
             </p>
           </div>
           <button type="button" onClick={onClose} className="text-text-faint hover:text-text text-xl px-2">
@@ -342,6 +348,13 @@ export function KeywordBackfillModal({ open, onClose }: Props) {
           <label className="flex items-center gap-1.5 text-[11px] text-text-dim cursor-pointer select-none">
             <input type="checkbox" checked={includeDrafts} onChange={(e) => setIncludeDrafts(e.target.checked)} />
             include drafts
+          </label>
+          <label
+            className="flex items-center gap-1.5 text-[11px] text-text-dim cursor-pointer select-none"
+            title="Off by default — only untreated products are shown. Turn on to also see products already backfilled."
+          >
+            <input type="checkbox" checked={showDone} onChange={(e) => setShowDone(e.target.checked)} />
+            show done
           </label>
           <input
             type="text"
@@ -529,6 +542,14 @@ function DressCard({
           <div className="flex items-center gap-2 flex-wrap">
             <span className="text-[14px] font-semibold text-text">{g.product_name || "(unnamed)"}</span>
             <StatusBadge status={status} />
+            {g.handled && (
+              <span
+                className="text-[10px] font-semibold px-2 py-0.5 rounded bg-accent/10 text-accent"
+                title={g.backfilled_at ? `Already backfilled (${g.backfilled_at})` : "Already backfilled"}
+              >
+                ✓ done
+              </span>
+            )}
             <span className="text-[10px] text-text-faint">
               {g.product_ids.length} colour{g.product_ids.length === 1 ? "" : "s"}
             </span>
