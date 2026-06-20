@@ -602,6 +602,73 @@ def audit_catalog():
     })
 
 
+@app.route('/api/duplicate_detail')
+def duplicate_detail():
+    """Read-only diagnostic: for every base-handle group with numbered siblings
+    (X + X-1/X-2...), return per-product detail (title, status, colour swatch,
+    siblings link, image filename) plus a verdict — 'distinct' (different images
+    = colour variants, not a duplicate) vs 'POSSIBLE-DUP' (two share an image).
+    Lets us understand what the audit's 'duplicates' count actually is. No writes."""
+    store = request.args.get('store', 'dk')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()} store.'}), 401
+    hdrs = shopify_headers(store)
+    try:
+        prods = list(_paginate_gql_products(
+            store,
+            'id handle title status featuredImage{url} '
+            'cutline: metafield(namespace:"theme",key:"cutline"){value} '
+            'siblings: metafield(namespace:"theme",key:"siblings"){value}',
+            hdrs,
+        ))
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+
+    def imgfile(n):
+        u = ((n.get('featuredImage') or {}) or {}).get('url') or ''
+        return u.split('?', 1)[0].rsplit('/', 1)[-1].lower()
+
+    groups = {}
+    for n in prods:
+        base = re.sub(r'-\d+$', '', n.get('handle') or '')
+        groups.setdefault(base, []).append(n)
+
+    out = []
+    for base, members in groups.items():
+        if len(members) < 2:
+            continue
+        if not all(re.fullmatch(re.escape(base) + r'(-\d+)?', m.get('handle') or '') for m in members):
+            continue
+        items, imgs = [], {}
+        for m in members:
+            f = imgfile(m)
+            if f:
+                imgs[f] = imgs.get(f, 0) + 1
+            items.append({
+                'handle': m.get('handle'),
+                'title': m.get('title'),
+                'status': (m.get('status') or '').upper(),
+                'cutline': ((m.get('cutline') or {}) or {}).get('value') or '',
+                'siblings': ((m.get('siblings') or {}) or {}).get('value') or '',
+                'image': f,
+            })
+        same_img = any(c >= 2 for c in imgs.values())
+        out.append({
+            'base': base,
+            'count': len(members),
+            'distinct_images': len(imgs),
+            'verdict': 'POSSIBLE-DUP (shared image)' if same_img else 'distinct (different images)',
+            'items': items,
+        })
+    out.sort(key=lambda g: (-1 if g['verdict'].startswith('POSSIBLE') else 0, -g['count']))
+    return jsonify({
+        'store': store,
+        'group_count': len(out),
+        'possible_dup_groups': sum(1 for g in out if g['verdict'].startswith('POSSIBLE')),
+        'groups': out,
+    })
+
+
 @app.route('/api/backup_now', methods=['POST'])
 @require_droplet_token
 def backup_now():
