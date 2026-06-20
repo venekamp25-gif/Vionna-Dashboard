@@ -2867,16 +2867,24 @@ def history():
 
 # --- Publish helpers (shared by /api/publish and the granular per-variant endpoints) ---
 
+def _md_inline(s):
+    """Convert inline markdown bold (**text**) to <strong>. The copy prompt asks
+    Claude for '**eigenschap**: …' bullets, so without this the literal asterisks
+    end up shown verbatim on the storefront."""
+    return re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', s or '')
+
+
 def _publish_to_html(text):
-    """Convert plain-text description to body_html (lists when '•' or '-').
-    Truncates the output if it would exceed Shopify's 65535-char body_html
-    cap so the publish call doesn't get rejected with a cryptic 422."""
+    """Convert plain-text description to body_html (lists when '•' or '-'), with
+    inline **bold** converted to <strong>. Truncates the output if it would
+    exceed Shopify's 65535-char body_html cap so the publish call doesn't get
+    rejected with a cryptic 422."""
     lines  = (text or '').strip().splitlines()
     html   = []
     bullets = []
     def flush_bullets():
         if bullets:
-            html.append('<ul>' + ''.join(f'<li>{b}</li>' for b in bullets) + '</ul>')
+            html.append('<ul>' + ''.join(f'<li>{_md_inline(b)}</li>' for b in bullets) + '</ul>')
             bullets.clear()
     for line in lines:
         stripped = line.strip()
@@ -2887,7 +2895,7 @@ def _publish_to_html(text):
             bullets.append(stripped.lstrip('•- ').strip())
         else:
             flush_bullets()
-            html.append(f'<p>{stripped}</p>')
+            html.append(f'<p>{_md_inline(stripped)}</p>')
     flush_bullets()
     body = '\n'.join(html)
     # Shopify hard-caps body_html at 65535 chars; truncate at 60_000 to give
@@ -2990,7 +2998,7 @@ _PUBLICATION_CACHE: dict = {}  # store_key -> list of {id, name}
 # Match shop-configured publication names case-insensitively. Shopify renames
 # these every couple of years (Facebook → Facebook & Instagram, Google →
 # Google & YouTube, etc.) so we use substring matches.
-_DEFAULT_PUBLICATION_MATCHERS = ('online store', 'facebook', 'google')
+_DEFAULT_PUBLICATION_MATCHERS = ('online store', 'facebook', 'google', 'pinterest')
 
 
 def _list_publications(store, hdrs):
@@ -3464,29 +3472,9 @@ def publish():
     shared_images    = images_by_color.get('shared') or images_flat
     print(f"[publish] Received: {len(images_flat)} flat images, color-keys: {list(images_by_color.keys())}, shared: {len(shared_images)}")
 
-    # Convert plain-text description to body_html
-    def to_html(text):
-        lines  = text.strip().splitlines()
-        html   = []
-        bullets = []
-        def flush_bullets():
-            if bullets:
-                html.append('<ul>' + ''.join(f'<li>{b}</li>' for b in bullets) + '</ul>')
-                bullets.clear()
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                flush_bullets()
-                continue
-            if stripped.startswith('•') or stripped.startswith('-'):
-                bullets.append(stripped.lstrip('•- ').strip())
-            else:
-                flush_bullets()
-                html.append(f'<p>{stripped}</p>')
-        flush_bullets()
-        return '\n'.join(html)
-
-    description = to_html(data.get('description', ''))
+    # Convert plain-text description to body_html via the shared helper, which
+    # handles bullets, inline **bold** → <strong>, and the 65535-char truncation.
+    description = _publish_to_html(data.get('description', ''))
 
     hdrs    = shopify_headers(store)
     base    = shopify_url(store, '')
