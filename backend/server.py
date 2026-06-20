@@ -493,7 +493,7 @@ def verify_products():
         id_list = ', '.join(f'"{g}"' for g in chunk)
         query = (
             '{ nodes(ids: [%s]) { ... on Product { '
-            'id title status '
+            'id title status descriptionHtml '
             'images(first: 30) { nodes { id } } '
             'cutline: metafield(namespace:"theme", key:"cutline") { value } '
             'siblings: metafield(namespace:"theme", key:"siblings") { value } '
@@ -514,6 +514,7 @@ def verify_products():
             siblings_v  = ((n.get('siblings') or {}) or {}).get('value') or ''
             channels    = ((n.get('resourcePublicationsCount') or {}) or {}).get('count') or 0
             variants    = ((n.get('variantsCount') or {}) or {}).get('count') or 0
+            body_html   = n.get('descriptionHtml') or ''
             issues = []
             if n_images == 0:
                 issues.append({'level': 'fail', 'msg': 'No images attached'})
@@ -525,6 +526,8 @@ def verify_products():
                 issues.append({'level': 'warn', 'msg': 'Not on any sales channel'})
             if variants == 0:
                 issues.append({'level': 'fail', 'msg': 'No variants'})
+            if '**' in body_html:
+                issues.append({'level': 'warn', 'msg': 'Description still shows ** (unformatted bold)'})
             out.append({
                 'id': n.get('id', '').rsplit('/', 1)[-1],
                 'title': n.get('title', ''),
