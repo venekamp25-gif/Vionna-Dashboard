@@ -42,10 +42,16 @@ const JOB_DEFS: JobDef[] = [
   {
     type: "dedup",
     title: "Draft true duplicates",
-    desc: "Set verified duplicates to draft — only when another product has the SAME title AND the SAME featured image. Handle collisions with a different image are left untouched. Reversible (re-activate in Shopify).",
+    desc: "Set verified duplicates to draft — only when another product has the SAME title AND the SAME featured image (now also matching a re-uploaded photo with a different extension/hash). Handle collisions with a different image are left untouched. Reversible (re-activate in Shopify).",
     cta: "Draft duplicates",
     danger: true,
     confirm: (s) => `This sets verified duplicate products to DRAFT on Store ${s}.\nThey stay fully recoverable in Shopify (just re-activate).\n\nContinue?`,
+  },
+  {
+    type: "relink",
+    title: "Relink colour variants",
+    desc: "Re-link colour variants of the same product (the numbered -1/-10 handles) so the colour swatches show together again. Conservative: only touches sets that clearly belong together (one title, no conflicting links); mixed sets are left alone.",
+    cta: "Relink siblings",
   },
 ];
 

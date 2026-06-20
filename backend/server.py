@@ -625,8 +625,7 @@ def duplicate_detail():
         return jsonify({'error': str(e)[:200]}), 500
 
     def imgfile(n):
-        u = ((n.get('featuredImage') or {}) or {}).get('url') or ''
-        return u.split('?', 1)[0].rsplit('/', 1)[-1].lower()
+        return _img_key(((n.get('featuredImage') or {}) or {}).get('url') or '')
 
     groups = {}
     for n in prods:
@@ -2375,18 +2374,28 @@ def _job_cutline(jid, store, hdrs):
         _job_summary(jid, f"Set {j['changed']} cutline(s); {j['skipped']} skipped (no colour in handle) of {j['processed']} scanned.")
 
 
+def _img_key(url):
+    """Normalized featured-image identity: filename without query, extension, or
+    Shopify's re-upload hash suffix — so sigrid.png, sigrid.webp and
+    sigrid_5b5431b7.png all compare equal (the same photo re-uploaded)."""
+    f = (url or '').split('?', 1)[0].rsplit('/', 1)[-1].lower()
+    f = re.sub(r'\.[a-z0-9]+$', '', f)      # drop extension
+    f = re.sub(r'_[0-9a-f]{6,}$', '', f)    # drop Shopify's _<hex> re-upload suffix
+    return f
+
+
 def _job_dedup(jid, store, hdrs):
     """Set true duplicate products to draft. A '-1/-2' handle suffix alone is NOT
     enough (those false positives were the Margaux/Sascha problem): we only draft
     a product when another in its base-handle group has the SAME title AND the
-    SAME featured image. Different image (or no image) → left untouched. Drafting
-    is reversible — re-activate in Shopify if ever wrong."""
+    SAME featured image (normalized via _img_key, so a re-uploaded photo with a
+    different extension/hash still matches). Different image (or no image) → left
+    untouched. Drafting is reversible — re-activate in Shopify if ever wrong."""
     products = list(_paginate_gql_products(store, 'id handle title status featuredImage{url}', hdrs))
     _job_set(jid, total=len(products))
 
     def img_key(n):
-        u = ((n.get('featuredImage') or {}) or {}).get('url') or ''
-        return u.split('?', 1)[0].rsplit('/', 1)[-1].lower()  # filename without ?v=…
+        return _img_key(((n.get('featuredImage') or {}) or {}).get('url') or '')
 
     def num_id(n):
         try:
@@ -2433,10 +2442,78 @@ def _job_dedup(jid, store, hdrs):
         _job_summary(jid, f"Drafted {j['changed']} verified duplicate(s); {j['skipped']} left alone (different/no image). Reversible in Shopify.")
 
 
+def _job_relink_siblings(jid, store, hdrs):
+    """Relink colour-variant sets that lost their theme.siblings link (the numbered
+    -1/-10 handles from the old empty-colour era). CONSERVATIVE: only acts on a
+    base-handle group when every member shares ONE title and at most one existing
+    siblings handle — so mixed sets (e.g. a 'Nina' necklace + earrings) are left
+    alone. For a coherent set it ensures the siblings collection exists, writes the
+    theme.siblings metafield on members missing it, and adds them to the collection."""
+    base_url = shopify_url(store, '')
+    prods = list(_paginate_gql_products(
+        store,
+        'id handle title status siblings: metafield(namespace:"theme",key:"siblings"){value}',
+        hdrs,
+    ))
+    _job_set(jid, total=len(prods))
+
+    groups = {}
+    for n in prods:
+        _job_inc(jid, processed=1)
+        base = re.sub(r'-\d+$', '', n.get('handle') or '')
+        groups.setdefault(base, []).append(n)
+
+    def sib_of(m):
+        return ((m.get('siblings') or {}) or {}).get('value') or ''
+
+    for base, members in groups.items():
+        if len(members) < 2:
+            continue
+        if not all(re.fullmatch(re.escape(base) + r'(-\d+)?', m.get('handle') or '') for m in members):
+            continue
+        titles = set((m.get('title') or '').strip().lower() for m in members)
+        sibs = set(sib_of(m) for m in members if sib_of(m))
+        # Only coherent colour-variant sets: one title, at most one existing siblings handle.
+        if len(titles) != 1 or len(sibs) > 1:
+            _job_inc(jid, skipped=len(members))
+            continue
+        # already fully linked to the same handle → nothing to do
+        if sibs and all(sib_of(m) for m in members):
+            continue
+        title = members[0].get('title') or base
+        handle = next(iter(sibs)) if sibs else (_publish_slug(title) + '-siblings')
+        try:
+            coll_id, actual_handle, _ = _ensure_siblings_collection(store, title, handle, hdrs, base_url)
+        except Exception as e:
+            _job_error(jid, f"{base}: collection {e}")
+            continue
+        if not actual_handle:
+            _job_error(jid, f"{base}: no siblings handle")
+            continue
+        for m in members:
+            num = (m.get('id') or '').rsplit('/', 1)[-1]
+            try:
+                if sib_of(m) != actual_handle:
+                    _shopify_call('post', shopify_url(store, f'products/{num}/metafields.json'), hdrs,
+                                  json={'metafield': {'namespace': 'theme', 'key': 'siblings',
+                                                      'value': actual_handle, 'type': 'single_line_text_field'}},
+                                  timeout=20)
+                    _job_inc(jid, changed=1)
+                if coll_id:
+                    _shopify_call('post', f"{base_url}collects.json", hdrs,
+                                  json={'collect': {'product_id': int(num), 'collection_id': coll_id}}, timeout=20)
+            except Exception as ex:
+                _job_error(jid, f"{m.get('handle')}: {ex}")
+    with _JOBS_LOCK:
+        j = _JOBS[jid]
+        _job_summary(jid, f"Relinked {j['changed']} product(s) into siblings sets; {j['skipped']} left alone (mixed/ambiguous groups).")
+
+
 _JOB_TYPES = {
     'bold_cleanup': _job_bold_cleanup,
     'channels':     _job_channels,
     'cutline':      _job_cutline,
+    'relink':       _job_relink_siblings,
     'dedup':        _job_dedup,
 }
 
