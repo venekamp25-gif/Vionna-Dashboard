@@ -73,47 +73,73 @@ export function CatalogMaintenanceModal({ open, onClose }: Props) {
     setJobs({});
   }, [store]);
 
-  const pollJob = (type: CatalogJobType, id: string) => {
-    const tick = async () => {
-      try {
-        const s = await api.catalogJobStatus(id);
-        setJobs((j) => ({ ...j, [type]: s }));
-        if (s.status === "running") timers.current[type] = setTimeout(tick, 2000);
-      } catch {
-        timers.current[type] = setTimeout(tick, 3000); // transient — keep polling
-      }
-    };
-    void tick();
-  };
+  const [runningAll, setRunningAll] = useState(false);
 
-  const runJob = async (def: JobDef) => {
-    if (def.confirm && !window.confirm(def.confirm(store.toUpperCase()))) return;
-    // optimistic "running" placeholder
-    setJobs((j) => ({
-      ...j,
-      [def.type]: {
-        id: "", type: def.type, store, status: "running", total: null,
-        processed: 0, changed: 0, skipped: 0, errors: [], summary: "",
-        started_at: "", finished_at: null,
-      },
-    }));
-    try {
-      const r = await api.catalogJobStart(store, def.type);
-      if (r.error || !r.job_id) throw new Error(r.error || "Could not start job");
-      pollJob(def.type, r.job_id);
-    } catch (e) {
-      setJobs((j) => ({
-        ...j,
-        [def.type]: {
-          id: "", type: def.type, store, status: "error", total: null,
-          processed: 0, changed: 0, skipped: 0, errors: [String(e instanceof Error ? e.message : e)],
-          summary: "Could not start", started_at: "", finished_at: null,
-        },
-      }));
+  const mkJob = (type: CatalogJobType, status: CatalogJob["status"], extra: Partial<CatalogJob> = {}): CatalogJob => ({
+    id: "", type, store, status, total: null, processed: 0, changed: 0, skipped: 0,
+    errors: [], summary: "", started_at: "", finished_at: null, ...extra,
+  });
+
+  // Start one job and resolve only when it finishes (done/error). Used for a
+  // single "Run" click and chained by "Run all for this store".
+  const runJobToCompletion = (def: JobDef, skipConfirm = false): Promise<void> =>
+    new Promise((resolve) => {
+      void (async () => {
+        if (def.confirm && !skipConfirm && !window.confirm(def.confirm(store.toUpperCase()))) {
+          resolve();
+          return;
+        }
+        setJobs((j) => ({ ...j, [def.type]: mkJob(def.type, "running") }));
+        let id = "";
+        try {
+          const r = await api.catalogJobStart(store, def.type);
+          if (r.error || !r.job_id) throw new Error(r.error || "Could not start job");
+          id = r.job_id;
+        } catch (e) {
+          setJobs((j) => ({
+            ...j,
+            [def.type]: mkJob(def.type, "error", {
+              errors: [String(e instanceof Error ? e.message : e)],
+              summary: "Could not start",
+            }),
+          }));
+          resolve();
+          return;
+        }
+        const tick = async () => {
+          try {
+            const s = await api.catalogJobStatus(id);
+            setJobs((j) => ({ ...j, [def.type]: s }));
+            if (s.status === "running") {
+              timers.current[def.type] = setTimeout(tick, 2000);
+            } else {
+              resolve();
+            }
+          } catch {
+            timers.current[def.type] = setTimeout(tick, 3000); // transient — keep polling
+          }
+        };
+        void tick();
+      })();
+    });
+
+  // Run all four jobs sequentially for the selected store (one confirm up front).
+  const runAll = async () => {
+    if (
+      !window.confirm(
+        `Run ALL four maintenance jobs on Store ${store.toUpperCase()}, one after another?\n\n` +
+          `This includes drafting verified duplicates (reversible in Shopify). It can take a while on a large store — keep this tab open.`
+      )
+    )
+      return;
+    setRunningAll(true);
+    for (const def of JOB_DEFS) {
+      await runJobToCompletion(def, true);
     }
+    setRunningAll(false);
   };
 
-  const anyRunning = Object.values(jobs).some((j) => j?.status === "running");
+  const anyRunning = runningAll || Object.values(jobs).some((j) => j?.status === "running");
 
   if (!open) return null;
 
@@ -138,8 +164,8 @@ export function CatalogMaintenanceModal({ open, onClose }: Props) {
           </button>
         </div>
 
-        {/* Store selector */}
-        <div className="px-6 py-3 border-b border-border flex items-center gap-3">
+        {/* Store selector + run-all */}
+        <div className="px-6 py-3 border-b border-border flex items-center gap-3 flex-wrap">
           <span className="text-[11px] text-text-dim">Store:</span>
           <div className="inline-flex bg-bg-elev-2 rounded-lg p-[3px] gap-[2px]">
             {STORE_KEYS.map((s) => (
@@ -147,14 +173,21 @@ export function CatalogMaintenanceModal({ open, onClose }: Props) {
                 key={s}
                 type="button"
                 onClick={() => setStore(s)}
+                disabled={anyRunning}
                 className={[
                   "px-3 py-1 rounded-md text-[11px] font-medium uppercase tracking-wider transition-all",
                   s === store ? "bg-accent text-on-accent shadow-sm" : "text-text-dim hover:text-text",
+                  anyRunning ? "opacity-50 cursor-not-allowed" : "",
                 ].join(" ")}
               >
                 {STORE_CONFIG[s].label.replace("Store ", "")}
               </button>
             ))}
+          </div>
+          <div className="ml-auto">
+            <Button variant="primary" size="sm" onClick={() => void runAll()} disabled={anyRunning}>
+              {runningAll ? "⟳ Running all…" : "▶ Run all for this store"}
+            </Button>
           </div>
         </div>
 
@@ -168,7 +201,7 @@ export function CatalogMaintenanceModal({ open, onClose }: Props) {
               def={def}
               job={jobs[def.type] ?? null}
               anyRunning={anyRunning}
-              onRun={() => void runJob(def)}
+              onRun={() => void runJobToCompletion(def)}
             />
           ))}
         </div>
