@@ -501,6 +501,13 @@ export const api = {
   /** Poll a running maintenance job for progress. */
   catalogJobStatus: (id: string) =>
     call<CatalogJob>(`/api/catalog_job/status?id=${encodeURIComponent(id)}`),
+
+  /** All maintenance jobs (newest first), optionally for one store — lets the UI
+   *  re-discover running jobs after the modal closes or the page reloads. */
+  catalogJobList: (store?: "dk" | "fr" | "fi") =>
+    call<{ jobs: CatalogJob[]; error?: string }>(
+      `/api/catalog_job/list${store ? `?store=${store}` : ""}`
+    ),
 };
 
 export const BACKEND = BACKEND_URL;

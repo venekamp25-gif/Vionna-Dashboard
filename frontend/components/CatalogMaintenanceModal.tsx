@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { api, CatalogJob, CatalogJobType } from "@/lib/api";
+import { useState } from "react";
+import { CatalogJob, CatalogJobType } from "@/lib/api";
 import { StoreKey, STORE_CONFIG, STORE_KEYS, useStore } from "@/lib/store";
 import { Button } from "@/components/ui/Button";
+import { startCatalogJob, waitForJob, useCatalogJobs } from "@/lib/catalogJobs";
 
 interface Props {
   open: boolean;
@@ -51,84 +52,40 @@ const JOB_DEFS: JobDef[] = [
 export function CatalogMaintenanceModal({ open, onClose }: Props) {
   const { store: globalStore } = useStore();
   const [store, setStore] = useState<StoreKey>(globalStore);
-  const [jobs, setJobs] = useState<Record<string, CatalogJob | null>>({});
-  const timers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
-
-  const clearTimers = () => {
-    Object.values(timers.current).forEach((t) => clearTimeout(t));
-    timers.current = {};
-  };
-
-  // Stop polling + reset the display when the modal closes or the store changes.
-  useEffect(() => {
-    if (!open) {
-      clearTimers();
-      setJobs({});
-    }
-    return () => clearTimers();
-  }, [open]);
-
-  useEffect(() => {
-    clearTimers();
-    setJobs({});
-  }, [store]);
-
   const [runningAll, setRunningAll] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
 
-  const mkJob = (type: CatalogJobType, status: CatalogJob["status"], extra: Partial<CatalogJob> = {}): CatalogJob => ({
-    id: "", type, store, status, total: null, processed: 0, changed: 0, skipped: 0,
-    errors: [], summary: "", started_at: "", finished_at: null, ...extra,
-  });
+  // Shared store — keeps polling and remembers progress even while this modal is
+  // closed, and re-discovers running jobs after a page reload.
+  const allJobs = useCatalogJobs();
 
-  // Start one job and resolve only when it finishes (done/error). Used for a
-  // single "Run" click and chained by "Run all for this store".
-  const runJobToCompletion = (def: JobDef, skipConfirm = false): Promise<void> =>
-    new Promise((resolve) => {
-      void (async () => {
-        if (def.confirm && !skipConfirm && !window.confirm(def.confirm(store.toUpperCase()))) {
-          resolve();
-          return;
-        }
-        setJobs((j) => ({ ...j, [def.type]: mkJob(def.type, "running") }));
-        let id = "";
-        try {
-          const r = await api.catalogJobStart(store, def.type);
-          if (r.error || !r.job_id) throw new Error(r.error || "Could not start job");
-          id = r.job_id;
-        } catch (e) {
-          setJobs((j) => ({
-            ...j,
-            [def.type]: mkJob(def.type, "error", {
-              errors: [String(e instanceof Error ? e.message : e)],
-              summary: "Could not start",
-            }),
-          }));
-          resolve();
-          return;
-        }
-        const tick = async () => {
-          try {
-            const s = await api.catalogJobStatus(id);
-            setJobs((j) => ({ ...j, [def.type]: s }));
-            if (s.status === "running") {
-              timers.current[def.type] = setTimeout(tick, 2000);
-            } else {
-              resolve();
-            }
-          } catch {
-            timers.current[def.type] = setTimeout(tick, 3000); // transient — keep polling
-          }
-        };
-        void tick();
-      })();
-    });
+  const jobsByType: Record<string, CatalogJob | null> = {};
+  for (const def of JOB_DEFS) {
+    // list is newest-first → the first match is the latest job of that type
+    jobsByType[def.type] = allJobs.find((j) => j.store === store && j.type === def.type) ?? null;
+  }
+  const anyRunning = runningAll || allJobs.some((j) => j.store === store && j.status === "running");
+
+  // Start one job and resolve only when it finishes. Used for a single "Run"
+  // click and chained by "Run all for this store".
+  const runJobToCompletion = async (def: JobDef, skipConfirm = false): Promise<void> => {
+    if (def.confirm && !skipConfirm && !window.confirm(def.confirm(store.toUpperCase()))) return;
+    setStartError(null);
+    try {
+      const r = await startCatalogJob(store, def.type);
+      if (r.error || !r.job_id) throw new Error(r.error || "Could not start job");
+      await waitForJob(r.job_id);
+    } catch (e) {
+      setStartError(`${def.title}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
 
   // Run all four jobs sequentially for the selected store (one confirm up front).
   const runAll = async () => {
     if (
       !window.confirm(
         `Run ALL four maintenance jobs on Store ${store.toUpperCase()}, one after another?\n\n` +
-          `This includes drafting verified duplicates (reversible in Shopify). It can take a while on a large store — keep this tab open.`
+          `This includes drafting verified duplicates (reversible in Shopify). It can take a while on a large store.`
       )
     )
       return;
@@ -138,8 +95,6 @@ export function CatalogMaintenanceModal({ open, onClose }: Props) {
     }
     setRunningAll(false);
   };
-
-  const anyRunning = runningAll || Object.values(jobs).some((j) => j?.status === "running");
 
   if (!open) return null;
 
@@ -173,11 +128,9 @@ export function CatalogMaintenanceModal({ open, onClose }: Props) {
                 key={s}
                 type="button"
                 onClick={() => setStore(s)}
-                disabled={anyRunning}
                 className={[
                   "px-3 py-1 rounded-md text-[11px] font-medium uppercase tracking-wider transition-all",
                   s === store ? "bg-accent text-on-accent shadow-sm" : "text-text-dim hover:text-text",
-                  anyRunning ? "opacity-50 cursor-not-allowed" : "",
                 ].join(" ")}
               >
                 {STORE_CONFIG[s].label.replace("Store ", "")}
@@ -192,14 +145,17 @@ export function CatalogMaintenanceModal({ open, onClose }: Props) {
         </div>
 
         <div className="px-6 py-4 space-y-3">
+          {startError && <p className="text-[11px] text-danger -mb-1">⚠ {startError}</p>}
           {anyRunning && (
-            <p className="text-[11px] text-text-faint -mb-1">One job runs at a time per store — let the running one finish first.</p>
+            <p className="text-[11px] text-text-faint -mb-1">
+              A job is running for this store — progress keeps updating even if you close this window.
+            </p>
           )}
           {JOB_DEFS.map((def) => (
             <JobCard
               key={def.type}
               def={def}
-              job={jobs[def.type] ?? null}
+              job={jobsByType[def.type]}
               anyRunning={anyRunning}
               onRun={() => void runJobToCompletion(def)}
             />

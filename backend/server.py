@@ -2419,6 +2419,19 @@ def catalog_job_status():
         return jsonify(dict(j))
 
 
+@app.route('/api/catalog_job/list')
+def catalog_job_list():
+    """All jobs (optionally filtered by store), newest first — lets the UI
+    re-discover running jobs after the modal is closed or the page reloaded."""
+    store = request.args.get('store', '')
+    with _JOBS_LOCK:
+        items = [dict(j) for j in _JOBS.values()]
+    if store:
+        items = [j for j in items if j.get('store') == store]
+    items.sort(key=lambda j: j.get('started_at') or '', reverse=True)
+    return jsonify({'jobs': items[:50]})
+
+
 # --- Per-user draft storage ---
 
 def _sanitize_owner(raw):
