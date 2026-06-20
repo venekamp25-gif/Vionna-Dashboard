@@ -10,12 +10,14 @@ import { SettingsModal } from "./SettingsModal";
 import { HistoryModal } from "./HistoryModal";
 import { ReportBugModal } from "./ReportBugModal";
 import { KeywordBackfillModal } from "./KeywordBackfillModal";
+import { CatalogMaintenanceModal } from "./CatalogMaintenanceModal";
 
 export function Header() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [historyOpen, setHistoryOpen]   = useState(false);
   const [bugOpen, setBugOpen]           = useState(false);
   const [backfillOpen, setBackfillOpen] = useState(false);
+  const [maintenanceOpen, setMaintenanceOpen] = useState(false);
 
   return (
     <>
@@ -44,6 +46,15 @@ export function Header() {
           </button>
           <button
             type="button"
+            onClick={() => setMaintenanceOpen(true)}
+            title="Catalogue maintenance — bulk fixes (bold, channels, cutlines, duplicates)"
+            aria-label="Open catalogue maintenance"
+            className="w-9 h-9 flex items-center justify-center rounded-md bg-bg-elev-2 text-text-dim hover:text-accent hover:border-accent border border-border transition-colors text-[14px]"
+          >
+            🧹
+          </button>
+          <button
+            type="button"
             onClick={() => setHistoryOpen(true)}
             title="Publish history"
             aria-label="Open publish history"
@@ -68,6 +79,7 @@ export function Header() {
       <HistoryModal open={historyOpen} onClose={() => setHistoryOpen(false)} />
       <ReportBugModal open={bugOpen} onClose={() => setBugOpen(false)} />
       <KeywordBackfillModal open={backfillOpen} onClose={() => setBackfillOpen(false)} />
+      <CatalogMaintenanceModal open={maintenanceOpen} onClose={() => setMaintenanceOpen(false)} />
     </>
   );
 }
