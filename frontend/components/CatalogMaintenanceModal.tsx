@@ -113,6 +113,8 @@ export function CatalogMaintenanceModal({ open, onClose }: Props) {
     }
   };
 
+  const anyRunning = Object.values(jobs).some((j) => j?.status === "running");
+
   if (!open) return null;
 
   return (
@@ -157,8 +159,17 @@ export function CatalogMaintenanceModal({ open, onClose }: Props) {
         </div>
 
         <div className="px-6 py-4 space-y-3">
+          {anyRunning && (
+            <p className="text-[11px] text-text-faint -mb-1">One job runs at a time per store — let the running one finish first.</p>
+          )}
           {JOB_DEFS.map((def) => (
-            <JobCard key={def.type} def={def} job={jobs[def.type] ?? null} onRun={() => void runJob(def)} />
+            <JobCard
+              key={def.type}
+              def={def}
+              job={jobs[def.type] ?? null}
+              anyRunning={anyRunning}
+              onRun={() => void runJob(def)}
+            />
           ))}
         </div>
 
@@ -172,7 +183,17 @@ export function CatalogMaintenanceModal({ open, onClose }: Props) {
   );
 }
 
-function JobCard({ def, job, onRun }: { def: JobDef; job: CatalogJob | null; onRun: () => void }) {
+function JobCard({
+  def,
+  job,
+  anyRunning,
+  onRun,
+}: {
+  def: JobDef;
+  job: CatalogJob | null;
+  anyRunning: boolean;
+  onRun: () => void;
+}) {
   const running = job?.status === "running";
   const pct = job && job.total ? Math.min(100, Math.round((job.processed / job.total) * 100)) : null;
 
@@ -183,7 +204,12 @@ function JobCard({ def, job, onRun }: { def: JobDef; job: CatalogJob | null; onR
           <div className="text-[13px] font-semibold text-text">{def.title}</div>
           <p className="text-[11px] text-text-faint mt-0.5 leading-relaxed">{def.desc}</p>
         </div>
-        <Button variant={def.danger ? "secondary" : "primary"} size="sm" onClick={onRun} disabled={running}>
+        <Button
+          variant={def.danger ? "secondary" : "primary"}
+          size="sm"
+          onClick={onRun}
+          disabled={running || anyRunning}
+        >
           {running ? "⟳ Running…" : def.cta}
         </Button>
       </div>

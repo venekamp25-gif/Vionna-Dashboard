@@ -2144,7 +2144,7 @@ def backfill_apply():
 # channel publish.
 
 _JOBS = {}
-_JOBS_LOCK = threading.Lock()
+_JOBS_LOCK = threading.RLock()  # reentrant: job helpers re-acquire it while a caller already holds it
 _JOB_COUNTER = [0]
 
 
@@ -2382,6 +2382,16 @@ def catalog_job_start():
     fn = _JOB_TYPES.get(job_type)
     if not fn:
         return jsonify({'error': f'Unknown job_type {job_type!r}.'}), 400
+
+    # One maintenance job per store at a time — running four big jobs at once
+    # hammers Shopify's rate limit and the box.
+    with _JOBS_LOCK:
+        for j in _JOBS.values():
+            if j.get('store') == store and j.get('status') == 'running':
+                return jsonify({
+                    'error': f'A maintenance job ({j.get("type")}) is already running for Store {store.upper()}. '
+                             'Wait for it to finish before starting another.'
+                }), 409
 
     jid = _job_new(job_type, store)
     hdrs = shopify_headers(store)
