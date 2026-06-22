@@ -1,5 +1,10 @@
 @import "tailwindcss";
 
+/* Make Tailwind's `dark:` variant follow this app's theme toggle instead of the
+   OS preference: the app sets data-theme="light" on <html> for light mode and
+   removes it for dark, so "dark" = :root WITHOUT data-theme="light". */
+@custom-variant dark (&:where(:root:not([data-theme="light"]) *));
+
 /* ===== DARK THEME (default) ===== */
 :root {
   --bg:           #0b0f14;
@@ -71,3 +76,29 @@ body {
 *::-webkit-scrollbar-track { background: var(--bg); }
 *::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
 *::-webkit-scrollbar-thumb:hover { background: var(--border-hover); }
+
+/* ===== Aurora background component =====
+   Tailwind v4 equivalent of the pasted v3 tailwind.config.js:
+   - the `aurora` animation/keyframes (v3 theme.extend.animation) live here,
+   - the colour CSS variables the component reads via var(--blue-500) etc. (v3
+     addVariablesForColors plugin) are declared directly. The component only
+     needs this handful, so we don't replicate the whole palette. */
+:root {
+  --white: #fff;
+  --black: #000;
+  --transparent: transparent;
+  --blue-300: #93c5fd;
+  --blue-400: #60a5fa;
+  --blue-500: #3b82f6;
+  --indigo-300: #a5b4fc;
+  --violet-200: #ddd6fe;
+}
+
+@theme {
+  --animate-aurora: aurora 60s linear infinite;
+}
+
+@keyframes aurora {
+  from { background-position: 50% 50%, 50% 50%; }
+  to   { background-position: 350% 50%, 350% 50%; }
+}
