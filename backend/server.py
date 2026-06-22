@@ -2600,13 +2600,12 @@ def _fix_collection_titles(jid, store, hdrs, dry_run):
             _job_error(jid, f"'{sib_handle}': products link here but no collection exists at that handle — run Relink/republish")
             _job_inc(jid, skipped=len(members))
             continue
-        # Defence-in-depth: only act on this tool's sibling-collection handle conventions
-        # ('-siblings' canonical, '-collection' legacy). Anything else the metafield
-        # happens to reference is surfaced for review but left completely untouched.
-        if not (info['handle'].endswith('-siblings') or info['handle'].endswith('-collection')):
-            _job_error(jid, f"'{info['handle']}' (title '{info['title']}') — unusual handle, not auto-renamed")
-            _job_inc(jid, skipped=len(members))
-            continue
+        # No handle-pattern filter: the members all share ONE product title AND
+        # explicitly point here via their theme.siblings metafield — that's a genuine
+        # colour-variant set whatever the handle convention ('-siblings', legacy
+        # '-collection', Danish '-soskende', …). A marketing/curated collection would be
+        # referenced by products with DIFFERENT titles, which the single-title guard
+        # above already excludes. Scan-then-apply gives the operator the final look.
         proposed = f"{product_title} Siblings"
         needs_rename = info['title'].strip() != proposed
         # members whose stored value isn't EXACTLY the real (lowercase) handle — e.g. the
