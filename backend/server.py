@@ -2504,9 +2504,112 @@ def _job_relink_siblings(jid, store, hdrs):
                                   json={'collect': {'product_id': int(num), 'collection_id': coll_id}}, timeout=20)
             except Exception as ex:
                 _job_error(jid, f"{m.get('handle')}: {ex}")
+    # ── Pass 2: re-create siblings collections that products point at but which no
+    # longer exist. The handle-grouping above can't see colour-NAME handles
+    # (angela-violet) and skips numbered sets whose metafield is already set, so a
+    # DELETED collection leaves the swatches dangling ("no collection exists"). Group by
+    # the theme.siblings value itself and, ONLY where the collection is *confirmed* absent,
+    # re-create it at that handle and add the members.
+    #
+    # FAIL-CLOSED: a lookup that errors / throttles is treated as 'unknown' (skip), NEVER
+    # as 'absent' — otherwise a rate-limit blip would create an orphan '-1' duplicate and
+    # rewrite valid links to it. Self-contained (doesn't use _ensure_siblings_collection)
+    # so the publish path is untouched; every call goes through the _shopify_call throttle.
+    def _coll_state(h):
+        """('exists', gid) / ('absent', None) / ('unknown', None). A GraphQL error or
+        non-200 is 'unknown', not 'absent'."""
+        try:
+            r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                              json={'query': 'query($h:String!){ collectionByHandle(handle:$h){ id } }',
+                                    'variables': {'h': h}}, timeout=20)
+        except Exception:
+            return ('unknown', None)
+        if r is None or r.status_code != 200:
+            return ('unknown', None)
+        try:
+            body = r.json() or {}
+        except Exception:
+            return ('unknown', None)
+        if body.get('errors') or 'data' not in body:
+            return ('unknown', None)
+        node = (body.get('data') or {}).get('collectionByHandle')
+        if node and node.get('id'):
+            return ('exists', node.get('id'))
+        return ('absent', None)
+
+    recreated = 0
+    mf_groups = {}
+    for n in prods:
+        sv = sib_of(n).strip()
+        if sv:
+            mf_groups.setdefault(sv.lower(), []).append(n)
+    for handle, members in mf_groups.items():
+        if len(members) < 2:
+            continue
+        titles = {(m.get('title') or '').strip().lower() for m in members if (m.get('title') or '').strip()}
+        if len(titles) != 1:
+            continue  # ambiguous set — don't guess
+        # shape guard: only ever materialise a real Shopify handle, never a typo'd value
+        if not re.fullmatch(r'[a-z0-9][a-z0-9-]{1,100}', handle):
+            _job_error(jid, f"'{handle}': not a valid collection handle — not recreated")
+            continue
+        state, _gid = _coll_state(handle)
+        if state == 'exists':
+            continue  # fine → naming handled by fix_titles
+        if state == 'unknown':
+            _job_error(jid, f"'{handle}': lookup uncertain — skipped (safe to re-run)")
+            continue
+        # state == 'absent' → create it (throttled) at EXACTLY this handle
+        title = next((m.get('title').strip() for m in members if (m.get('title') or '').strip()), handle)
+        try:
+            cr = _shopify_call('post', f"{base_url}custom_collections.json", hdrs,
+                               json={'custom_collection': {'title': f"{title} Siblings",
+                                                           'handle': handle, 'published': True}}, timeout=20)
+        except Exception as e:
+            _job_error(jid, f"'{handle}': create failed — {str(e)[:120]}")
+            continue
+        if cr.status_code not in (200, 201):
+            _job_error(jid, f"'{handle}': create HTTP {cr.status_code}")
+            continue
+        try:
+            payload = (cr.json() or {}).get('custom_collection') or {}
+        except Exception:
+            _job_error(jid, f"'{handle}': create returned a non-JSON body")
+            continue
+        new_id = payload.get('id')
+        new_handle = payload.get('handle') or handle
+        if not new_id:
+            _job_error(jid, f"'{handle}': create returned no id")
+            continue
+        if new_handle != handle:
+            # handle was actually taken (our 'absent' lost a race) → Shopify suffixed it.
+            # Don't keep a duplicate and don't rewrite member links: delete and skip.
+            try:
+                _shopify_call('delete', shopify_url(store, f'custom_collections/{new_id}.json'), hdrs, timeout=20)
+            except Exception:
+                pass
+            _job_error(jid, f"'{handle}': unexpectedly already taken — skipped, re-run")
+            continue
+        recreated += 1
+        for m in members:
+            num = (m.get('id') or '').rsplit('/', 1)[-1]
+            try:
+                if sib_of(m).strip() != handle:
+                    _shopify_call('post', shopify_url(store, f'products/{num}/metafields.json'), hdrs,
+                                  json={'metafield': {'namespace': 'theme', 'key': 'siblings',
+                                                      'value': handle, 'type': 'single_line_text_field'}},
+                                  timeout=20)
+                    _job_inc(jid, changed=1)
+                _shopify_call('post', f"{base_url}collects.json", hdrs,
+                              json={'collect': {'product_id': int(num), 'collection_id': new_id}}, timeout=20)
+            except Exception as ex:
+                _job_error(jid, f"{m.get('handle')}: {ex}")
+
     with _JOBS_LOCK:
         j = _JOBS[jid]
-        _job_summary(jid, f"Relinked {j['changed']} product(s) into siblings sets; {j['skipped']} left alone (mixed/ambiguous groups).")
+        _job_summary(jid, f"Relinked {j['changed']} product(s) into siblings sets; "
+                          f"re-created {recreated} missing collection(s); "
+                          f"{j['skipped']} left alone (mixed/ambiguous groups).")
 
 
 def _fix_collection_titles(jid, store, hdrs, dry_run):
