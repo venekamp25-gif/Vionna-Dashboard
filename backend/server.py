@@ -2573,6 +2573,10 @@ def _fix_collection_titles(jid, store, hdrs, dry_run):
         coll_cache[handle] = info
         return info
 
+    def _norm(s):
+        # case / diacritic / separator-insensitive form for comparing titles
+        return re.sub(r'[\s_-]+', ' ', _publish_strip_diacritics(s or '').lower()).strip()
+
     renames = []      # (handle, old_title, new_title) — also the rollback record
     relink_sets = 0   # sets whose theme.siblings value needs normalising (e.g. casing)
 
@@ -2607,7 +2611,18 @@ def _fix_collection_titles(jid, store, hdrs, dry_run):
         # referenced by products with DIFFERENT titles, which the single-title guard
         # above already excludes. Scan-then-apply gives the operator the final look.
         proposed = f"{product_title} Siblings"
-        needs_rename = info['title'].strip() != proposed
+        cur = (info['title'] or '').strip()
+        # Only auto-rename when the title differs from canonical by mere FORMATTING —
+        # case, separators, diacritics, or a 'collection' suffix instead of 'Siblings'.
+        # If it differs by actual WORDS (e.g. an 'Ava Siblings' collection whose products
+        # are titled 'Flavia', or 'Nina Armbånd Siblings' for plain 'Nina' products), that
+        # is a deliberate name or a mis-link — leave it alone and flag it for review.
+        fixable = _norm(cur) in (f"{_norm(product_title)} siblings", f"{_norm(product_title)} collection")
+        if cur != proposed and not fixable:
+            _job_error(jid, f"'{info['handle']}' titled '{cur}' but its products are '{product_title}' — left alone (rename manually if needed)")
+            _job_inc(jid, skipped=len(members))
+            continue
+        needs_rename = cur != proposed
         # members whose stored value isn't EXACTLY the real (lowercase) handle — e.g. the
         # legacy capitalised "Angela-collection" — get their link repaired so swatches work.
         needs_relink = any(sib_of(m).strip() != info['handle'] for m in members)
