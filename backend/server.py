@@ -2516,9 +2516,10 @@ def _fix_collection_titles(jid, store, hdrs, dry_run):
     mode it ALSO re-links the members (metafield + collection membership) so the colour
     swatches actually show.
 
-    Conservative, mirrors _job_relink_siblings: only acts on a numbered colour-variant
-    group whose members share ONE title and point at exactly ONE existing siblings
-    collection. dry_run=True makes ZERO writes — safe to run on a live store."""
+    Conservative: groups products by the theme.siblings collection they point at, and
+    only acts on a set whose members share ONE product title. Works for ANY handle style
+    (numbered angela-1/-2 OR colour-named angela-violet/-noir). dry_run=True makes ZERO
+    writes — safe to run on a live store."""
     base_url = shopify_url(store, '')
     prods = list(_paginate_gql_products(
         store,
@@ -2527,14 +2528,20 @@ def _fix_collection_titles(jid, store, hdrs, dry_run):
     ))
     _job_set(jid, total=len(prods))
 
-    groups = {}
-    for n in prods:
-        _job_inc(jid, processed=1)
-        base = re.sub(r'-\d+$', '', n.get('handle') or '')
-        groups.setdefault(base, []).append(n)
-
     def sib_of(m):
         return ((m.get('siblings') or {}) or {}).get('value') or ''
+
+    # Group products by the siblings collection they POINT AT (the theme.siblings
+    # metafield), case-insensitively. Handle-agnostic: groups colour variants whether
+    # their product handles are numbered (angela-1/-2) OR colour-named (angela-violet/
+    # -noir). Shopify handles are lowercase, so a legacy capitalised value like
+    # "Angela-collection" maps to the same group as the real "angela-collection".
+    groups = {}  # lowercased siblings handle -> [member product nodes]
+    for n in prods:
+        _job_inc(jid, processed=1)
+        sv = sib_of(n).strip()
+        if sv:
+            groups.setdefault(sv.lower(), []).append(n)
 
     coll_cache = {}
 
@@ -2566,78 +2573,73 @@ def _fix_collection_titles(jid, store, hdrs, dry_run):
         coll_cache[handle] = info
         return info
 
-    renames = []  # (handle, old_title, new_title) — also the rollback record
+    renames = []      # (handle, old_title, new_title) — also the rollback record
+    relink_sets = 0   # sets whose theme.siblings value needs normalising (e.g. casing)
 
-    for base, members in groups.items():
+    for sib_handle, members in groups.items():
         if len(members) < 2:
-            continue
-        if not all(re.fullmatch(re.escape(base) + r'(-\d+)?', m.get('handle') or '') for m in members):
-            continue
-        norm_titles = set((m.get('title') or '').strip().lower() for m in members if (m.get('title') or '').strip())
-        sibs = set(sib_of(m) for m in members if sib_of(m))
+            continue  # a lone product isn't a clear colour-variant set
+        titles_present = sorted({(m.get('title') or '').strip() for m in members if (m.get('title') or '').strip()})
+        norm_titles = {t.lower() for t in titles_present}
         if len(norm_titles) != 1:
             # members disagree on the product name → can't safely derive the title
+            _job_error(jid, f"'{sib_handle}': members have different titles {titles_present[:4]} — skipped")
             _job_inc(jid, skipped=len(members))
             continue
-        if len(sibs) > 1:
-            # split across >1 collection — relink territory, don't guess here
-            _job_error(jid, f"{base}: split across {len(sibs)} collections {sorted(sibs)} — run Relink first")
-            _job_inc(jid, skipped=len(members))
-            continue
-        if len(sibs) == 0:
-            # no existing siblings link → nothing to rename (Relink/republish creates it)
-            _job_inc(jid, skipped=len(members))
-            continue
-        # canonical, deterministically-cased product title → '<Title> Siblings'.
-        # All members share one title ignoring case (guard above); pick a stable
-        # spelling (prefer a mixed-case one) so re-runs never churn the casing.
-        titles_present = sorted({(m.get('title') or '').strip() for m in members if (m.get('title') or '').strip()})
+        # canonical, deterministically-cased product title → '<Title> Siblings'
+        # (prefer a mixed-case spelling so re-runs never churn the casing).
         mixed = [t for t in titles_present if t != t.lower() and t != t.upper()]
-        product_title = (mixed[0] if mixed else (titles_present[0] if titles_present else base))
-        target_handle = next(iter(sibs))
+        product_title = mixed[0] if mixed else titles_present[0]
         try:
-            info = coll_info(target_handle)
+            info = coll_info(sib_handle)
         except Exception as e:
-            _job_error(jid, f"{base}: lookup '{target_handle}' failed — {str(e)[:120]} (skipped; safe to re-run)")
+            _job_error(jid, f"'{sib_handle}': lookup failed — {str(e)[:120]} (skipped; safe to re-run)")
             _job_inc(jid, skipped=len(members))
             continue
         if not info:
-            _job_error(jid, f"{base}: linked to '{target_handle}' but that collection no longer exists — run Relink")
+            _job_error(jid, f"'{sib_handle}': products link here but no collection exists at that handle — run Relink/republish")
             _job_inc(jid, skipped=len(members))
             continue
-        # Defence-in-depth: only auto-rename this tool's own sibling-collection handle
-        # conventions ('-siblings' canonical, '-collection' legacy). Anything else the
-        # metafield happens to reference is surfaced for review but left untouched.
+        # Defence-in-depth: only act on this tool's sibling-collection handle conventions
+        # ('-siblings' canonical, '-collection' legacy). Anything else the metafield
+        # happens to reference is surfaced for review but left completely untouched.
         if not (info['handle'].endswith('-siblings') or info['handle'].endswith('-collection')):
-            _job_error(jid, f"{base}: linked to '{info['handle']}' (title '{info['title']}') — unusual handle, not auto-renamed")
+            _job_error(jid, f"'{info['handle']}' (title '{info['title']}') — unusual handle, not auto-renamed")
             _job_inc(jid, skipped=len(members))
             continue
         proposed = f"{product_title} Siblings"
-        if info['title'].strip() == proposed:
-            continue  # already correct → nothing to do
-        renames.append((info['handle'], info['title'], proposed))
+        needs_rename = info['title'].strip() != proposed
+        # members whose stored value isn't EXACTLY the real (lowercase) handle — e.g. the
+        # legacy capitalised "Angela-collection" — get their link repaired so swatches work.
+        needs_relink = any(sib_of(m).strip() != info['handle'] for m in members)
+        if needs_rename:
+            renames.append((info['handle'], info['title'], proposed))
+        if needs_relink:
+            relink_sets += 1
+        if not needs_rename and not needs_relink:
+            continue  # already perfect
         if dry_run:
             continue  # SCAN — record only, make no writes
         # APPLY — rename the title via GraphQL collectionUpdate (works for custom AND
-        # smart collections). We deliberately omit `handle` so the URL + theme.siblings
-        # links are preserved.
-        try:
-            rr = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
-                               json={'query': 'mutation($id:ID!,$t:String!){ collectionUpdate(input:{id:$id,title:$t}){ userErrors{field message} } }',
-                                     'variables': {'id': info['gid'], 't': proposed}}, timeout=20)
-            errs = (((rr.json().get('data') or {}).get('collectionUpdate') or {}).get('userErrors')) or []
-            if errs:
-                _job_error(jid, f"{info['handle']} rename: {errs[0].get('message')}")
-                continue
-            _job_inc(jid, changed=1)
-        except Exception as e:
-            _job_error(jid, f"{info['handle']} rename: {e}")
-            continue
-        # repair linkage so the swatches truly work for these products
+        # smart collections; we omit `handle` so the URL stays the same).
+        if needs_rename:
+            try:
+                rr = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                                   json={'query': 'mutation($id:ID!,$t:String!){ collectionUpdate(input:{id:$id,title:$t}){ userErrors{field message} } }',
+                                         'variables': {'id': info['gid'], 't': proposed}}, timeout=20)
+                errs = (((rr.json().get('data') or {}).get('collectionUpdate') or {}).get('userErrors')) or []
+                if errs:
+                    _job_error(jid, f"{info['handle']} rename: {errs[0].get('message')}")
+                else:
+                    _job_inc(jid, changed=1)
+            except Exception as e:
+                _job_error(jid, f"{info['handle']} rename: {e}")
+        # repair linkage: write the EXACT lowercase handle into theme.siblings (fixes the
+        # capitalised-value bug) and ensure membership so the swatches truly show.
         for m in members:
             num = (m.get('id') or '').rsplit('/', 1)[-1]
             try:
-                if sib_of(m) != info['handle']:
+                if sib_of(m).strip() != info['handle']:
                     _shopify_call('post', shopify_url(store, f'products/{num}/metafields.json'), hdrs,
                                   json={'metafield': {'namespace': 'theme', 'key': 'siblings',
                                                       'value': info['handle'], 'type': 'single_line_text_field'}},
@@ -2651,11 +2653,12 @@ def _fix_collection_titles(jid, store, hdrs, dry_run):
     lines = '; '.join(f"'{o}' → '{p}'" for (_h, o, p) in renames[:25])
     n_ren = len(renames)
     if dry_run:
-        _job_summary(jid, f"SCAN (no changes made): {n_ren} sibling collection(s) need renaming. "
+        _job_summary(jid, f"SCAN (no changes made): {n_ren} collection(s) need renaming, "
+                          f"{relink_sets} set(s) need a link repair. "
                           + (lines if lines else "All sibling-collection names are already correct."))
     else:
-        _job_summary(jid, f"Renamed {n_ren} sibling collection(s) to '<Product> Siblings' and re-linked their colour variants. "
-                          f"Handles/URLs untouched — links preserved, reversible. " + lines)
+        _job_summary(jid, f"Renamed {n_ren} collection(s) to '<Product> Siblings' and repaired links on "
+                          f"{relink_sets} set(s). Handles/URLs untouched — preserved + reversible. " + lines)
 
 
 def _job_fix_titles_scan(jid, store, hdrs):
