@@ -2605,10 +2605,92 @@ def _job_relink_siblings(jid, store, hdrs):
             except Exception as ex:
                 _job_error(jid, f"{m.get('handle')}: {ex}")
 
+    # ── Pass 3: repair MALFORMED siblings links. Some products store an ILLEGAL handle
+    # in theme.siblings — an accent ("nina-armbånd-soskende") or a space ("brit siblings")
+    # — which can never resolve to a Shopify collection (handles are ascii, no spaces).
+    # Normalise the value to a valid handle, REUSE the collection already at that handle
+    # (so a distinct name like "Nina Armbånd Siblings" is preserved) or create one, then
+    # rewrite the members' metafield to the valid handle and link them. Same fail-closed
+    # discipline as Pass 2 (tri-state probe, throttled calls, suffix→delete+skip).
+    def _norm_handle(v):
+        return re.sub(r'[^a-z0-9]+', '-', _publish_strip_diacritics(v or '').lower()).strip('-')
+
+    repaired = 0
+    bad_groups = {}
+    for n in prods:
+        sv = sib_of(n).strip()
+        if not sv or re.fullmatch(r'[a-z0-9][a-z0-9-]*', sv):
+            continue  # empty or already a valid handle → handled by Pass 1/2
+        nh = _norm_handle(sv)
+        if re.fullmatch(r'[a-z0-9][a-z0-9-]{1,100}', nh):
+            bad_groups.setdefault(nh, []).append(n)
+        else:
+            _job_error(jid, f"'{sv}': cannot normalise to a valid handle — skipped")
+    for handle, members in bad_groups.items():
+        if len(members) < 2:
+            continue
+        titles = {(m.get('title') or '').strip().lower() for m in members if (m.get('title') or '').strip()}
+        if len(titles) != 1:
+            _job_error(jid, f"'{handle}': mixed titles — malformed-link repair skipped")
+            continue
+        title = next((m.get('title').strip() for m in members if (m.get('title') or '').strip()), handle)
+        state, gid = _coll_state(handle)
+        if state == 'unknown':
+            _job_error(jid, f"'{handle}': lookup uncertain — skipped (safe to re-run)")
+            continue
+        if state == 'exists':
+            coll_id = (gid or '').rsplit('/', 1)[-1]
+        else:
+            # absent → create it at the normalised handle
+            try:
+                cr = _shopify_call('post', f"{base_url}custom_collections.json", hdrs,
+                                   json={'custom_collection': {'title': f"{title} Siblings",
+                                                               'handle': handle, 'published': True}}, timeout=20)
+            except Exception as e:
+                _job_error(jid, f"'{handle}': create failed — {str(e)[:120]}")
+                continue
+            if cr.status_code not in (200, 201):
+                _job_error(jid, f"'{handle}': create HTTP {cr.status_code}")
+                continue
+            try:
+                payload = (cr.json() or {}).get('custom_collection') or {}
+            except Exception:
+                _job_error(jid, f"'{handle}': create returned a non-JSON body")
+                continue
+            coll_id = payload.get('id')
+            new_handle = payload.get('handle') or handle
+            if not coll_id:
+                _job_error(jid, f"'{handle}': create returned no id")
+                continue
+            if new_handle != handle:
+                try:
+                    _shopify_call('delete', shopify_url(store, f'custom_collections/{coll_id}.json'), hdrs, timeout=20)
+                except Exception:
+                    pass
+                _job_error(jid, f"'{handle}': unexpectedly already taken — skipped, re-run")
+                continue
+        # rewrite the malformed metafield → valid handle, and add to the collection
+        for m in members:
+            num = (m.get('id') or '').rsplit('/', 1)[-1]
+            try:
+                if sib_of(m).strip() != handle:
+                    _shopify_call('post', shopify_url(store, f'products/{num}/metafields.json'), hdrs,
+                                  json={'metafield': {'namespace': 'theme', 'key': 'siblings',
+                                                      'value': handle, 'type': 'single_line_text_field'}},
+                                  timeout=20)
+                    _job_inc(jid, changed=1)
+                if coll_id:
+                    _shopify_call('post', f"{base_url}collects.json", hdrs,
+                                  json={'collect': {'product_id': int(num), 'collection_id': int(coll_id)}}, timeout=20)
+            except Exception as ex:
+                _job_error(jid, f"{m.get('handle')}: {ex}")
+        repaired += 1
+
     with _JOBS_LOCK:
         j = _JOBS[jid]
         _job_summary(jid, f"Relinked {j['changed']} product(s) into siblings sets; "
                           f"re-created {recreated} missing collection(s); "
+                          f"repaired {repaired} malformed link(s); "
                           f"{j['skipped']} left alone (mixed/ambiguous groups).")
 
 
