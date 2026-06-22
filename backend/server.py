@@ -2442,6 +2442,54 @@ def _job_dedup(jid, store, hdrs):
         _job_summary(jid, f"Drafted {j['changed']} verified duplicate(s); {j['skipped']} left alone (different/no image). Reversible in Shopify.")
 
 
+def _fetch_all_collections(store, hdrs):
+    """Return [{id(gid), handle, title, smart}] for EVERY collection (custom + smart),
+    or None if the listing failed. Paginated GraphQL — one handful of calls instead of a
+    probe per group, so the relink job doesn't hammer the rate limit on big stores."""
+    out = []
+    cursor = None
+    for _ in range(400):  # safety cap (400*250 = 100k collections)
+        after = f', after:"{cursor}"' if cursor else ''
+        q = ('{ collections(first:250%s){ pageInfo{hasNextPage endCursor} '
+             'edges{ node{ id handle title ruleSet{appliedDisjunctively} } } } }') % after
+        try:
+            r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs, json={'query': q}, timeout=45)
+        except Exception:
+            return None
+        if r is None or r.status_code != 200:
+            return None
+        try:
+            body = r.json() or {}
+        except Exception:
+            return None
+        if body.get('errors') or 'data' not in body:
+            return None
+        conn = (body.get('data') or {}).get('collections') or {}
+        for e in conn.get('edges', []):
+            n = e.get('node') or {}
+            if n.get('handle'):
+                out.append({'id': n.get('id'), 'handle': n.get('handle'),
+                            'title': n.get('title') or '', 'smart': bool(n.get('ruleSet'))})
+        page = conn.get('pageInfo') or {}
+        if not page.get('hasNextPage'):
+            return out
+        cursor = page.get('endCursor')
+    return None  # hit the cap without finishing → treat as failed (caller falls back)
+
+
+@app.route('/api/list_collections')
+def api_list_collections():
+    """Read-only: list every collection on a store (handle, title, type). Used to sweep
+    for odd / mangled sibling-collection handles."""
+    store = request.args.get('store', 'dk')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()}.'}), 401
+    cols = _fetch_all_collections(store, shopify_headers(store))
+    if cols is None:
+        return jsonify({'error': 'collection listing failed'}), 502
+    return jsonify({'store': store, 'count': len(cols), 'collections': cols})
+
+
 def _job_relink_siblings(jid, store, hdrs):
     """Relink colour-variant sets that lost their theme.siblings link (the numbered
     -1/-10 handles from the old empty-colour era). CONSERVATIVE: only acts on a
@@ -2515,9 +2563,19 @@ def _job_relink_siblings(jid, store, hdrs):
     # as 'absent' — otherwise a rate-limit blip would create an orphan '-1' duplicate and
     # rewrite valid links to it. Self-contained (doesn't use _ensure_siblings_collection)
     # so the publish path is untouched; every call goes through the _shopify_call throttle.
+    #
+    # SPEED: fetch every collection ONCE up front (a few list calls) instead of a probe
+    # per group (hundreds of calls). If that listing fails we fall back to per-handle
+    # probes so the fail-closed guarantee still holds.
+    _all_cols = _fetch_all_collections(store, hdrs)
+    coll_map = {c['handle']: c['id'] for c in _all_cols} if _all_cols is not None else None
+
     def _coll_state(h):
-        """('exists', gid) / ('absent', None) / ('unknown', None). A GraphQL error or
-        non-200 is 'unknown', not 'absent'."""
+        """('exists', gid) / ('absent', None) / ('unknown', None). With the prefetched map
+        it's a local lookup (no call); without it, a fail-closed per-handle probe where any
+        GraphQL error / non-200 is 'unknown', never 'absent'."""
+        if coll_map is not None:
+            return ('exists', coll_map[h]) if h in coll_map else ('absent', None)
         try:
             r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
                               json={'query': 'query($h:String!){ collectionByHandle(handle:$h){ id } }',
@@ -2549,9 +2607,8 @@ def _job_relink_siblings(jid, store, hdrs):
         titles = {(m.get('title') or '').strip().lower() for m in members if (m.get('title') or '').strip()}
         if len(titles) != 1:
             continue  # ambiguous set — don't guess
-        # shape guard: only ever materialise a real Shopify handle, never a typo'd value
+        # shape guard: malformed handles (accent/space) are Pass 3's job → skip silently
         if not re.fullmatch(r'[a-z0-9][a-z0-9-]{1,100}', handle):
-            _job_error(jid, f"'{handle}': not a valid collection handle — not recreated")
             continue
         state, _gid = _coll_state(handle)
         if state == 'exists':
@@ -2590,6 +2647,8 @@ def _job_relink_siblings(jid, store, hdrs):
                 pass
             _job_error(jid, f"'{handle}': unexpectedly already taken — skipped, re-run")
             continue
+        if coll_map is not None:
+            coll_map[handle] = new_id
         recreated += 1
         for m in members:
             num = (m.get('id') or '').rsplit('/', 1)[-1]
@@ -2613,7 +2672,15 @@ def _job_relink_siblings(jid, store, hdrs):
     # rewrite the members' metafield to the valid handle and link them. Same fail-closed
     # discipline as Pass 2 (tri-state probe, throttled calls, suffix→delete+skip).
     def _norm_handle(v):
-        return re.sub(r'[^a-z0-9]+', '-', _publish_strip_diacritics(v or '').lower()).strip('-')
+        # Map Nordic/German letters the way Shopify does (æ→ae, ø→o, å→a, …) BEFORE
+        # stripping diacritics, so the normalised handle matches the existing ASCII
+        # collection (nina-halskæde-soskende → nina-halskaede-soskende) instead of
+        # dropping the letter to a dash (→ "nina-halsk-de-soskende").
+        s = (v or '').lower()
+        for a, b in (('æ', 'ae'), ('ø', 'o'), ('å', 'a'), ('ä', 'a'), ('ö', 'o'),
+                     ('ü', 'u'), ('ß', 'ss'), ('œ', 'oe')):
+            s = s.replace(a, b)
+        return re.sub(r'[^a-z0-9]+', '-', _publish_strip_diacritics(s).lower()).strip('-')
 
     repaired = 0
     bad_groups = {}
@@ -2669,6 +2736,8 @@ def _job_relink_siblings(jid, store, hdrs):
                     pass
                 _job_error(jid, f"'{handle}': unexpectedly already taken — skipped, re-run")
                 continue
+        if coll_map is not None and coll_id:
+            coll_map[handle] = coll_id
         # rewrite the malformed metafield → valid handle, and add to the collection
         for m in members:
             num = (m.get('id') or '').rsplit('/', 1)[-1]
