@@ -12,6 +12,29 @@ export interface CheckItem {
 }
 
 /**
+ * Returns true if the price string can be parsed to a positive number by
+ * the same cleaning logic the backend uses. Catches formats like "€349",
+ * "349,-", "1.299,00 DKK" but rejects symbols-only or empty strings.
+ */
+function isPriceValid(priceStr: string): boolean {
+  let raw = priceStr;
+  // Strip currency symbols and codes
+  raw = raw.replace(/[€$£¥₩]/g, "");
+  raw = raw.replace(/\b(DKK|EUR|USD|GBP|SEK|NOK|CHF|FIN)\b/gi, "");
+  // Normalise decimal separator
+  raw = raw.replace(/,/g, ".");
+  // Strip trailing dash ("349,-")
+  raw = raw.replace(/-+$/, "");
+  // Strip all remaining non-digit, non-period chars
+  raw = raw.replace(/[^\d.]/g, "").replace(/^\.+|\.+$/g, "");
+  // Handle multiple periods (thousands separator)
+  const parts = raw.split(".");
+  if (parts.length > 2) raw = parts.slice(0, -1).join("") + "." + parts[parts.length - 1];
+  const n = parseFloat(raw);
+  return !isNaN(n) && n >= 0;
+}
+
+/**
  * Live pre-publish checks. Used both as a confirmation popup (when the user
  * clicks Publish and there are issues) and as a programmatic "is anything
  * wrong?" inspector for the publish flow.
@@ -109,7 +132,18 @@ export function buildPrePublishChecks(
       : content?.metaDescription ?? "";
     const mTitleSpecs = isActive ? data.mTitleSpecs : content?.mTitleSpecs ?? "";
     const cutline = isActive ? data.cutline : content?.cutline ?? "";
+    const priceStr = isActive ? data.price : content?.price ?? "";
     const storeLabel = STORE_CONFIG[store].label;
+
+    // Price check: must be parseable as a non-negative number
+    if (!isPriceValid(priceStr)) {
+      out.push({
+        id: `price-${store}`,
+        label: `${storeLabel}: price "${priceStr}" can't be parsed — Shopify will reject it`,
+        level: "fail",
+        detail: `Use a plain number or a format like "349,00 DKK" / "49,00 EUR"`,
+      });
+    }
 
     if (!description.trim()) {
       out.push({

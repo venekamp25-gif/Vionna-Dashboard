@@ -3394,14 +3394,35 @@ def _find_product_by_handle(store, handle, hdrs):
 
 
 def _publish_normalize_price(store, price_raw):
-    """Strip currency suffix + apply per-store psychological suffix (.95 DK / .99 FR + FI)."""
-    raw = (price_raw or '0.00').replace(',', '.').replace(' DKK', '').replace(' EUR', '').strip()
+    """Strip currency suffix + apply per-store psychological suffix (.95 DK / .99 FR + FI).
+
+    Handles common user-entered formats: "349,00 DKK", "€349", "349,-", "kr. 349",
+    "1.299,00 DKK" (thousands separator), "49,00 EUR", plain "349", etc.
+    If the value still can't be parsed after cleaning, falls back to "0<suffix>"
+    rather than forwarding garbage to Shopify (which rejects non-money_fuzzy strings).
+    """
+    raw = str(price_raw or '0.00')
+    # Strip currency symbols (€, $, £, ¥, ₩)
+    raw = re.sub(r'[€$£¥₩]', '', raw)
+    # Strip currency codes as whole words (DKK, EUR, USD, GBP, SEK, NOK, CHF, FIN)
+    raw = re.sub(r'\b(DKK|EUR|USD|GBP|SEK|NOK|CHF|FIN)\b', '', raw, flags=re.IGNORECASE)
+    # Normalise decimal separator: comma → period (handles "349,00")
+    raw = raw.replace(',', '.')
+    # Strip trailing dash — common Danish "349,-" shorthand
+    raw = raw.rstrip('-')
+    # Remove all remaining non-digit, non-period characters (spaces, "kr.", etc.)
+    raw = re.sub(r'[^\d.]', '', raw).strip('.')
+    # Handle European thousands separators: "1.299.00" (two periods) → "1299.00"
+    parts = raw.split('.')
+    if len(parts) > 2:
+        raw = ''.join(parts[:-1]) + '.' + parts[-1]
+    suffix = STORE_PRICE_SUFFIX.get(store, '.99')
     try:
-        price_int = int(float(raw))
-        suffix = STORE_PRICE_SUFFIX.get(store, '.99')
+        price_int = int(float(raw)) if raw else 0
         return f'{price_int}{suffix}'
     except Exception:
-        return raw
+        print(f'[publish] WARN: could not parse price {price_raw!r} after cleaning → using 0{suffix}')
+        return f'0{suffix}'
 
 
 def _probe_collection_by_handle(store, handle, hdrs):
