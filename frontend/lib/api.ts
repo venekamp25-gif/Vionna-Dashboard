@@ -252,7 +252,14 @@ export interface BackfillApplyResponse {
 }
 
 // ── Catalogue maintenance background jobs ──
-export type CatalogJobType = "bold_cleanup" | "channels" | "cutline" | "dedup" | "relink";
+export type CatalogJobType =
+  | "bold_cleanup"
+  | "channels"
+  | "cutline"
+  | "dedup"
+  | "relink"
+  | "fix_titles_scan"
+  | "fix_titles_apply";
 export interface CatalogJob {
   id: string;
   type: CatalogJobType;

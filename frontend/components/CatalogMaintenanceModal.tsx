@@ -18,6 +18,7 @@ interface JobDef {
   cta: string;
   danger?: boolean;
   confirm?: (store: string) => string;
+  excludeFromRunAll?: boolean;
 }
 
 const JOB_DEFS: JobDef[] = [
@@ -53,6 +54,25 @@ const JOB_DEFS: JobDef[] = [
     desc: "Re-link colour variants of the same product (the numbered -1/-10 handles) so the colour swatches show together again. Conservative: only touches sets that clearly belong together (one title, no conflicting links); mixed sets are left alone.",
     cta: "Relink siblings",
   },
+  {
+    type: "fix_titles_scan",
+    title: "Check sibling collection names",
+    desc: "Read-only scan: lists every sibling collection whose name isn't '<Product> Siblings' (e.g. 'angela collection') and what it would become. Changes nothing — safe to run anytime.",
+    cta: "Scan names",
+    excludeFromRunAll: true,
+  },
+  {
+    type: "fix_titles_apply",
+    title: "Fix sibling collection names",
+    desc: "Renames mis-named sibling collections to '<Product> Siblings' and re-links their colour variants so the swatches show. The handle/URL is left untouched, so storefront links stay intact. Reversible. Run the scan first.",
+    cta: "Fix names",
+    danger: true,
+    excludeFromRunAll: true,
+    confirm: (s) =>
+      `Rename mis-titled sibling collections on Store ${s} to '<Product> Siblings' and re-link their colour variants?\n\n` +
+      `Handles/URLs are NOT changed, so storefront links stay intact, and it's reversible.\n` +
+      `Run the Scan first if you haven't. Continue?`,
+  },
 ];
 
 export function CatalogMaintenanceModal({ open, onClose }: Props) {
@@ -86,17 +106,19 @@ export function CatalogMaintenanceModal({ open, onClose }: Props) {
     }
   };
 
-  // Run all four jobs sequentially for the selected store (one confirm up front).
+  // Run every non-excluded job sequentially for the selected store (one confirm up
+  // front). The name-fixing jobs are excluded — those stay deliberate scan-first actions.
   const runAll = async () => {
+    const runAllDefs = JOB_DEFS.filter((d) => !d.excludeFromRunAll);
     if (
       !window.confirm(
-        `Run ALL four maintenance jobs on Store ${store.toUpperCase()}, one after another?\n\n` +
+        `Run all ${runAllDefs.length} maintenance jobs on Store ${store.toUpperCase()}, one after another?\n\n` +
           `This includes drafting verified duplicates (reversible in Shopify). It can take a while on a large store.`
       )
     )
       return;
     setRunningAll(true);
-    for (const def of JOB_DEFS) {
+    for (const def of runAllDefs) {
       await runJobToCompletion(def, true);
     }
     setRunningAll(false);

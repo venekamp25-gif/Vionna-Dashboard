@@ -2509,12 +2509,171 @@ def _job_relink_siblings(jid, store, hdrs):
         _job_summary(jid, f"Relinked {j['changed']} product(s) into siblings sets; {j['skipped']} left alone (mixed/ambiguous groups).")
 
 
+def _fix_collection_titles(jid, store, hdrs, dry_run):
+    """Find sibling collections whose TITLE isn't the canonical '<Product> Siblings'
+    (e.g. a legacy/manual 'angela collection') and rename them — WITHOUT touching the
+    handle, so the storefront URL and the theme.siblings links stay intact. In apply
+    mode it ALSO re-links the members (metafield + collection membership) so the colour
+    swatches actually show.
+
+    Conservative, mirrors _job_relink_siblings: only acts on a numbered colour-variant
+    group whose members share ONE title and point at exactly ONE existing siblings
+    collection. dry_run=True makes ZERO writes — safe to run on a live store."""
+    base_url = shopify_url(store, '')
+    prods = list(_paginate_gql_products(
+        store,
+        'id handle title status siblings: metafield(namespace:"theme",key:"siblings"){value}',
+        hdrs,
+    ))
+    _job_set(jid, total=len(prods))
+
+    groups = {}
+    for n in prods:
+        _job_inc(jid, processed=1)
+        base = re.sub(r'-\d+$', '', n.get('handle') or '')
+        groups.setdefault(base, []).append(n)
+
+    def sib_of(m):
+        return ((m.get('siblings') or {}) or {}).get('value') or ''
+
+    coll_cache = {}
+
+    def coll_info(handle):
+        """GraphQL lookup → {gid, num, handle, title, smart}, or None ONLY when the
+        collection genuinely doesn't exist. RAISES on a GraphQL/throttle error so the
+        caller never mistakes a transient failure (HTTP 200 + errors[] + data:null) for
+        a deleted collection. Covers custom + smart; ruleSet is non-null only for smart."""
+        if handle in coll_cache:
+            return coll_cache[handle]
+        r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                          json={'query': 'query($h:String!){ collectionByHandle(handle:$h){ id handle title ruleSet{appliedDisjunctively} } }',
+                                'variables': {'h': handle}}, timeout=20)
+        body = r.json() if r is not None else {}
+        if (body or {}).get('errors'):
+            # GraphQL-level error (throttle/cost/etc.) — NOT a missing collection.
+            raise RuntimeError(f"graphql: {str(body['errors'][:1])[:140]}")
+        node = ((body.get('data') or {}) or {}).get('collectionByHandle')
+        info = None
+        if node:
+            gid = node.get('id') or ''
+            info = {
+                'gid': gid,
+                'num': gid.rsplit('/', 1)[-1],
+                'handle': node.get('handle') or handle,
+                'title': node.get('title') or '',
+                'smart': bool(node.get('ruleSet')),
+            }
+        coll_cache[handle] = info
+        return info
+
+    renames = []  # (handle, old_title, new_title) — also the rollback record
+
+    for base, members in groups.items():
+        if len(members) < 2:
+            continue
+        if not all(re.fullmatch(re.escape(base) + r'(-\d+)?', m.get('handle') or '') for m in members):
+            continue
+        norm_titles = set((m.get('title') or '').strip().lower() for m in members if (m.get('title') or '').strip())
+        sibs = set(sib_of(m) for m in members if sib_of(m))
+        if len(norm_titles) != 1:
+            # members disagree on the product name → can't safely derive the title
+            _job_inc(jid, skipped=len(members))
+            continue
+        if len(sibs) > 1:
+            # split across >1 collection — relink territory, don't guess here
+            _job_error(jid, f"{base}: split across {len(sibs)} collections {sorted(sibs)} — run Relink first")
+            _job_inc(jid, skipped=len(members))
+            continue
+        if len(sibs) == 0:
+            # no existing siblings link → nothing to rename (Relink/republish creates it)
+            _job_inc(jid, skipped=len(members))
+            continue
+        # canonical, deterministically-cased product title → '<Title> Siblings'.
+        # All members share one title ignoring case (guard above); pick a stable
+        # spelling (prefer a mixed-case one) so re-runs never churn the casing.
+        titles_present = sorted({(m.get('title') or '').strip() for m in members if (m.get('title') or '').strip()})
+        mixed = [t for t in titles_present if t != t.lower() and t != t.upper()]
+        product_title = (mixed[0] if mixed else (titles_present[0] if titles_present else base))
+        target_handle = next(iter(sibs))
+        try:
+            info = coll_info(target_handle)
+        except Exception as e:
+            _job_error(jid, f"{base}: lookup '{target_handle}' failed — {str(e)[:120]} (skipped; safe to re-run)")
+            _job_inc(jid, skipped=len(members))
+            continue
+        if not info:
+            _job_error(jid, f"{base}: linked to '{target_handle}' but that collection no longer exists — run Relink")
+            _job_inc(jid, skipped=len(members))
+            continue
+        # Defence-in-depth: only auto-rename this tool's own sibling-collection handle
+        # conventions ('-siblings' canonical, '-collection' legacy). Anything else the
+        # metafield happens to reference is surfaced for review but left untouched.
+        if not (info['handle'].endswith('-siblings') or info['handle'].endswith('-collection')):
+            _job_error(jid, f"{base}: linked to '{info['handle']}' (title '{info['title']}') — unusual handle, not auto-renamed")
+            _job_inc(jid, skipped=len(members))
+            continue
+        proposed = f"{product_title} Siblings"
+        if info['title'].strip() == proposed:
+            continue  # already correct → nothing to do
+        renames.append((info['handle'], info['title'], proposed))
+        if dry_run:
+            continue  # SCAN — record only, make no writes
+        # APPLY — rename the title via GraphQL collectionUpdate (works for custom AND
+        # smart collections). We deliberately omit `handle` so the URL + theme.siblings
+        # links are preserved.
+        try:
+            rr = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                               json={'query': 'mutation($id:ID!,$t:String!){ collectionUpdate(input:{id:$id,title:$t}){ userErrors{field message} } }',
+                                     'variables': {'id': info['gid'], 't': proposed}}, timeout=20)
+            errs = (((rr.json().get('data') or {}).get('collectionUpdate') or {}).get('userErrors')) or []
+            if errs:
+                _job_error(jid, f"{info['handle']} rename: {errs[0].get('message')}")
+                continue
+            _job_inc(jid, changed=1)
+        except Exception as e:
+            _job_error(jid, f"{info['handle']} rename: {e}")
+            continue
+        # repair linkage so the swatches truly work for these products
+        for m in members:
+            num = (m.get('id') or '').rsplit('/', 1)[-1]
+            try:
+                if sib_of(m) != info['handle']:
+                    _shopify_call('post', shopify_url(store, f'products/{num}/metafields.json'), hdrs,
+                                  json={'metafield': {'namespace': 'theme', 'key': 'siblings',
+                                                      'value': info['handle'], 'type': 'single_line_text_field'}},
+                                  timeout=20)
+                if not info['smart']:
+                    _shopify_call('post', f"{base_url}collects.json", hdrs,
+                                  json={'collect': {'product_id': int(num), 'collection_id': int(info['num'])}}, timeout=20)
+            except Exception as ex:
+                _job_error(jid, f"{m.get('handle')} relink: {ex}")
+
+    lines = '; '.join(f"'{o}' → '{p}'" for (_h, o, p) in renames[:25])
+    n_ren = len(renames)
+    if dry_run:
+        _job_summary(jid, f"SCAN (no changes made): {n_ren} sibling collection(s) need renaming. "
+                          + (lines if lines else "All sibling-collection names are already correct."))
+    else:
+        _job_summary(jid, f"Renamed {n_ren} sibling collection(s) to '<Product> Siblings' and re-linked their colour variants. "
+                          f"Handles/URLs untouched — links preserved, reversible. " + lines)
+
+
+def _job_fix_titles_scan(jid, store, hdrs):
+    _fix_collection_titles(jid, store, hdrs, dry_run=True)
+
+
+def _job_fix_titles_apply(jid, store, hdrs):
+    _fix_collection_titles(jid, store, hdrs, dry_run=False)
+
+
 _JOB_TYPES = {
-    'bold_cleanup': _job_bold_cleanup,
-    'channels':     _job_channels,
-    'cutline':      _job_cutline,
-    'relink':       _job_relink_siblings,
-    'dedup':        _job_dedup,
+    'bold_cleanup':     _job_bold_cleanup,
+    'channels':         _job_channels,
+    'cutline':          _job_cutline,
+    'relink':           _job_relink_siblings,
+    'dedup':            _job_dedup,
+    'fix_titles_scan':  _job_fix_titles_scan,
+    'fix_titles_apply': _job_fix_titles_apply,
 }
 
 
