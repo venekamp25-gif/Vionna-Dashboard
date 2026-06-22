@@ -2863,6 +2863,13 @@ def bug_reports_create():
         _post_bug_to_slack(entry)
     except Exception as ex:
         print(f"[bugs] slack notify failed: {ex}")
+    # Hands-off auto-fix: kick the Claude Code routine (best-effort, no-op when
+    # unconfigured). The routine fixes the bug, opens a PR, and auto-merges it
+    # once CI is green — the CEO just gets the "fixed" notification from the app.
+    try:
+        _fire_routine(entry)
+    except Exception as ex:
+        print(f"[bugs] routine fire failed: {ex}")
     return jsonify({'success': True, 'id': bug_id})
 
 
@@ -2911,6 +2918,69 @@ def _post_bug_to_slack(entry):
     blocks.append({'type': 'context', 'elements': [
         {'type': 'mrkdwn', 'text': "Open Claude Code and say *“work the bug queue”* to fix."}]})
     req.post(url, json={'text': f"🐛 New bug #{bug_id}: {entry.get('title','')}", 'blocks': blocks}, timeout=10)
+
+
+def _fire_routine(entry):
+    """Kick off the hands-off bug-fix routine on Claude Code (cloud) for a newly
+    reported bug. Best-effort: no-op when unconfigured, never raises to the
+    caller path.
+
+    Config (droplet .env, gitignored):
+      ROUTINE_FIRE_URL    https://api.anthropic.com/v1/claude_code/routines/<id>/fire
+      ROUTINE_FIRE_TOKEN  the routine's sk-ant-... bearer token (keep secret)
+      ROUTINE_FIRE_BETA   optional override for the anthropic-beta header
+
+    The routine runs in a sandbox that can't reach this droplet, so we hand it
+    everything it needs (bug details + import context) in the `text` payload
+    rather than expecting it to call back for the queue.
+    """
+    fire_url = os.getenv('ROUTINE_FIRE_URL', '').strip()
+    token    = os.getenv('ROUTINE_FIRE_TOKEN', '').strip()
+    if not fire_url or not token:
+        return  # auto-fix not configured on this droplet
+
+    bug_id = entry.get('id', '?')
+    shop_base = os.getenv('PUBLIC_BASE_URL', 'https://188-166-11-177.nip.io').rstrip('/')
+    lines = [
+        "A new bug was just reported in the Vionna Dashboard. Fix it hands-off, "
+        "following your routine instructions.",
+        "",
+        f"Bug #{bug_id}: {entry.get('title','')}",
+        f"Store: {entry.get('store') or '—'}",
+        f"Page: {entry.get('page_url') or '—'}",
+        f"Reporter: {entry.get('reporter_email') or 'unknown'}",
+        "",
+        "Description:",
+        (entry.get('description') or '(none)'),
+    ]
+    diag = entry.get('diagnostics')
+    if isinstance(diag, dict):
+        if diag.get('competitor_url'):
+            lines.append(f"\nCompetitor URL: {diag['competitor_url']}")
+        if diag.get('color_count') is not None:
+            colors = ', '.join(diag.get('detected_colors') or []) or '—'
+            lines.append(f"Detected colours ({diag.get('color_count')}): {colors}")
+        if diag.get('sizes'):
+            lines.append(f"Sizes: {', '.join(diag['sizes'])}")
+    if entry.get('screenshot_filename'):
+        lines.append(f"\nScreenshot: {shop_base}/api/bug_reports/{bug_id}/screenshot")
+
+    headers = {
+        'Authorization':    f'Bearer {token}',
+        'anthropic-version': '2023-06-01',
+        'Content-Type':     'application/json',
+    }
+    beta = os.getenv('ROUTINE_FIRE_BETA', 'experimental-cc-routine-2026-04-01').strip()
+    if beta:
+        headers['anthropic-beta'] = beta
+    try:
+        r = req.post(fire_url, headers=headers, json={'text': '\n'.join(lines)}, timeout=15)
+        if r.status_code >= 300:
+            print(f"[bugs] routine fire returned {r.status_code}: {r.text[:300]}")
+        else:
+            print(f"[bugs] routine fired for #{bug_id}")
+    except Exception as ex:
+        print(f"[bugs] routine fire failed: {ex}")
 
 
 @app.route('/api/config/slack_webhook', methods=['POST'])
