@@ -1,8 +1,10 @@
 name: CI
 
-# Runs on every push to main + PRs. Surfaces broken commits loudly (red X +
-# email) before they cause trouble. Note: the droplet auto-pulls main on a
-# timer, so this is a fast warning signal, not a hard deploy gate.
+# Runs on every push to main + PRs. This is the gate that makes hands-off
+# auto-merge safe: a PR only goes live once these jobs are green. The backend
+# job imports server.py (the file the droplet runs verbatim) so a broken edit
+# can't reach production; the frontend job runs the same `next build` Netlify
+# uses to publish.
 on:
   push:
     branches: [main]
@@ -10,20 +12,22 @@ on:
 
 jobs:
   backend-tests:
-    name: Backend tests (classifier)
+    name: Backend tests + import smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install test deps
-        run: pip install requests pytest
-      - name: Run pytest
+      - name: Install deps
+        run: pip install -r backend/requirements.txt pytest
+      - name: Compile-check the live backend
+        run: python -m py_compile backend/server.py backend/shipping_check.py
+      - name: Run pytest (incl. server.py import smoke test)
         run: python -m pytest backend/tests -q
 
   frontend-types:
-    name: Frontend type-check
+    name: Frontend type-check + build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,3 +40,7 @@ jobs:
       - name: Type-check
         run: npx tsc --noEmit -p tsconfig.json
         working-directory: frontend
+      - name: Build (same as Netlify publish)
+        run: npm run build
+        working-directory: frontend
+
