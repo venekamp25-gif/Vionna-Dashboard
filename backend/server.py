@@ -2940,15 +2940,55 @@ def _find_product_by_handle(store, handle, hdrs):
     return None
 
 
-def _publish_normalize_price(store, price_raw):
-    """Strip currency suffix + apply per-store psychological suffix (.95 DK / .99 FR + FI)."""
-    raw = (price_raw or '0.00').replace(',', '.').replace(' DKK', '').replace(' EUR', '').strip()
+def _parse_money_amount(raw):
+    """Best-effort parse of a price string into a float, tolerant of currency
+    codes/symbols and EU/US thousands+decimal separators. Returns None when no
+    positive amount can be found.
+
+      "349,00 DKK" -> 349.0    "1.295,00 DKK" -> 1295.0   "5,077.25" -> 5077.25
+      "Rs. 1.234,50" -> 1234.5  "€49" -> 49.0   "" / "kr" / None -> None
+    """
+    s = re.sub(r'[^0-9.,]', '', str(raw if raw is not None else ''))  # keep digits + separators only
+    if not any(ch.isdigit() for ch in s):
+        return None
+    if ',' in s and '.' in s:
+        # Both present: the RIGHTMOST separator is the decimal point; the other
+        # groups thousands (handles "1.295,00" EU and "5,077.25" US alike).
+        dec = ',' if s.rfind(',') > s.rfind('.') else '.'
+        thou = '.' if dec == ',' else ','
+        s = s.replace(thou, '').replace(dec, '.')
+    elif ',' in s:
+        # Only commas: decimal when the last group is 1-2 digits ("349,00"),
+        # otherwise a thousands separator ("5,077").
+        s = s.replace(',', '.') if len(s.split(',')[-1]) <= 2 else s.replace(',', '')
+    # else: only dots (or plain digits) — the dot is already the decimal point.
     try:
-        price_int = int(float(raw))
-        suffix = STORE_PRICE_SUFFIX.get(store, '.99')
-        return f'{price_int}{suffix}'
-    except Exception:
-        return raw
+        val = float(s)
+    except ValueError:
+        return None
+    return val if val > 0 else None
+
+
+def _publish_normalize_price(store, price_raw):
+    """Selling price for Shopify: parse the amount robustly, then apply the
+    per-store psychological suffix (.95 DK / .99 FR + FI). Returns None when the
+    input has no usable number, so the caller can fail with a clear message
+    instead of letting Shopify reject it with a cryptic 'money_fuzzy' error."""
+    amount = _parse_money_amount(price_raw)
+    if amount is None:
+        return None
+    suffix = STORE_PRICE_SUFFIX.get(store, '.99')
+    return f'{int(amount)}{suffix}'
+
+
+def _publish_clean_money(raw):
+    """Shopify-safe 'X.XX' money string for fields written verbatim
+    (compare_at_price), or None when blank/unparseable. Keeps the actual amount
+    — no psychological suffix."""
+    if raw in (None, ''):
+        return None
+    amount = _parse_money_amount(raw)
+    return f'{amount:.2f}' if amount is not None else None
 
 
 def _probe_collection_by_handle(store, handle, hdrs):
@@ -3387,7 +3427,14 @@ def publish_create_variant():
     m_title_specs    = data.get('m_title_specs', '')
     product_type     = data.get('product_type', '')
     price            = _publish_normalize_price(store, data.get('price', '0.00'))
-    compare_at_price = data.get('compare_at_price')
+    if price is None:
+        return jsonify({
+            'success': False,
+            'error': (f"Invalid price {data.get('price')!r} for {store.upper()} — "
+                      "enter a numeric price in Review and retry."),
+            'metafield_errors': [],
+        }), 400
+    compare_at_price = _publish_clean_money(data.get('compare_at_price'))
     images           = data.get('images', []) or []
     collection_id    = data.get('collection_id')
     actual_handle    = data.get('actual_handle', '') or data.get('siblings_handle', '')
@@ -3443,16 +3490,15 @@ def publish():
     meta_description = data.get('meta_description', '')
     m_title_specs    = data.get('m_title_specs', '')
     product_type     = data.get('product_type', '')
-    price_raw        = data.get('price', '0.00').replace(',', '.').replace(' DKK','').replace(' EUR','').strip()
-    # Adjust selling price suffix: .95 for DK, .99 for FR + FI (via STORE_PRICE_SUFFIX)
-    try:
-        price_int   = int(float(price_raw))
-        suffix      = STORE_PRICE_SUFFIX.get(store, '.99')
-        price       = f'{price_int}{suffix}'
-    except Exception:
-        price       = price_raw
-    print(f"[publish] Price '{price_raw}' -> '{price}' (store: {store})")
-    compare_at_price = data.get('compare_at_price')   # optional, None = no compare price
+    # Selling price: parse robustly (EU/US separators, currency tokens) + apply
+    # the per-store psychological suffix. None = no usable number → bail clearly
+    # instead of sending junk that Shopify rejects with a cryptic 'money_fuzzy'.
+    price = _publish_normalize_price(store, data.get('price', '0.00'))
+    if price is None:
+        return jsonify({'error': (f"Invalid price {data.get('price')!r} for {store.upper()} — "
+                                  "enter a numeric price in Review and retry.")}), 400
+    print(f"[publish] Price {data.get('price')!r} -> '{price}' (store: {store})")
+    compare_at_price = _publish_clean_money(data.get('compare_at_price'))   # None = no compare price
     size_option_name = STORE_SIZE_OPTION.get(store, 'Taille')
     colors           = data.get('colors', [])
     sizes            = data.get('sizes', ['XS', 'S', 'M', 'L', 'XL'])
