@@ -2838,16 +2838,20 @@ def _fix_collection_titles(jid, store, hdrs, dry_run):
         if len(members) < 2:
             continue  # a lone product isn't a clear colour-variant set
         titles_present = sorted({(m.get('title') or '').strip() for m in members if (m.get('title') or '').strip()})
-        norm_titles = {t.lower() for t in titles_present}
+        # Accent/case-insensitive grouping: a set whose members differ ONLY by accents or
+        # case (Valerie vs Valérie, Josephine vs Joséphine) is still one product — name it.
+        norm_titles = {_norm(t) for t in titles_present}
         if len(norm_titles) != 1:
-            # members disagree on the product name → can't safely derive the title
+            # members genuinely disagree on the product name → can't safely derive the title
             _job_error(jid, f"'{sib_handle}': members have different titles {titles_present[:4]} — skipped")
             _job_inc(jid, skipped=len(members))
             continue
-        # canonical, deterministically-cased product title → '<Title> Siblings'
-        # (prefer a mixed-case spelling so re-runs never churn the casing).
-        mixed = [t for t in titles_present if t != t.lower() and t != t.upper()]
-        product_title = mixed[0] if mixed else titles_present[0]
+        # canonical product title → '<Title> Siblings'. Prefer the richest spelling —
+        # accented over plain, mixed-case over all-lower/all-upper — deterministically, so
+        # re-runs don't churn. This only names the COLLECTION; product titles are untouched.
+        def _title_rank(t):
+            return (_publish_strip_diacritics(t) != t, t != t.lower() and t != t.upper(), t)
+        product_title = max(titles_present, key=_title_rank)
         try:
             info = coll_info(sib_handle)
         except Exception as e:
@@ -2871,7 +2875,9 @@ def _fix_collection_titles(jid, store, hdrs, dry_run):
         # If it differs by actual WORDS (e.g. an 'Ava Siblings' collection whose products
         # are titled 'Flavia', or 'Nina Armbånd Siblings' for plain 'Nina' products), that
         # is a deliberate name or a mis-link — leave it alone and flag it for review.
-        fixable = _norm(cur) in (f"{_norm(product_title)} siblings", f"{_norm(product_title)} collection")
+        np = _norm(product_title)
+        # 'collection' synonyms — incl. Finnish kokoelma / mallisto — count as fixable formatting
+        fixable = _norm(cur) in (f"{np} siblings", f"{np} collection", f"{np} kokoelma", f"{np} mallisto")
         if cur != proposed and not fixable:
             _job_error(jid, f"'{info['handle']}' titled '{cur}' but its products are '{product_title}' — left alone (rename manually if needed)")
             _job_inc(jid, skipped=len(members))
