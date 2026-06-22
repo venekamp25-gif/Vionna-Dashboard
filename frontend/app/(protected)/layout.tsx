@@ -1,6 +1,7 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { verifySession, COOKIE_NAME } from "@/lib/auth";
+import { AuroraDashboardBackground } from "@/components/AuroraDashboardBackground";
 
 /**
  * Server-side auth gate.
@@ -16,5 +17,10 @@ export default async function ProtectedLayout({ children }: { children: React.Re
     redirect("/login");
   }
 
-  return <>{children}</>;
+  return (
+    <>
+      <AuroraDashboardBackground />
+      {children}
+    </>
+  );
 }

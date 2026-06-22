@@ -10,12 +10,16 @@ import { SettingsModal } from "./SettingsModal";
 import { HistoryModal } from "./HistoryModal";
 import { ReportBugModal } from "./ReportBugModal";
 import { KeywordBackfillModal } from "./KeywordBackfillModal";
+import { CatalogMaintenanceModal } from "./CatalogMaintenanceModal";
+import { useCatalogJobs } from "@/lib/catalogJobs";
 
 export function Header() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [historyOpen, setHistoryOpen]   = useState(false);
   const [bugOpen, setBugOpen]           = useState(false);
   const [backfillOpen, setBackfillOpen] = useState(false);
+  const [maintenanceOpen, setMaintenanceOpen] = useState(false);
+  const maintenanceRunning = useCatalogJobs().some((j) => j.status === "running");
 
   return (
     <>
@@ -44,6 +48,18 @@ export function Header() {
           </button>
           <button
             type="button"
+            onClick={() => setMaintenanceOpen(true)}
+            title={maintenanceRunning ? "Catalogue maintenance — a job is running" : "Catalogue maintenance — bulk fixes (bold, channels, cutlines, duplicates)"}
+            aria-label="Open catalogue maintenance"
+            className="relative w-9 h-9 flex items-center justify-center rounded-md bg-bg-elev-2 text-text-dim hover:text-accent hover:border-accent border border-border transition-colors text-[14px]"
+          >
+            🧹
+            {maintenanceRunning && (
+              <span className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-accent border border-bg-elev animate-pulse" />
+            )}
+          </button>
+          <button
+            type="button"
             onClick={() => setHistoryOpen(true)}
             title="Publish history"
             aria-label="Open publish history"
@@ -68,6 +84,7 @@ export function Header() {
       <HistoryModal open={historyOpen} onClose={() => setHistoryOpen(false)} />
       <ReportBugModal open={bugOpen} onClose={() => setBugOpen(false)} />
       <KeywordBackfillModal open={backfillOpen} onClose={() => setBackfillOpen(false)} />
+      <CatalogMaintenanceModal open={maintenanceOpen} onClose={() => setMaintenanceOpen(false)} />
     </>
   );
 }

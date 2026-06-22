@@ -493,7 +493,7 @@ def verify_products():
         id_list = ', '.join(f'"{g}"' for g in chunk)
         query = (
             '{ nodes(ids: [%s]) { ... on Product { '
-            'id title status '
+            'id title status descriptionHtml '
             'images(first: 30) { nodes { id } } '
             'cutline: metafield(namespace:"theme", key:"cutline") { value } '
             'siblings: metafield(namespace:"theme", key:"siblings") { value } '
@@ -514,6 +514,7 @@ def verify_products():
             siblings_v  = ((n.get('siblings') or {}) or {}).get('value') or ''
             channels    = ((n.get('resourcePublicationsCount') or {}) or {}).get('count') or 0
             variants    = ((n.get('variantsCount') or {}) or {}).get('count') or 0
+            body_html   = n.get('descriptionHtml') or ''
             issues = []
             if n_images == 0:
                 issues.append({'level': 'fail', 'msg': 'No images attached'})
@@ -525,6 +526,8 @@ def verify_products():
                 issues.append({'level': 'warn', 'msg': 'Not on any sales channel'})
             if variants == 0:
                 issues.append({'level': 'fail', 'msg': 'No variants'})
+            if '**' in body_html:
+                issues.append({'level': 'warn', 'msg': 'Description still shows ** (unformatted bold)'})
             out.append({
                 'id': n.get('id', '').rsplit('/', 1)[-1],
                 'title': n.get('title', ''),
@@ -596,6 +599,72 @@ def audit_catalog():
         'no_images': _summ(no_images),
         'not_on_channels': _summ(not_on_channels),
         'duplicates': {'count': dup_extra, 'groups': dup_groups[:20]},
+    })
+
+
+@app.route('/api/duplicate_detail')
+def duplicate_detail():
+    """Read-only diagnostic: for every base-handle group with numbered siblings
+    (X + X-1/X-2...), return per-product detail (title, status, colour swatch,
+    siblings link, image filename) plus a verdict — 'distinct' (different images
+    = colour variants, not a duplicate) vs 'POSSIBLE-DUP' (two share an image).
+    Lets us understand what the audit's 'duplicates' count actually is. No writes."""
+    store = request.args.get('store', 'dk')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()} store.'}), 401
+    hdrs = shopify_headers(store)
+    try:
+        prods = list(_paginate_gql_products(
+            store,
+            'id handle title status featuredImage{url} '
+            'cutline: metafield(namespace:"theme",key:"cutline"){value} '
+            'siblings: metafield(namespace:"theme",key:"siblings"){value}',
+            hdrs,
+        ))
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+
+    def imgfile(n):
+        return _img_key(((n.get('featuredImage') or {}) or {}).get('url') or '')
+
+    groups = {}
+    for n in prods:
+        base = re.sub(r'-\d+$', '', n.get('handle') or '')
+        groups.setdefault(base, []).append(n)
+
+    out = []
+    for base, members in groups.items():
+        if len(members) < 2:
+            continue
+        if not all(re.fullmatch(re.escape(base) + r'(-\d+)?', m.get('handle') or '') for m in members):
+            continue
+        items, imgs = [], {}
+        for m in members:
+            f = imgfile(m)
+            if f:
+                imgs[f] = imgs.get(f, 0) + 1
+            items.append({
+                'handle': m.get('handle'),
+                'title': m.get('title'),
+                'status': (m.get('status') or '').upper(),
+                'cutline': ((m.get('cutline') or {}) or {}).get('value') or '',
+                'siblings': ((m.get('siblings') or {}) or {}).get('value') or '',
+                'image': f,
+            })
+        same_img = any(c >= 2 for c in imgs.values())
+        out.append({
+            'base': base,
+            'count': len(members),
+            'distinct_images': len(imgs),
+            'verdict': 'POSSIBLE-DUP (shared image)' if same_img else 'distinct (different images)',
+            'items': items,
+        })
+    out.sort(key=lambda g: (-1 if g['verdict'].startswith('POSSIBLE') else 0, -g['count']))
+    return jsonify({
+        'store': store,
+        'group_count': len(out),
+        'possible_dup_groups': sum(1 for g in out if g['verdict'].startswith('POSSIBLE')),
+        'groups': out,
     })
 
 
@@ -2134,6 +2203,382 @@ def backfill_apply():
     })
 
 
+# --- Catalogue maintenance: long-running background jobs -------------------
+# Bulk fixes over a whole store (thousands of products) can't finish inside one
+# HTTP request — they blow past the gateway timeout (the "Failed to fetch" on the
+# big stores). So each fix runs in a background thread, reports progress into an
+# in-memory registry, and the frontend polls /api/catalog_job/status. Every write
+# goes through _shopify_call so we stay under Shopify's ~2-calls/sec cap. All four
+# job types are REVERSIBLE: text edit / add metafield / set draft / idempotent
+# channel publish.
+
+_JOBS = {}
+_JOBS_LOCK = threading.RLock()  # reentrant: job helpers re-acquire it while a caller already holds it
+_JOB_COUNTER = [0]
+
+
+def _job_new(job_type, store):
+    with _JOBS_LOCK:
+        _JOB_COUNTER[0] += 1
+        jid = f'job_{_JOB_COUNTER[0]}'
+        _JOBS[jid] = {
+            'id': jid, 'type': job_type, 'store': store, 'status': 'running',
+            'total': None, 'processed': 0, 'changed': 0, 'skipped': 0,
+            'errors': [], 'summary': '',
+            'started_at': datetime.datetime.utcnow().isoformat() + 'Z', 'finished_at': None,
+        }
+    return jid
+
+
+def _job_set(jid, **fields):
+    with _JOBS_LOCK:
+        if jid in _JOBS:
+            _JOBS[jid].update(fields)
+
+
+def _job_inc(jid, **deltas):
+    with _JOBS_LOCK:
+        j = _JOBS.get(jid)
+        if j:
+            for k, v in deltas.items():
+                j[k] = (j.get(k) or 0) + v
+
+
+def _job_error(jid, msg):
+    with _JOBS_LOCK:
+        j = _JOBS.get(jid)
+        if j and len(j['errors']) < 50:
+            j['errors'].append(str(msg)[:200])
+
+
+def _job_summary(jid, text):
+    with _JOBS_LOCK:
+        if jid in _JOBS:
+            _JOBS[jid]['summary'] = text
+
+
+def _paginate_rest_products(store, path, hdrs):
+    """Yield product dicts across all REST pages via the Link header (throttled)."""
+    next_url = shopify_url(store, path)
+    while next_url:
+        r = _shopify_call('get', next_url, hdrs, timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(f'list failed HTTP {r.status_code}: {r.text[:150]}')
+        for p in r.json().get('products', []):
+            yield p
+        link = r.headers.get('Link') or r.headers.get('link') or ''
+        m = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        next_url = m.group(1) if m else None
+
+
+def _paginate_gql_products(store, node_fields, hdrs):
+    """Yield product nodes across all GraphQL pages (throttled)."""
+    cursor = None
+    while True:
+        after = f', after:"{cursor}"' if cursor else ''
+        q = '{ products(first:200%s){ pageInfo{hasNextPage endCursor} edges{ node{ %s } } } }' % (after, node_fields)
+        r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs, json={'query': q}, timeout=45)
+        conn = (r.json().get('data') or {}).get('products') or {}
+        for e in conn.get('edges', []):
+            yield e['node']
+        page = conn.get('pageInfo') or {}
+        if not page.get('hasNextPage'):
+            break
+        cursor = page.get('endCursor')
+
+
+def _store_product_count(store, hdrs, status='active,draft'):
+    try:
+        r = _shopify_call('get', shopify_url(store, f'products/count.json?status={status}'), hdrs, timeout=20)
+        return int((r.json() or {}).get('count') or 0)
+    except Exception:
+        return None
+
+
+def _job_bold_cleanup(jid, store, hdrs):
+    """Convert literal '**bold**' left in existing product bodies to <strong>."""
+    _job_set(jid, total=_store_product_count(store, hdrs))
+    for p in _paginate_rest_products(store, 'products.json?limit=250&fields=id,handle,body_html&status=active,draft', hdrs):
+        _job_inc(jid, processed=1)
+        body = p.get('body_html') or ''
+        if '**' not in body:
+            continue
+        new_body = _md_inline(body)
+        if new_body == body:
+            continue
+        try:
+            r = _shopify_call('put', shopify_url(store, f"products/{p['id']}.json"), hdrs,
+                              json={'product': {'id': p['id'], 'body_html': new_body}}, timeout=20)
+            if r.status_code in (200, 201):
+                _job_inc(jid, changed=1)
+            else:
+                _job_error(jid, f"{p.get('handle')}: HTTP {r.status_code}")
+        except Exception as e:
+            _job_error(jid, f"{p.get('handle')}: {e}")
+    with _JOBS_LOCK:
+        j = _JOBS[jid]
+        _job_summary(jid, f"Cleaned ** from {j['changed']} product(s) of {j['processed']} scanned.")
+
+
+def _job_channels(jid, store, hdrs):
+    """(Re)publish every product to the store's default sales channels."""
+    pubs = _list_publications(store, hdrs)
+    targets = _default_publication_targets(pubs)
+    if not targets:
+        _job_error(jid, f"available publications: {[p.get('name') for p in pubs]}")
+        _job_summary(jid, 'No Online Store / Facebook / Google / Pinterest channels are installed on this store.')
+        return
+    names = ', '.join(str(p.get('name') or '?') for p in targets)
+    _job_set(jid, total=_store_product_count(store, hdrs, status='active,draft,archived'))
+    for p in _paginate_rest_products(store, 'products.json?limit=250&fields=id,title,status&status=active,draft,archived', hdrs):
+        _job_inc(jid, processed=1)
+        pid = p.get('id')
+        if not pid:
+            continue
+        errs = _publish_to_default_channels(store, pid, hdrs)
+        if errs:
+            _job_error(jid, f"{p.get('title')}: {errs[0]}")
+        else:
+            _job_inc(jid, changed=1)
+    with _JOBS_LOCK:
+        j = _JOBS[jid]
+        _job_summary(jid, f"{j['changed']} of {j['processed']} product(s) confirmed on [{names}].")
+
+
+def _job_cutline(jid, store, hdrs):
+    """Set theme.cutline (colour swatch) on products that are missing it, deriving
+    the colour from the product handle."""
+    _job_set(jid, total=_store_product_count(store, hdrs))
+    for n in _paginate_gql_products(store, 'id handle status cutline: metafield(namespace:"theme",key:"cutline"){value}', hdrs):
+        _job_inc(jid, processed=1)
+        cut = ((n.get('cutline') or {}) or {}).get('value') or ''
+        if cut.strip():
+            continue
+        color = _derive_color_from_handle(n.get('handle') or '')
+        if not color:
+            _job_inc(jid, skipped=1)
+            continue
+        num = (n.get('id') or '').rsplit('/', 1)[-1]
+        try:
+            pr = _shopify_call('post', shopify_url(store, f'products/{num}/metafields.json'), hdrs,
+                               json={'metafield': {'namespace': 'theme', 'key': 'cutline',
+                                                   'value': color, 'type': 'single_line_text_field'}}, timeout=20)
+            if pr.status_code in (200, 201):
+                _job_inc(jid, changed=1)
+            else:
+                _job_error(jid, f"{n.get('handle')}: HTTP {pr.status_code}")
+        except Exception as ex:
+            _job_error(jid, f"{n.get('handle')}: {ex}")
+    with _JOBS_LOCK:
+        j = _JOBS[jid]
+        _job_summary(jid, f"Set {j['changed']} cutline(s); {j['skipped']} skipped (no colour in handle) of {j['processed']} scanned.")
+
+
+def _img_key(url):
+    """Normalized featured-image identity: filename without query, extension, or
+    Shopify's re-upload hash suffix — so sigrid.png, sigrid.webp and
+    sigrid_5b5431b7.png all compare equal (the same photo re-uploaded)."""
+    f = (url or '').split('?', 1)[0].rsplit('/', 1)[-1].lower()
+    f = re.sub(r'\.[a-z0-9]+$', '', f)      # drop extension
+    f = re.sub(r'_[0-9a-f]{6,}$', '', f)    # drop Shopify's _<hex> re-upload suffix
+    return f
+
+
+def _job_dedup(jid, store, hdrs):
+    """Set true duplicate products to draft. A '-1/-2' handle suffix alone is NOT
+    enough (those false positives were the Margaux/Sascha problem): we only draft
+    a product when another in its base-handle group has the SAME title AND the
+    SAME featured image (normalized via _img_key, so a re-uploaded photo with a
+    different extension/hash still matches). Different image (or no image) → left
+    untouched. Drafting is reversible — re-activate in Shopify if ever wrong."""
+    products = list(_paginate_gql_products(store, 'id handle title status featuredImage{url}', hdrs))
+    _job_set(jid, total=len(products))
+
+    def img_key(n):
+        return _img_key(((n.get('featuredImage') or {}) or {}).get('url') or '')
+
+    def num_id(n):
+        try:
+            return int((n.get('id') or '').rsplit('/', 1)[-1])
+        except Exception:
+            return 0
+
+    groups = {}
+    for n in products:
+        _job_inc(jid, processed=1)
+        base = re.sub(r'-\d+$', '', n.get('handle') or '')
+        groups.setdefault(base, []).append(n)
+
+    for base, members in groups.items():
+        if len(members) < 2:
+            continue
+        if not all(re.fullmatch(re.escape(base) + r'(-\d+)?', m.get('handle') or '') for m in members):
+            continue
+        buckets = {}
+        for m in members:
+            buckets.setdefault(((m.get('title') or '').strip().lower(), img_key(m)), []).append(m)
+        for (title, ik), bucket in buckets.items():
+            if len(bucket) < 2:
+                continue
+            if not ik:  # no image to compare → too risky, leave alone
+                _job_inc(jid, skipped=len(bucket) - 1)
+                continue
+            bucket.sort(key=lambda m: (0 if (m.get('status') or '').upper() == 'ACTIVE' else 1, num_id(m)))
+            for dup in bucket[1:]:
+                if (dup.get('status') or '').upper() in ('DRAFT', 'ARCHIVED'):
+                    continue
+                num = (dup.get('id') or '').rsplit('/', 1)[-1]
+                try:
+                    pr = _shopify_call('put', shopify_url(store, f'products/{num}.json'), hdrs,
+                                       json={'product': {'id': int(num), 'status': 'draft'}}, timeout=20)
+                    if pr.status_code in (200, 201):
+                        _job_inc(jid, changed=1)
+                    else:
+                        _job_error(jid, f"{dup.get('handle')}: HTTP {pr.status_code}")
+                except Exception as ex:
+                    _job_error(jid, f"{dup.get('handle')}: {ex}")
+    with _JOBS_LOCK:
+        j = _JOBS[jid]
+        _job_summary(jid, f"Drafted {j['changed']} verified duplicate(s); {j['skipped']} left alone (different/no image). Reversible in Shopify.")
+
+
+def _job_relink_siblings(jid, store, hdrs):
+    """Relink colour-variant sets that lost their theme.siblings link (the numbered
+    -1/-10 handles from the old empty-colour era). CONSERVATIVE: only acts on a
+    base-handle group when every member shares ONE title and at most one existing
+    siblings handle — so mixed sets (e.g. a 'Nina' necklace + earrings) are left
+    alone. For a coherent set it ensures the siblings collection exists, writes the
+    theme.siblings metafield on members missing it, and adds them to the collection."""
+    base_url = shopify_url(store, '')
+    prods = list(_paginate_gql_products(
+        store,
+        'id handle title status siblings: metafield(namespace:"theme",key:"siblings"){value}',
+        hdrs,
+    ))
+    _job_set(jid, total=len(prods))
+
+    groups = {}
+    for n in prods:
+        _job_inc(jid, processed=1)
+        base = re.sub(r'-\d+$', '', n.get('handle') or '')
+        groups.setdefault(base, []).append(n)
+
+    def sib_of(m):
+        return ((m.get('siblings') or {}) or {}).get('value') or ''
+
+    for base, members in groups.items():
+        if len(members) < 2:
+            continue
+        if not all(re.fullmatch(re.escape(base) + r'(-\d+)?', m.get('handle') or '') for m in members):
+            continue
+        titles = set((m.get('title') or '').strip().lower() for m in members)
+        sibs = set(sib_of(m) for m in members if sib_of(m))
+        # Only coherent colour-variant sets: one title, at most one existing siblings handle.
+        if len(titles) != 1 or len(sibs) > 1:
+            _job_inc(jid, skipped=len(members))
+            continue
+        # already fully linked to the same handle → nothing to do
+        if sibs and all(sib_of(m) for m in members):
+            continue
+        title = members[0].get('title') or base
+        handle = next(iter(sibs)) if sibs else (_publish_slug(title) + '-siblings')
+        try:
+            coll_id, actual_handle, _ = _ensure_siblings_collection(store, title, handle, hdrs, base_url)
+        except Exception as e:
+            _job_error(jid, f"{base}: collection {e}")
+            continue
+        if not actual_handle:
+            _job_error(jid, f"{base}: no siblings handle")
+            continue
+        for m in members:
+            num = (m.get('id') or '').rsplit('/', 1)[-1]
+            try:
+                if sib_of(m) != actual_handle:
+                    _shopify_call('post', shopify_url(store, f'products/{num}/metafields.json'), hdrs,
+                                  json={'metafield': {'namespace': 'theme', 'key': 'siblings',
+                                                      'value': actual_handle, 'type': 'single_line_text_field'}},
+                                  timeout=20)
+                    _job_inc(jid, changed=1)
+                if coll_id:
+                    _shopify_call('post', f"{base_url}collects.json", hdrs,
+                                  json={'collect': {'product_id': int(num), 'collection_id': coll_id}}, timeout=20)
+            except Exception as ex:
+                _job_error(jid, f"{m.get('handle')}: {ex}")
+    with _JOBS_LOCK:
+        j = _JOBS[jid]
+        _job_summary(jid, f"Relinked {j['changed']} product(s) into siblings sets; {j['skipped']} left alone (mixed/ambiguous groups).")
+
+
+_JOB_TYPES = {
+    'bold_cleanup': _job_bold_cleanup,
+    'channels':     _job_channels,
+    'cutline':      _job_cutline,
+    'relink':       _job_relink_siblings,
+    'dedup':        _job_dedup,
+}
+
+
+@app.route('/api/catalog_job/start', methods=['POST'])
+@require_droplet_token
+def catalog_job_start():
+    data = request.json or {}
+    store = data.get('store', 'dk')
+    job_type = data.get('job_type', '')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()} store.'}), 401
+    fn = _JOB_TYPES.get(job_type)
+    if not fn:
+        return jsonify({'error': f'Unknown job_type {job_type!r}.'}), 400
+
+    # One maintenance job per store at a time — running four big jobs at once
+    # hammers Shopify's rate limit and the box.
+    with _JOBS_LOCK:
+        for j in _JOBS.values():
+            if j.get('store') == store and j.get('status') == 'running':
+                return jsonify({
+                    'error': f'A maintenance job ({j.get("type")}) is already running for Store {store.upper()}. '
+                             'Wait for it to finish before starting another.'
+                }), 409
+
+    jid = _job_new(job_type, store)
+    hdrs = shopify_headers(store)
+
+    def _runner():
+        try:
+            fn(jid, store, hdrs)
+            _job_set(jid, status='done', finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+        except Exception as e:
+            _job_error(jid, str(e))
+            _job_set(jid, status='error', summary=f'Job failed: {str(e)[:150]}',
+                     finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+
+    threading.Thread(target=_runner, daemon=True).start()
+    return jsonify({'job_id': jid, 'status': 'running'})
+
+
+@app.route('/api/catalog_job/status')
+def catalog_job_status():
+    jid = request.args.get('id', '')
+    with _JOBS_LOCK:
+        j = _JOBS.get(jid)
+        if not j:
+            return jsonify({'error': 'unknown job id'}), 404
+        return jsonify(dict(j))
+
+
+@app.route('/api/catalog_job/list')
+def catalog_job_list():
+    """All jobs (optionally filtered by store), newest first — lets the UI
+    re-discover running jobs after the modal is closed or the page reloaded."""
+    store = request.args.get('store', '')
+    with _JOBS_LOCK:
+        items = [dict(j) for j in _JOBS.values()]
+    if store:
+        items = [j for j in items if j.get('store') == store]
+    items.sort(key=lambda j: j.get('started_at') or '', reverse=True)
+    return jsonify({'jobs': items[:50]})
+
+
 # --- Per-user draft storage ---
 
 def _sanitize_owner(raw):
@@ -2867,16 +3312,24 @@ def history():
 
 # --- Publish helpers (shared by /api/publish and the granular per-variant endpoints) ---
 
+def _md_inline(s):
+    """Convert inline markdown bold (**text**) to <strong>. The copy prompt asks
+    Claude for '**eigenschap**: …' bullets, so without this the literal asterisks
+    end up shown verbatim on the storefront."""
+    return re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', s or '')
+
+
 def _publish_to_html(text):
-    """Convert plain-text description to body_html (lists when '•' or '-').
-    Truncates the output if it would exceed Shopify's 65535-char body_html
-    cap so the publish call doesn't get rejected with a cryptic 422."""
+    """Convert plain-text description to body_html (lists when '•' or '-'), with
+    inline **bold** converted to <strong>. Truncates the output if it would
+    exceed Shopify's 65535-char body_html cap so the publish call doesn't get
+    rejected with a cryptic 422."""
     lines  = (text or '').strip().splitlines()
     html   = []
     bullets = []
     def flush_bullets():
         if bullets:
-            html.append('<ul>' + ''.join(f'<li>{b}</li>' for b in bullets) + '</ul>')
+            html.append('<ul>' + ''.join(f'<li>{_md_inline(b)}</li>' for b in bullets) + '</ul>')
             bullets.clear()
     for line in lines:
         stripped = line.strip()
@@ -2887,7 +3340,7 @@ def _publish_to_html(text):
             bullets.append(stripped.lstrip('•- ').strip())
         else:
             flush_bullets()
-            html.append(f'<p>{stripped}</p>')
+            html.append(f'<p>{_md_inline(stripped)}</p>')
     flush_bullets()
     body = '\n'.join(html)
     # Shopify hard-caps body_html at 65535 chars; truncate at 60_000 to give
@@ -3030,7 +3483,7 @@ _PUBLICATION_CACHE: dict = {}  # store_key -> list of {id, name}
 # Match shop-configured publication names case-insensitively. Shopify renames
 # these every couple of years (Facebook → Facebook & Instagram, Google →
 # Google & YouTube, etc.) so we use substring matches.
-_DEFAULT_PUBLICATION_MATCHERS = ('online store', 'facebook', 'google')
+_DEFAULT_PUBLICATION_MATCHERS = ('online store', 'facebook', 'google', 'pinterest')
 
 
 def _list_publications(store, hdrs):
@@ -3089,7 +3542,7 @@ def _publish_to_default_channels(store, product_id, hdrs):
         'variables': {'id': product_gid, 'input': publication_inputs},
     }
     try:
-        r = req.post(shopify_url(store, 'graphql.json'), headers=hdrs, json=body, timeout=15)
+        r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs, json=body, timeout=15)
     except Exception as e:
         return [f'graphql request failed: {e}']
     if r.status_code != 200:
@@ -3510,29 +3963,9 @@ def publish():
     shared_images    = images_by_color.get('shared') or images_flat
     print(f"[publish] Received: {len(images_flat)} flat images, color-keys: {list(images_by_color.keys())}, shared: {len(shared_images)}")
 
-    # Convert plain-text description to body_html
-    def to_html(text):
-        lines  = text.strip().splitlines()
-        html   = []
-        bullets = []
-        def flush_bullets():
-            if bullets:
-                html.append('<ul>' + ''.join(f'<li>{b}</li>' for b in bullets) + '</ul>')
-                bullets.clear()
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                flush_bullets()
-                continue
-            if stripped.startswith('•') or stripped.startswith('-'):
-                bullets.append(stripped.lstrip('•- ').strip())
-            else:
-                flush_bullets()
-                html.append(f'<p>{stripped}</p>')
-        flush_bullets()
-        return '\n'.join(html)
-
-    description = to_html(data.get('description', ''))
+    # Convert plain-text description to body_html via the shared helper, which
+    # handles bullets, inline **bold** → <strong>, and the 65535-char truncation.
+    description = _publish_to_html(data.get('description', ''))
 
     hdrs    = shopify_headers(store)
     base    = shopify_url(store, '')

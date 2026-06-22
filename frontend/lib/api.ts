@@ -251,6 +251,24 @@ export interface BackfillApplyResponse {
   error?: string;
 }
 
+// ── Catalogue maintenance background jobs ──
+export type CatalogJobType = "bold_cleanup" | "channels" | "cutline" | "dedup" | "relink";
+export interface CatalogJob {
+  id: string;
+  type: CatalogJobType;
+  store: "dk" | "fr" | "fi";
+  status: "running" | "done" | "error";
+  total: number | null;
+  processed: number;
+  changed: number;
+  skipped: number;
+  errors: string[];
+  summary: string;
+  started_at: string;
+  finished_at: string | null;
+  error?: string;
+}
+
 // ── Public API ──
 export const api = {
   status: () => call<BackendStatus>("/api/status"),
@@ -470,6 +488,26 @@ export const api = {
     /** Tag the product as handled (default true). Pass false to un-mark, e.g. on revert. */
     set_handled?: boolean;
   }) => call<BackfillApplyResponse>("/api/backfill/apply", { method: "POST", body: params, authed: true }),
+
+  /** Start a long-running catalogue-maintenance job (runs in a backend thread so
+   *  it can't time out). Returns a job id to poll with catalogJobStatus. */
+  catalogJobStart: (store: "dk" | "fr" | "fi", job_type: CatalogJobType) =>
+    call<{ job_id: string; status: string; error?: string }>("/api/catalog_job/start", {
+      method: "POST",
+      body: { store, job_type },
+      authed: true,
+    }),
+
+  /** Poll a running maintenance job for progress. */
+  catalogJobStatus: (id: string) =>
+    call<CatalogJob>(`/api/catalog_job/status?id=${encodeURIComponent(id)}`),
+
+  /** All maintenance jobs (newest first), optionally for one store — lets the UI
+   *  re-discover running jobs after the modal closes or the page reloads. */
+  catalogJobList: (store?: "dk" | "fr" | "fi") =>
+    call<{ jobs: CatalogJob[]; error?: string }>(
+      `/api/catalog_job/list${store ? `?store=${store}` : ""}`
+    ),
 };
 
 export const BACKEND = BACKEND_URL;
