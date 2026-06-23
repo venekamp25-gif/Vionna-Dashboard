@@ -2951,6 +2951,15 @@ def _fix_collection_titles(jid, store, hdrs, dry_run):
             rest = nc[len(np) + 1:]
             if rest and ' ' not in rest and any(_edit_distance(rest, s) <= 2 for s in SYN):
                 fixable = True
+        # Relaxed: this collection is metafield-linked (its members point here via
+        # theme.siblings), so it IS a swatch collection and should be hidden. If its title
+        # isn't already a "… Siblings" name, rename it to "<product> Siblings" regardless of
+        # how well the old base matches — it gets hidden, so an imperfect base (e.g. a
+        # product-title typo "Annaa") is invisible to customers. Titles already ending in
+        # "siblings" are left alone (already hidden; may carry a deliberate descriptive word
+        # like "Armbånd", e.g. "Nina Armbånd Siblings" / "Jacky Siblings").
+        if not fixable and not nc.endswith(' siblings'):
+            fixable = True
         if cur != proposed and not fixable:
             _job_error(jid, f"'{info['handle']}' titled '{cur}' but its products are '{product_title}' — left alone (rename manually if needed)")
             _job_inc(jid, skipped=len(members))
