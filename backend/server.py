@@ -5235,19 +5235,30 @@ STORE_COUNTRY = {'dk': 'DK', 'fr': 'FR', 'fi': 'FI'}
 
 def _meta_post(node, data):
     """POST to the Graph API. Nested values are JSON-encoded (Marketing API convention).
-    Returns parsed JSON (with an 'error' key on failure)."""
+    Retries transient 5xx / connection errors (up to 3 attempts). Returns parsed JSON
+    (with an 'error' key on failure)."""
     payload = {}
     for k, v in (data or {}).items():
         payload[k] = v if isinstance(v, (str, int, float, bool)) else json.dumps(v)
     payload['access_token'] = META_ACCESS_TOKEN or ''
-    try:
-        r = req.post(f"{META_GRAPH}/{str(node).lstrip('/')}", data=payload, timeout=30)
-    except Exception as e:
-        return {'error': {'message': f'request failed: {e}'}}
-    try:
-        return r.json()
-    except Exception:
-        return {'error': {'message': f'non-JSON response (HTTP {r.status_code})'}}
+    url = f"{META_GRAPH}/{str(node).lstrip('/')}"
+    last = {'error': {'message': 'request failed'}}
+    for attempt in range(3):
+        if attempt:
+            time.sleep(1.5 * attempt)
+        try:
+            r = req.post(url, data=payload, timeout=30)
+        except Exception as e:
+            last = {'error': {'message': f'request failed: {e}'}}
+            continue
+        if r.status_code >= 500:
+            last = {'error': {'message': f'transient HTTP {r.status_code}'}}
+            continue  # Meta hiccup — retry
+        try:
+            return r.json()
+        except Exception:
+            return {'error': {'message': f'non-JSON response (HTTP {r.status_code})'}}
+    return last
 
 
 def _meta_account_pixel():
