@@ -2804,6 +2804,24 @@ def _job_relink_siblings(jid, store, hdrs):
                           f"{j['skipped']} left alone (mixed/ambiguous groups).")
 
 
+def _edit_distance(a, b):
+    """Levenshtein distance, with an early-out: words differing in length by >2 can't be
+    within 2 edits, so return a large number. Used to spot typo'd collection-words
+    ('collectin'≈'collection') without matching real distinguishing words."""
+    a, b = a or '', b or ''
+    if a == b:
+        return 0
+    if abs(len(a) - len(b)) > 2:
+        return 99
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (0 if ca == cb else 1)))
+        prev = cur
+    return prev[-1]
+
+
 def _fix_collection_titles(jid, store, hdrs, dry_run):
     """Find sibling collections whose TITLE isn't the canonical '<Product> Siblings'
     (e.g. a legacy/manual 'angela collection') and rename them — WITHOUT touching the
@@ -2921,8 +2939,18 @@ def _fix_collection_titles(jid, store, hdrs, dry_run):
         # are titled 'Flavia', or 'Nina Armbånd Siblings' for plain 'Nina' products), that
         # is a deliberate name or a mis-link — leave it alone and flag it for review.
         np = _norm(product_title)
-        # 'collection' synonyms — incl. Finnish kokoelma / mallisto — count as fixable formatting
-        fixable = _norm(cur) in (f"{np} siblings", f"{np} collection", f"{np} kokoelma", f"{np} mallisto")
+        nc = _norm(cur)
+        # 'collection' synonyms — English/Dutch/German/Danish/Finnish — count as fixable formatting.
+        SYN = ('siblings', 'collection', 'collections', 'collectie', 'kollektion', 'kokoelma', 'mallisto', 'soskende')
+        fixable = nc in tuple(f"{np} {s}" for s in SYN)
+        if not fixable and nc.startswith(np + ' '):
+            # title is "<product> <one extra word>": fixable when that word is a (possibly
+            # mis-spelled) collection-word — edit-distance ≤2 catches typos like "collectin"/
+            # "coolection" while a real distinguishing word ("Armbånd", "Comfy") stays far from
+            # every synonym and is left alone. Must be a SINGLE trailing word.
+            rest = nc[len(np) + 1:]
+            if rest and ' ' not in rest and any(_edit_distance(rest, s) <= 2 for s in SYN):
+                fixable = True
         if cur != proposed and not fixable:
             _job_error(jid, f"'{info['handle']}' titled '{cur}' but its products are '{product_title}' — left alone (rename manually if needed)")
             _job_inc(jid, skipped=len(members))
