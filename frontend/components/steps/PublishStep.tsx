@@ -1,10 +1,14 @@
 "use client";
 
+import { useState } from "react";
 import { AnimatedCheckmark } from "@/components/ui/AnimatedCheckmark";
 import { Button } from "@/components/ui/Button";
+import { api, MetaDraftResult } from "@/lib/api";
 import { useProduct, colorLabelFor, pickRandomBgReferenceUrl, ProductVerify } from "@/lib/product";
 import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
 import { useStep } from "@/lib/step";
+
+type MetaItem = { store: string; product_url: string; image_url: string };
 
 function FlagDK() {
   return (
@@ -52,6 +56,24 @@ export function PublishStep() {
   // tied to the activeViewStore (single-store flow).
   const fallbackList: StoreKey[] =
     publishedStores.length > 0 ? publishedStores : [data.activeViewStore];
+
+  // Per published store: product URL (for the ad link) + a product photo (step-1, then
+  // step-2, then any published/competitor image) for the Meta draft.
+  const metaItems: MetaItem[] = fallbackList
+    .map((store) => {
+      const result =
+        resultsByStore[store] ?? (store === data.activeViewStore ? data.publishResult : null);
+      const url = result?.productUrls?.[0];
+      if (!url) return null;
+      const img =
+        data.nbResults?.[1]?.[0]?.url ||
+        data.nbResults?.[2]?.[0]?.url ||
+        data.publishPool?.[0]?.url ||
+        data.competitorImages?.[0]?.url ||
+        "";
+      return { store: store as string, product_url: url, image_url: img };
+    })
+    .filter((x): x is MetaItem => !!x);
 
   const resetForNewProduct = () => {
     setData((prev) => ({
@@ -122,12 +144,83 @@ export function PublishStep() {
         );
       })}
 
+      <MetaDraftSection items={metaItems} productName={data.name} />
+
       <div className="flex items-center justify-between bg-bg-elev border border-border rounded-2xl px-6 py-4">
         <span className="text-[13px] text-text-dim">Ready for the next one?</span>
         <Button variant="primary" onClick={resetForNewProduct}>
           ← Create another product
         </Button>
       </div>
+    </div>
+  );
+}
+
+/** Create PAUSED Meta Ads draft campaigns for the published stores. Nothing goes live —
+ *  the operator finalises + launches in Ads Manager. */
+function MetaDraftSection({ items, productName }: { items: MetaItem[]; productName: string }) {
+  const [running, setRunning] = useState(false);
+  const [results, setResults] = useState<MetaDraftResult[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  if (items.length === 0) return null;
+
+  const run = async () => {
+    setRunning(true);
+    setErr(null);
+    setResults(null);
+    try {
+      const r = await api.metaCreateDraft({ product_name: productName || "Product", items });
+      if (r.error) setErr(r.error);
+      else setResults(r.results ?? []);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <div className="bg-bg-elev border border-border rounded-2xl px-6 py-4 space-y-3">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="text-[14px] font-semibold text-text">📣 Prepare Meta Ads campaign</div>
+          <p className="text-[11px] text-text-faint mt-0.5 leading-relaxed">
+            Creates a <strong>PAUSED</strong> Sales campaign (€30/day) per published store, targeted to that
+            country. Nothing goes live — you finalise &amp; launch it in Ads Manager.
+          </p>
+        </div>
+        <Button variant="primary" size="sm" onClick={() => void run()} disabled={running}>
+          {running ? "Creating…" : "Create paused drafts"}
+        </Button>
+      </div>
+
+      {err && <p className="text-[12px] text-danger">⚠ {err}</p>}
+
+      {results && (
+        <div className="space-y-1.5 border-t border-border pt-2.5">
+          {results.map((r) => (
+            <div key={r.store} className="text-[12px] flex items-center gap-2 flex-wrap">
+              <span className="font-semibold uppercase tracking-wider">{r.store}</span>
+              {r.error ? (
+                <span className="text-danger">✕ {r.error}</span>
+              ) : (
+                <>
+                  <span className="text-accent">✓ paused campaign created</span>
+                  <a
+                    href="https://adsmanager.facebook.com/adsmanager/manage/campaigns?act=6399532626780380"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-accent hover:underline"
+                  >
+                    open in Ads Manager →
+                  </a>
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

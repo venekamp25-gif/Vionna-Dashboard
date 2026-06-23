@@ -515,7 +515,43 @@ export const api = {
     call<{ jobs: CatalogJob[]; error?: string }>(
       `/api/catalog_job/list${store ? `?store=${store}` : ""}`
     ),
+
+  /** Read-only: confirm Meta config + that the token reaches the ad account + page. */
+  metaCheck: () => call<MetaCheckResponse>("/api/meta/check"),
+
+  /** Create PAUSED Meta draft campaigns — one per store. Gated (session token). */
+  metaCreateDraft: (params: {
+    product_name: string;
+    items: { store: string; product_url: string; image_url: string }[];
+  }) =>
+    call<MetaCreateDraftResponse>("/api/meta/create_draft", {
+      method: "POST",
+      body: params,
+      authed: true,
+    }),
 };
+
+export interface MetaDraftResult {
+  store: string;
+  country: string | null;
+  campaign_id: string | null;
+  adset_id: string | null;
+  creative_id: string | null;
+  ad_id: string | null;
+  error: string | null;
+}
+export interface MetaCreateDraftResponse {
+  pixel_used?: string | null;
+  results?: MetaDraftResult[];
+  error?: string;
+}
+export interface MetaCheckResponse {
+  config?: Record<string, unknown>;
+  account?: { name?: string; account_status?: number } | null;
+  page?: { name?: string; id?: string } | null;
+  errors?: string[];
+  error?: string;
+}
 
 export const BACKEND = BACKEND_URL;
 
