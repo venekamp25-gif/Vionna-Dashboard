@@ -93,6 +93,38 @@ export function SettingsModal({ open, onClose }: Props) {
 
   // ── System health + backups (#7/#8/#9) ──
   const [health, setHealth] = useState<Awaited<ReturnType<typeof api.health>> | null>(null);
+
+  // ── Meta Ads connection test: one paused draft, no import needed ──
+  const [metaTestBusy, setMetaTestBusy] = useState(false);
+  const [metaTestResult, setMetaTestResult] = useState<string | null>(null);
+  const runMetaTest = async () => {
+    setMetaTestBusy(true);
+    setMetaTestResult(null);
+    try {
+      const r = await api.metaCreateDraft({
+        product_name: "TEST – Meta draft (delete me)",
+        items: [{
+          store: "fr",
+          product_url: "https://www.vionnaclothing.com",
+          image_url: "https://picsum.photos/seed/vionnatest/800/800",
+        }],
+      });
+      if (r.error) {
+        setMetaTestResult("✕ " + r.error);
+      } else {
+        const res = (r.results || [])[0];
+        setMetaTestResult(
+          res?.error
+            ? "✕ " + res.error
+            : `✓ paused test campaign created (id ${res?.campaign_id ?? "?"}) · pixel: ${r.pixel_used ?? "none"}`
+        );
+      }
+    } catch (e) {
+      setMetaTestResult("✕ " + (e instanceof Error ? e.message : String(e)));
+    } finally {
+      setMetaTestBusy(false);
+    }
+  };
   const [sysBusy, setSysBusy] = useState<"backup" | "export" | null>(null);
   const [sysMsg, setSysMsg] = useState<string | null>(null);
 
@@ -477,6 +509,23 @@ export function SettingsModal({ open, onClose }: Props) {
               </Button>
               {sysMsg && <span className="text-[11px] text-text-faint">{sysMsg}</span>}
             </div>
+          </div>
+
+          {/* ── Meta Ads connection test ───────────────────────────── */}
+          <div className="mt-8 pt-6 border-t border-border">
+            <div className="text-[14px] font-semibold text-text mb-1">Meta Ads — connection test</div>
+            <p className="text-[12px] text-text-faint mb-3 leading-relaxed">
+              Creates ONE <strong>paused</strong> test campaign (FR · €30/day · placeholder image) to confirm
+              the draft pipeline works — without a full product import. Delete it in Ads Manager afterwards.
+            </p>
+            <Button variant="secondary" size="sm" onClick={() => void runMetaTest()} disabled={metaTestBusy}>
+              {metaTestBusy ? "Creating…" : "Create paused test draft"}
+            </Button>
+            {metaTestResult && (
+              <p className={`text-[12px] mt-2 ${metaTestResult.startsWith("✓") ? "text-accent" : "text-danger"}`}>
+                {metaTestResult}
+              </p>
+            )}
           </div>
 
           {/* ── Reset draft (escape hatch) ─────────────────────────── */}
