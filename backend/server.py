@@ -2477,6 +2477,47 @@ def _fetch_all_collections(store, hdrs):
     return None  # hit the cap without finishing → treat as failed (caller falls back)
 
 
+def _fetch_collections_with_members(store, hdrs):
+    """Like _fetch_all_collections but also samples up to 12 member product titles per
+    collection, so we can tell a per-product swatch collection (members share ONE product
+    title) from a marketing/curated one (members have different titles). Returns
+    [{id, handle, title, smart, member_titles[]}] or None on failure."""
+    out = []
+    cursor = None
+    for _ in range(400):
+        after = f', after:"{cursor}"' if cursor else ''
+        q = ('{ collections(first:40%s){ pageInfo{hasNextPage endCursor} edges{ node{ '
+             'id handle title ruleSet{appliedDisjunctively} '
+             'products(first:12){ pageInfo{hasNextPage} edges{node{title}} } } } } }') % after
+        try:
+            r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs, json={'query': q}, timeout=45)
+        except Exception:
+            return None
+        if r is None or r.status_code != 200:
+            return None
+        try:
+            body = r.json() or {}
+        except Exception:
+            return None
+        if body.get('errors') or 'data' not in body:
+            return None
+        conn = (body.get('data') or {}).get('collections') or {}
+        for e in conn.get('edges', []):
+            n = e.get('node') or {}
+            if not n.get('handle'):
+                continue
+            prod = n.get('products') or {}
+            mt = [(pe.get('node') or {}).get('title') or '' for pe in (prod.get('edges') or [])]
+            more = bool(((prod.get('pageInfo') or {}) or {}).get('hasNextPage'))
+            out.append({'id': n.get('id'), 'handle': n.get('handle'), 'title': n.get('title') or '',
+                        'smart': bool(n.get('ruleSet')), 'has_more': more, 'member_titles': mt})
+        page = conn.get('pageInfo') or {}
+        if not page.get('hasNextPage'):
+            return out
+        cursor = page.get('endCursor')
+    return None
+
+
 @app.route('/api/list_collections')
 def api_list_collections():
     """Read-only: list every collection on a store (handle, title, type). Used to sweep
@@ -2831,6 +2872,11 @@ def _fix_collection_titles(jid, store, hdrs, dry_run):
         # case / diacritic / separator-insensitive form for comparing titles
         return re.sub(r'[\s_-]+', ' ', _publish_strip_diacritics(s or '').lower()).strip()
 
+    def _title_rank(t):
+        # prefer accented over plain, mixed-case over all-lower/all-upper; deterministic
+        return (_publish_strip_diacritics(t) != t, t != t.lower() and t != t.upper(), t)
+
+    handled_handles = set()  # collections the metafield pass touched (so Pass B skips them)
     renames = []      # (handle, old_title, new_title) — also the rollback record
     relink_sets = 0   # sets whose theme.siblings value needs normalising (e.g. casing)
 
@@ -2849,8 +2895,6 @@ def _fix_collection_titles(jid, store, hdrs, dry_run):
         # canonical product title → '<Title> Siblings'. Prefer the richest spelling —
         # accented over plain, mixed-case over all-lower/all-upper — deterministically, so
         # re-runs don't churn. This only names the COLLECTION; product titles are untouched.
-        def _title_rank(t):
-            return (_publish_strip_diacritics(t) != t, t != t.lower() and t != t.upper(), t)
         product_title = max(titles_present, key=_title_rank)
         try:
             info = coll_info(sib_handle)
@@ -2862,6 +2906,7 @@ def _fix_collection_titles(jid, store, hdrs, dry_run):
             _job_error(jid, f"'{sib_handle}': products link here but no collection exists at that handle — run Relink/republish")
             _job_inc(jid, skipped=len(members))
             continue
+        handled_handles.add(info['handle'])  # so Pass B (collection-centric) doesn't re-touch it
         # No handle-pattern filter: the members all share ONE product title AND
         # explicitly point here via their theme.siblings metafield — that's a genuine
         # colour-variant set whatever the handle convention ('-siblings', legacy
@@ -2924,14 +2969,72 @@ def _fix_collection_titles(jid, store, hdrs, dry_run):
             except Exception as ex:
                 _job_error(jid, f"{m.get('handle')} relink: {ex}")
 
+    # ── Pass B (collection-centric): catch swatch collections the metafield pass missed —
+    # the orphan / unlinked ones (FI "X-kokoelma", legacy "X collection") that AREN'T named
+    # "Siblings", so the theme doesn't exclude them and they show to customers. Rename them
+    # to "<Product> Siblings". STRICTLY GUARDED so a browsable/marketing collection can NEVER
+    # be hidden — a collection is only renamed when ALL of these hold:
+    #   • it's a CUSTOM collection (a per-product swatch set is never a smart collection);
+    #   • its handle is swatch-style (-collection / -siblings / -soskende / -kokoelma / -mallisto);
+    #   • it has ≤12 members, so the 12-product sample IS the whole collection (no hasNextPage)
+    #     — this is what stops a large collection with a homogeneous first-12 from being hidden;
+    #   • those members are colour-variants of ONE product (one shared, accent-insensitive title).
+    # Empty, multi-title, large, smart, and non-swatch-handle collections are all left alone.
+    SWATCH_SUFFIX = ('-siblings', '-collection', '-soskende', '-kokoelma', '-mallisto')
+    cols = _fetch_collections_with_members(store, hdrs)
+    if cols is None:
+        _job_error(jid, "collection listing failed — orphan swatch collections were not scanned")
+        cols = []
+    orphan_swatch = 0
+    for c in cols:
+        ctitle = (c.get('title') or '').strip()
+        chandle = c.get('handle') or ''
+        if not c.get('id') or not ctitle or not chandle or chandle in handled_handles:
+            continue
+        if c.get('smart'):
+            continue  # swatch sets are always custom collections — never touch a smart/marketing one
+        if ctitle.endswith(' Siblings'):
+            continue  # already named correctly → theme already excludes it
+        if c.get('has_more'):
+            continue  # >12 members → the sample can't prove the WHOLE collection is one product → skip
+        if not chandle.endswith(SWATCH_SUFFIX):
+            continue  # require a swatch-style handle as positive evidence it's not a browsable collection
+        mtitles = [t for t in (c.get('member_titles') or []) if (t or '').strip()]
+        norm_m = {_norm(t) for t in mtitles}
+        if len(norm_m) != 1:
+            continue  # empty (0 members) or marketing/curated (>1 distinct title) → leave alone
+        base = max(mtitles, key=_title_rank).strip()
+        if not base:
+            continue
+        proposed = f"{base} Siblings"
+        if proposed == ctitle:
+            continue
+        renames.append((chandle, ctitle, proposed))
+        orphan_swatch += 1
+        if dry_run:
+            continue
+        try:
+            rr = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                               json={'query': 'mutation($id:ID!,$t:String!){ collectionUpdate(input:{id:$id,title:$t}){ userErrors{field message} } }',
+                                     'variables': {'id': c.get('id'), 't': proposed}}, timeout=20)
+            errs = (((rr.json().get('data') or {}).get('collectionUpdate') or {}).get('userErrors')) or []
+            if errs:
+                _job_error(jid, f"{chandle} rename: {errs[0].get('message')}")
+            else:
+                _job_inc(jid, changed=1)
+        except Exception as e:
+            _job_error(jid, f"{chandle} rename: {e}")
+
     lines = '; '.join(f"'{o}' → '{p}'" for (_h, o, p) in renames[:25])
     n_ren = len(renames)
     if dry_run:
-        _job_summary(jid, f"SCAN (no changes made): {n_ren} collection(s) need renaming, "
+        _job_summary(jid, f"SCAN (no changes made): {n_ren} collection(s) need renaming "
+                          f"({orphan_swatch} unlinked/orphan swatch collection(s) shown to customers), "
                           f"{relink_sets} set(s) need a link repair. "
                           + (lines if lines else "All sibling-collection names are already correct."))
     else:
-        _job_summary(jid, f"Renamed {n_ren} collection(s) to '<Product> Siblings' and repaired links on "
+        _job_summary(jid, f"Renamed {n_ren} collection(s) to '<Product> Siblings' "
+                          f"({orphan_swatch} unlinked/orphan) and repaired links on "
                           f"{relink_sets} set(s). Handles/URLs untouched — preserved + reversible. " + lines)
 
 
