@@ -5158,6 +5158,70 @@ def api_update():
     return jsonify({'success': True, 'updated': updated, 'restarting': True})
 
 
+# ── Meta Ads ──────────────────────────────────────────────────────────────────
+# Config + a read-only connectivity check. The "Prepare Meta Ads campaign" draft
+# feature builds on this. DRAFTS ONLY — this code never launches or spends.
+META_APP_ID        = os.getenv('META_APP_ID')
+META_APP_SECRET    = os.getenv('META_APP_SECRET')
+META_ACCESS_TOKEN  = os.getenv('META_ACCESS_TOKEN')
+META_AD_ACCOUNT_ID = os.getenv('META_AD_ACCOUNT_ID')   # e.g. act_6399532626780380
+META_PAGE_ID       = os.getenv('META_PAGE_ID')
+META_GRAPH_VERSION = os.getenv('META_GRAPH_VERSION', 'v21.0')
+META_GRAPH         = f'https://graph.facebook.com/{META_GRAPH_VERSION}'
+
+
+def _meta_acct():
+    a = (META_AD_ACCOUNT_ID or '').strip()
+    return a if a.startswith('act_') else (f'act_{a}' if a else '')
+
+
+def _meta_get(node, params=None):
+    """GET on the Graph API with the configured token. Returns parsed JSON (with an
+    'error' key on Graph errors)."""
+    p = dict(params or {})
+    p['access_token'] = META_ACCESS_TOKEN or ''
+    r = req.get(f"{META_GRAPH}/{str(node).lstrip('/')}", params=p, timeout=20)
+    try:
+        return r.json()
+    except Exception:
+        return {'error': {'message': f'non-JSON response (HTTP {r.status_code})'}}
+
+
+@app.route('/api/meta/check')
+def meta_check():
+    """Read-only: confirms the Meta .env config is present and that the token can reach
+    the fashion ad account + the Vionna page. Never exposes secret values."""
+    acct = _meta_acct()
+    out = {
+        'config': {
+            'app_id_set':       bool(META_APP_ID),
+            'app_secret_set':   bool(META_APP_SECRET),
+            'access_token_set': bool(META_ACCESS_TOKEN),
+            'ad_account_id':    acct or None,
+            'page_id':          META_PAGE_ID or None,
+            'graph_version':    META_GRAPH_VERSION,
+        },
+        'account': None,
+        'page': None,
+        'errors': [],
+    }
+    if not META_ACCESS_TOKEN or not acct:
+        out['errors'].append('Missing META_ACCESS_TOKEN and/or META_AD_ACCOUNT_ID in backend/.env')
+        return jsonify(out), 400
+    j = _meta_get(acct, {'fields': 'name,account_status,currency,timezone_name'})
+    if j.get('error'):
+        out['errors'].append('account: ' + str(j['error'].get('message') or j['error']))
+    else:
+        out['account'] = j   # account_status 1 = active
+    if META_PAGE_ID:
+        j = _meta_get(META_PAGE_ID, {'fields': 'name,id'})
+        if j.get('error'):
+            out['errors'].append('page: ' + str(j['error'].get('message') or j['error']))
+        else:
+            out['page'] = j
+    return jsonify(out)
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print(f"\nVionna Dashboard running on http://localhost:{port}\n")
