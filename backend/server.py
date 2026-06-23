@@ -5255,8 +5255,15 @@ def _meta_post(node, data):
             last = {'error': {'message': f'request failed: {e}'}}
             continue
         if r.status_code >= 500:
-            last = {'error': {'message': f'HTTP {r.status_code}: {(r.text or "")[:300]}'}}
-            continue  # transient — retry
+            # A JSON 5xx is a genuine transient Graph error → retry. A non-JSON HTML body
+            # is a Facebook EDGE block (IP rate-limit) → do NOT retry; hammering only
+            # extends the block. Surface it and stop.
+            try:
+                jb = r.json()
+            except Exception:
+                return {'error': {'message': f'HTTP {r.status_code} (Facebook edge block — backing off): {(r.text or "")[:140]}'}}
+            last = {'error': (jb.get('error') or {'message': f'HTTP {r.status_code}'})}
+            continue  # transient JSON 5xx — retry
         try:
             return r.json()
         except Exception:
