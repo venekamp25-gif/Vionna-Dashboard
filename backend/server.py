@@ -5171,6 +5171,11 @@ META_AD_ACCOUNT_ID = os.getenv('META_AD_ACCOUNT_ID')   # e.g. act_63995326267803
 META_PAGE_ID       = os.getenv('META_PAGE_ID')
 META_GRAPH_VERSION = os.getenv('META_GRAPH_VERSION', 'v21.0')
 META_GRAPH         = f'https://graph.facebook.com/{META_GRAPH_VERSION}'
+# Pixel + Instagram used in the drafts. Defaults mirror the live "Vionna Clothing" setup
+# (read from the reference ADV+ campaign); override per deployment via .env. Neither id is a
+# secret (both are visible in the public page / site code), so the in-repo fallbacks are safe.
+META_PIXEL_ID      = os.getenv('META_PIXEL_ID')   or '1140868834053907'
+META_IG_USER_ID    = os.getenv('META_IG_USER_ID') or '17841469761633612'
 
 
 def _meta_acct():
@@ -5225,6 +5230,10 @@ def meta_check():
             out['errors'].append('page: ' + str(j['error'].get('message') or j['error']))
         else:
             out['page'] = j
+    pj = _meta_get(f'{acct}/adspixels', {'fields': 'id,name', 'limit': 10})
+    out['pixels'] = (pj or {}).get('data') or []
+    out['pixel_default'] = META_PIXEL_ID or None
+    out['ig_user_id'] = META_IG_USER_ID or None
     return jsonify(out)
 
 
@@ -5389,9 +5398,12 @@ def generate_ad_copy():
             f"houd de toon enthousiast maar niet schreeuwerig. Gebruik de productnaam "
             f"\"{product_name}\" en behoud de link exact zoals gegeven.\n\n"
             f"Origineel (Nederlands):\n---\n{nl}\n---\n\n"
-            f"Geef ook een korte, pakkende headline van maximaal 40 tekens in het {language}.\n\n"
+            f"Geef ook:\n"
+            f"- een korte, pakkende headline van maximaal 40 tekens in het {language};\n"
+            f"- een korte description van maximaal 30 tekens in het {language} die een "
+            f"voordeel benoemt (bijvoorbeeld gratis verzending of snelle levering).\n\n"
             f"Antwoord UITSLUITEND als geldig JSON, zonder extra tekst:\n"
-            f'{{"primary_text": "...", "headline": "..."}}'
+            f'{{"primary_text": "...", "headline": "...", "description": "..."}}'
         )
         try:
             msg = client.messages.create(model='claude-sonnet-4-5', max_tokens=700,
@@ -5402,13 +5414,15 @@ def generate_ad_copy():
             out[store] = {
                 'primary_text': (obj.get('primary_text') or '').strip() or nl,
                 'headline': (obj.get('headline') or '').strip() or product_name,
+                'description': (obj.get('description') or '').strip(),
             }
         except Exception as e:
-            out[store] = {'primary_text': nl, 'headline': product_name, 'error': str(e)[:160]}
+            out[store] = {'primary_text': nl, 'headline': product_name, 'description': '',
+                          'error': str(e)[:160]}
     return jsonify(out)
 
 
-def _meta_create_draft(store, primary_text, headline, product_url, image_urls, hash_by_url, pixel_id):
+def _meta_create_draft(store, copy, product_url, image_urls, hash_by_url, pixel_id):
     """Create ONE paused Sales draft for a store/country: campaign (Sales, CBO €30/day) →
     1 ad set (geo-targeted, Advantage+ audience when accepted, conversion-optimised if a pixel
     exists) → up to 5 creatives + 5 ads (one per image, all sharing the ad set), each carrying
@@ -5426,8 +5440,10 @@ def _meta_create_draft(store, primary_text, headline, product_url, image_urls, h
     if not imgs:
         res['error'] = 'no valid image_urls'
         return res
-    primary_text = (primary_text or '').strip() or (headline or '').strip() or 'Shop now'
-    headline = (headline or '').strip() or primary_text[:40]
+    copy = copy or {}
+    primary_text = (copy.get('primary_text') or '').strip() or (copy.get('headline') or '').strip() or 'Shop now'
+    headline = (copy.get('headline') or '').strip() or primary_text[:40]
+    description = (copy.get('description') or '').strip()
     acct = _meta_acct()
     su = str(store).upper()
 
@@ -5459,8 +5475,11 @@ def _meta_create_draft(store, primary_text, headline, product_url, image_urls, h
     else:
         base['optimization_goal'] = 'LINK_CLICKS'
         base['destination_type'] = 'WEBSITE'   # required for LINK_CLICKS under OUTCOME_SALES
-    geo = {'geo_locations': {'countries': [country]}}
-    a = _meta_post(f'{acct}/adsets', dict(base, targeting=dict(geo, targeting_automation={'advantage_audience': 1})))
+    geo = {'geo_locations': {'countries': [country], 'location_types': ['home', 'recent']},
+           'age_min': 18, 'age_max': 65}
+    adv = dict(geo, targeting_automation={'advantage_audience': 1,
+                                          'individual_setting': {'age': 1, 'gender': 1}})
+    a = _meta_post(f'{acct}/adsets', dict(base, targeting=adv))
     if a.get('error') or not a.get('id'):
         time.sleep(0.4)
         a = _meta_post(f'{acct}/adsets', dict(base, targeting=geo))
@@ -5479,16 +5498,22 @@ def _meta_create_draft(store, primary_text, headline, product_url, image_urls, h
             'link': product_url,
             'message': primary_text,
             'name': headline,
+            'caption': _reg_domain(product_url),
             'call_to_action': {'type': 'SHOP_NOW', 'value': {'link': product_url}},
         }
+        if description:
+            link_data['description'] = description
         h = (hash_by_url or {}).get(image_url)
         if h:
             link_data['image_hash'] = h
         else:
             link_data['picture'] = image_url
+        story = {'page_id': META_PAGE_ID, 'link_data': link_data}
+        if META_IG_USER_ID:
+            story['instagram_user_id'] = META_IG_USER_ID
         cr = _meta_post(f'{acct}/adcreatives', {
             'name': f'{su} creative {i + 1}',
-            'object_story_spec': {'page_id': META_PAGE_ID, 'link_data': link_data},
+            'object_story_spec': story,
         })
         if cr.get('error') or not cr.get('id'):
             last_err = _meta_err(cr, 'creative')
@@ -5542,8 +5567,11 @@ def meta_create_draft():
             'store': (it.get('store') or '').lower(),
             'product_url': it.get('product_url') or '',
             'image_urls': urls,
-            'primary_text': (it.get('primary_text') or product_name),
-            'headline': (it.get('headline') or product_name),
+            'copy': {
+                'primary_text': it.get('primary_text') or product_name,
+                'headline': it.get('headline') or product_name,
+                'description': it.get('description') or '',
+            },
         })
         for u in urls:
             if u not in all_urls:
@@ -5556,11 +5584,13 @@ def meta_create_draft():
             hash_by_url[u] = h
         time.sleep(0.3)
 
-    pixel_id = _meta_account_pixel()
+    # the right pixel for this account (env / known default — the reference campaign
+    # optimises on it; falls back to the account's first pixel if neither is set)
+    pixel_id = META_PIXEL_ID or _meta_account_pixel()
     results = []
     for it in norm:
-        results.append(_meta_create_draft(it['store'], it['primary_text'], it['headline'],
-                                          it['product_url'], it['image_urls'], hash_by_url, pixel_id))
+        results.append(_meta_create_draft(it['store'], it['copy'], it['product_url'],
+                                          it['image_urls'], hash_by_url, pixel_id))
         time.sleep(0.5)
     return jsonify({'pixel_used': pixel_id, 'results': results})
 
