@@ -5222,6 +5222,167 @@ def meta_check():
     return jsonify(out)
 
 
+# ── Meta Ads: create a PAUSED draft campaign ──────────────────────────────────
+# Per store/country: a Sales CBO campaign (€30/day, campaign-level budget) → 1 ad set
+# (geo-targeted to that country, conversion-optimised if a pixel exists) → 1 ad with the
+# product's image, under the Vionna Clothing page. EVERYTHING IS PAUSED — the operator
+# finalises and launches in Ads Manager. This code never sets status ACTIVE and never spends.
+STORE_COUNTRY = {'dk': 'DK', 'fr': 'FR', 'fi': 'FI'}
+
+
+def _meta_post(node, data):
+    """POST to the Graph API. Nested values are JSON-encoded (Marketing API convention).
+    Returns parsed JSON (with an 'error' key on failure)."""
+    payload = {}
+    for k, v in (data or {}).items():
+        payload[k] = v if isinstance(v, (str, int, float, bool)) else json.dumps(v)
+    payload['access_token'] = META_ACCESS_TOKEN or ''
+    try:
+        r = req.post(f"{META_GRAPH}/{str(node).lstrip('/')}", data=payload, timeout=30)
+    except Exception as e:
+        return {'error': {'message': f'request failed: {e}'}}
+    try:
+        return r.json()
+    except Exception:
+        return {'error': {'message': f'non-JSON response (HTTP {r.status_code})'}}
+
+
+def _meta_account_pixel():
+    """First Pixel id on the ad account, or None (sales optimisation needs one)."""
+    j = _meta_get(f"{_meta_acct()}/adspixels", {'fields': 'id,name', 'limit': 5})
+    data = (j or {}).get('data') or []
+    return data[0].get('id') if data else None
+
+
+def _reg_domain(url):
+    """Host from a URL (scheme stripped, leading www. removed) — used as conversion_domain."""
+    try:
+        host = urllib.parse.urlparse(url or '').netloc.lower()
+        return host[4:] if host.startswith('www.') else host
+    except Exception:
+        return ''
+
+
+def _meta_err(j, step):
+    return f"{step}: " + str((j.get('error') or {}).get('message') or j)
+
+
+def _meta_create_draft(store, product_name, product_url, image_url, pixel_id):
+    """Create ONE paused Sales-CBO draft for a store/country. Returns created ids + the
+    first failing step's error (stops on first failure so we never leave a half-built ad)."""
+    country = STORE_COUNTRY.get((store or '').lower())
+    res = {'store': store, 'country': country, 'campaign_id': None, 'adset_id': None,
+           'creative_id': None, 'ad_id': None, 'error': None}
+    if not country:
+        res['error'] = f'unknown store {store!r}'
+        return res
+    # Validate URLs up front so we never create a campaign/ad set and then fail on a blank
+    # link/image (which would leave a paused half-build).
+    if not str(product_url).startswith('http'):
+        res['error'] = 'missing or invalid product_url'
+        return res
+    if not str(image_url).startswith('http'):
+        res['error'] = 'missing or invalid image_url'
+        return res
+    acct = _meta_acct()
+    label = f"{product_name} – {str(store).upper()}"
+
+    # 1) Campaign — Sales objective, CBO (budget on the campaign), €30/day, PAUSED.
+    c = _meta_post(f'{acct}/campaigns', {
+        'name': f'{label} (draft)',
+        'objective': 'OUTCOME_SALES',
+        'special_ad_categories': [],
+        'daily_budget': 3000,                       # €30.00 in cents (account is EUR)
+        'bid_strategy': 'LOWEST_COST_WITHOUT_CAP',
+        'status': 'PAUSED',
+    })
+    if c.get('error') or not c.get('id'):
+        res['error'] = _meta_err(c, 'campaign')
+        return res
+    res['campaign_id'] = c['id']
+
+    # 2) Ad set — geo-targeted to the country; conversion-optimised if a pixel exists,
+    #    otherwise a safe non-pixel goal the operator can switch in Ads Manager.
+    adset = {
+        'name': f'{label} ad set',
+        'campaign_id': c['id'],
+        'billing_event': 'IMPRESSIONS',
+        'targeting': {'geo_locations': {'countries': [country]}},
+        'status': 'PAUSED',
+    }
+    if pixel_id:
+        adset['optimization_goal'] = 'OFFSITE_CONVERSIONS'
+        adset['promoted_object'] = {'pixel_id': pixel_id, 'custom_event_type': 'PURCHASE'}
+    else:
+        adset['optimization_goal'] = 'LINK_CLICKS'
+        adset['destination_type'] = 'WEBSITE'   # required for LINK_CLICKS under OUTCOME_SALES
+    a = _meta_post(f'{acct}/adsets', adset)
+    if a.get('error') or not a.get('id'):
+        res['error'] = _meta_err(a, 'adset')
+        return res
+    res['adset_id'] = a['id']
+
+    # 3) Creative — page-backed link ad with the product image + Shop Now → product URL.
+    cr = _meta_post(f'{acct}/adcreatives', {
+        'name': f'{label} creative',
+        'object_story_spec': {
+            'page_id': META_PAGE_ID,
+            'link_data': {
+                'link': product_url or '',
+                'message': product_name,
+                'name': product_name,
+                'picture': image_url or '',
+                'call_to_action': {'type': 'SHOP_NOW', 'value': {'link': product_url or ''}},
+            },
+        },
+    })
+    if cr.get('error') or not cr.get('id'):
+        res['error'] = _meta_err(cr, 'creative')
+        return res
+    res['creative_id'] = cr['id']
+
+    # 4) Ad — PAUSED. conversion_domain is required (since Graph v14) when the ad set
+    #    optimises for offsite conversions (the pixel path).
+    ad_payload = {
+        'name': f'{label} ad',
+        'adset_id': a['id'],
+        'creative': {'creative_id': cr['id']},
+        'status': 'PAUSED',
+    }
+    if pixel_id:
+        dom = _reg_domain(product_url)
+        if dom:
+            ad_payload['conversion_domain'] = dom
+    ad = _meta_post(f'{acct}/ads', ad_payload)
+    if ad.get('error') or not ad.get('id'):
+        res['error'] = _meta_err(ad, 'ad')
+        return res
+    res['ad_id'] = ad['id']
+    return res
+
+
+@app.route('/api/meta/create_draft', methods=['POST'])
+@require_droplet_token
+def meta_create_draft():
+    """Create one paused Sales-CBO draft per store. Body: {product_name, items:[{store,
+    product_url, image_url}]}. Gated by the session token — never callable from outside."""
+    if not DROPLET_TOKEN_SECRET:
+        # fail closed: this route touches a live ad account, so never run it ungated
+        return jsonify({'error': 'session-token gate not configured'}), 503
+    if not (META_ACCESS_TOKEN and _meta_acct() and META_PAGE_ID):
+        return jsonify({'error': 'Meta not configured in backend/.env'}), 400
+    data = request.json or {}
+    product_name = (data.get('product_name') or '').strip() or 'Product'
+    items = data.get('items') or []
+    if not items:
+        return jsonify({'error': 'no stores/items provided'}), 400
+    pixel_id = _meta_account_pixel()
+    results = [_meta_create_draft((it.get('store') or '').lower(), product_name,
+                                  it.get('product_url') or '', it.get('image_url') or '', pixel_id)
+               for it in items]
+    return jsonify({'pixel_used': pixel_id, 'results': results})
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print(f"\nVionna Dashboard running on http://localhost:{port}\n")
