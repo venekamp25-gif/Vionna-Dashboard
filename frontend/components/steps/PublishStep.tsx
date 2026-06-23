@@ -3,12 +3,11 @@
 import { useState } from "react";
 import { AnimatedCheckmark } from "@/components/ui/AnimatedCheckmark";
 import { Button } from "@/components/ui/Button";
-import { api, MetaDraftResult } from "@/lib/api";
+import { api, MetaDraftResult, AdCopyEntry } from "@/lib/api";
 import { useProduct, colorLabelFor, pickRandomBgReferenceUrl, ProductVerify } from "@/lib/product";
 import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
 import { useStep } from "@/lib/step";
-
-type MetaItem = { store: string; product_url: string; image_url: string };
+import { higgsfieldQueue } from "@/lib/concurrency";
 
 function FlagDK() {
   return (
@@ -57,23 +56,26 @@ export function PublishStep() {
   const fallbackList: StoreKey[] =
     publishedStores.length > 0 ? publishedStores : [data.activeViewStore];
 
-  // Per published store: product URL (for the ad link) + a product photo (step-1, then
-  // step-2, then any published/competitor image) for the Meta draft.
-  const metaItems: MetaItem[] = fallbackList
-    .map((store) => {
-      const result =
-        resultsByStore[store] ?? (store === data.activeViewStore ? data.publishResult : null);
-      const url = result?.productUrls?.[0];
-      if (!url) return null;
-      const img =
-        data.nbResults?.[1]?.[0]?.url ||
-        data.nbResults?.[2]?.[0]?.url ||
-        data.publishPool?.[0]?.url ||
-        data.competitorImages?.[0]?.url ||
-        "";
-      return { store: store as string, product_url: url, image_url: img };
-    })
-    .filter((x): x is MetaItem => !!x);
+  // For the Meta drafts: per-store product URL (the ad link) + the shared product photos.
+  // Step-1 + step-2 are the AI model shots; 3 more lifestyle shots are generated on demand.
+  const urlByStore: Partial<Record<StoreKey, string>> = {};
+  for (const store of fallbackList) {
+    const result =
+      resultsByStore[store] ?? (store === data.activeViewStore ? data.publishResult : null);
+    const url = result?.productUrls?.[0];
+    if (url) urlByStore[store] = url;
+  }
+  const metaStores = fallbackList.filter((s) => !!urlByStore[s]);
+  const step1img = data.nbResults?.[1]?.[0]?.url || "";
+  const step2img = data.nbResults?.[2]?.[0]?.url || "";
+  // References Higgsfield uses to generate the 3 lifestyle shots (the model shots we already
+  // have, plus the original product/competitor photos as a fallback).
+  const referenceImages = [
+    step1img,
+    step2img,
+    ...(data.publishPool ?? []).map((p) => p.url),
+    ...(data.competitorImages ?? []).map((c) => c.url),
+  ].filter(Boolean);
 
   const resetForNewProduct = () => {
     setData((prev) => ({
@@ -144,7 +146,15 @@ export function PublishStep() {
         );
       })}
 
-      <MetaDraftSection items={metaItems} productName={data.name} />
+      <MetaDraftSection
+        stores={metaStores}
+        urlByStore={urlByStore}
+        productName={data.name}
+        productType={data.productType}
+        step1img={step1img}
+        step2img={step2img}
+        referenceImages={referenceImages}
+      />
 
       <div className="flex items-center justify-between bg-bg-elev border border-border rounded-2xl px-6 py-4">
         <span className="text-[13px] text-text-dim">Ready for the next one?</span>
@@ -156,27 +166,126 @@ export function PublishStep() {
   );
 }
 
-/** Create PAUSED Meta Ads draft campaigns for the published stores. Nothing goes live —
- *  the operator finalises + launches in Ads Manager. */
-function MetaDraftSection({ items, productName }: { items: MetaItem[]; productName: string }) {
-  const [running, setRunning] = useState(false);
+/** Prepare PAUSED Meta Ads draft campaigns for the published stores. Per checked store it
+ *  generates 3 lifestyle shots (Higgsfield) to join the 2 model shots, writes per-language ad
+ *  copy, then creates a paused Sales campaign with up to 5 image ads. Nothing goes live — the
+ *  operator finalises + launches in Ads Manager. */
+function MetaDraftSection({
+  stores,
+  urlByStore,
+  productName,
+  productType,
+  step1img,
+  step2img,
+  referenceImages,
+}: {
+  stores: StoreKey[];
+  urlByStore: Partial<Record<StoreKey, string>>;
+  productName: string;
+  productType: string;
+  step1img: string;
+  step2img: string;
+  referenceImages: string[];
+}) {
+  const [selected, setSelected] = useState<Record<string, boolean>>(
+    Object.fromEntries(stores.map((s) => [s, true]))
+  );
+  const [phase, setPhase] = useState<string | null>(null);
   const [results, setResults] = useState<MetaDraftResult[] | null>(null);
+  const [note, setNote] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
-  if (items.length === 0) return null;
+  if (stores.length === 0) return null;
+
+  const running = phase !== null;
+  const chosen = stores.filter((s) => selected[s]);
 
   const run = async () => {
-    setRunning(true);
-    setErr(null);
+    if (chosen.length === 0) return;
     setResults(null);
+    setErr(null);
+    setNote(null);
     try {
+      // 1) Generate 3 lifestyle shots (shared across stores). Degrade gracefully — if it
+      //    fails we still ship the 2 model shots as ads.
+      setPhase("Generating lifestyle images… (this can take a minute)");
+      let lifestyle: string[] = [];
+      const refs = referenceImages.slice(0, 4);
+      if (refs.length > 0) {
+        try {
+          const res = await higgsfieldQueue.run(() =>
+            api.higgsfield({
+              prompt_type: 1,
+              product_type: productType || "dress",
+              image_urls: refs,
+              count: 3,
+            })
+          );
+          lifestyle = res.urls ?? [];
+        } catch {
+          /* keep going with the model shots */
+        }
+      }
+      const images = Array.from(
+        new Set([step1img, step2img, ...lifestyle].filter(Boolean))
+      ).slice(0, 5);
+      if (images.length === 0) {
+        setErr("No images available to build ads from.");
+        setPhase(null);
+        return;
+      }
+
+      // 2) Per-store ad copy (translated + fluent), each with that store's product URL.
+      setPhase("Writing ad copy per language…");
+      const copyByStore: Record<string, AdCopyEntry | undefined> = {};
+      await Promise.all(
+        chosen.map(async (store) => {
+          try {
+            const res = await api.generateAdCopy({
+              stores: [store],
+              product_name: productName || "ons product",
+              product_url: urlByStore[store] || "",
+            });
+            const entry = res[store];
+            copyByStore[store] = entry && typeof entry === "object" ? entry : undefined;
+          } catch {
+            copyByStore[store] = undefined;
+          }
+        })
+      );
+
+      // 3) Create the paused drafts.
+      setPhase("Creating paused campaigns…");
+      const items = chosen
+        .map((store) => {
+          const url = urlByStore[store];
+          if (!url) return null;
+          const c = copyByStore[store];
+          return {
+            store: store as string,
+            product_url: url,
+            image_urls: images,
+            primary_text: c?.primary_text,
+            headline: c?.headline,
+            description: c?.description,
+          };
+        })
+        .filter((x): x is NonNullable<typeof x> => !!x);
+
       const r = await api.metaCreateDraft({ product_name: productName || "Product", items });
-      if (r.error) setErr(r.error);
-      else setResults(r.results ?? []);
+      if (r.error) {
+        setErr(r.error);
+      } else {
+        setResults(r.results ?? []);
+        setNote(
+          `${images.length} image${images.length === 1 ? "" : "s"} per campaign` +
+            (lifestyle.length ? ` · ${lifestyle.length} AI lifestyle` : "")
+        );
+      }
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
-      setRunning(false);
+      setPhase(null);
     }
   };
 
@@ -186,19 +295,53 @@ function MetaDraftSection({ items, productName }: { items: MetaItem[]; productNa
         <div>
           <div className="text-[14px] font-semibold text-text">📣 Prepare Meta Ads campaign</div>
           <p className="text-[11px] text-text-faint mt-0.5 leading-relaxed">
-            Creates a <strong>PAUSED</strong> Sales campaign (€30/day) per published store, targeted to that
-            country. Nothing goes live — you finalise &amp; launch it in Ads Manager.
+            Per checked store: a <strong>PAUSED</strong> Sales campaign (€30/day, Advantage+)
+            targeted to that country, with <strong>5 image ads</strong> (2 model shots + 3 AI
+            lifestyle) and auto-translated ad copy. Nothing goes live — you finalise &amp; launch
+            in Ads Manager.
           </p>
         </div>
-        <Button variant="primary" size="sm" onClick={() => void run()} disabled={running}>
-          {running ? "Creating…" : "Create paused drafts"}
+        <Button
+          variant="primary"
+          size="sm"
+          onClick={() => void run()}
+          disabled={running || chosen.length === 0}
+        >
+          {running ? "Working…" : "Create paused drafts"}
         </Button>
       </div>
 
+      <div className="flex flex-wrap gap-2">
+        {stores.map((store) => {
+          const on = !!selected[store];
+          return (
+            <button
+              key={store}
+              type="button"
+              onClick={() => setSelected((p) => ({ ...p, [store]: !p[store] }))}
+              disabled={running}
+              aria-pressed={on}
+              className={[
+                "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-[12px] font-semibold transition-colors disabled:opacity-50",
+                on
+                  ? "bg-accent/15 border-accent/50 text-accent"
+                  : "bg-transparent border-border text-text-dim hover:border-accent/40",
+              ].join(" ")}
+            >
+              {FLAGS[store]}
+              <span className="uppercase tracking-wider">{store}</span>
+              {on && <span>✓</span>}
+            </button>
+          );
+        })}
+      </div>
+
+      {phase && <p className="text-[12px] text-text-dim">⏳ {phase}</p>}
       {err && <p className="text-[12px] text-danger">⚠ {err}</p>}
 
       {results && (
         <div className="space-y-1.5 border-t border-border pt-2.5">
+          {note && <p className="text-[11px] text-text-faint">{note}</p>}
           {results.map((r) => (
             <div key={r.store} className="text-[12px] flex items-center gap-2 flex-wrap">
               <span className="font-semibold uppercase tracking-wider">{r.store}</span>
@@ -206,7 +349,9 @@ function MetaDraftSection({ items, productName }: { items: MetaItem[]; productNa
                 <span className="text-danger">✕ {r.error}</span>
               ) : (
                 <>
-                  <span className="text-accent">✓ paused campaign created</span>
+                  <span className="text-accent">
+                    ✓ {r.ad_ids?.length ?? 0} paused ad{(r.ad_ids?.length ?? 0) === 1 ? "" : "s"} created
+                  </span>
                   <a
                     href="https://adsmanager.facebook.com/adsmanager/manage/campaigns?act=6399532626780380"
                     target="_blank"

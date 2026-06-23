@@ -106,7 +106,16 @@ export function SettingsModal({ open, onClose }: Props) {
         items: [{
           store: "fr",
           product_url: "https://www.vionnaclothing.com",
-          image_url: "https://picsum.photos/seed/vionnatest/800/800",
+          image_urls: [
+            "https://picsum.photos/seed/vionna1/800/800",
+            "https://picsum.photos/seed/vionna2/800/800",
+            "https://picsum.photos/seed/vionna3/800/800",
+            "https://picsum.photos/seed/vionna4/800/800",
+            "https://picsum.photos/seed/vionna5/800/800",
+          ],
+          primary_text: "TEST advertentietekst – verwijder deze campagne na de test.",
+          headline: "TEST",
+          description: "Gratis verzending",
         }],
       });
       if (r.error) {
@@ -116,7 +125,7 @@ export function SettingsModal({ open, onClose }: Props) {
         setMetaTestResult(
           res?.error
             ? "✕ " + res.error
-            : `✓ paused test campaign created (id ${res?.campaign_id ?? "?"}) · pixel: ${r.pixel_used ?? "none"}`
+            : `✓ test campaign ${res?.campaign_id ?? "?"} · ${res?.ad_ids?.length ?? 0} ads created · pixel ${r.pixel_used ?? "none"}`
         );
       }
     } catch (e) {
@@ -515,8 +524,9 @@ export function SettingsModal({ open, onClose }: Props) {
           <div className="mt-8 pt-6 border-t border-border">
             <div className="text-[14px] font-semibold text-text mb-1">Meta Ads — connection test</div>
             <p className="text-[12px] text-text-faint mb-3 leading-relaxed">
-              Creates ONE <strong>paused</strong> test campaign (FR · €30/day · placeholder image) to confirm
-              the draft pipeline works — without a full product import. Delete it in Ads Manager afterwards.
+              Creates ONE <strong>paused</strong> test campaign (FR · €30/day · <strong>5 placeholder
+              ads</strong>) to confirm the full draft pipeline works — without a product import or
+              image generation. Delete it in Ads Manager afterwards.
             </p>
             <Button variant="secondary" size="sm" onClick={() => void runMetaTest()} disabled={metaTestBusy}>
               {metaTestBusy ? "Creating…" : "Create paused test draft"}

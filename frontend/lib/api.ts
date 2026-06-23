@@ -519,16 +519,33 @@ export const api = {
   /** Read-only: confirm Meta config + that the token reaches the ad account + page. */
   metaCheck: () => call<MetaCheckResponse>("/api/meta/check"),
 
-  /** Create PAUSED Meta draft campaigns — one per store. Gated (session token). */
+  /** Create PAUSED Meta draft campaigns — one per store, each with up to 5 image ads +
+   *  per-store ad copy. Gated (session token). Back-compatible single-image `image_url` too. */
   metaCreateDraft: (params: {
     product_name: string;
-    items: { store: string; product_url: string; image_url: string }[];
+    items: {
+      store: string;
+      product_url: string;
+      image_urls?: string[];
+      image_url?: string;
+      primary_text?: string;
+      headline?: string;
+      description?: string;
+    }[];
   }) =>
     call<MetaCreateDraftResponse>("/api/meta/create_draft", {
       method: "POST",
       body: params,
       authed: true,
     }),
+
+  /** Translate the Dutch ad-copy template into fluent ad copy per store-language. */
+  generateAdCopy: (params: {
+    stores: string[];
+    product_name: string;
+    product_url: string;
+    template?: string;
+  }) => call<AdCopyResponse>("/api/generate_ad_copy", { method: "POST", body: params }),
 };
 
 export interface MetaDraftResult {
@@ -536,8 +553,8 @@ export interface MetaDraftResult {
   country: string | null;
   campaign_id: string | null;
   adset_id: string | null;
-  creative_id: string | null;
-  ad_id: string | null;
+  creative_ids: string[];
+  ad_ids: string[];
   error: string | null;
 }
 export interface MetaCreateDraftResponse {
@@ -545,6 +562,14 @@ export interface MetaCreateDraftResponse {
   results?: MetaDraftResult[];
   error?: string;
 }
+export interface AdCopyEntry {
+  primary_text?: string;
+  headline?: string;
+  description?: string;
+  error?: string;
+}
+/** Keyed by store ("dk"|"fr"|"fi"); may also carry a top-level `error`. */
+export type AdCopyResponse = Record<string, AdCopyEntry | string | undefined>;
 export interface MetaCheckResponse {
   config?: Record<string, unknown>;
   account?: { name?: string; account_status?: number } | null;
