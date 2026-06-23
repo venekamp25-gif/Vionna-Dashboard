@@ -5228,6 +5228,37 @@ def meta_check():
     return jsonify(out)
 
 
+@app.route('/api/meta/inspect')
+def meta_inspect():
+    """Read-only: dump a campaign's structure (campaign + ad sets + ads + creatives) so we
+    can mirror an existing campaign's settings. Never mutates anything."""
+    if not META_ACCESS_TOKEN:
+        return jsonify({'error': 'Meta not configured'}), 400
+    cid = (request.args.get('campaign_id') or request.args.get('id') or '').strip()
+    if not cid:
+        return jsonify({'error': 'campaign_id required'}), 400
+    out = {'campaign': None, 'adsets': [], 'ads': [], 'errors': []}
+    c = _meta_get(cid, {'fields': 'name,objective,status,effective_status,buying_type,'
+                        'daily_budget,lifetime_budget,bid_strategy,special_ad_categories,'
+                        'smart_promotion_type'})
+    if c.get('error'):
+        out['errors'].append('campaign: ' + str(c['error'].get('message') or c['error']))
+        return jsonify(out)
+    out['campaign'] = c
+    aj = _meta_get(f'{cid}/adsets', {'fields': 'name,status,optimization_goal,billing_event,'
+                   'bid_strategy,daily_budget,destination_type,promoted_object,targeting,'
+                   'attribution_spec', 'limit': 25})
+    out['adsets'] = (aj or {}).get('data') or []
+    if aj.get('error'):
+        out['errors'].append('adsets: ' + str(aj['error'].get('message') or aj['error']))
+    adj = _meta_get(f'{cid}/ads', {'fields': 'name,status,creative{id,name,'
+                    'object_story_spec,call_to_action_type,image_url}', 'limit': 25})
+    out['ads'] = (adj or {}).get('data') or []
+    if adj.get('error'):
+        out['errors'].append('ads: ' + str(adj['error'].get('message') or adj['error']))
+    return jsonify(out)
+
+
 # ── Meta Ads: create a PAUSED draft campaign ──────────────────────────────────
 # Per store/country: a Sales CBO campaign (€30/day, campaign-level budget) → 1 ad set
 # (geo-targeted to that country, conversion-optimised if a pixel exists) → 1 ad with the
@@ -5318,29 +5349,91 @@ def _meta_err(j, step):
     return f"{step}: " + ' | '.join(parts)
 
 
-def _meta_create_draft(store, product_name, product_url, image_url, pixel_id):
-    """Create ONE paused Sales-CBO draft for a store/country. Returns created ids + the
-    first failing step's error (stops on first failure so we never leave a half-built ad)."""
+# Default Dutch ad-copy template (user-provided). /api/generate_ad_copy translates it per
+# store-language; {product} and {url} are filled in before translation.
+META_AD_COPY_TEMPLATE_NL = (
+    "Er goed uitzien was nog nooit zo makkelijk – Ontdek onze {product}🥰☀️\n\n"
+    "✅ 30 dagen retour & 100% geld-terug-garantie\n"
+    "✅ Voorraad bijna uitverkocht – wees er snel bij!\n\n"
+    "Nu winkelen👉{url}"
+)
+
+
+@app.route('/api/generate_ad_copy', methods=['POST'])
+def generate_ad_copy():
+    """Translate the Dutch ad-copy template into fluent, natural ad copy per store-language.
+    Body: {stores:[...], product_name, product_url, template?}. Returns
+    {dk:{primary_text,headline}, ...}. Falls back to the filled template on a translation error."""
+    if not ANTHROPIC_KEY:
+        return jsonify({'error': 'Anthropic API key missing'}), 400
+    import anthropic
+    import re as _re
+    data = request.json or {}
+    stores = [str(s).lower() for s in (data.get('stores') or ['dk', 'fr', 'fi'])]
+    product_name = (data.get('product_name') or 'ons product').strip()
+    product_url = (data.get('product_url') or '').strip()
+    template = data.get('template') or META_AD_COPY_TEMPLATE_NL
+    nl = (template.replace('{product}', product_name).replace('{productnaam}', product_name)
+                  .replace('{url}', product_url).replace('{productpage link}', product_url))
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    out = {}
+    for store in stores:
+        language = STORE_LANGUAGE.get(store)
+        if not language:
+            out[store] = {'error': f'unknown store {store}'}
+            continue
+        prompt = (
+            f"Je bent copywriter voor een vrouwenmodemerk. Vertaal en herschrijf onderstaande "
+            f"Facebook-advertentietekst naar vloeiend, natuurlijk {language} (niet letterlijk). "
+            f"Behoud de structuur, de emoji's en de twee regels die met een vinkje beginnen, en "
+            f"houd de toon enthousiast maar niet schreeuwerig. Gebruik de productnaam "
+            f"\"{product_name}\" en behoud de link exact zoals gegeven.\n\n"
+            f"Origineel (Nederlands):\n---\n{nl}\n---\n\n"
+            f"Geef ook een korte, pakkende headline van maximaal 40 tekens in het {language}.\n\n"
+            f"Antwoord UITSLUITEND als geldig JSON, zonder extra tekst:\n"
+            f'{{"primary_text": "...", "headline": "..."}}'
+        )
+        try:
+            msg = client.messages.create(model='claude-sonnet-4-5', max_tokens=700,
+                                         messages=[{'role': 'user', 'content': prompt}])
+            text = msg.content[0].text
+            m = _re.search(r'\{.*\}', text, _re.DOTALL)
+            obj = json.loads(m.group(0)) if m else {}
+            out[store] = {
+                'primary_text': (obj.get('primary_text') or '').strip() or nl,
+                'headline': (obj.get('headline') or '').strip() or product_name,
+            }
+        except Exception as e:
+            out[store] = {'primary_text': nl, 'headline': product_name, 'error': str(e)[:160]}
+    return jsonify(out)
+
+
+def _meta_create_draft(store, primary_text, headline, product_url, image_urls, hash_by_url, pixel_id):
+    """Create ONE paused Sales draft for a store/country: campaign (Sales, CBO €30/day) →
+    1 ad set (geo-targeted, Advantage+ audience when accepted, conversion-optimised if a pixel
+    exists) → up to 5 creatives + 5 ads (one per image, all sharing the ad set), each carrying
+    the per-store copy. EVERYTHING PAUSED. Skips a bad image rather than sinking the campaign."""
     country = STORE_COUNTRY.get((store or '').lower())
     res = {'store': store, 'country': country, 'campaign_id': None, 'adset_id': None,
-           'creative_id': None, 'ad_id': None, 'error': None}
+           'creative_ids': [], 'ad_ids': [], 'error': None}
     if not country:
         res['error'] = f'unknown store {store!r}'
         return res
-    # Validate URLs up front so we never create a campaign/ad set and then fail on a blank
-    # link/image (which would leave a paused half-build).
     if not str(product_url).startswith('http'):
         res['error'] = 'missing or invalid product_url'
         return res
-    if not str(image_url).startswith('http'):
-        res['error'] = 'missing or invalid image_url'
+    imgs = [u for u in (image_urls or []) if str(u).startswith('http')][:5]
+    if not imgs:
+        res['error'] = 'no valid image_urls'
         return res
+    primary_text = (primary_text or '').strip() or (headline or '').strip() or 'Shop now'
+    headline = (headline or '').strip() or primary_text[:40]
     acct = _meta_acct()
-    label = f"{product_name} – {str(store).upper()}"
+    su = str(store).upper()
 
     # 1) Campaign — Sales objective, CBO (budget on the campaign), €30/day, PAUSED.
     c = _meta_post(f'{acct}/campaigns', {
-        'name': f'{label} (draft)',
+        'name': f'{headline} – {su} (draft)',
         'objective': 'OUTCOME_SALES',
         'special_ad_categories': [],
         'daily_budget': 3000,                       # €30.00 in cents (account is EUR)
@@ -5352,74 +5445,81 @@ def _meta_create_draft(store, product_name, product_url, image_url, pixel_id):
         return res
     res['campaign_id'] = c['id']
 
-    # 2) Ad set — geo-targeted to the country; conversion-optimised if a pixel exists,
-    #    otherwise a safe non-pixel goal the operator can switch in Ads Manager.
-    adset = {
-        'name': f'{label} ad set',
+    # 2) Ad set — geo-targeted; automatic (Advantage+) placements by leaving placements unset.
+    #    Try Advantage+ audience first; if the account rejects it, fall back to plain geo.
+    base = {
+        'name': f'{su} ad set',
         'campaign_id': c['id'],
         'billing_event': 'IMPRESSIONS',
-        'targeting': {'geo_locations': {'countries': [country]}},
         'status': 'PAUSED',
     }
     if pixel_id:
-        adset['optimization_goal'] = 'OFFSITE_CONVERSIONS'
-        adset['promoted_object'] = {'pixel_id': pixel_id, 'custom_event_type': 'PURCHASE'}
+        base['optimization_goal'] = 'OFFSITE_CONVERSIONS'
+        base['promoted_object'] = {'pixel_id': pixel_id, 'custom_event_type': 'PURCHASE'}
     else:
-        adset['optimization_goal'] = 'LINK_CLICKS'
-        adset['destination_type'] = 'WEBSITE'   # required for LINK_CLICKS under OUTCOME_SALES
-    a = _meta_post(f'{acct}/adsets', adset)
+        base['optimization_goal'] = 'LINK_CLICKS'
+        base['destination_type'] = 'WEBSITE'   # required for LINK_CLICKS under OUTCOME_SALES
+    geo = {'geo_locations': {'countries': [country]}}
+    a = _meta_post(f'{acct}/adsets', dict(base, targeting=dict(geo, targeting_automation={'advantage_audience': 1})))
+    if a.get('error') or not a.get('id'):
+        time.sleep(0.4)
+        a = _meta_post(f'{acct}/adsets', dict(base, targeting=geo))
     if a.get('error') or not a.get('id'):
         res['error'] = _meta_err(a, 'adset')
         return res
     res['adset_id'] = a['id']
 
-    # 3) Creative — page-backed link ad. Upload the image for a reliable image_hash
-    #    (fall back to a picture URL if the upload fails).
-    link_data = {
-        'link': product_url,
-        'message': product_name,
-        'name': product_name,
-        'call_to_action': {'type': 'SHOP_NOW', 'value': {'link': product_url}},
-    }
-    img_hash = _meta_upload_image(image_url)
-    if img_hash:
-        link_data['image_hash'] = img_hash
-    else:
-        link_data['picture'] = image_url
-    cr = _meta_post(f'{acct}/adcreatives', {
-        'name': f'{label} creative',
-        'object_story_spec': {'page_id': META_PAGE_ID, 'link_data': link_data},
-    })
-    if cr.get('error') or not cr.get('id'):
-        res['error'] = _meta_err(cr, 'creative')
-        return res
-    res['creative_id'] = cr['id']
-
-    # 4) Ad — PAUSED. conversion_domain is required (since Graph v14) when the ad set
-    #    optimises for offsite conversions (the pixel path).
-    ad_payload = {
-        'name': f'{label} ad',
-        'adset_id': a['id'],
-        'creative': {'creative_id': cr['id']},
-        'status': 'PAUSED',
-    }
-    if pixel_id:
-        dom = _reg_domain(product_url)
+    # 3+4) One creative + one ad per image (max 5), all in the same ad set. Same per-store copy
+    #      on every creative; different image each. Paced to stay under Facebook edge limits.
+    dom = _reg_domain(product_url) if pixel_id else ''
+    last_err = None
+    for i, image_url in enumerate(imgs):
+        time.sleep(0.4)
+        link_data = {
+            'link': product_url,
+            'message': primary_text,
+            'name': headline,
+            'call_to_action': {'type': 'SHOP_NOW', 'value': {'link': product_url}},
+        }
+        h = (hash_by_url or {}).get(image_url)
+        if h:
+            link_data['image_hash'] = h
+        else:
+            link_data['picture'] = image_url
+        cr = _meta_post(f'{acct}/adcreatives', {
+            'name': f'{su} creative {i + 1}',
+            'object_story_spec': {'page_id': META_PAGE_ID, 'link_data': link_data},
+        })
+        if cr.get('error') or not cr.get('id'):
+            last_err = _meta_err(cr, 'creative')
+            continue
+        res['creative_ids'].append(cr['id'])
+        time.sleep(0.4)
+        ad_payload = {
+            'name': f'{su} ad {i + 1}',
+            'adset_id': a['id'],
+            'creative': {'creative_id': cr['id']},
+            'status': 'PAUSED',
+        }
         if dom:
             ad_payload['conversion_domain'] = dom
-    ad = _meta_post(f'{acct}/ads', ad_payload)
-    if ad.get('error') or not ad.get('id'):
-        res['error'] = _meta_err(ad, 'ad')
-        return res
-    res['ad_id'] = ad['id']
+        ad = _meta_post(f'{acct}/ads', ad_payload)
+        if ad.get('error') or not ad.get('id'):
+            last_err = _meta_err(ad, 'ad')
+            continue
+        res['ad_ids'].append(ad['id'])
+    if not res['ad_ids']:
+        res['error'] = last_err or 'no ads created'
     return res
 
 
 @app.route('/api/meta/create_draft', methods=['POST'])
 @require_droplet_token
 def meta_create_draft():
-    """Create one paused Sales-CBO draft per store. Body: {product_name, items:[{store,
-    product_url, image_url}]}. Gated by the session token — never callable from outside."""
+    """Create one paused Sales draft per store, each with up to 5 image ads + per-store copy.
+    Body: {product_name, items:[{store, product_url, image_urls:[...], primary_text, headline}]}
+    (back-compatible with the old {image_url} single-image shape). Gated by the session token —
+    never callable from outside; everything created is PAUSED."""
     if not DROPLET_TOKEN_SECRET:
         # fail closed: this route touches a live ad account, so never run it ungated
         return jsonify({'error': 'session-token gate not configured'}), 503
@@ -5430,10 +5530,38 @@ def meta_create_draft():
     items = data.get('items') or []
     if not items:
         return jsonify({'error': 'no stores/items provided'}), 400
+
+    # Normalise each item (back-compatible with the old {image_url} shape) and collect every
+    # unique image URL so we upload each one ONCE — image_hash is account-wide, so the hash is
+    # reused across all stores. Gentler on the API + faster.
+    norm, all_urls = [], []
+    for it in items:
+        urls = it.get('image_urls') or ([it['image_url']] if it.get('image_url') else [])
+        urls = [u for u in urls if str(u).startswith('http')]
+        norm.append({
+            'store': (it.get('store') or '').lower(),
+            'product_url': it.get('product_url') or '',
+            'image_urls': urls,
+            'primary_text': (it.get('primary_text') or product_name),
+            'headline': (it.get('headline') or product_name),
+        })
+        for u in urls:
+            if u not in all_urls:
+                all_urls.append(u)
+
+    hash_by_url = {}
+    for u in all_urls[:10]:
+        h = _meta_upload_image(u)
+        if h:
+            hash_by_url[u] = h
+        time.sleep(0.3)
+
     pixel_id = _meta_account_pixel()
-    results = [_meta_create_draft((it.get('store') or '').lower(), product_name,
-                                  it.get('product_url') or '', it.get('image_url') or '', pixel_id)
-               for it in items]
+    results = []
+    for it in norm:
+        results.append(_meta_create_draft(it['store'], it['primary_text'], it['headline'],
+                                          it['product_url'], it['image_urls'], hash_by_url, pixel_id))
+        time.sleep(0.5)
     return jsonify({'pixel_used': pixel_id, 'results': results})
 
 
