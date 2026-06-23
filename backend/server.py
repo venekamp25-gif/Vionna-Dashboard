@@ -5266,6 +5266,25 @@ def _reg_domain(url):
         return ''
 
 
+def _meta_upload_image(image_url):
+    """Download an image URL and upload its bytes to the ad account → image_hash (or None).
+    More reliable than a `picture` URL the creative endpoint has to re-fetch itself."""
+    if not str(image_url).startswith('http'):
+        return None
+    try:
+        ir = req.get(image_url, timeout=20)
+        if ir.status_code != 200 or not ir.content:
+            return None
+        b64 = base64.b64encode(ir.content).decode()
+    except Exception:
+        return None
+    j = _meta_post(f"{_meta_acct()}/adimages", {'bytes': b64})
+    for v in ((j or {}).get('images') or {}).values():
+        if v.get('hash'):
+            return v['hash']
+    return None
+
+
 def _meta_err(j, step):
     e = (j or {}).get('error') or {}
     parts = [str(e.get('message') or j)]
@@ -5333,19 +5352,22 @@ def _meta_create_draft(store, product_name, product_url, image_url, pixel_id):
         return res
     res['adset_id'] = a['id']
 
-    # 3) Creative — page-backed link ad with the product image + Shop Now → product URL.
+    # 3) Creative — page-backed link ad. Upload the image for a reliable image_hash
+    #    (fall back to a picture URL if the upload fails).
+    link_data = {
+        'link': product_url,
+        'message': product_name,
+        'name': product_name,
+        'call_to_action': {'type': 'SHOP_NOW', 'value': {'link': product_url}},
+    }
+    img_hash = _meta_upload_image(image_url)
+    if img_hash:
+        link_data['image_hash'] = img_hash
+    else:
+        link_data['picture'] = image_url
     cr = _meta_post(f'{acct}/adcreatives', {
         'name': f'{label} creative',
-        'object_story_spec': {
-            'page_id': META_PAGE_ID,
-            'link_data': {
-                'link': product_url or '',
-                'message': product_name,
-                'name': product_name,
-                'picture': image_url or '',
-                'call_to_action': {'type': 'SHOP_NOW', 'value': {'link': product_url or ''}},
-            },
-        },
+        'object_story_spec': {'page_id': META_PAGE_ID, 'link_data': link_data},
     })
     if cr.get('error') or not cr.get('id'):
         res['error'] = _meta_err(cr, 'creative')
