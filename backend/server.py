@@ -5134,7 +5134,10 @@ def api_update():
     errors  = []
     for fname in files_to_update:
         try:
-            r = req.get(f'{GITHUB_RAW}/backend/{fname}', timeout=15)
+            # cache-bust the GitHub raw CDN — without this it sometimes serves a stale
+            # server.py while version.txt is already fresh, so a deploy half-lands.
+            r = req.get(f'{GITHUB_RAW}/backend/{fname}', timeout=15,
+                        params={'t': int(time.time())}, headers={'Cache-Control': 'no-cache'})
             r.raise_for_status()
             dest = os.path.join(base_dir, fname)
             with open(dest, 'wb') as f:
@@ -5264,7 +5267,15 @@ def _reg_domain(url):
 
 
 def _meta_err(j, step):
-    return f"{step}: " + str((j.get('error') or {}).get('message') or j)
+    e = (j or {}).get('error') or {}
+    parts = [str(e.get('message') or j)]
+    if e.get('error_user_msg'):
+        parts.append(str(e['error_user_msg']))
+    if e.get('error_subcode'):
+        parts.append(f"subcode {e['error_subcode']}")
+    if e.get('error_data'):
+        parts.append(str(e['error_data'])[:200])
+    return f"{step}: " + ' | '.join(parts)
 
 
 def _meta_create_draft(store, product_name, product_url, image_url, pixel_id):
