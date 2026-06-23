@@ -3002,12 +3002,15 @@ def _fix_collection_titles(jid, store, hdrs, dry_run):
     # "Siblings", so the theme doesn't exclude them and they show to customers. Rename them
     # to "<Product> Siblings". STRICTLY GUARDED so a browsable/marketing collection can NEVER
     # be hidden — a collection is only renamed when ALL of these hold:
-    #   • it's a CUSTOM collection (a per-product swatch set is never a smart collection);
     #   • its handle is swatch-style (-collection / -siblings / -soskende / -kokoelma / -mallisto);
     #   • it has ≤12 members, so the 12-product sample IS the whole collection (no hasNextPage)
     #     — this is what stops a large collection with a homogeneous first-12 from being hidden;
     #   • those members are colour-variants of ONE product (one shared, accent-insensitive title).
-    # Empty, multi-title, large, smart, and non-swatch-handle collections are all left alone.
+    # NOTE: this store's swatch collections are SMART collections, so we deliberately do NOT
+    # skip smart — the one-title + swatch-handle + ≤12 guards are what separate a swatch set
+    # from a marketing collection, not custom-vs-smart. Renaming touches the TITLE only (the
+    # smart rule + handle stay intact). Empty, multi-title, large, and non-swatch-handle
+    # collections are all left alone.
     SWATCH_SUFFIX = ('-siblings', '-collection', '-soskende', '-kokoelma', '-mallisto')
     cols = _fetch_collections_with_members(store, hdrs)
     if cols is None:
@@ -3019,8 +3022,6 @@ def _fix_collection_titles(jid, store, hdrs, dry_run):
         chandle = c.get('handle') or ''
         if not c.get('id') or not ctitle or not chandle or chandle in handled_handles:
             continue
-        if c.get('smart'):
-            continue  # swatch sets are always custom collections — never touch a smart/marketing one
         if ctitle.endswith(' Siblings'):
             continue  # already named correctly → theme already excludes it
         if c.get('has_more'):
