@@ -5183,11 +5183,14 @@ def _meta_get(node, params=None):
     'error' key on Graph errors)."""
     p = dict(params or {})
     p['access_token'] = META_ACCESS_TOKEN or ''
-    r = req.get(f"{META_GRAPH}/{str(node).lstrip('/')}", params=p, timeout=20)
+    try:
+        r = req.get(f"{META_GRAPH}/{str(node).lstrip('/')}", params=p, timeout=20)
+    except Exception as e:
+        return {'error': {'message': f'request failed: {e}'}}
     try:
         return r.json()
     except Exception:
-        return {'error': {'message': f'non-JSON response (HTTP {r.status_code})'}}
+        return {'error': {'message': f'HTTP {r.status_code}: {(r.text or "")[:300]}'}}
 
 
 @app.route('/api/meta/check')
@@ -5252,8 +5255,8 @@ def _meta_post(node, data):
             last = {'error': {'message': f'request failed: {e}'}}
             continue
         if r.status_code >= 500:
-            last = {'error': {'message': f'transient HTTP {r.status_code}'}}
-            continue  # Meta hiccup — retry
+            last = {'error': {'message': f'HTTP {r.status_code}: {(r.text or "")[:300]}'}}
+            continue  # transient — retry
         try:
             return r.json()
         except Exception:
