@@ -189,6 +189,9 @@ export interface ProductData {
   publishResult: PublishResult | null;
   /** Per-store publish results, populated as each store finishes. */
   publishResultsByStore: Partial<Record<StoreKey, PublishResult>>;
+
+  /** UI intent (ticked in Review): prepare paused Meta Ads drafts after publishing. */
+  prepareMeta?: boolean;
 }
 
 const DEFAULT_DATA: ProductData = {
@@ -233,6 +236,7 @@ const DEFAULT_DATA: ProductData = {
   publishPool: [],
   publishResult: null,
   publishResultsByStore: {},
+  prepareMeta: false,
 };
 
 /** Where the most recent saved draft was found (or `null` if no draft). */

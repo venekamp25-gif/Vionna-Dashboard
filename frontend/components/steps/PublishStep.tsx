@@ -106,6 +106,7 @@ export function PublishStep() {
       publishPool: [],
       publishResult: null,
       publishResultsByStore: {},
+      prepareMeta: false,
       price: "349,00 DKK",
       contentByStore: {
         dk: { description: "", metaDescription: "", mTitleSpecs: "", cutline: "", price: "349,00 DKK", colorLabels: {} },
@@ -159,6 +160,7 @@ export function PublishStep() {
         urlByStoreColor={urlByStoreColor}
         productName={data.name}
         productType={data.productType}
+        defaultEnabled={!!data.prepareMeta}
       />
 
       <div className="flex items-center justify-between bg-bg-elev border border-border rounded-2xl px-6 py-4">
@@ -182,6 +184,7 @@ function MetaDraftSection({
   urlByStoreColor,
   productName,
   productType,
+  defaultEnabled = false,
 }: {
   stores: StoreKey[];
   colorKeys: string[];
@@ -189,8 +192,9 @@ function MetaDraftSection({
   urlByStoreColor: Partial<Record<StoreKey, string[]>>;
   productName: string;
   productType: string;
+  defaultEnabled?: boolean;
 }) {
-  const [enabled, setEnabled] = useState(false);
+  const [enabled, setEnabled] = useState(defaultEnabled);
   const [selected, setSelected] = useState<Record<string, boolean>>(
     Object.fromEntries(stores.map((s) => [s, true]))
   );

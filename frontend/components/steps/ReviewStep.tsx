@@ -360,7 +360,7 @@ export function ReviewStep() {
       </div>
 
       {/* Bottom bar (sticky) — bleeds to viewport edges via negative margin matching parent padding */}
-      <div className="sticky bottom-0 mt-8 -mx-8 lg:-mx-12 xl:-mx-16 px-8 lg:px-12 xl:px-16 py-4 bg-bg-elev border-t border-border backdrop-blur flex items-center justify-between gap-4">
+      <div className="sticky bottom-0 z-20 mt-8 -mx-8 lg:-mx-12 xl:-mx-16 px-8 lg:px-12 xl:px-16 py-4 bg-bg-elev border-t border-border backdrop-blur flex items-center justify-between gap-4">
         <div className="flex flex-col">
           {error ? (
             <span className="text-[13px] text-danger">{error}</span>
@@ -393,7 +393,20 @@ export function ReviewStep() {
             </span>
           )}
         </div>
-        <div className="flex gap-2">
+        <div className="flex items-center gap-3">
+          <label
+            className="flex items-center gap-2 cursor-pointer select-none text-[12px] text-text-dim hover:text-text"
+            title="Bereid na publiceren PAUSED Meta Ads-campagnes voor (per kleur). Niks gaat live."
+          >
+            <input
+              type="checkbox"
+              checked={!!data.prepareMeta}
+              onChange={(e) => patch({ prepareMeta: e.target.checked })}
+              disabled={publishing}
+              className="h-4 w-4 accent-[var(--accent)] cursor-pointer"
+            />
+            <span className="whitespace-nowrap">📣 Prepare Meta&nbsp;Ads</span>
+          </label>
           <Button
             variant="secondary"
             onClick={() => {
