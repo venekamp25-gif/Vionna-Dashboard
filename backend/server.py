@@ -497,7 +497,7 @@ def verify_products():
             'images(first: 30) { nodes { id } } '
             'cutline: metafield(namespace:"theme", key:"cutline") { value } '
             'siblings: metafield(namespace:"theme", key:"siblings") { value } '
-            'resourcePublicationsCount(onlyPublished: true) { count } '
+            'resourcePublicationsCount(onlyPublished: false) { count } '
             'variantsCount { count } } } }' % id_list
         )
         try:
@@ -522,6 +522,9 @@ def verify_products():
                 issues.append({'level': 'warn', 'msg': 'No cutline (colour swatch)'})
             if not siblings_v.strip():
                 issues.append({'level': 'warn', 'msg': 'Siblings link missing'})
+            # onlyPublished:false (above) counts channels the product is ASSIGNED to, even
+            # while it's still draft — drafts aren't "live" yet but ARE on the channel. Using
+            # onlyPublished:true here gave a false "not on any sales channel" on every draft.
             if channels == 0:
                 issues.append({'level': 'warn', 'msg': 'Not on any sales channel'})
             if variants == 0:
