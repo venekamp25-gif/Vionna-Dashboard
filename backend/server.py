@@ -5275,6 +5275,25 @@ def meta_inspect():
     return jsonify(out)
 
 
+@app.route('/api/meta/campaigns')
+def meta_campaigns():
+    """Read-only: list recent campaigns (id, name, status) for diagnostics + cleanup.
+    Optional ?q= filters by name substring (case-insensitive)."""
+    if not META_ACCESS_TOKEN or not _meta_acct():
+        return jsonify({'error': 'Meta not configured'}), 400
+    j = _meta_get(f'{_meta_acct()}/campaigns', {
+        'fields': 'name,status,effective_status,created_time',
+        'limit': 50,
+    })
+    if j.get('error'):
+        return jsonify({'error': str(j['error'].get('message') or j['error'])}), 502
+    rows = (j or {}).get('data') or []
+    q = (request.args.get('q') or '').strip().lower()
+    if q:
+        rows = [c for c in rows if q in str(c.get('name', '')).lower()]
+    return jsonify({'campaigns': rows, 'count': len(rows)})
+
+
 # ── Meta Ads: create a PAUSED draft campaign ──────────────────────────────────
 # Per store/country: a Sales CBO campaign (€30/day, campaign-level budget) → 1 ad set
 # (geo-targeted to that country, conversion-optimised if a pixel exists) → 1 ad with the
