@@ -5176,6 +5176,9 @@ META_GRAPH         = f'https://graph.facebook.com/{META_GRAPH_VERSION}'
 # secret (both are visible in the public page / site code), so the in-repo fallbacks are safe.
 META_PIXEL_ID      = os.getenv('META_PIXEL_ID')   or '1140868834053907'
 META_IG_USER_ID    = os.getenv('META_IG_USER_ID') or '17841469761633612'
+# EU DSA disclosure (advertiser = payer shown in the Meta Ad Library). Without this Meta
+# defaults to the account's legal name ("The Light Supplier"); we want the brand name.
+META_DSA_NAME      = os.getenv('META_DSA_NAME')    or 'Vionna Clothing'
 
 
 def _meta_acct():
@@ -5260,8 +5263,9 @@ def meta_inspect():
     out['adsets'] = (aj or {}).get('data') or []
     if aj.get('error'):
         out['errors'].append('adsets: ' + str(aj['error'].get('message') or aj['error']))
-    adj = _meta_get(f'{cid}/ads', {'fields': 'name,status,creative{id,name,'
-                    'object_story_spec,call_to_action_type,image_url}', 'limit': 25})
+    adj = _meta_get(f'{cid}/ads', {'fields': 'name,status,dsa_beneficiary,dsa_payor,'
+                    'creative{id,name,object_story_spec,call_to_action_type,image_url}',
+                    'limit': 25})
     out['ads'] = (adj or {}).get('data') or []
     if adj.get('error'):
         out['errors'].append('ads: ' + str(adj['error'].get('message') or adj['error']))
@@ -5528,7 +5532,17 @@ def _meta_create_draft(store, copy, product_url, image_urls, hash_by_url, pixel_
         }
         if dom:
             ad_payload['conversion_domain'] = dom
+        # EU DSA: advertiser (= payer) name shown in the Ad Library — the brand, not the
+        # account's legal entity. Retry without these if the account rejects the fields.
+        if META_DSA_NAME:
+            ad_payload['dsa_beneficiary'] = META_DSA_NAME
+            ad_payload['dsa_payor'] = META_DSA_NAME
         ad = _meta_post(f'{acct}/ads', ad_payload)
+        if (ad.get('error') or not ad.get('id')) and META_DSA_NAME:
+            time.sleep(0.3)
+            ad_payload.pop('dsa_beneficiary', None)
+            ad_payload.pop('dsa_payor', None)
+            ad = _meta_post(f'{acct}/ads', ad_payload)
         if ad.get('error') or not ad.get('id'):
             last_err = _meta_err(ad, 'ad')
             continue
