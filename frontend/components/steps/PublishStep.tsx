@@ -56,26 +56,29 @@ export function PublishStep() {
   const fallbackList: StoreKey[] =
     publishedStores.length > 0 ? publishedStores : [data.activeViewStore];
 
-  // For the Meta drafts: per-store product URL (the ad link) + the shared product photos.
-  // Step-1 + step-2 are the AI model shots; 3 more lifestyle shots are generated on demand.
-  const urlByStore: Partial<Record<StoreKey, string>> = {};
-  for (const store of fallbackList) {
-    const result =
-      resultsByStore[store] ?? (store === data.activeViewStore ? data.publishResult : null);
-    const url = result?.productUrls?.[0];
-    if (url) urlByStore[store] = url;
-  }
-  const metaStores = fallbackList.filter((s) => !!urlByStore[s]);
+  // For the Meta drafts (one ad per COLOUR variant): per-colour photos + per-store, per-colour
+  // product URLs. canonicalColors[i] aligns with publishResult.productUrls[i].
   const step1img = data.nbResults?.[1]?.[0]?.url || "";
   const step2img = data.nbResults?.[2]?.[0]?.url || "";
-  // References Higgsfield uses to generate the 3 lifestyle shots (the model shots we already
-  // have, plus the original product/competitor photos as a fallback).
-  const referenceImages = [
+  const sharedFallback = [
     step1img,
     step2img,
     ...(data.publishPool ?? []).map((p) => p.url),
     ...(data.competitorImages ?? []).map((c) => c.url),
   ].filter(Boolean);
+  const colorKeys = (data.canonicalColors ?? []).length > 0 ? data.canonicalColors : ["Product"];
+  const imagesByColor: Record<string, string[]> = {};
+  for (const c of colorKeys) {
+    const own = (data.nbResultsPerColor?.[c] ?? []).map((r) => r.url).filter(Boolean);
+    imagesByColor[c] = own.length > 0 ? own : sharedFallback;
+  }
+  const urlByStoreColor: Partial<Record<StoreKey, string[]>> = {};
+  for (const store of fallbackList) {
+    const result =
+      resultsByStore[store] ?? (store === data.activeViewStore ? data.publishResult : null);
+    if (result?.productUrls?.length) urlByStoreColor[store] = result.productUrls;
+  }
+  const metaStores = fallbackList.filter((s) => (urlByStoreColor[s]?.length ?? 0) > 0);
 
   const resetForNewProduct = () => {
     setData((prev) => ({
@@ -148,12 +151,11 @@ export function PublishStep() {
 
       <MetaDraftSection
         stores={metaStores}
-        urlByStore={urlByStore}
+        colorKeys={colorKeys}
+        imagesByColor={imagesByColor}
+        urlByStoreColor={urlByStoreColor}
         productName={data.name}
         productType={data.productType}
-        step1img={step1img}
-        step2img={step2img}
-        referenceImages={referenceImages}
       />
 
       <div className="flex items-center justify-between bg-bg-elev border border-border rounded-2xl px-6 py-4">
@@ -166,26 +168,24 @@ export function PublishStep() {
   );
 }
 
-/** Prepare PAUSED Meta Ads draft campaigns for the published stores. Per checked store it
- *  generates 3 lifestyle shots (Higgsfield) to join the 2 model shots, writes per-language ad
- *  copy, then creates a paused Sales campaign with up to 5 image ads. Nothing goes live — the
- *  operator finalises + launches in Ads Manager. */
+/** Prepare PAUSED Meta Ads draft campaigns for the published stores. Per checked store: one
+ *  Flexible ad per colour variant (that colour's photos + 2 generated lifestyle shots), with
+ *  per-language ad copy, in a paused Sales campaign. Nothing goes live — the operator finalises
+ *  + launches in Ads Manager. */
 function MetaDraftSection({
   stores,
-  urlByStore,
+  colorKeys,
+  imagesByColor,
+  urlByStoreColor,
   productName,
   productType,
-  step1img,
-  step2img,
-  referenceImages,
 }: {
   stores: StoreKey[];
-  urlByStore: Partial<Record<StoreKey, string>>;
+  colorKeys: string[];
+  imagesByColor: Record<string, string[]>;
+  urlByStoreColor: Partial<Record<StoreKey, string[]>>;
   productName: string;
   productType: string;
-  step1img: string;
-  step2img: string;
-  referenceImages: string[];
 }) {
   const [enabled, setEnabled] = useState(false);
   const [selected, setSelected] = useState<Record<string, boolean>>(
@@ -207,36 +207,46 @@ function MetaDraftSection({
     setErr(null);
     setNote(null);
     try {
-      // 1) Generate 3 lifestyle shots (shared across stores). Degrade gracefully — if it
-      //    fails we still ship the 2 model shots as ads.
-      setPhase("Generating lifestyle images… (this can take a minute)");
-      let lifestyle: string[] = [];
-      const refs = referenceImages.slice(0, 4);
-      if (refs.length > 0) {
-        try {
-          const res = await higgsfieldQueue.run(() =>
-            api.higgsfield({
-              prompt_type: 1,
-              product_type: productType || "dress",
-              image_urls: refs,
-              count: 3,
-            })
-          );
-          lifestyle = res.urls ?? [];
-        } catch {
-          /* keep going with the model shots */
-        }
-      }
-      const images = Array.from(
-        new Set([step1img, step2img, ...lifestyle].filter(Boolean))
-      ).slice(0, 5);
-      if (images.length === 0) {
-        setErr("No images available to build ads from.");
-        setPhase(null);
-        return;
+      // 1) Generate 2 lifestyle shots PER COLOUR (shared across stores). Degrade gracefully —
+      //    if a colour's generation fails we still ship that colour's existing photos.
+      const total = colorKeys.length;
+      let done = 0;
+      setPhase(`Generating lifestyle images… (0/${total} colours)`);
+      const lifestyleByColor: Record<string, string[]> = {};
+      await Promise.all(
+        colorKeys.map(async (c) => {
+          const refs = (imagesByColor[c] ?? []).slice(0, 4);
+          if (refs.length > 0) {
+            try {
+              const res = await higgsfieldQueue.run(() =>
+                api.higgsfield({
+                  prompt_type: 1,
+                  product_type: productType || "dress",
+                  image_urls: refs,
+                  count: 2,
+                })
+              );
+              lifestyleByColor[c] = res.urls ?? [];
+            } catch {
+              lifestyleByColor[c] = [];
+            }
+          } else {
+            lifestyleByColor[c] = [];
+          }
+          done += 1;
+          setPhase(`Generating lifestyle images… (${done}/${total} colours)`);
+        })
+      );
+      const finalImagesByColor: Record<string, string[]> = {};
+      let lifestyleCount = 0;
+      for (const c of colorKeys) {
+        finalImagesByColor[c] = Array.from(
+          new Set([...(imagesByColor[c] ?? []), ...(lifestyleByColor[c] ?? [])].filter(Boolean))
+        ).slice(0, 10);
+        lifestyleCount += (lifestyleByColor[c] ?? []).length;
       }
 
-      // 2) Per-store ad copy (translated + fluent), each with that store's product URL.
+      // 2) Per-store ad copy (translated + fluent), with that store's product URL for context.
       setPhase("Writing ad copy per language…");
       const copyByStore: Record<string, AdCopyEntry | undefined> = {};
       await Promise.all(
@@ -245,7 +255,7 @@ function MetaDraftSection({
             const res = await api.generateAdCopy({
               stores: [store],
               product_name: productName || "ons product",
-              product_url: urlByStore[store] || "",
+              product_url: urlByStoreColor[store]?.[0] || "",
             });
             const entry = res[store];
             copyByStore[store] = entry && typeof entry === "object" ? entry : undefined;
@@ -255,23 +265,25 @@ function MetaDraftSection({
         })
       );
 
-      // 3) Create the paused drafts.
+      // 3) Create the paused drafts — one Flexible ad per colour variant per store.
       setPhase("Creating paused campaigns…");
-      const items = chosen
-        .map((store) => {
-          const url = urlByStore[store];
-          if (!url) return null;
-          const c = copyByStore[store];
-          return {
-            store: store as string,
-            product_url: url,
-            image_urls: images,
-            primary_text: c?.primary_text,
-            headline: c?.headline,
-            description: c?.description,
-          };
-        })
-        .filter((x): x is NonNullable<typeof x> => !!x);
+      const items = chosen.map((store) => {
+        const urls = urlByStoreColor[store] ?? [];
+        const c = copyByStore[store];
+        const colors = colorKeys
+          .map((colorKey, i) => ({
+            product_url: urls[i] || urls[0] || "",
+            image_urls: finalImagesByColor[colorKey] ?? [],
+          }))
+          .filter((col) => col.product_url && col.image_urls.length > 0);
+        return {
+          store: store as string,
+          primary_text: c?.primary_text,
+          headline: c?.headline,
+          description: c?.description,
+          colors,
+        };
+      });
 
       const r = await api.metaCreateDraft({ product_name: productName || "Product", items });
       if (r.error) {
@@ -279,8 +291,8 @@ function MetaDraftSection({
       } else {
         setResults(r.results ?? []);
         setNote(
-          `${images.length} image${images.length === 1 ? "" : "s"} per campaign` +
-            (lifestyle.length ? ` · ${lifestyle.length} AI lifestyle` : "")
+          `${colorKeys.length} colour${colorKeys.length === 1 ? "" : "s"} per store` +
+            (lifestyleCount ? ` · ${lifestyleCount} AI lifestyle shots generated` : "")
         );
       }
     } catch (e) {

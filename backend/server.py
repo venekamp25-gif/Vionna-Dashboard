@@ -5426,23 +5426,72 @@ def generate_ad_copy():
     return jsonify(out)
 
 
-def _meta_create_draft(store, copy, product_url, image_urls, hash_by_url, pixel_id):
-    """Create ONE paused Sales draft for a store/country: campaign (Sales, CBO €30/day) →
-    1 ad set (geo-targeted, Advantage+ audience when accepted, conversion-optimised if a pixel
-    exists) → up to 5 creatives + 5 ads (one per image, all sharing the ad set), each carrying
-    the per-store copy. EVERYTHING PAUSED. Skips a bad image rather than sinking the campaign."""
+def _meta_flexible_creative(acct, su, idx, product_url, primary_text, headline, description, hashes, image_urls):
+    """A Flexible (asset_feed_spec / Advantage+) creative holding ALL of a colour's images so
+    Meta can mix/optimise which it shows. Falls back to a plain single-image link creative if
+    the account rejects the flexible format. Returns the creative JSON ('id' on success)."""
+    story = {'page_id': META_PAGE_ID}
+    if META_IG_USER_ID:
+        story['instagram_user_id'] = META_IG_USER_ID
+    if hashes:
+        afs = {
+            'images': [{'hash': h} for h in hashes[:10]],
+            'bodies': [{'text': primary_text}],
+            'titles': [{'text': headline}],
+            'link_urls': [{'website_url': product_url, 'display_url': _reg_domain(product_url)}],
+            'call_to_action_types': ['SHOP_NOW'],
+            'ad_formats': ['SINGLE_IMAGE'],
+            'optimization_type': 'DEGREES_OF_FREEDOM',   # the "Flexible" format
+        }
+        if description:
+            afs['descriptions'] = [{'text': description}]
+        cr = _meta_post(f'{acct}/adcreatives', {
+            'name': f'{su} creative {idx + 1} (flex)',
+            'object_story_spec': story,
+            'asset_feed_spec': afs,
+        })
+        if cr.get('id'):
+            return cr
+    # fallback: a plain single-image link creative (first available image)
+    link_data = {
+        'link': product_url,
+        'message': primary_text,
+        'name': headline,
+        'caption': _reg_domain(product_url),
+        'call_to_action': {'type': 'SHOP_NOW', 'value': {'link': product_url}},
+    }
+    if description:
+        link_data['description'] = description
+    if hashes:
+        link_data['image_hash'] = hashes[0]
+    elif image_urls:
+        link_data['picture'] = image_urls[0]
+    return _meta_post(f'{acct}/adcreatives', {
+        'name': f'{su} creative {idx + 1}',
+        'object_story_spec': dict(story, link_data=link_data),
+    })
+
+
+def _meta_create_draft(store, copy, colors, hash_by_url, pixel_id):
+    """Create ONE paused Sales draft per store: campaign (Sales, CBO €30/day) → 1 ad set
+    (geo-targeted, Advantage+ audience when accepted, conversion-optimised on the pixel) → one
+    Flexible ad PER COLOUR VARIANT (each holding that colour's photos + lifestyle shots and
+    linking to that colour's product URL), all sharing the ad set. EVERYTHING PAUSED. Skips a
+    colour that fails rather than sinking the whole campaign."""
     country = STORE_COUNTRY.get((store or '').lower())
     res = {'store': store, 'country': country, 'campaign_id': None, 'adset_id': None,
            'creative_ids': [], 'ad_ids': [], 'error': None}
     if not country:
         res['error'] = f'unknown store {store!r}'
         return res
-    if not str(product_url).startswith('http'):
-        res['error'] = 'missing or invalid product_url'
-        return res
-    imgs = [u for u in (image_urls or []) if str(u).startswith('http')][:5]
-    if not imgs:
-        res['error'] = 'no valid image_urls'
+    valid = []
+    for col in (colors or []):
+        purl = col.get('product_url') or ''
+        imgs = [u for u in (col.get('image_urls') or []) if str(u).startswith('http')][:10]
+        if str(purl).startswith('http') and imgs:
+            valid.append({'product_url': purl, 'image_urls': imgs})
+    if not valid:
+        res['error'] = 'no valid colour variants (need a product_url + at least one image)'
         return res
     copy = copy or {}
     primary_text = (copy.get('primary_text') or '').strip() or (copy.get('headline') or '').strip() or 'Shop now'
@@ -5492,48 +5541,32 @@ def _meta_create_draft(store, copy, product_url, image_urls, hash_by_url, pixel_
         return res
     res['adset_id'] = a['id']
 
-    # 3+4) One creative + one ad per image (max 5), all in the same ad set. Same per-store copy
-    #      on every creative; different image each. Paced to stay under Facebook edge limits.
-    dom = _reg_domain(product_url) if pixel_id else ''
+    # 3+4) One Flexible ad per colour variant, all sharing the ad set. Paced to stay under
+    #      Facebook's edge limits.
     last_err = None
-    for i, image_url in enumerate(imgs):
+    for idx, col in enumerate(valid):
+        purl = col['product_url']
+        hashes = [hash_by_url[u] for u in col['image_urls'] if (hash_by_url or {}).get(u)]
         time.sleep(0.4)
-        link_data = {
-            'link': product_url,
-            'message': primary_text,
-            'name': headline,
-            'caption': _reg_domain(product_url),
-            'call_to_action': {'type': 'SHOP_NOW', 'value': {'link': product_url}},
-        }
-        if description:
-            link_data['description'] = description
-        h = (hash_by_url or {}).get(image_url)
-        if h:
-            link_data['image_hash'] = h
-        else:
-            link_data['picture'] = image_url
-        story = {'page_id': META_PAGE_ID, 'link_data': link_data}
-        if META_IG_USER_ID:
-            story['instagram_user_id'] = META_IG_USER_ID
-        cr = _meta_post(f'{acct}/adcreatives', {
-            'name': f'{su} creative {i + 1}',
-            'object_story_spec': story,
-        })
-        if cr.get('error') or not cr.get('id'):
-            last_err = _meta_err(cr, 'creative')
+        cr = _meta_flexible_creative(acct, su, idx, purl, primary_text, headline, description,
+                                     hashes, col['image_urls'])
+        if not cr or cr.get('error') or not cr.get('id'):
+            last_err = _meta_err(cr or {}, 'creative')
             continue
         res['creative_ids'].append(cr['id'])
         time.sleep(0.4)
         ad_payload = {
-            'name': f'{su} ad {i + 1}',
+            'name': f'{su} ad {idx + 1}',
             'adset_id': a['id'],
             'creative': {'creative_id': cr['id']},
             'status': 'PAUSED',
         }
-        if dom:
-            ad_payload['conversion_domain'] = dom
-        # EU DSA: advertiser (= payer) name shown in the Ad Library — the brand, not the
-        # account's legal entity. Retry without these if the account rejects the fields.
+        if pixel_id:
+            dom = _reg_domain(purl)
+            if dom:
+                ad_payload['conversion_domain'] = dom
+        # EU DSA: advertiser (= payer) shown in the Ad Library — the brand, not the legal
+        # entity. Retry without these fields if the account rejects them.
         if META_DSA_NAME:
             ad_payload['dsa_beneficiary'] = META_DSA_NAME
             ad_payload['dsa_payor'] = META_DSA_NAME
@@ -5555,10 +5588,12 @@ def _meta_create_draft(store, copy, product_url, image_urls, hash_by_url, pixel_
 @app.route('/api/meta/create_draft', methods=['POST'])
 @require_droplet_token
 def meta_create_draft():
-    """Create one paused Sales draft per store, each with up to 5 image ads + per-store copy.
-    Body: {product_name, items:[{store, product_url, image_urls:[...], primary_text, headline}]}
-    (back-compatible with the old {image_url} single-image shape). Gated by the session token —
-    never callable from outside; everything created is PAUSED."""
+    """Create one paused Sales draft per store — one Flexible ad per colour variant (each with
+    that colour's photos + lifestyle shots, linking to that colour's product URL) + per-store
+    ad copy. Body: {product_name, items:[{store, primary_text, headline, description,
+    colors:[{product_url, image_urls:[...]}]}]}. Back-compatible with the old item-level
+    {product_url, image_urls/image_url} shape (treated as a single colour). Session-token gated;
+    everything created is PAUSED."""
     if not DROPLET_TOKEN_SECRET:
         # fail closed: this route touches a live ad account, so never run it ungated
         return jsonify({'error': 'session-token gate not configured'}), 503
@@ -5570,41 +5605,48 @@ def meta_create_draft():
     if not items:
         return jsonify({'error': 'no stores/items provided'}), 400
 
-    # Normalise each item (back-compatible with the old {image_url} shape) and collect every
-    # unique image URL so we upload each one ONCE — image_hash is account-wide, so the hash is
-    # reused across all stores. Gentler on the API + faster.
+    # Normalise items into {store, copy, colors[]}. Collect every unique image URL so each is
+    # uploaded ONCE (image_hash is account-wide → reused across stores). Gentler + faster.
     norm, all_urls = [], []
     for it in items:
-        urls = it.get('image_urls') or ([it['image_url']] if it.get('image_url') else [])
-        urls = [u for u in urls if str(u).startswith('http')]
+        colors = []
+        for col in (it.get('colors') or []):
+            urls = [u for u in (col.get('image_urls') or []) if str(u).startswith('http')][:10]
+            if col.get('product_url') and urls:
+                colors.append({'product_url': col['product_url'], 'image_urls': urls})
+        if not colors:
+            # back-compat: old item-level shape → a single colour
+            urls = it.get('image_urls') or ([it['image_url']] if it.get('image_url') else [])
+            urls = [u for u in urls if str(u).startswith('http')]
+            if it.get('product_url') and urls:
+                colors = [{'product_url': it['product_url'], 'image_urls': urls}]
+        for col in colors:
+            for u in col['image_urls']:
+                if u not in all_urls:
+                    all_urls.append(u)
         norm.append({
             'store': (it.get('store') or '').lower(),
-            'product_url': it.get('product_url') or '',
-            'image_urls': urls,
             'copy': {
                 'primary_text': it.get('primary_text') or product_name,
                 'headline': it.get('headline') or product_name,
                 'description': it.get('description') or '',
             },
+            'colors': colors,
         })
-        for u in urls:
-            if u not in all_urls:
-                all_urls.append(u)
 
     hash_by_url = {}
-    for u in all_urls[:10]:
+    for u in all_urls[:60]:
         h = _meta_upload_image(u)
         if h:
             hash_by_url[u] = h
-        time.sleep(0.3)
+        time.sleep(0.25)
 
     # the right pixel for this account (env / known default — the reference campaign
     # optimises on it; falls back to the account's first pixel if neither is set)
     pixel_id = META_PIXEL_ID or _meta_account_pixel()
     results = []
     for it in norm:
-        results.append(_meta_create_draft(it['store'], it['copy'], it['product_url'],
-                                          it['image_urls'], hash_by_url, pixel_id))
+        results.append(_meta_create_draft(it['store'], it['copy'], it['colors'], hash_by_url, pixel_id))
         time.sleep(0.5)
     return jsonify({'pixel_used': pixel_id, 'results': results})
 

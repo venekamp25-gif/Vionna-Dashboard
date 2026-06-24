@@ -105,17 +105,27 @@ export function SettingsModal({ open, onClose }: Props) {
         product_name: "TEST – Meta draft (delete me)",
         items: [{
           store: "fr",
-          product_url: "https://www.vionnaclothing.com",
-          image_urls: [
-            "https://picsum.photos/seed/vionna1/800/800",
-            "https://picsum.photos/seed/vionna2/800/800",
-            "https://picsum.photos/seed/vionna3/800/800",
-            "https://picsum.photos/seed/vionna4/800/800",
-            "https://picsum.photos/seed/vionna5/800/800",
-          ],
           primary_text: "TEST advertentietekst – verwijder deze campagne na de test.",
           headline: "TEST",
           description: "Gratis verzending",
+          colors: [
+            {
+              product_url: "https://www.vionnaclothing.com",
+              image_urls: [
+                "https://picsum.photos/seed/vionnaA1/800/800",
+                "https://picsum.photos/seed/vionnaA2/800/800",
+                "https://picsum.photos/seed/vionnaA3/800/800",
+              ],
+            },
+            {
+              product_url: "https://www.vionnaclothing.com",
+              image_urls: [
+                "https://picsum.photos/seed/vionnaB1/800/800",
+                "https://picsum.photos/seed/vionnaB2/800/800",
+                "https://picsum.photos/seed/vionnaB3/800/800",
+              ],
+            },
+          ],
         }],
       });
       if (r.error) {
@@ -524,9 +534,9 @@ export function SettingsModal({ open, onClose }: Props) {
           <div className="mt-8 pt-6 border-t border-border">
             <div className="text-[14px] font-semibold text-text mb-1">Meta Ads — connection test</div>
             <p className="text-[12px] text-text-faint mb-3 leading-relaxed">
-              Creates ONE <strong>paused</strong> test campaign (FR · €30/day · <strong>5 placeholder
-              ads</strong>) to confirm the full draft pipeline works — without a product import or
-              image generation. Delete it in Ads Manager afterwards.
+              Creates ONE <strong>paused</strong> test campaign (FR · €30/day · <strong>2 Flexible
+              colour ads</strong>) to confirm the full draft pipeline works — without a product
+              import or image generation. Delete it in Ads Manager afterwards.
             </p>
             <Button variant="secondary" size="sm" onClick={() => void runMetaTest()} disabled={metaTestBusy}>
               {metaTestBusy ? "Creating…" : "Create paused test draft"}

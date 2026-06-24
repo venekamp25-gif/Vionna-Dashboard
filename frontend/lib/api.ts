@@ -519,18 +519,20 @@ export const api = {
   /** Read-only: confirm Meta config + that the token reaches the ad account + page. */
   metaCheck: () => call<MetaCheckResponse>("/api/meta/check"),
 
-  /** Create PAUSED Meta draft campaigns — one per store, each with up to 5 image ads +
-   *  per-store ad copy. Gated (session token). Back-compatible single-image `image_url` too. */
+  /** Create PAUSED Meta draft campaigns — one per store, with one Flexible ad per colour
+   *  variant + per-store ad copy. Gated (session token). Back-compatible with the old
+   *  item-level single-colour shape (product_url + image_urls/image_url). */
   metaCreateDraft: (params: {
     product_name: string;
     items: {
       store: string;
-      product_url: string;
-      image_urls?: string[];
-      image_url?: string;
       primary_text?: string;
       headline?: string;
       description?: string;
+      colors?: { product_url: string; image_urls: string[] }[];
+      product_url?: string;
+      image_urls?: string[];
+      image_url?: string;
     }[];
   }) =>
     call<MetaCreateDraftResponse>("/api/meta/create_draft", {
