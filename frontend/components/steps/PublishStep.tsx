@@ -7,7 +7,14 @@ import { api, MetaDraftResult, AdCopyEntry } from "@/lib/api";
 import { useProduct, colorLabelFor, pickRandomBgReferenceUrl, ProductVerify, saveLastProduct } from "@/lib/product";
 import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
 import { useStep } from "@/lib/step";
-import { higgsfieldQueue } from "@/lib/concurrency";
+import { createLimiter } from "@/lib/concurrency";
+
+// Gentle concurrency for the Meta lifestyle generation: a many-colour product fires one
+// generation per colour, and doing 8 at once (the global queue) spiked the small droplet
+// enough that the follow-up create_draft came back "Failed to fetch". Cap at 2 concurrent.
+const metaGenLimiter = createLimiter(2);
+// Cap images per colour ad — keeps the create_draft upload step short enough to finish.
+const MAX_IMAGES_PER_COLOR = 5;
 
 function FlagDK() {
   return (
@@ -228,7 +235,7 @@ function MetaDraftSection({
           const refs = (imagesByColor[c] ?? []).slice(0, 4);
           if (refs.length > 0) {
             try {
-              const res = await higgsfieldQueue.run(() =>
+              const res = await metaGenLimiter.run(() =>
                 api.higgsfield({
                   prompt_type: 1,
                   product_type: productType || "dress",
@@ -252,7 +259,7 @@ function MetaDraftSection({
       for (const c of colorKeys) {
         finalImagesByColor[c] = Array.from(
           new Set([...(imagesByColor[c] ?? []), ...(lifestyleByColor[c] ?? [])].filter(Boolean))
-        ).slice(0, 10);
+        ).slice(0, MAX_IMAGES_PER_COLOR);
         lifestyleCount += (lifestyleByColor[c] ?? []).length;
       }
 
