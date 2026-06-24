@@ -187,6 +187,7 @@ function MetaDraftSection({
   step2img: string;
   referenceImages: string[];
 }) {
+  const [enabled, setEnabled] = useState(false);
   const [selected, setSelected] = useState<Record<string, boolean>>(
     Object.fromEntries(stores.map((s) => [s, true]))
   );
@@ -291,80 +292,94 @@ function MetaDraftSection({
 
   return (
     <div className="bg-bg-elev border border-border rounded-2xl px-6 py-4 space-y-3">
-      <div className="flex items-start justify-between gap-3">
+      {/* master opt-in — OFF by default; nothing shows or runs until checked */}
+      <label className="flex items-start gap-3 cursor-pointer select-none">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => setEnabled(e.target.checked)}
+          disabled={running}
+          className="mt-0.5 h-4 w-4 accent-[var(--accent)] cursor-pointer"
+        />
         <div>
           <div className="text-[14px] font-semibold text-text">📣 Prepare Meta Ads campaign</div>
           <p className="text-[11px] text-text-faint mt-0.5 leading-relaxed">
-            Per checked store: a <strong>PAUSED</strong> Sales campaign (€30/day, Advantage+)
-            targeted to that country, with <strong>5 image ads</strong> (2 model shots + 3 AI
-            lifestyle) and auto-translated ad copy. Nothing goes live — you finalise &amp; launch
-            in Ads Manager.
+            Optional. Per checked store: a <strong>PAUSED</strong> Sales campaign (€30/day,
+            Advantage+) targeted to that country, with <strong>5 image ads</strong> (2 model shots +
+            3 AI lifestyle) and auto-translated ad copy. Nothing goes live — you finalise &amp;
+            launch in Ads Manager.
           </p>
         </div>
-        <Button
-          variant="primary"
-          size="sm"
-          onClick={() => void run()}
-          disabled={running || chosen.length === 0}
-        >
-          {running ? "Working…" : "Create paused drafts"}
-        </Button>
-      </div>
+      </label>
 
-      <div className="flex flex-wrap gap-2">
-        {stores.map((store) => {
-          const on = !!selected[store];
-          return (
-            <button
-              key={store}
-              type="button"
-              onClick={() => setSelected((p) => ({ ...p, [store]: !p[store] }))}
-              disabled={running}
-              aria-pressed={on}
-              className={[
-                "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-[12px] font-semibold transition-colors disabled:opacity-50",
-                on
-                  ? "bg-accent/15 border-accent/50 text-accent"
-                  : "bg-transparent border-border text-text-dim hover:border-accent/40",
-              ].join(" ")}
-            >
-              {FLAGS[store]}
-              <span className="uppercase tracking-wider">{store}</span>
-              {on && <span>✓</span>}
-            </button>
-          );
-        })}
-      </div>
-
-      {phase && <p className="text-[12px] text-text-dim">⏳ {phase}</p>}
-      {err && <p className="text-[12px] text-danger">⚠ {err}</p>}
-
-      {results && (
-        <div className="space-y-1.5 border-t border-border pt-2.5">
-          {note && <p className="text-[11px] text-text-faint">{note}</p>}
-          {results.map((r) => (
-            <div key={r.store} className="text-[12px] flex items-center gap-2 flex-wrap">
-              <span className="font-semibold uppercase tracking-wider">{r.store}</span>
-              {r.error ? (
-                <span className="text-danger">✕ {r.error}</span>
-              ) : (
-                <>
-                  <span className="text-accent">
-                    ✓ {r.ad_ids?.length ?? 0} paused ad{(r.ad_ids?.length ?? 0) === 1 ? "" : "s"} created
-                  </span>
-                  <a
-                    href="https://adsmanager.facebook.com/adsmanager/manage/campaigns?act=6399532626780380"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-accent hover:underline"
+      {enabled && (
+        <>
+          <div className="flex items-center justify-between gap-3 flex-wrap pt-1">
+            <div className="flex flex-wrap gap-2">
+              {stores.map((store) => {
+                const on = !!selected[store];
+                return (
+                  <button
+                    key={store}
+                    type="button"
+                    onClick={() => setSelected((p) => ({ ...p, [store]: !p[store] }))}
+                    disabled={running}
+                    aria-pressed={on}
+                    className={[
+                      "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-[12px] font-semibold transition-colors disabled:opacity-50",
+                      on
+                        ? "bg-accent/15 border-accent/50 text-accent"
+                        : "bg-transparent border-border text-text-dim hover:border-accent/40",
+                    ].join(" ")}
                   >
-                    open in Ads Manager →
-                  </a>
-                </>
-              )}
+                    {FLAGS[store]}
+                    <span className="uppercase tracking-wider">{store}</span>
+                    {on && <span>✓</span>}
+                  </button>
+                );
+              })}
             </div>
-          ))}
-        </div>
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => void run()}
+              disabled={running || chosen.length === 0}
+            >
+              {running ? "Working…" : "Create paused drafts"}
+            </Button>
+          </div>
+
+          {phase && <p className="text-[12px] text-text-dim">⏳ {phase}</p>}
+          {err && <p className="text-[12px] text-danger">⚠ {err}</p>}
+
+          {results && (
+            <div className="space-y-1.5 border-t border-border pt-2.5">
+              {note && <p className="text-[11px] text-text-faint">{note}</p>}
+              {results.map((r) => (
+                <div key={r.store} className="text-[12px] flex items-center gap-2 flex-wrap">
+                  <span className="font-semibold uppercase tracking-wider">{r.store}</span>
+                  {r.error ? (
+                    <span className="text-danger">✕ {r.error}</span>
+                  ) : (
+                    <>
+                      <span className="text-accent">
+                        ✓ {r.ad_ids?.length ?? 0} paused ad{(r.ad_ids?.length ?? 0) === 1 ? "" : "s"} created
+                      </span>
+                      <a
+                        href="https://adsmanager.facebook.com/adsmanager/manage/campaigns?act=6399532626780380"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-accent hover:underline"
+                      >
+                        open in Ads Manager →
+                      </a>
+                    </>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   );
