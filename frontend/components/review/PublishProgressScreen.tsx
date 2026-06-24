@@ -66,6 +66,8 @@ interface Props {
   /** Total variants finished across ALL stores so far. */
   variantsCompleted: number;
   error: string | null;
+  /** When true, Meta Ads drafts will be auto-prepared once publishing finishes. */
+  prepareMeta?: boolean;
   onRetry: () => void;
   onBack: () => void;
 }
@@ -83,6 +85,7 @@ export function PublishProgressScreen({
   startedAt,
   variantsCompleted,
   error,
+  prepareMeta,
   onRetry,
   onBack,
 }: Props) {
@@ -161,6 +164,11 @@ export function PublishProgressScreen({
           {!error && stepText && (
             <p className="text-[12px] text-accent mt-2 font-medium animate-pulse">
               {stepText}
+            </p>
+          )}
+          {!error && prepareMeta && (
+            <p className="text-[11px] text-text-faint mt-2">
+              📣 Daarna worden automatisch je Meta Ads-campagnes voorbereid (per kleur).
             </p>
           )}
         </div>

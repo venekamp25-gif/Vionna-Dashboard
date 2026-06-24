@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import { AnimatedCheckmark } from "@/components/ui/AnimatedCheckmark";
 import { Button } from "@/components/ui/Button";
 import { api, MetaDraftResult, AdCopyEntry } from "@/lib/api";
@@ -161,6 +161,7 @@ export function PublishStep() {
         productName={data.name}
         productType={data.productType}
         defaultEnabled={!!data.prepareMeta}
+        onAutoStarted={() => setData((p) => ({ ...p, prepareMeta: false }))}
       />
 
       <div className="flex items-center justify-between bg-bg-elev border border-border rounded-2xl px-6 py-4">
@@ -185,6 +186,7 @@ function MetaDraftSection({
   productName,
   productType,
   defaultEnabled = false,
+  onAutoStarted,
 }: {
   stores: StoreKey[];
   colorKeys: string[];
@@ -193,6 +195,7 @@ function MetaDraftSection({
   productName: string;
   productType: string;
   defaultEnabled?: boolean;
+  onAutoStarted?: () => void;
 }) {
   const [enabled, setEnabled] = useState(defaultEnabled);
   const [selected, setSelected] = useState<Record<string, boolean>>(
@@ -202,8 +205,8 @@ function MetaDraftSection({
   const [results, setResults] = useState<MetaDraftResult[] | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
-
-  if (stores.length === 0) return null;
+  const autoRan = useRef(false);
+  const sectionRef = useRef<HTMLDivElement>(null);
 
   const running = phase !== null;
   const chosen = stores.filter((s) => selected[s]);
@@ -309,8 +312,23 @@ function MetaDraftSection({
     }
   };
 
+  // If the user ticked "Prepare Meta Ads" in Review, auto-start once on mount so the drafts
+  // are prepared right after publishing (with visible progress) — no extra click needed.
+  // onAutoStarted clears the flag so it can't re-fire on a remount or a later revisit.
+  useEffect(() => {
+    if (defaultEnabled && !autoRan.current && stores.length > 0) {
+      autoRan.current = true;
+      sectionRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+      onAutoStarted?.();
+      void run();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  if (stores.length === 0) return null;
+
   return (
-    <div className="bg-bg-elev border border-border rounded-2xl px-6 py-4 space-y-3">
+    <div ref={sectionRef} className="bg-bg-elev border border-border rounded-2xl px-6 py-4 space-y-3">
       {/* master opt-in — OFF by default; nothing shows or runs until checked */}
       <label className="flex items-start gap-3 cursor-pointer select-none">
         <input

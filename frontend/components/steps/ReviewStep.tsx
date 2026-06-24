@@ -319,6 +319,7 @@ export function ReviewStep() {
         startedAt={publishStartedAt.current}
         variantsCompleted={variantsCompleted}
         error={error}
+        prepareMeta={!!data.prepareMeta}
         onRetry={() => {
           setError(null);
           publish();
