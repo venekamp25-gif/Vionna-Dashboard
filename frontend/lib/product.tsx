@@ -355,6 +355,42 @@ function stripInternalKeys(
   return merged;
 }
 
+/**
+ * Separate "last completed product" slot. Lets the user jump back into a product they already
+ * imported (e.g. to re-test Meta campaign creation) WITHOUT re-importing. Kept independent of
+ * the active draft so starting a new product doesn't wipe it.
+ */
+const LAST_PRODUCT_KEY = "vionna-dashboard:last-product-v1";
+
+export function saveLastProduct(d: ProductData): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(LAST_PRODUCT_KEY, JSON.stringify(withSchemaVersion(d)));
+  } catch {
+    /* storage full / unavailable — non-fatal */
+  }
+}
+
+export function loadLastProduct(): ProductData | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(LAST_PRODUCT_KEY);
+    if (!raw) return null;
+    return stripInternalKeys(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+export function clearLastProduct(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(LAST_PRODUCT_KEY);
+  } catch {
+    /* non-fatal */
+  }
+}
+
 /** Minimum "draft is worth saving" check — only persist once the user has done meaningful work. */
 function isDraftWorthSaving(d: ProductData): boolean {
   return (

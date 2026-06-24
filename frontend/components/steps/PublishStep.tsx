@@ -4,7 +4,7 @@ import { useState } from "react";
 import { AnimatedCheckmark } from "@/components/ui/AnimatedCheckmark";
 import { Button } from "@/components/ui/Button";
 import { api, MetaDraftResult, AdCopyEntry } from "@/lib/api";
-import { useProduct, colorLabelFor, pickRandomBgReferenceUrl, ProductVerify } from "@/lib/product";
+import { useProduct, colorLabelFor, pickRandomBgReferenceUrl, ProductVerify, saveLastProduct } from "@/lib/product";
 import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
 import { useStep } from "@/lib/step";
 import { higgsfieldQueue } from "@/lib/concurrency";
@@ -81,6 +81,9 @@ export function PublishStep() {
   const metaStores = fallbackList.filter((s) => (urlByStoreColor[s]?.length ?? 0) > 0);
 
   const resetForNewProduct = () => {
+    // Stash the finished product so the user can jump back into it later (e.g. to re-test
+    // Meta campaign creation) without re-importing.
+    saveLastProduct(data);
     setData((prev) => ({
       ...prev,
       competitorUrl: "",

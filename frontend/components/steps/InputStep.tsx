@@ -4,7 +4,7 @@ import { useState } from "react";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Field, Label, Input, Textarea } from "@/components/ui/Field";
-import { useProduct } from "@/lib/product";
+import { useProduct, loadLastProduct } from "@/lib/product";
 import { useStep } from "@/lib/step";
 import { useStore, StoreKey, STORE_CONFIG, STORE_KEYS } from "@/lib/store";
 import { api } from "@/lib/api";
@@ -73,11 +73,16 @@ const FLAGS: Record<StoreKey, React.ReactNode> = {
 
 export function InputStep() {
   const {
-    data, patch,
+    data, patch, setData,
     hasSavedDraft, draftSource, draftSavedAt, restoreDraft, clearDraft,
   } = useProduct();
   const { setStep } = useStep();
   const { setStore } = useStore();
+
+  // "Back to last finished product" — restore a previously-imported product (e.g. to re-test
+  // Meta campaign creation) without re-importing. Read once on mount; survives refresh.
+  const [lastProduct] = useState(() => loadLastProduct());
+  const [confirmBack, setConfirmBack] = useState(false);
 
   // Dropshipper check at import: classify the source store's shipping policy and
   // warn before importing if it's NOT a confirmed dropshipper.
@@ -235,6 +240,70 @@ export function InputStep() {
             >
               Resume →
             </button>
+          </div>
+        </div>
+      )}
+
+      {lastProduct && (
+        <div className="mb-4 flex items-center justify-between gap-3 px-4 py-3 rounded-[10px] bg-bg-elev border border-border">
+          <div className="flex-1 text-[12px] text-text-dim leading-relaxed">
+            <span className="text-text font-semibold">↩ {lastProduct.name || "Vorig product"}</span>{" "}
+            — ga terug naar je laatst geïmporteerde product (bijv. om Meta-campagnes te testen),
+            zonder opnieuw te importeren.
+          </div>
+          <button
+            type="button"
+            onClick={() => setConfirmBack(true)}
+            className="shrink-0 text-[11px] font-semibold tracking-wider uppercase px-3 py-1.5 rounded-md border border-border bg-bg-elev-2 text-text-dim hover:border-accent hover:text-accent"
+          >
+            Terug naar product →
+          </button>
+        </div>
+      )}
+
+      {confirmBack && lastProduct && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          onClick={() => setConfirmBack(false)}
+        >
+          <div
+            className="bg-bg-elev border border-border rounded-2xl p-6 max-w-md w-full shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="text-[15px] font-semibold text-text mb-2">
+              ⚠ Terug naar een geïmporteerd product
+            </div>
+            <p className="text-[13px] text-text-dim leading-relaxed mb-4">
+              Je gaat terug naar <strong className="text-text">{lastProduct.name || "je vorige product"}</strong>,
+              dat al is geïmporteerd. Handig om bijvoorbeeld de Meta-campagnes opnieuw te bekijken of te maken.
+              <br />
+              <br />
+              <span className="text-warning font-semibold">Let op:</span> als je in deze flow nogmaals op{" "}
+              <strong>publiceren</strong> klikt, maak je <strong>duplicaten</strong> aan in je stores. Gebruik
+              dit dus alleen om te bekijken of campagnes te maken — niet om opnieuw te publiceren.
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setConfirmBack(false)}
+                className="text-[12px] font-semibold px-4 py-2 rounded-md border border-border bg-bg-elev-2 text-text-dim hover:text-text"
+              >
+                Annuleer
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!lastProduct) return;
+                  setData(lastProduct);
+                  setStore(lastProduct.activeViewStore);
+                  setConfirmBack(false);
+                  setStep(4);
+                }}
+                className="text-[12px] font-semibold px-4 py-2 rounded-md bg-accent text-on-accent hover:bg-accent-hover"
+              >
+                Ja, ga terug →
+              </button>
+            </div>
           </div>
         </div>
       )}
