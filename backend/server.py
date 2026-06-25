@@ -5709,6 +5709,61 @@ def meta_create_draft():
     return jsonify({'pixel_used': pixel_id, 'results': results})
 
 
+# Season-aware lifestyle scenes for the Meta ad imagery (Northern Hemisphere — DK/FR/FI).
+_LIFESTYLE_SETTINGS = {
+    'spring': "a candid outdoor spring scene — a blossoming park or a charming European street "
+              "with budding trees and soft natural daylight, fresh and airy",
+    'summer': "a candid outdoor summer scene — a sunlit Mediterranean street, a café terrace or a "
+              "seaside promenade with warm golden sunlight, relaxed and holiday-like",
+    'autumn': "a candid outdoor autumn scene — a park with golden fallen leaves or a cobblestone "
+              "city street with warm low-angle sunlight, cosy and elegant",
+    'winter': "a candid winter scene — a warm, softly lit interior with seasonal tones or a snowy "
+              "European street with festive lights, snug and elegant",
+}
+
+
+def _season_now():
+    """Current Northern-Hemisphere season from the server date."""
+    try:
+        m = datetime.datetime.now().month
+    except Exception:
+        m = 6
+    if m in (12, 1, 2):
+        return 'winter'
+    if m in (3, 4, 5):
+        return 'spring'
+    if m in (6, 7, 8):
+        return 'summer'
+    return 'autumn'
+
+
+def _lifestyle_prompt(product_type, season=None):
+    """Build the Nano Banana prompt for a lifestyle ad shot, picking the scene from the season +
+    the product type. The reference image is our existing model shot — we keep the garment and
+    just re-stage the model in a seasonal lifestyle setting. Returns (prompt, season_used)."""
+    season = (season or _season_now()).lower()
+    pt = (product_type or 'fashion product').strip() or 'fashion product'
+    ptl = pt.lower()
+    # A few product types imply their own setting regardless of the calendar season.
+    if any(w in ptl for w in ('swim', 'bikini', 'beach')):
+        setting = "a sunny beach or seaside promenade with bright summer sunlight, relaxed and holiday-like"
+    elif any(w in ptl for w in ('coat', 'jacket', 'puffer', 'knit', 'sweater', 'wool', 'cardigan', 'trench')):
+        setting = ("a crisp cool-weather outdoor scene — a European city street or park with soft "
+                   "daylight and cosy, layered styling")
+    else:
+        setting = _LIFESTYLE_SETTINGS.get(season, _LIFESTYLE_SETTINGS['summer'])
+    prompt = (
+        f"I've uploaded a photo of our model wearing a {pt}. Keep the EXACT same {pt} — same cut, "
+        f"colour, fabric and design details — and keep a realistic woman model whose face and body "
+        f"look completely natural (it must be unnoticeable that she is AI-generated). Re-stage her "
+        f"in {setting}. Use a natural, relaxed candid pose with three-quarter or full-body framing, "
+        f"an authentic editorial fashion-campaign feel, and photorealistic lighting that matches the "
+        f"scene. Do NOT change the garment in any way — only change the environment, lighting and "
+        f"pose to this lifestyle setting."
+    )
+    return prompt, season
+
+
 def _meta_draft_job(jid, payload):
     """Background worker for the Meta drafts: generate lifestyle shots (paced, server-side) →
     write per-store copy → upload images once → create one Flexible ad per colour per store.
@@ -5733,7 +5788,10 @@ def _meta_draft_job(jid, payload):
         sf_by_store[store] = [_storefront_url(store, u) for u in (url_by_store_color.get(store) or [])]
 
     # 1) Lifestyle generation per colour — paced sequentially so it never overloads the box.
-    _job_set(jid, phase='Generating lifestyle images', total=len(color_keys), processed=0)
+    #    The prompt is season- + product-type-aware (re-stages the model in a seasonal scene).
+    lifestyle_prompt, season = _lifestyle_prompt(product_type, payload.get('lifestyle_season'))
+    _job_set(jid, phase='Generating lifestyle images', total=len(color_keys), processed=0,
+             lifestyle_season=season)
     lifestyle_by_color = {}
     for color in color_keys:
         refs = [u for u in (images_by_color.get(color) or []) if str(u).startswith('http')][:4]
@@ -5741,7 +5799,8 @@ def _meta_draft_job(jid, payload):
         if refs and per_color > 0:
             try:
                 r = req.post(f'{self_base}/api/higgsfield',
-                             json={'prompt_type': 1, 'product_type': product_type,
+                             json={'prompt_type': 0, 'prompt': lifestyle_prompt,
+                                   'product_type': product_type,
                                    'image_urls': refs, 'count': per_color}, timeout=340)
                 urls = (r.json() or {}).get('urls') or []
             except Exception as e:
