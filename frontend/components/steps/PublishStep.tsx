@@ -3,18 +3,10 @@
 import { useState, useEffect, useRef } from "react";
 import { AnimatedCheckmark } from "@/components/ui/AnimatedCheckmark";
 import { Button } from "@/components/ui/Button";
-import { api, MetaDraftResult, AdCopyEntry } from "@/lib/api";
+import { api, MetaDraftResult } from "@/lib/api";
 import { useProduct, colorLabelFor, pickRandomBgReferenceUrl, ProductVerify, saveLastProduct } from "@/lib/product";
 import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
 import { useStep } from "@/lib/step";
-import { createLimiter } from "@/lib/concurrency";
-
-// Gentle concurrency for the Meta lifestyle generation: a many-colour product fires one
-// generation per colour, and doing 8 at once (the global queue) spiked the small droplet
-// enough that the follow-up create_draft came back "Failed to fetch". Cap at 2 concurrent.
-const metaGenLimiter = createLimiter(2);
-// Cap images per colour ad — keeps the create_draft upload step short enough to finish.
-const MAX_IMAGES_PER_COLOR = 5;
 
 function FlagDK() {
   return (
@@ -224,94 +216,48 @@ function MetaDraftSection({
     setErr(null);
     setNote(null);
     try {
-      // 1) Generate 2 lifestyle shots PER COLOUR (shared across stores). Degrade gracefully —
-      //    if a colour's generation fails we still ship that colour's existing photos.
-      const total = colorKeys.length;
-      let done = 0;
-      setPhase(`Generating lifestyle images… (0/${total} colours)`);
-      const lifestyleByColor: Record<string, string[]> = {};
-      await Promise.all(
-        colorKeys.map(async (c) => {
-          const refs = (imagesByColor[c] ?? []).slice(0, 4);
-          if (refs.length > 0) {
-            try {
-              const res = await metaGenLimiter.run(() =>
-                api.higgsfield({
-                  prompt_type: 1,
-                  product_type: productType || "dress",
-                  image_urls: refs,
-                  count: 2,
-                })
-              );
-              lifestyleByColor[c] = res.urls ?? [];
-            } catch {
-              lifestyleByColor[c] = [];
-            }
-          } else {
-            lifestyleByColor[c] = [];
-          }
-          done += 1;
-          setPhase(`Generating lifestyle images… (${done}/${total} colours)`);
-        })
-      );
-      const finalImagesByColor: Record<string, string[]> = {};
-      let lifestyleCount = 0;
-      for (const c of colorKeys) {
-        finalImagesByColor[c] = Array.from(
-          new Set([...(imagesByColor[c] ?? []), ...(lifestyleByColor[c] ?? [])].filter(Boolean))
-        ).slice(0, MAX_IMAGES_PER_COLOR);
-        lifestyleCount += (lifestyleByColor[c] ?? []).length;
-      }
+      // Hand the whole job to the backend: it generates lifestyle shots, writes copy, uploads
+      // images and creates the Flexible ads — all paced server-side. We just poll for progress,
+      // so the browser is never blocked and a many-colour product can't overload the box.
+      setPhase("Starting…");
+      const url_by_store_color: Record<string, string[]> = {};
+      for (const s of chosen) url_by_store_color[s] = urlByStoreColor[s] ?? [];
 
-      // 2) Per-store ad copy (translated + fluent), with that store's product URL for context.
-      setPhase("Writing ad copy per language…");
-      const copyByStore: Record<string, AdCopyEntry | undefined> = {};
-      await Promise.all(
-        chosen.map(async (store) => {
-          try {
-            const res = await api.generateAdCopy({
-              stores: [store],
-              product_name: productName || "ons product",
-              product_url: urlByStoreColor[store]?.[0] || "",
-            });
-            const entry = res[store];
-            copyByStore[store] = entry && typeof entry === "object" ? entry : undefined;
-          } catch {
-            copyByStore[store] = undefined;
-          }
-        })
-      );
-
-      // 3) Create the paused drafts — one Flexible ad per colour variant per store.
-      setPhase("Creating paused campaigns…");
-      const items = chosen.map((store) => {
-        const urls = urlByStoreColor[store] ?? [];
-        const c = copyByStore[store];
-        const colors = colorKeys
-          .map((colorKey, i) => ({
-            product_url: urls[i] || urls[0] || "",
-            image_urls: finalImagesByColor[colorKey] ?? [],
-          }))
-          .filter((col) => col.product_url && col.image_urls.length > 0);
-        return {
-          store: store as string,
-          primary_text: c?.primary_text,
-          headline: c?.headline,
-          description: c?.description,
-          colors,
-        };
+      const start = await api.metaCreateDraftJob({
+        product_name: productName || "Product",
+        product_type: productType || "dress",
+        stores: chosen as string[],
+        color_keys: colorKeys,
+        images_by_color: imagesByColor,
+        url_by_store_color,
       });
-
-      const r = await api.metaCreateDraft({ product_name: productName || "Product", items });
-      if (r.error) {
-        setErr(r.error);
-      } else {
-        setResults(r.results ?? []);
-        setNote(
-          `${colorKeys.length} colour${colorKeys.length === 1 ? "" : "s"} per store` +
-            (lifestyleCount ? ` · ${lifestyleCount} AI lifestyle shots generated` : "")
-        );
+      if (start.error || !start.job_id) {
+        setErr(start.error || "Could not start the job.");
+        return;
       }
+
+      const jobId = start.job_id;
+      for (let polls = 0; polls < 600; polls++) {
+        await new Promise((r) => setTimeout(r, 2500));
+        let job;
+        try {
+          job = await api.metaJobStatus(jobId);
+        } catch {
+          continue; // transient network blip — keep polling
+        }
+        const prog = job.total ? ` (${job.processed}/${job.total})` : "";
+        setPhase(`${job.phase || "Working"}${prog}…`);
+        if (job.status === "done") {
+          setResults(job.result ?? []);
+          if (job.summary) setNote(job.summary);
+          return;
+        }
+        if (job.status === "error") {
+          setErr(job.error || job.summary || (job.errors && job.errors[0]) || "The job failed.");
+          return;
+        }
+      }
+      setErr("Timed out waiting for the job — check Ads Manager.");
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {

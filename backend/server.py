@@ -5673,6 +5673,128 @@ def meta_create_draft():
     return jsonify({'pixel_used': pixel_id, 'results': results})
 
 
+def _meta_draft_job(jid, payload):
+    """Background worker for the Meta drafts: generate lifestyle shots (paced, server-side) →
+    write per-store copy → upload images once → create one Flexible ad per colour per store.
+    Updates the job dict so the frontend can poll progress. Reuses /api/higgsfield +
+    /api/generate_ad_copy via internal (localhost) calls and _meta_create_draft directly, so a
+    many-colour product can't overload the box and the browser is never blocked."""
+    self_base = f'http://127.0.0.1:{os.environ.get("PORT", "5000")}'
+    stores = [str(s).lower() for s in (payload.get('stores') or [])]
+    color_keys = payload.get('color_keys') or ['Product']
+    images_by_color = payload.get('images_by_color') or {}
+    url_by_store_color = payload.get('url_by_store_color') or {}
+    product_name = (payload.get('product_name') or 'Product').strip() or 'Product'
+    product_type = payload.get('product_type') or 'dress'
+    template = payload.get('template')
+    per_color = int(payload.get('lifestyle_per_color') or 2)
+
+    # 1) Lifestyle generation per colour — paced sequentially so it never overloads the box.
+    _job_set(jid, phase='Generating lifestyle images', total=len(color_keys), processed=0)
+    lifestyle_by_color = {}
+    for color in color_keys:
+        refs = [u for u in (images_by_color.get(color) or []) if str(u).startswith('http')][:4]
+        urls = []
+        if refs and per_color > 0:
+            try:
+                r = req.post(f'{self_base}/api/higgsfield',
+                             json={'prompt_type': 1, 'product_type': product_type,
+                                   'image_urls': refs, 'count': per_color}, timeout=340)
+                urls = (r.json() or {}).get('urls') or []
+            except Exception as e:
+                _job_error(jid, f'lifestyle {color}: {str(e)[:120]}')
+        lifestyle_by_color[color] = urls
+        _job_inc(jid, processed=1)
+
+    final_images_by_color = {}
+    for color in color_keys:
+        merged = []
+        for u in list(images_by_color.get(color) or []) + list(lifestyle_by_color.get(color) or []):
+            if u and u not in merged:
+                merged.append(u)
+        final_images_by_color[color] = merged[:5]
+
+    # 2) Ad copy per store-language.
+    _job_set(jid, phase='Writing ad copy')
+    copy_by_store = {}
+    for store in stores:
+        first_url = (url_by_store_color.get(store) or [''])[0] or ''
+        try:
+            r = req.post(f'{self_base}/api/generate_ad_copy',
+                         json={'stores': [store], 'product_name': product_name,
+                               'product_url': first_url, 'template': template}, timeout=90)
+            entry = (r.json() or {}).get(store)
+            copy_by_store[store] = entry if isinstance(entry, dict) else {}
+        except Exception as e:
+            _job_error(jid, f'copy {store}: {str(e)[:120]}')
+            copy_by_store[store] = {'primary_text': product_name, 'headline': product_name}
+
+    # 3) Upload every unique image once (hash reused across stores), paced.
+    _job_set(jid, phase='Uploading images')
+    all_urls = []
+    for color in color_keys:
+        for u in final_images_by_color.get(color) or []:
+            if u not in all_urls:
+                all_urls.append(u)
+    hash_by_url = {}
+    for u in all_urls[:80]:
+        h = _meta_upload_image(u)
+        if h:
+            hash_by_url[u] = h
+        time.sleep(0.2)
+
+    # 4) Create campaign + per-colour Flexible ads per store.
+    _job_set(jid, phase='Creating campaigns')
+    pixel_id = META_PIXEL_ID or _meta_account_pixel()
+    results = []
+    for store in stores:
+        urls = url_by_store_color.get(store) or []
+        colors = []
+        for i, ck in enumerate(color_keys):
+            purl = (urls[i] if i < len(urls) else None) or (urls[0] if urls else '')
+            imgs = final_images_by_color.get(ck) or []
+            if str(purl).startswith('http') and imgs:
+                colors.append({'product_url': purl, 'image_urls': imgs})
+        results.append(_meta_create_draft(store, copy_by_store.get(store) or {}, colors, hash_by_url, pixel_id))
+        time.sleep(0.5)
+
+    total_ads = sum(len(r.get('ad_ids') or []) for r in results)
+    _job_set(jid, result=results, pixel_used=pixel_id, phase='Done')
+    _job_summary(jid, f'{total_ads} paused ad(s) across {len(results)} store(s)')
+
+
+@app.route('/api/meta/create_draft_job', methods=['POST'])
+@require_droplet_token
+def meta_create_draft_job():
+    """Start a background job that prepares the Meta drafts (generation + copy + creation), so
+    the browser isn't blocked and a many-colour product can't overload the box. Returns a
+    job_id; poll /api/catalog_job/status?id=<job_id>. Session-token gated; all drafts PAUSED."""
+    if not DROPLET_TOKEN_SECRET:
+        return jsonify({'error': 'session-token gate not configured'}), 503
+    if not (META_ACCESS_TOKEN and _meta_acct() and META_PAGE_ID):
+        return jsonify({'error': 'Meta not configured in backend/.env'}), 400
+    payload = request.json or {}
+    if not (payload.get('stores') and payload.get('color_keys')):
+        return jsonify({'error': 'stores + color_keys required'}), 400
+    with _JOBS_LOCK:
+        for j in _JOBS.values():
+            if j.get('type') == 'meta_draft' and j.get('status') == 'running':
+                return jsonify({'error': 'A Meta draft job is already running. Wait for it to finish.'}), 409
+    jid = _job_new('meta_draft', 'meta')
+
+    def _runner():
+        try:
+            _meta_draft_job(jid, payload)
+            _job_set(jid, status='done', finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+        except Exception as e:
+            _job_error(jid, str(e))
+            _job_set(jid, status='error', summary=f'Job failed: {str(e)[:150]}',
+                     finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+
+    threading.Thread(target=_runner, daemon=True).start()
+    return jsonify({'job_id': jid, 'status': 'running'})
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print(f"\nVionna Dashboard running on http://localhost:{port}\n")

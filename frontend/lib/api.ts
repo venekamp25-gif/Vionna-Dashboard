@@ -548,6 +548,28 @@ export const api = {
     product_url: string;
     template?: string;
   }) => call<AdCopyResponse>("/api/generate_ad_copy", { method: "POST", body: params }),
+
+  /** Start the background Meta-draft job (generation + copy + ad creation, paced server-side).
+   *  Returns a job_id to poll with metaJobStatus. Gated (session token). */
+  metaCreateDraftJob: (params: {
+    product_name: string;
+    product_type?: string;
+    stores: string[];
+    color_keys: string[];
+    images_by_color: Record<string, string[]>;
+    url_by_store_color: Record<string, string[]>;
+    lifestyle_per_color?: number;
+    template?: string;
+  }) =>
+    call<{ job_id?: string; status?: string; error?: string }>("/api/meta/create_draft_job", {
+      method: "POST",
+      body: params,
+      authed: true,
+    }),
+
+  /** Poll a Meta-draft background job (reuses the catalog-job status route). */
+  metaJobStatus: (id: string) =>
+    call<MetaDraftJob>(`/api/catalog_job/status?id=${encodeURIComponent(id)}`),
 };
 
 export interface MetaDraftResult {
@@ -568,6 +590,18 @@ export interface AdCopyEntry {
   primary_text?: string;
   headline?: string;
   description?: string;
+  error?: string;
+}
+export interface MetaDraftJob {
+  id: string;
+  status: "running" | "done" | "error";
+  phase?: string;
+  total: number | null;
+  processed: number;
+  summary: string;
+  errors: string[];
+  result?: MetaDraftResult[];
+  pixel_used?: string | null;
   error?: string;
 }
 /** Keyed by store ("dk"|"fr"|"fi"); may also carry a top-level `error`. */
