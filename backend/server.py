@@ -5182,6 +5182,13 @@ META_IG_USER_ID    = os.getenv('META_IG_USER_ID') or '17841469761633612'
 # EU DSA disclosure (advertiser = payer shown in the Meta Ad Library). Without this Meta
 # defaults to the account's legal name ("The Light Supplier"); we want the brand name.
 META_DSA_NAME      = os.getenv('META_DSA_NAME')    or 'Vionna Clothing'
+# Public storefront domains per store — the ad link must point HERE, not at the myshopify /
+# admin URL the publish step returns. Env-overridable per deployment.
+META_STORE_DOMAIN  = {
+    'dk': os.getenv('META_DOMAIN_DK') or 'vionna-clothing.dk',
+    'fr': os.getenv('META_DOMAIN_FR') or 'vionna-clothing.fr',
+    'fi': os.getenv('META_DOMAIN_FI') or 'vionna-clothing.fi',
+}
 
 
 def _meta_acct():
@@ -5353,6 +5360,25 @@ def _reg_domain(url):
         return ''
 
 
+def _storefront_url(store, admin_url):
+    """Turn an admin product URL (…/admin/products/<id>) into the public storefront URL on the
+    store's custom domain (…/products/<handle>) — that's what an ad must link to. Looks up the
+    real handle from Shopify by id; falls back to the input URL if anything is missing."""
+    domain = META_STORE_DOMAIN.get((store or '').lower())
+    m = re.search(r'/products/(\d+)', str(admin_url or ''))
+    if not domain or not m:
+        return admin_url
+    try:
+        r = req.get(shopify_url(store, f'products/{m.group(1)}.json'),
+                    headers=shopify_headers(store), params={'fields': 'handle'}, timeout=15)
+        handle = ((r.json() or {}).get('product') or {}).get('handle')
+        if handle:
+            return f'https://{domain}/products/{handle}'
+    except Exception:
+        pass
+    return admin_url
+
+
 def _meta_upload_image(image_url):
     """Download an image URL and upload its bytes to the ad account → image_hash (or None).
     More reliable than a `picture` URL the creative endpoint has to re-fetch itself."""
@@ -5448,33 +5474,41 @@ def generate_ad_copy():
     return jsonify(out)
 
 
-def _meta_flexible_creative(acct, su, idx, product_url, primary_text, headline, description, hashes, image_urls):
-    """A Flexible (asset_feed_spec / Advantage+) creative holding ALL of a colour's images so
-    Meta can mix/optimise which it shows. Falls back to a plain single-image link creative if
-    the account rejects the flexible format. Returns the creative JSON ('id' on success)."""
+def _meta_creative(acct, su, idx, product_url, primary_text, headline, description, hashes, image_urls):
+    """Page-backed creative for one colour. With ≥2 images → a CAROUSEL (one swipeable card per
+    image, all linking to the product); with exactly 1 → a single-image link ad. Replaces the
+    old Flexible/asset_feed_spec format (no longer reliably available). Returns the creative
+    JSON ('id' on success)."""
     story = {'page_id': META_PAGE_ID}
     if META_IG_USER_ID:
         story['instagram_user_id'] = META_IG_USER_ID
-    if hashes:
-        afs = {
-            'images': [{'hash': h} for h in hashes[:10]],
-            'bodies': [{'text': primary_text}],
-            'titles': [{'text': headline}],
-            'link_urls': [{'website_url': product_url, 'display_url': _reg_domain(product_url)}],
-            'call_to_action_types': ['SHOP_NOW'],
-            'ad_formats': ['SINGLE_IMAGE'],
-            'optimization_type': 'DEGREES_OF_FREEDOM',   # the "Flexible" format
+    hashes = [h for h in (hashes or []) if h]
+
+    # ≥2 images → carousel
+    if len(hashes) >= 2:
+        child = []
+        for h in hashes[:10]:
+            card = {'link': product_url, 'image_hash': h, 'name': headline}
+            if description:
+                card['description'] = description
+            child.append(card)
+        link_data = {
+            'link': product_url,
+            'message': primary_text,
+            'child_attachments': child,
+            'multi_share_optimized': True,    # let Meta order the cards by performance
+            'multi_share_end_card': True,     # closing card with the page/CTA
+            'call_to_action': {'type': 'SHOP_NOW', 'value': {'link': product_url}},
         }
-        if description:
-            afs['descriptions'] = [{'text': description}]
         cr = _meta_post(f'{acct}/adcreatives', {
-            'name': f'{su} creative {idx + 1} (flex)',
-            'object_story_spec': story,
-            'asset_feed_spec': afs,
+            'name': f'{su} carousel {idx + 1}',
+            'object_story_spec': dict(story, link_data=link_data),
         })
         if cr.get('id'):
             return cr
-    # fallback: a plain single-image link creative (first available image)
+        # if the carousel is rejected, fall through to a single-image creative
+
+    # single image (1 image, or carousel rejected → first image)
     link_data = {
         'link': product_url,
         'message': primary_text,
@@ -5494,7 +5528,7 @@ def _meta_flexible_creative(acct, su, idx, product_url, primary_text, headline, 
     })
 
 
-def _meta_create_draft(store, copy, colors, hash_by_url, pixel_id):
+def _meta_create_draft(store, product_name, copy, colors, hash_by_url, pixel_id):
     """Create ONE paused Sales draft per store: campaign (Sales, CBO €30/day) → 1 ad set
     (geo-targeted, Advantage+ audience when accepted, conversion-optimised on the pixel) → one
     Flexible ad PER COLOUR VARIANT (each holding that colour's photos + lifestyle shots and
@@ -5519,12 +5553,14 @@ def _meta_create_draft(store, copy, colors, hash_by_url, pixel_id):
     primary_text = (copy.get('primary_text') or '').strip() or (copy.get('headline') or '').strip() or 'Shop now'
     headline = (copy.get('headline') or '').strip() or primary_text[:40]
     description = (copy.get('description') or '').strip()
+    pname = (product_name or '').strip() or 'Product'
     acct = _meta_acct()
     su = str(store).upper()
 
     # 1) Campaign — Sales objective, CBO (budget on the campaign), €30/day, PAUSED.
+    #    Name mirrors the operator's manual convention: "ADV+ | <product> | <STORE>".
     c = _meta_post(f'{acct}/campaigns', {
-        'name': f'{headline} – {su} (draft)',
+        'name': f'ADV+ | {pname} | {su}',
         'objective': 'OUTCOME_SALES',
         'special_ad_categories': [],
         'daily_budget': 3000,                       # €30.00 in cents (account is EUR)
@@ -5570,8 +5606,8 @@ def _meta_create_draft(store, copy, colors, hash_by_url, pixel_id):
         purl = col['product_url']
         hashes = [hash_by_url[u] for u in col['image_urls'] if (hash_by_url or {}).get(u)]
         time.sleep(0.4)
-        cr = _meta_flexible_creative(acct, su, idx, purl, primary_text, headline, description,
-                                     hashes, col['image_urls'])
+        cr = _meta_creative(acct, su, idx, purl, primary_text, headline, description,
+                            hashes, col['image_urls'])
         if not cr or cr.get('error') or not cr.get('id'):
             last_err = _meta_err(cr or {}, 'creative')
             continue
@@ -5668,7 +5704,7 @@ def meta_create_draft():
     pixel_id = META_PIXEL_ID or _meta_account_pixel()
     results = []
     for it in norm:
-        results.append(_meta_create_draft(it['store'], it['copy'], it['colors'], hash_by_url, pixel_id))
+        results.append(_meta_create_draft(it['store'], product_name, it['copy'], it['colors'], hash_by_url, pixel_id))
         time.sleep(0.5)
     return jsonify({'pixel_used': pixel_id, 'results': results})
 
@@ -5688,6 +5724,13 @@ def _meta_draft_job(jid, payload):
     product_type = payload.get('product_type') or 'dress'
     template = payload.get('template')
     per_color = int(payload.get('lifestyle_per_color') or 2)
+
+    # 0) Resolve admin/myshopify product URLs → public storefront URLs (custom domain) — used
+    #    for the ad link AND inside the ad copy. One lookup per store-colour.
+    _job_set(jid, phase='Resolving product links')
+    sf_by_store = {}
+    for store in stores:
+        sf_by_store[store] = [_storefront_url(store, u) for u in (url_by_store_color.get(store) or [])]
 
     # 1) Lifestyle generation per colour — paced sequentially so it never overloads the box.
     _job_set(jid, phase='Generating lifestyle images', total=len(color_keys), processed=0)
@@ -5718,7 +5761,7 @@ def _meta_draft_job(jid, payload):
     _job_set(jid, phase='Writing ad copy')
     copy_by_store = {}
     for store in stores:
-        first_url = (url_by_store_color.get(store) or [''])[0] or ''
+        first_url = (sf_by_store.get(store) or [''])[0] or ''
         try:
             r = req.post(f'{self_base}/api/generate_ad_copy',
                          json={'stores': [store], 'product_name': product_name,
@@ -5743,19 +5786,19 @@ def _meta_draft_job(jid, payload):
             hash_by_url[u] = h
         time.sleep(0.2)
 
-    # 4) Create campaign + per-colour Flexible ads per store.
+    # 4) Create campaign + per-colour carousel ads per store.
     _job_set(jid, phase='Creating campaigns')
     pixel_id = META_PIXEL_ID or _meta_account_pixel()
     results = []
     for store in stores:
-        urls = url_by_store_color.get(store) or []
+        urls = sf_by_store.get(store) or []
         colors = []
         for i, ck in enumerate(color_keys):
             purl = (urls[i] if i < len(urls) else None) or (urls[0] if urls else '')
             imgs = final_images_by_color.get(ck) or []
             if str(purl).startswith('http') and imgs:
                 colors.append({'product_url': purl, 'image_urls': imgs})
-        results.append(_meta_create_draft(store, copy_by_store.get(store) or {}, colors, hash_by_url, pixel_id))
+        results.append(_meta_create_draft(store, product_name, copy_by_store.get(store) or {}, colors, hash_by_url, pixel_id))
         time.sleep(0.5)
 
     total_ads = sum(len(r.get('ad_ids') or []) for r in results)
