@@ -5301,6 +5301,36 @@ def meta_campaigns():
     return jsonify({'campaigns': rows, 'count': len(rows)})
 
 
+@app.route('/api/meta/storefront_test')
+def meta_storefront_test():
+    """Read-only debug: show how _storefront_url resolves an admin product URL → storefront URL,
+    including the raw Shopify lookup, so we can see why a link isn't converting."""
+    store = (request.args.get('store') or 'fr').lower()
+    pid = re.sub(r'\D', '', request.args.get('id') or '')
+    admin_url = request.args.get('url') or (f'https://x/admin/products/{pid}' if pid else '')
+    out = {
+        'store': store,
+        'store_authed': store in tokens,
+        'shop': tokens.get(store, {}).get('shop'),
+        'domain': META_STORE_DOMAIN.get(store),
+        'admin_url': admin_url,
+    }
+    m = re.search(r'/products/(\d+)', admin_url)
+    out['matched_id'] = m.group(1) if m else None
+    if m and store in tokens:
+        url = shopify_url(store, f'products/{m.group(1)}.json')
+        out['shopify_url'] = url
+        try:
+            r = req.get(url, headers=shopify_headers(store), params={'fields': 'handle'}, timeout=15)
+            out['status'] = r.status_code
+            out['body'] = (r.text or '')[:300]
+            out['handle'] = ((r.json() or {}).get('product') or {}).get('handle')
+        except Exception as e:
+            out['error'] = str(e)[:200]
+    out['result'] = _storefront_url(store, admin_url)
+    return jsonify(out)
+
+
 # ── Meta Ads: create a PAUSED draft campaign ──────────────────────────────────
 # Per store/country: a Sales CBO campaign (€30/day, campaign-level budget) → 1 ad set
 # (geo-targeted to that country, conversion-optimised if a pixel exists) → 1 ad with the
