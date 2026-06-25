@@ -5328,6 +5328,20 @@ def meta_storefront_test():
         except Exception as e:
             out['error'] = str(e)[:200]
     out['result'] = _storefront_url(store, admin_url)
+    # handle-based path: build the storefront URL from name+colour + confirm the handle exists
+    name = request.args.get('name')
+    if name:
+        hurl = _storefront_handle_url(store, name, request.args.get('color') or '')
+        out['handle_url'] = hurl
+        hm = re.search(r'/products/([^/?#]+)', hurl or '')
+        if hm and store in tokens:
+            try:
+                hr = req.get(shopify_url(store, 'products.json'), headers=shopify_headers(store),
+                             params={'handle': hm.group(1), 'fields': 'id,handle,status'}, timeout=15)
+                out['handle_lookup_status'] = hr.status_code
+                out['handle_products'] = (hr.json() or {}).get('products')
+            except Exception as e:
+                out['handle_error'] = str(e)[:200]
     return jsonify(out)
 
 
@@ -5407,6 +5421,28 @@ def _storefront_url(store, admin_url):
     except Exception:
         pass
     return admin_url
+
+
+def _meta_slug(text):
+    """Same slug rule as the publisher's make_handle: NFKD → strip accents → lowercase → dashes."""
+    norm = unicodedata.normalize('NFKD', text or '')
+    ascii_text = ''.join(c for c in norm if not unicodedata.combining(c))
+    return re.sub(r'[^a-z0-9]+', '-', ascii_text.lower()).strip('-')
+
+
+def _storefront_handle_url(store, product_name, color):
+    """Public storefront URL for a colour variant, built from the DETERMINISTIC handle
+    (slug(product_name)-slug(colour)) — exactly what the publisher's make_handle creates. No
+    Shopify lookup, so it doesn't depend on the (often stale) admin product id."""
+    domain = META_STORE_DOMAIN.get((store or '').lower())
+    if not domain:
+        return None
+    name_slug = _meta_slug(product_name)
+    if (color or '').strip().lower() in ('', 'product'):
+        handle = name_slug
+    else:
+        handle = f'{name_slug}-{_meta_slug(color)}'.strip('-')
+    return f'https://{domain}/products/{handle}' if handle else None
 
 
 def _meta_upload_image(image_url):
@@ -5810,12 +5846,12 @@ def _meta_draft_job(jid, payload):
     template = payload.get('template')
     per_color = int(payload.get('lifestyle_per_color') or 2)
 
-    # 0) Resolve admin/myshopify product URLs → public storefront URLs (custom domain) — used
-    #    for the ad link AND inside the ad copy. One lookup per store-colour.
-    _job_set(jid, phase='Resolving product links')
+    # 0) Build public storefront URLs (custom domain) per store-colour from the DETERMINISTIC
+    #    handle — used for the ad link AND inside the ad copy. Aligned with color_keys order, so
+    #    it doesn't depend on the (often stale) admin product ids the publish step returns.
     sf_by_store = {}
     for store in stores:
-        sf_by_store[store] = [_storefront_url(store, u) for u in (url_by_store_color.get(store) or [])]
+        sf_by_store[store] = [_storefront_handle_url(store, product_name, ck) for ck in color_keys]
 
     # 1) Lifestyle generation per colour — paced sequentially so it never overloads the box.
     #    The prompt is season- + product-type-aware (re-stages the model in a seasonal scene).
