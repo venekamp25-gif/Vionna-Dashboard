@@ -3,6 +3,7 @@
 import { useState, FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { Logo } from "@/components/Logo";
+import { AuroraDashboardBackground } from "@/components/AuroraDashboardBackground";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -37,7 +38,8 @@ export default function LoginPage() {
   };
 
   return (
-    <main className="min-h-screen flex items-center justify-center bg-bg px-6">
+    <main className="min-h-screen flex items-center justify-center px-6">
+      <AuroraDashboardBackground />
       <form
         onSubmit={onSubmit}
         className="w-full max-w-sm bg-bg-elev border border-border rounded-2xl p-8 shadow-lg"
