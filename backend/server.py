@@ -542,6 +542,37 @@ def verify_products():
     return jsonify({'products': out})
 
 
+@app.route('/api/retry_fix', methods=['POST'])
+@require_droplet_token
+def retry_fix():
+    """Re-attempt the auto-fixable post-publish issues for the given products — currently
+    (re)publishes each to the default sales channels (Online Store / Facebook / Google). The
+    frontend re-verifies afterwards and offers to report whatever still fails as a bug. Gated."""
+    if not DROPLET_TOKEN_SECRET:
+        return jsonify({'error': 'session-token gate not configured'}), 503
+    data = request.json or {}
+    store = data.get('store', 'dk')
+    ids = data.get('product_ids') or []
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()} store.'}), 401
+    hdrs = shopify_headers(store)
+    fixed, errors = 0, []
+    for pid in ids:
+        num = re.sub(r'\D', '', str(pid).rsplit('/', 1)[-1])
+        if not num:
+            continue
+        try:
+            errs = _publish_to_default_channels(store, num, hdrs)
+            if errs:
+                errors.extend([f'{num}: {e}' for e in errs])
+            else:
+                fixed += 1
+        except Exception as e:
+            errors.append(f'{num}: {str(e)[:150]}')
+        time.sleep(0.2)
+    return jsonify({'success': True, 'fixed': fixed, 'errors': errors[:20]})
+
+
 @app.route('/api/audit')
 def audit_catalog():
     """Catalog-audit (#2): scan every product of a store and flag missing cutlines,

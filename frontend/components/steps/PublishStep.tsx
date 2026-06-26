@@ -154,6 +154,16 @@ export function PublishStep() {
             productsCreated={result.productsCreated}
             metafieldErrors={result.metafieldErrors}
             verification={result.verification}
+            productIds={result.productIds}
+            onVerificationUpdate={(v) =>
+              setData((prev) => ({
+                ...prev,
+                publishResultsByStore: {
+                  ...prev.publishResultsByStore,
+                  [store]: { ...result, verification: v },
+                },
+              }))
+            }
             getColorLabel={(canonical) => colorLabelFor(data, canonical, store)}
             onJump={() => setStore(store)}
           />
@@ -408,6 +418,8 @@ interface CardProps {
   productsCreated: number;
   metafieldErrors: string[];
   verification?: ProductVerify[];
+  productIds?: number[];
+  onVerificationUpdate?: (verification: ProductVerify[]) => void;
   getColorLabel: (canonical: string) => string;
   onJump: () => void;
 }
@@ -423,6 +435,8 @@ function StoreResultCard({
   productsCreated,
   metafieldErrors,
   verification,
+  productIds,
+  onVerificationUpdate,
   getColorLabel,
   onJump,
 }: CardProps) {
@@ -430,6 +444,58 @@ function StoreResultCard({
   const verifyFails = (verification ?? []).some((p) =>
     (p.issues ?? []).some((i) => i.level === "fail")
   );
+
+  const [retrying, setRetrying] = useState(false);
+  const [retryMsg, setRetryMsg] = useState<string | null>(null);
+  const [showBug, setShowBug] = useState(false);
+  const [bugState, setBugState] = useState<"idle" | "sending" | "sent">("idle");
+
+  // Re-attempt the auto-fixable issues (re-publish to channels) then re-verify; whatever still
+  // fails gets a "report as bug" option.
+  const retryFix = async () => {
+    if (!productIds || productIds.length === 0) {
+      setRetryMsg("Geen product-ids beschikbaar om te retryen.");
+      setShowBug(true);
+      return;
+    }
+    setRetrying(true);
+    setRetryMsg(null);
+    setShowBug(false);
+    setBugState("idle");
+    try {
+      await api.retryFix(store, productIds);
+      const v = await api.verifyProducts(store, productIds);
+      onVerificationUpdate?.(v.products as ProductVerify[]);
+      const stillBroken = (v.products ?? []).some((p) => (p.issues ?? []).length > 0);
+      setRetryMsg(stillBroken ? "Een paar punten blijven openstaan." : "✓ Opgelost!");
+      setShowBug(stillBroken);
+    } catch (e) {
+      setRetryMsg("Retry mislukt: " + (e instanceof Error ? e.message : String(e)));
+      setShowBug(true);
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  const reportBug = async () => {
+    setBugState("sending");
+    try {
+      const issuesText = verifyIssues
+        .map((p) => `${p.title}: ${(p.issues ?? []).map((i) => i.msg).join(", ")}`)
+        .join("\n");
+      await api.reportBug({
+        title: `Post-publish check blijft falen na retry — ${name} (${store.toUpperCase()})`,
+        description:
+          `Na "Retry fix" bleven deze post-publish issues openstaan:\n\n${issuesText}\n\n` +
+          `Product: ${name} · Store: ${store.toUpperCase()} · ${productIds?.length ?? 0} producten.`,
+        store,
+      });
+      setBugState("sent");
+    } catch {
+      setBugState("idle");
+    }
+  };
+
   return (
     <div className="bg-bg-elev border border-accent/30 rounded-2xl p-8 shadow-lg">
       <div className="flex items-start gap-4 mb-6">
@@ -544,6 +610,36 @@ function StoreResultCard({
                   </li>
                 ))}
               </ul>
+              <div className="flex items-center gap-2 mt-2.5 flex-wrap">
+                <button
+                  type="button"
+                  onClick={() => void retryFix()}
+                  disabled={retrying}
+                  className="text-[11px] font-semibold uppercase tracking-wider px-2.5 py-1 rounded-md border border-current/40 hover:bg-current/10 disabled:opacity-50"
+                >
+                  {retrying ? "↻ Bezig…" : "↻ Retry fix"}
+                </button>
+                {retryMsg && <span className="text-[11px] font-medium">{retryMsg}</span>}
+              </div>
+              {showBug && (
+                <div className="mt-1.5 text-[11px]">
+                  {bugState === "sent" ? (
+                    <span className="text-accent">✓ Als bug gemeld — Claude pakt 'm op bij de volgende sessie.</span>
+                  ) : (
+                    <>
+                      Lukt het niet automatisch?{" "}
+                      <button
+                        type="button"
+                        onClick={() => void reportBug()}
+                        disabled={bugState === "sending"}
+                        className="underline font-semibold disabled:opacity-50"
+                      >
+                        {bugState === "sending" ? "Bezig met melden…" : "Meld dit als bug →"}
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </div>

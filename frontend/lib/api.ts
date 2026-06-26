@@ -303,6 +303,13 @@ export const api = {
       error?: string;
     }>("/api/verify_products", { method: "POST", body: { store, product_ids } }),
 
+  /** Re-attempt the auto-fixable post-publish issues (re-publish to sales channels). Gated. */
+  retryFix: (store: "dk" | "fr" | "fi", product_ids: (number | string)[]) =>
+    call<{ success: boolean; fixed: number; errors: string[]; error?: string }>(
+      "/api/retry_fix",
+      { method: "POST", body: { store, product_ids }, authed: true }
+    ),
+
   /** Catalogue audit (#2): scan a store for missing cutlines / images, duplicate
    *  products, and active-but-off-channel products. */
   auditCatalog: (store: "dk" | "fr" | "fi") =>
