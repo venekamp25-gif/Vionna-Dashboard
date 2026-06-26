@@ -5345,6 +5345,29 @@ def meta_storefront_test():
     return jsonify(out)
 
 
+@app.route('/api/meta/lifestyle_debug')
+def meta_lifestyle_debug():
+    """Read-only: show the EXACT lifestyle prompt the job sends to Higgsfield (prompt_type 0) +
+    optionally run that exact call on ?image_url= to prove the deployed job path produces a
+    lifestyle shot. Confirms the season-aware prompt is really deployed + used."""
+    pt = request.args.get('product_type', 'dress')
+    prompt, season = _lifestyle_prompt(pt, request.args.get('season'))
+    out = {'prompt_type_sent': 0, 'season': season, 'prompt': prompt}
+    ref = request.args.get('image_url')
+    if ref:
+        self_base = f'http://127.0.0.1:{os.environ.get("PORT", "5000")}'
+        try:
+            r = req.post(f'{self_base}/api/higgsfield',
+                         json={'prompt_type': 0, 'prompt': prompt, 'product_type': pt,
+                               'image_urls': [ref], 'count': 1}, timeout=300)
+            j = r.json() or {}
+            out['result_urls'] = j.get('urls')
+            out['result_error'] = (j.get('error') or '')[:200]
+        except Exception as e:
+            out['result_error'] = str(e)[:200]
+    return jsonify(out)
+
+
 # ── Meta Ads: create a PAUSED draft campaign ──────────────────────────────────
 # Per store/country: a Sales CBO campaign (€30/day, campaign-level budget) → 1 ad set
 # (geo-targeted to that country, conversion-optimised if a pixel exists) → 1 ad with the
