@@ -17,15 +17,15 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'), ov
 app = Flask(__name__, static_folder='.')
 app.secret_key = os.environ.get('SECRET_KEY') or os.urandom(24)
 
-# CORS: allow Next.js frontend (localhost:3000 in dev, vercel.app domain in prod).
-# Routes under /api/* will accept cross-origin requests from these origins.
+# CORS: allow the Next.js dashboard frontend (localhost in dev, Netlify in prod). Routes under
+# /api/* accept cross-origin requests from these origins. A renamed/extra Netlify URL can be
+# added via the FRONTEND_URL env var (comma-separated) — no code change or PR needed.
 _allowed_origins = [
     'http://localhost:3000',
     'http://127.0.0.1:3000',
-    'https://fashion-listing-dashboard.netlify.app',  # current public URL
-    'https://vionna-dashboard.netlify.app',           # legacy — keep until the old name is freed
-    os.environ.get('FRONTEND_URL', ''),
-]
+    'https://fashion-dashboard.netlify.app',          # current public URL
+    'https://fashion-listing-dashboard.netlify.app',  # previous name — kept (harmless)
+] + [o.strip() for o in os.environ.get('FRONTEND_URL', '').split(',') if o.strip()]
 CORS(app, resources={r'/api/*': {'origins': [o for o in _allowed_origins if o]}}, supports_credentials=True,
      allow_headers=['Content-Type', 'X-Droplet-Token'])
 
