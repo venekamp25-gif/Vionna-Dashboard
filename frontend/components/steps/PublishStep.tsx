@@ -44,6 +44,7 @@ export function PublishStep() {
   const { data, setData, clearDraft } = useProduct();
   const { setStore } = useStore();
   const { setStep } = useStep();
+  const [kept, setKept] = useState(false);
 
   const resultsByStore = data.publishResultsByStore ?? {};
   const publishedStores = (Object.keys(resultsByStore) as StoreKey[]).filter(
@@ -121,6 +122,13 @@ export function PublishStep() {
     setStep(1);
   };
 
+  // Stash this finished product so it survives a refresh — then retrieve it via the "back to
+  // last product" banner on the Input step to re-test campaigns without re-importing.
+  const keepForLater = () => {
+    saveLastProduct(data);
+    setKept(true);
+  };
+
   return (
     <div className="max-w-3xl mx-auto space-y-5">
       {fallbackList.map((store) => {
@@ -163,11 +171,25 @@ export function PublishStep() {
         onAutoStarted={() => setData((p) => ({ ...p, prepareMeta: false }))}
       />
 
-      <div className="flex items-center justify-between bg-bg-elev border border-border rounded-2xl px-6 py-4">
-        <span className="text-[13px] text-text-dim">Ready for the next one?</span>
-        <Button variant="primary" onClick={resetForNewProduct}>
-          ← Create another product
-        </Button>
+      <div className="bg-bg-elev border border-border rounded-2xl px-6 py-4 space-y-2.5">
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <span className="text-[13px] text-text-dim">Klaar — wat nu?</span>
+          <div className="flex gap-2 flex-wrap">
+            <Button variant="secondary" onClick={keepForLater} disabled={kept}>
+              {kept ? "✓ Bewaard" : "↩ Bewaar om terug te komen"}
+            </Button>
+            <Button variant="primary" onClick={resetForNewProduct}>
+              ← Create another product
+            </Button>
+          </div>
+        </div>
+        {kept && (
+          <p className="text-[11px] text-text-faint leading-relaxed">
+            ✓ Bewaard! Je kunt nu veilig <strong>refreshen</strong> (Ctrl+Shift+R) — daarna haal je
+            dit product terug via <strong>&ldquo;↩ Terug naar product&rdquo;</strong> op het
+            startscherm, om snel campagnes te (her)maken zonder opnieuw te importeren.
+          </p>
+        )}
       </div>
     </div>
   );
