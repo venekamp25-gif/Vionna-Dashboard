@@ -267,3 +267,38 @@ export function translateColor(color: string, store: Store): string {
   // 5: give up — keep the original (no regression vs. before)
   return raw;
 }
+
+/** Lowercased set of every recognised colour / pattern word across EN + DK/FR/FI,
+ *  harvested from the translation tables above. */
+const COLOR_WORDS: Set<string> = (() => {
+  const s = new Set<string>();
+  const add = (w: string) => { const t = w.toLowerCase().trim(); if (t.length > 1) s.add(t); };
+  for (const store of ["dk", "fr", "fi"] as const) {
+    for (const tbl of [COLOR_TRANSLATIONS[store], EXTRA_COLOR[store], PATTERN[store]]) {
+      for (const [en, tr] of Object.entries(tbl)) {
+        en.split(/\s+/).forEach(add);
+        tr.split(/[\s/]+/).forEach(add);
+      }
+    }
+  }
+  // a few common shade/finish words the tables don't key on directly
+  ["multi", "multicolor", "multicolour", "multicolore", "neutral", "neutrals",
+   "natural", "print", "printed", "metallic"].forEach(add);
+  return s;
+})();
+
+/**
+ * Does a competitor option VALUE look like a colour — vs. a size, an occasion
+ * ("Abend"/"Sommer"), a category ("Handtasche") or a product name ("Calista")?
+ *
+ * Token-exact against the known colour vocabulary, deliberately conservative:
+ * a value counts as colour-like if ANY of its words is a recognised colour.
+ * Used to pick the right variant option and to reject a name-only handle
+ * fallback, so a non-colour field never becomes a bogus colour swatch.
+ */
+export function isColorLike(value: string): boolean {
+  const v = (value || "").toLowerCase().trim();
+  if (!v) return false;
+  const tokens = v.split(/[\s/&,\-]+/).filter((t) => t.length > 1);
+  return tokens.some((t) => COLOR_WORDS.has(t));
+}

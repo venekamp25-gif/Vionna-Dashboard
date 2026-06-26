@@ -1,12 +1,13 @@
 import type { ScrapedProduct } from "./api";
+import { isColorLike } from "./colors";
 
 // Recognise the full Shopify-ish size lexicon so an option like
 // ["XXS","XS","S","M","L","XL","XXL","3XL"] is correctly identified as
 // SIZES rather than mistaken for colour values (would otherwise cause the
 // dashboard to show "Xxs / Xs / S / M / L / Xl" as colour chips).
 const SIZE_RE = /^(x{0,5}s|m|l|x{0,5}l|[2-5]xs|[2-5]xl|one\s?size|os|free\s?size|\d{1,3}(cm|mm)?|(uk|us|eu|fr|it)\s?\d{1,2}(\.\d)?)$/i;
-const COLOR_OPT_RE = /colou?r|kleur|farve|couleur|colore/i;
-const SIZE_OPT_NAME_RE = /size|maat|taille|størrelse|talla/i;
+const COLOR_OPT_RE = /colou?r|kleur|farve|farbe|färg|couleur|colore|colori|väri|farba/i;
+const SIZE_OPT_NAME_RE = /size|maat|taille|størrelse|talla|gr(ö|oe|o|ø)?sse|grootte|storlek|koko|taglia/i;
 
 /** Extract color list from a scraped product (Shopify .json format). */
 export function extractColors(product: ScrapedProduct["product"]): string[] {
@@ -17,52 +18,49 @@ export function extractColors(product: ScrapedProduct["product"]): string[] {
 
   const opts = product.options ?? [];
 
-  // 1. Highest-confidence match: option NAME literally contains "color".
-  let colorOpt =
-    opts.find((o) => COLOR_OPT_RE.test(o.name)) || null;
-
-  // 2. If no name-based match, take ANY option that is NOT explicitly named
-  //    "size" AND whose values are not all sizes. The size-name exclusion is
-  //    what catches meshki.co.uk where the only option is `SIZE` with values
-  //    ["XXS","XS",...,"3XL"] — without it, an exotic size like "3XL" that
-  //    slipped past SIZE_RE would make us misinterpret the whole option as a
-  //    colour list.
-  if (!colorOpt) {
-    colorOpt =
-      opts.find(
-        (o) =>
-          !isSizeOption(o.name) &&
-          o.values?.length &&
-          !o.values.every(isSize)
-      ) || null;
+  // 1. Highest-confidence match: an option whose NAME means "colour" in any
+  //    supported language (now incl. German "Farbe", Swedish "Färg", Finnish
+  //    "Väri"). Trust the name even if a value or two is exotic.
+  const named = opts.find((o) => COLOR_OPT_RE.test(o.name));
+  if (named?.values?.length && !named.values.every(isSize)) {
+    return named.values.slice(0, 30);
   }
 
-  if (colorOpt?.values?.length && !colorOpt.values.every(isSize)) {
-    // Cap at 30 — shops like Ever-Pretty / bridesmaid-dress vendors routinely
-    // have 15-25 colours per product. The user can still remove any they don't
-    // want from the chip list in Review. Going beyond 30 has practical UX
-    // limits (NB Step 5 would do 30 × 4 = 120 generations per product).
-    return colorOpt.values.slice(0, 30);
+  // 2. No name match: SCORE each non-size option by how many of its values look
+  //    like real colours and take the best — but only if a clear majority do.
+  //    This is what stops us grabbing an occasion / category option (e.g. a
+  //    German "Anlass" → Abend/Sommer, or "Kategorie" → Handtasche/Sonnenbrille)
+  //    purely because it isn't a size. A genuine colour option scores ~1.0;
+  //    such non-colour options score ~0 and are rejected.
+  let best: { values: string[]; score: number } | null = null;
+  for (const o of opts) {
+    if (isSizeOption(o.name)) continue;
+    const vals = (o.values ?? []).filter((v) => v && v.trim());
+    if (!vals.length || vals.every(isSize)) continue;
+    const score = vals.filter(isColorLike).length / vals.length;
+    if (!best || score > best.score) best = { values: vals, score };
+  }
+  if (best && best.score >= 0.5) {
+    // Cap at 30 — bridesmaid vendors routinely have 15-25 colours; the user can
+    // trim the chip list in Review. (NB: 30 × stores generations downstream.)
+    return best.values.slice(0, 30);
   }
 
-  // Fallback: derive from handle (skip generic clothing words).
+  // 3. Fallback: derive ONE colour from the handle — but ONLY if it actually
+  //    looks like a colour. A name-ending handle (`…-calista`) must NOT become
+  //    a "Calista" swatch; better to return nothing and let the user set it.
   const handle = product.handle || "";
   const skip = /^(dress|top|skirt|blouse|coat|jacket|shirt|pants|jeans|mini|maxi|midi|womens|women|lace|satin|silk|cotton|linen|long|short|sleeve|sleeveless)$/i;
-  // Single-colour names are usually 1 word at the end of the handle (e.g.
-  // `dinah-lace-and-satin-maxi-dress-black`). Two-word colours (e.g.
-  // `royal-blue`, `dusty-pink`) are common enough that we also try the last
-  // TWO tokens combined when the last one is a generic colour modifier.
   const tokens = handle.split("-").filter((w) => w.length > 1 && !skip.test(w));
   if (tokens.length === 0) return [];
-  const lastTwo = tokens.slice(-2).join(" ");
-  const lastOne = tokens[tokens.length - 1];
-  // Prefer the two-token form ONLY when both look like real words (no digits)
-  // and the first of the two is a known colour modifier.
+  // Two-word colours (`royal-blue`, `dusty-pink`) when the penultimate token is
+  // a known modifier; otherwise the single last token.
   const modifier = /^(light|dark|deep|bright|hot|baby|dusty|royal|navy|forest|burnt|rose|ice)$/i;
-  if (tokens.length >= 2 && modifier.test(tokens[tokens.length - 2])) {
-    return [titleCase(lastTwo)];
-  }
-  return [titleCase(lastOne)];
+  const candidate =
+    tokens.length >= 2 && modifier.test(tokens[tokens.length - 2])
+      ? titleCase(tokens.slice(-2).join(" "))
+      : titleCase(tokens[tokens.length - 1]);
+  return isColorLike(candidate) ? [candidate] : [];
 }
 
 function titleCase(s: string): string {
