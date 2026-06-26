@@ -636,6 +636,34 @@ def audit_catalog():
     })
 
 
+@app.route('/api/catalog_cutlines')
+def catalog_cutlines():
+    """Read-only: every product's handle/title/status/cutline for a store, so a
+    catalog-wide cutline analysis (localisation + mis-detected colours) can run
+    client-side. No writes."""
+    store = request.args.get('store', 'dk')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()} store.'}), 401
+    hdrs = shopify_headers(store)
+    out = []
+    try:
+        for n in _paginate_gql_products(
+            store,
+            'id handle title status '
+            'cutline: metafield(namespace:"theme",key:"cutline"){value}',
+            hdrs,
+        ):
+            out.append({
+                'handle': n.get('handle', ''),
+                'title': n.get('title', ''),
+                'status': (n.get('status') or '').upper(),
+                'cutline': ((n.get('cutline') or {}) or {}).get('value') or '',
+            })
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 500
+    return jsonify({'store': store, 'total': len(out), 'products': out})
+
+
 @app.route('/api/duplicate_detail')
 def duplicate_detail():
     """Read-only diagnostic: for every base-handle group with numbered siblings
