@@ -5876,8 +5876,13 @@ def _meta_draft_job(jid, payload):
 
     final_images_by_color = {}
     for color in color_keys:
+        pub = [u for u in (images_by_color.get(color) or []) if u]
+        life = [u for u in (lifestyle_by_color.get(color) or []) if u]
+        # Lifestyle shots LEAD the carousel (they're the scroll-stopper + what shows first in the
+        # feed); then up to 2 product shots for garment clarity. Without this the many imported
+        # studio photos filled every slot and buried the lifestyle ones.
         merged = []
-        for u in list(images_by_color.get(color) or []) + list(lifestyle_by_color.get(color) or []):
+        for u in life + pub[:2]:
             if u and u not in merged:
                 merged.append(u)
         final_images_by_color[color] = merged[:5]
