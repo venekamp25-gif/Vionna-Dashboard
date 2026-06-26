@@ -4,6 +4,7 @@ import { useState, FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { Logo } from "@/components/Logo";
 import { AuroraDashboardBackground } from "@/components/AuroraDashboardBackground";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -40,6 +41,9 @@ export default function LoginPage() {
   return (
     <main className="min-h-screen flex items-center justify-center px-6">
       <AuroraDashboardBackground />
+      <div className="fixed top-5 right-5 z-10">
+        <ThemeToggle />
+      </div>
       <form
         onSubmit={onSubmit}
         className="w-full max-w-sm bg-bg-elev border border-border rounded-2xl p-8 shadow-lg"
