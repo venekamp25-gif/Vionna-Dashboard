@@ -13,10 +13,17 @@ export function BackendStatusBadge() {
   const [healthOpen, setHealthOpen] = useState(false);
 
   useEffect(() => {
-    api
-      .status()
-      .then((s) => { setStatus(s); setState("ok"); })
-      .catch((e) => { setErr(String(e.message ?? e)); setState("fail"); });
+    let cancelled = false;
+    const check = () =>
+      api
+        .status()
+        .then((s) => { if (!cancelled) { setStatus(s); setState("ok"); setErr(""); } })
+        .catch((e) => { if (!cancelled) { setErr(String(e.message ?? e)); setState("fail"); } });
+    void check();
+    // Re-check periodically so a transient blip (e.g. a backend deploy/restart) auto-recovers
+    // instead of sticking on "offline" until the user manually refreshes.
+    const id = setInterval(() => void check(), 20000);
+    return () => { cancelled = true; clearInterval(id); };
   }, []);
 
   // Shared wrapper button — clicking the badge opens the full health-check
