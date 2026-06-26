@@ -158,9 +158,6 @@ export interface GenerateResponse {
   description?: string;
   meta_description?: string;
   m_title_specs?: string;
-  /** Colour labels translated into the store language, SAME ORDER as the request's
-   *  `colors`. Empty/absent when no colours were sent. */
-  colors?: string[];
   error?: string;
 }
 
@@ -370,9 +367,6 @@ export const api = {
     product_name: string;
     product_title: string;
     keywords: string[];
-    /** Canonical colour list (may be in the competitor's language). The backend
-     *  translates each into the store language and returns them as `colors`. */
-    colors?: string[];
     /** Regenerate only this one field. When omitted, all three fields are generated. */
     only_field?: GenerateField;
     /** Existing values for the OTHER fields, so partial regenerations stay consistent. */
@@ -385,6 +379,16 @@ export const api = {
      */
     tone_references?: string[];
   }) => call<GenerateResponse>("/api/generate", { method: "POST", body: params }),
+
+  /** Translate colour-variant names into a store's language. Dedicated (not folded
+   *  into /api/generate) so the model returns them reliably. Response `colors` is
+   *  always the same length + order as the request, falling back to the input value
+   *  for any colour it couldn't place. */
+  translateColors: (params: { store: "dk" | "fr" | "fi"; colors: string[] }) =>
+    call<{ colors: string[]; error?: string }>("/api/translate_colors", {
+      method: "POST",
+      body: params,
+    }),
 
   higgsfield: (params: {
     prompt_type: number;

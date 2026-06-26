@@ -133,24 +133,30 @@ export function GenerateStep() {
             product_name: chosenName,
             product_title: product?.title ?? "",
             keywords: storeKeywords,
-            colors: canonicalColors,
             tone_references: toneRefs[store],
           });
           if (gen.error) throw new Error(`${store.toUpperCase()}: ${gen.error}`);
 
-          // Build localised colour labels for this store. Prefer the LLM
-          // translations the backend returns (robust for ANY source language —
-          // e.g. a French competitor's "Marron Café" / "Bleu Ciel"), and fall
-          // back to the static table → canonical so a missing/short list never
-          // garbles or drops a colour.
-          const llmColors =
-            Array.isArray(gen.colors) && gen.colors.length === canonicalColors.length
-              ? gen.colors
-              : null;
+          // Localise the colour names into this store's language via a dedicated,
+          // reliable call (robust for ANY source language — e.g. a French
+          // competitor's "Marron Café" / "Bleu Ciel"). Falls back to the static
+          // table → canonical if the call fails or returns a short list, so a
+          // colour is never garbled or dropped.
+          let translated: string[] | null = null;
+          if (canonicalColors.length > 0) {
+            try {
+              const tr = await api.translateColors({ store, colors: canonicalColors });
+              if (Array.isArray(tr.colors) && tr.colors.length === canonicalColors.length) {
+                translated = tr.colors;
+              }
+            } catch {
+              /* fall back below */
+            }
+          }
           const colorLabels: Record<string, string> = {};
           canonicalColors.forEach((canonical, i) => {
-            const llm = llmColors?.[i]?.trim();
-            colorLabels[canonical] = llm || translateColor(canonical, store);
+            const t = translated?.[i]?.trim();
+            colorLabels[canonical] = t || translateColor(canonical, store);
           });
           const cutline = canonicalColors
             .map((c) => colorLabels[c])

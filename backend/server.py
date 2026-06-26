@@ -3801,11 +3801,6 @@ def generate():
         tone_references = []
     tone_references = [s for s in tone_references if isinstance(s, str) and s.strip()]
     language      = STORE_LANGUAGE.get(store, 'Frans')
-    # Colour variants to localise into the store language. They may arrive in the
-    # competitor's language (a French shop → "Noir", "Bleu Ciel", "Marron Café");
-    # the model translates each into a natural store-language fashion colour name
-    # and returns them, in order, as "colors". Used only in the full-generation path.
-    colors_in = [str(c).strip() for c in (data.get('colors') or []) if str(c).strip()][:30]
 
     # Style anchor: user-supplied tone reference if provided, otherwise the
     # hard-coded Liviah default. The first user example replaces the example;
@@ -3903,20 +3898,6 @@ Antwoord ALLEEN als geldig JSON:
         return jsonify({'error': 'Kon respons niet parsen', 'raw': text}), 500
 
     # ── Full generation (default — all three fields at once) ──
-    # Optional colour-translation block — only when the frontend sent colours.
-    colors_block = ""
-    colors_json = ""
-    if colors_in:
-        colors_block = (
-            f"\n\nKleurvarianten van dit product (komen van de concurrent, mogelijk in een andere taal): "
-            f"{', '.join(colors_in)}\n"
-            f"- Vertaal ELKE kleur naar een natuurlijke, correcte {language} modekleur-naam zoals een "
-            f"{language}e modewebshop ze zou tonen (bv. \"Noir\" → Deens \"Sort\", \"Bleu Ciel\" → Deens \"Lyseblå\").\n"
-            f"- Behoud EXACT dezelfde volgorde en hetzelfde aantal kleuren ({len(colors_in)} stuks).\n"
-            f"- Staat een kleur al goed in het {language}, laat 'm dan ongemoeid."
-        )
-        colors_json = ', "colors": ["<vertaalde kleur 1>", "<vertaalde kleur 2>", ...]'
-
     prompt = f"""Je bent een productschrijver voor een vrouwenmodezaak. Schrijf productcontent in het {language} voor een product genaamd "{product_name}".
 
 Competitor producttitel: {product_title}
@@ -3937,15 +3918,15 @@ Regels:
 
 Geef ook:
 - meta_description: max 155 tekens, SEO-geoptimaliseerd voor {language}
-- m_title_specs: één beschrijvende zin voor Google Shopping (wordt gebruikt als: {product_name} | m_title_specs){colors_block}
+- m_title_specs: één beschrijvende zin voor Google Shopping (wordt gebruikt als: {product_name} | m_title_specs)
 
 Antwoord uitsluitend als geldig JSON zonder extra tekst:
-{{"description": "...", "meta_description": "...", "m_title_specs": "..."{colors_json}}}"""
+{{"description": "...", "meta_description": "...", "m_title_specs": "..."}}"""
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     msg = client.messages.create(
         model='claude-sonnet-4-5',
-        max_tokens=1500,
+        max_tokens=1200,
         messages=[{'role': 'user', 'content': prompt}]
     )
     text = msg.content[0].text.strip()
@@ -3953,6 +3934,60 @@ Antwoord uitsluitend als geldig JSON zonder extra tekst:
     if match:
         return jsonify(json.loads(match.group()))
     return jsonify({'error': 'Kon respons niet parsen', 'raw': text}), 500
+
+
+@app.route('/api/translate_colors', methods=['POST'])
+def translate_colors():
+    """Translate colour-variant names into a store's language.
+
+    Kept SEPARATE from /api/generate on purpose: bundling the colours into the big
+    copy-generation call made the model drop them most of the time (it juggles
+    description + meta + title and silently omits the colour array). A small,
+    single-purpose call returns them reliably.
+
+    Body:    { "store": "dk|fr|fi", "colors": ["Noir", "Bleu Ciel", ...] }
+    Returns: { "colors": ["Sort", "Lyseblå", ...] }  — same order, same length;
+             falls back to the input value for any colour the model omits.
+    """
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        return jsonify({'error': 'Anthropic API key missing'}), 400
+    import anthropic
+    data      = request.json or {}
+    store     = data.get('store', 'dk')
+    language  = STORE_LANGUAGE.get(store, 'Frans')
+    colors_in = [str(c).strip() for c in (data.get('colors') or []) if str(c).strip()][:40]
+    if not colors_in:
+        return jsonify({'colors': []})
+
+    prompt = (
+        f"Vertaal deze modekleur-namen naar natuurlijke, correcte {language} modekleur-namen, "
+        f"zoals een {language}e modewebshop ze zou tonen. De input kan in een andere taal staan "
+        f"(bijv. Frans van een concurrent). Staat een kleur al goed in het {language}, laat 'm "
+        f"dan ongemoeid.\n\nKleuren (in volgorde):\n"
+        + "\n".join(f"{i+1}. {c}" for i, c in enumerate(colors_in))
+        + f"\n\nAntwoord UITSLUITEND met een geldige JSON-array van exact {len(colors_in)} strings, "
+        f"in EXACT dezelfde volgorde, zonder extra tekst. Voorbeeld: [\"Sort\", \"Lyseblå\"]"
+    )
+    out = []
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        msg = client.messages.create(
+            model='claude-sonnet-4-5',
+            max_tokens=700,
+            messages=[{'role': 'user', 'content': prompt}],
+        )
+        text  = msg.content[0].text.strip()
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        parsed = json.loads(match.group()) if match else []
+        if isinstance(parsed, list):
+            out = [str(x).strip() for x in parsed]
+    except Exception as e:
+        print(f"[translate_colors] failed: {e}")
+        out = []
+    # Reconcile to the input length — keep the model's value where present,
+    # else fall back to the original colour so nothing is dropped.
+    result = [(out[i] if i < len(out) and out[i] else c) for i, c in enumerate(colors_in)]
+    return jsonify({'colors': result})
 
 
 # --- Publish history (append-only JSONL log of every variant created) ---
