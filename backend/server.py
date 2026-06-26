@@ -5225,35 +5225,82 @@ def _version_tuple(v):
     except Exception:
         return (0, 0, 0)
 
+def _github_api_repo():
+    """Derive (owner, repo, ref) from GITHUB_RAW, which looks like
+    https://raw.githubusercontent.com/<owner>/<repo>/<ref>. Returns None if it
+    doesn't match (e.g. unset or a custom host)."""
+    m = re.match(r'https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)', GITHUB_RAW or '')
+    return (m.group(1), m.group(2), m.group(3)) if m else None
+
+def _resolve_commit_sha():
+    """Resolve the current commit SHA of the configured ref via the GitHub API.
+    raw.githubusercontent.com's Fastly CDN intermittently serves a STALE file off
+    a mutable ref (e.g. server.py lags while version.txt is already fresh), so we
+    pin the fetch to an immutable SHA instead. The repo is public, so no auth is
+    needed (unauthenticated ~60/hr is plenty for deploys). Returns the SHA string,
+    or None on any failure so the caller can fall back to the mutable ref."""
+    info = _github_api_repo()
+    if not info:
+        return None
+    owner, repo, ref = info
+    try:
+        r = req.get(f'https://api.github.com/repos/{owner}/{repo}/commits/{ref}',
+                    timeout=10, headers={'Accept': 'application/vnd.github+json',
+                                         'User-Agent': 'vionna-dashboard-updater'})
+        r.raise_for_status()
+        return (r.json() or {}).get('sha') or None
+    except Exception:
+        return None
+
 @app.route('/api/version')
 def api_version():
     local = _read_local_version()
+    # 'updater' marks which fetch strategy this running build uses. After a deploy,
+    # confirm 'sha-pinned' here to verify the NEW code actually landed — the version
+    # number alone can advance while stale code lingers (the bug this fixes).
     if not GITHUB_RAW:
-        return jsonify({'local': local, 'remote': None, 'update_available': False})
+        return jsonify({'local': local, 'remote': None, 'update_available': False,
+                        'updater': 'sha-pinned'})
     try:
         # Files moved to backend/ subdirectory after repo restructure
         r = req.get(f'{GITHUB_RAW}/backend/version.txt', timeout=5)
         remote = r.text.strip()
         update_available = _version_tuple(remote) > _version_tuple(local)
-        return jsonify({'local': local, 'remote': remote, 'update_available': update_available})
+        return jsonify({'local': local, 'remote': remote, 'update_available': update_available,
+                        'updater': 'sha-pinned'})
     except Exception as e:
-        return jsonify({'local': local, 'remote': None, 'update_available': False, 'error': str(e)})
+        return jsonify({'local': local, 'remote': None, 'update_available': False,
+                        'error': str(e), 'updater': 'sha-pinned'})
 
 @app.route('/api/update', methods=['POST'])
 def api_update():
     if not GITHUB_RAW:
         return jsonify({'error': 'GITHUB_RAW not configured'}), 400
     base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Resolve an IMMUTABLE source before fetching. A ?t=<ts> cache-bust is useless
+    # here — raw.githubusercontent.com ignores query strings for its cache key — so
+    # instead we pin to the latest commit SHA. A SHA-pinned raw URL is immutable and
+    # never stale; if the API lookup fails we fall back to the mutable `main` ref.
+    sha  = _resolve_commit_sha()
+    info = _github_api_repo()
+    if sha and info:
+        owner, repo, _ref = info
+        fetch_base = f'https://raw.githubusercontent.com/{owner}/{repo}/{sha}'
+        pinned = True
+    else:
+        fetch_base = GITHUB_RAW
+        pinned = False
+
     # Pull from backend/ on GitHub, save locally next to the running server.py
     files_to_update = ['index.html', 'server.py', 'version.txt']
     updated = []
     errors  = []
     for fname in files_to_update:
         try:
-            # cache-bust the GitHub raw CDN — without this it sometimes serves a stale
-            # server.py while version.txt is already fresh, so a deploy half-lands.
-            r = req.get(f'{GITHUB_RAW}/backend/{fname}', timeout=15,
-                        params={'t': int(time.time())}, headers={'Cache-Control': 'no-cache'})
+            r = req.get(f'{fetch_base}/backend/{fname}', timeout=15,
+                        headers={'Cache-Control': 'no-cache',
+                                 'User-Agent': 'vionna-dashboard-updater'})
             r.raise_for_status()
             dest = os.path.join(base_dir, fname)
             with open(dest, 'wb') as f:
@@ -5263,7 +5310,8 @@ def api_update():
             errors.append(f'{fname}: {e}')
 
     if errors:
-        return jsonify({'success': False, 'updated': updated, 'errors': errors}), 500
+        return jsonify({'success': False, 'updated': updated, 'errors': errors,
+                        'sha': sha, 'pinned': pinned}), 500
 
     # Schedule restart after response is sent
     def _restart():
@@ -5274,7 +5322,8 @@ def api_update():
 
     import threading
     threading.Thread(target=_restart, daemon=True).start()
-    return jsonify({'success': True, 'updated': updated, 'restarting': True})
+    return jsonify({'success': True, 'updated': updated, 'restarting': True,
+                    'sha': sha, 'pinned': pinned})
 
 
 # ── Meta Ads ──────────────────────────────────────────────────────────────────
