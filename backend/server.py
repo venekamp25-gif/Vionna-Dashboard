@@ -5368,6 +5368,45 @@ def meta_lifestyle_debug():
     return jsonify(out)
 
 
+@app.route('/api/meta/channels_debug')
+def meta_channels_debug():
+    """Read-only: for a product (by ?handle=), show its sales-channel publications counted both
+    ways — onlyPublished:true (LIVE) vs false (ASSIGNED) — + the publication list. Tells us if a
+    draft product is on the channels (assigned but not live) and whether the verify fix is live."""
+    store = (request.args.get('store') or 'fr').lower()
+    handle = request.args.get('handle') or 'celeste-noir'
+    if store not in tokens:
+        return jsonify({'error': f'not authenticated for {store}'}), 401
+    hdrs = shopify_headers(store)
+    try:
+        pr = req.get(shopify_url(store, 'products.json'), headers=hdrs,
+                     params={'handle': handle, 'fields': 'id,handle,status'}, timeout=15)
+        prods = (pr.json() or {}).get('products') or []
+    except Exception as e:
+        return jsonify({'error': f'lookup failed: {e}'}), 502
+    if not prods:
+        return jsonify({'store': store, 'handle': handle, 'error': 'no product with that handle'})
+    pid = prods[0]['id']
+    gid = f'gid://shopify/Product/{pid}'
+    q = ('{ node(id: "%s") { ... on Product { status '
+         'pubTrue: resourcePublicationsCount(onlyPublished: true) { count } '
+         'pubFalse: resourcePublicationsCount(onlyPublished: false) { count } '
+         'resourcePublications(first: 10) { nodes { isPublished publication { name } } } } } }' % gid)
+    try:
+        r = req.post(shopify_url(store, 'graphql.json'), headers=hdrs, json={'query': q}, timeout=20)
+        node = ((r.json() or {}).get('data') or {}).get('node') or {}
+    except Exception as e:
+        return jsonify({'error': f'graphql failed: {e}'}), 502
+    return jsonify({
+        'store': store, 'handle': handle, 'product_id': pid, 'status': prods[0].get('status'),
+        'channels_live (onlyPublished true)': (node.get('pubTrue') or {}).get('count'),
+        'channels_assigned (onlyPublished false)': (node.get('pubFalse') or {}).get('count'),
+        'publications': [{'name': (p.get('publication') or {}).get('name'),
+                          'isPublished': p.get('isPublished')}
+                         for p in ((node.get('resourcePublications') or {}).get('nodes') or [])],
+    })
+
+
 # ── Meta Ads: create a PAUSED draft campaign ──────────────────────────────────
 # Per store/country: a Sales CBO campaign (€30/day, campaign-level budget) → 1 ad set
 # (geo-targeted to that country, conversion-optimised if a pixel exists) → 1 ad with the
