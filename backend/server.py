@@ -3801,6 +3801,11 @@ def generate():
         tone_references = []
     tone_references = [s for s in tone_references if isinstance(s, str) and s.strip()]
     language      = STORE_LANGUAGE.get(store, 'Frans')
+    # Colour variants to localise into the store language. They may arrive in the
+    # competitor's language (a French shop → "Noir", "Bleu Ciel", "Marron Café");
+    # the model translates each into a natural store-language fashion colour name
+    # and returns them, in order, as "colors". Used only in the full-generation path.
+    colors_in = [str(c).strip() for c in (data.get('colors') or []) if str(c).strip()][:30]
 
     # Style anchor: user-supplied tone reference if provided, otherwise the
     # hard-coded Liviah default. The first user example replaces the example;
@@ -3898,6 +3903,20 @@ Antwoord ALLEEN als geldig JSON:
         return jsonify({'error': 'Kon respons niet parsen', 'raw': text}), 500
 
     # ── Full generation (default — all three fields at once) ──
+    # Optional colour-translation block — only when the frontend sent colours.
+    colors_block = ""
+    colors_json = ""
+    if colors_in:
+        colors_block = (
+            f"\n\nKleurvarianten van dit product (komen van de concurrent, mogelijk in een andere taal): "
+            f"{', '.join(colors_in)}\n"
+            f"- Vertaal ELKE kleur naar een natuurlijke, correcte {language} modekleur-naam zoals een "
+            f"{language}e modewebshop ze zou tonen (bv. \"Noir\" → Deens \"Sort\", \"Bleu Ciel\" → Deens \"Lyseblå\").\n"
+            f"- Behoud EXACT dezelfde volgorde en hetzelfde aantal kleuren ({len(colors_in)} stuks).\n"
+            f"- Staat een kleur al goed in het {language}, laat 'm dan ongemoeid."
+        )
+        colors_json = ', "colors": ["<vertaalde kleur 1>", "<vertaalde kleur 2>", ...]'
+
     prompt = f"""Je bent een productschrijver voor een vrouwenmodezaak. Schrijf productcontent in het {language} voor een product genaamd "{product_name}".
 
 Competitor producttitel: {product_title}
@@ -3918,15 +3937,15 @@ Regels:
 
 Geef ook:
 - meta_description: max 155 tekens, SEO-geoptimaliseerd voor {language}
-- m_title_specs: één beschrijvende zin voor Google Shopping (wordt gebruikt als: {product_name} | m_title_specs)
+- m_title_specs: één beschrijvende zin voor Google Shopping (wordt gebruikt als: {product_name} | m_title_specs){colors_block}
 
 Antwoord uitsluitend als geldig JSON zonder extra tekst:
-{{"description": "...", "meta_description": "...", "m_title_specs": "..."}}"""
+{{"description": "...", "meta_description": "...", "m_title_specs": "..."{colors_json}}}"""
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     msg = client.messages.create(
         model='claude-sonnet-4-5',
-        max_tokens=1200,
+        max_tokens=1500,
         messages=[{'role': 'user', 'content': prompt}]
     )
     text = msg.content[0].text.strip()

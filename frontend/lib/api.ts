@@ -158,6 +158,9 @@ export interface GenerateResponse {
   description?: string;
   meta_description?: string;
   m_title_specs?: string;
+  /** Colour labels translated into the store language, SAME ORDER as the request's
+   *  `colors`. Empty/absent when no colours were sent. */
+  colors?: string[];
   error?: string;
 }
 
@@ -367,6 +370,9 @@ export const api = {
     product_name: string;
     product_title: string;
     keywords: string[];
+    /** Canonical colour list (may be in the competitor's language). The backend
+     *  translates each into the store language and returns them as `colors`. */
+    colors?: string[];
     /** Regenerate only this one field. When omitted, all three fields are generated. */
     only_field?: GenerateField;
     /** Existing values for the OTHER fields, so partial regenerations stay consistent. */
