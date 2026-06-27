@@ -9,6 +9,7 @@ import { StoreKey, STORE_CONFIG } from "@/lib/store";
 import { randomName } from "@/lib/names";
 import { slugify } from "@/lib/slug";
 import { useUsedNames } from "@/lib/useUsedNames";
+import { translateColor } from "@/lib/colors";
 
 const COLOR_DOTS: Record<string, string> = {
   // English canonical keys
@@ -197,6 +198,44 @@ export function ProductInfoCard() {
     });
   };
 
+  // Manual colour escape-hatch: add a colour the importer missed (bug #4 — some
+  // shops hide sibling colours behind JS pickers we can't scrape). Mirrors
+  // removeColorAt so colorLabels + cutline stay in sync across every store.
+  const [newColor, setNewColor] = useState("");
+
+  const addColor = (raw: string) => {
+    const name = raw.trim();
+    if (!name) return;
+    setData((prev) => {
+      const canonical = name;
+      if (prev.canonicalColors.some((c) => c.toLowerCase() === canonical.toLowerCase())) {
+        return prev; // already present — ignore duplicates
+      }
+      const newCanonical = [...prev.canonicalColors, canonical];
+      const newColors = [...prev.colors, canonical];
+
+      const newContent: Record<StoreKey, StoreContent> = { ...prev.contentByStore };
+      (Object.keys(newContent) as StoreKey[]).forEach((s) => {
+        const labels = { ...newContent[s].colorLabels };
+        labels[canonical] = translateColor(canonical, s);
+        newContent[s] = {
+          ...newContent[s],
+          colorLabels: labels,
+          cutline: newCanonical.map((c) => labels[c] ?? c).join(", "),
+        };
+      });
+
+      return {
+        ...prev,
+        canonicalColors: newCanonical,
+        colors: newColors,
+        contentByStore: newContent,
+        cutline: newContent[prev.activeViewStore]?.cutline ?? "",
+      };
+    });
+    setNewColor("");
+  };
+
   return (
     <Card title="Product info">
       <Field>
@@ -239,6 +278,29 @@ export function ProductInfoCard() {
           {data.canonicalColors.length === 0 && (
             <span className="text-[12px] text-text-faint">No colors detected</span>
           )}
+        </div>
+        <div className="flex gap-2 mt-2">
+          <Input
+            type="text"
+            value={newColor}
+            onChange={(e) => setNewColor(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                addColor(newColor);
+              }
+            }}
+            placeholder="Add a colour the import missed (e.g. Black)"
+            className="flex-1"
+          />
+          <button
+            type="button"
+            title="Add colour"
+            onClick={() => addColor(newColor)}
+            className="px-3 h-10 flex items-center justify-center rounded-[10px] bg-bg-elev-2 border border-border text-text-dim hover:border-accent hover:text-accent transition active:scale-95 text-[13px] whitespace-nowrap"
+          >
+            + Add
+          </button>
         </div>
       </Field>
 

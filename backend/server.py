@@ -1629,7 +1629,22 @@ def scrape():
         if len(color_values) == 1:
             color_slug = _scrape_slugify(color_values[0])
             base_handle = base.get('handle', '')
-            if base_handle.endswith('-' + color_slug):
+            ends_with_color = base_handle.endswith('-' + color_slug)
+            # Also catch shops where the colour sits in the MIDDLE or START of
+            # the handle (e.g. 'lottie-hvid-kjole', 'hvid-lottie-kjole'). The
+            # HTML anchor search needs the colour at the end of the handle, but
+            # the catalog title-similarity fallback can still find the siblings
+            # — so without this, those shops only ever showed one colour (bug #4).
+            color_mid_handle = (
+                not ends_with_color and
+                (f'-{color_slug}-' in base_handle or
+                 base_handle.startswith(color_slug + '-'))
+            )
+
+            sibling_handles = []
+            siblings_method = None
+
+            if ends_with_color:
                 # Reuse the HTML we already fetched if we came in via the
                 # fallback path; otherwise fetch it now for sibling discovery.
                 html_text = fallback_html
@@ -1642,42 +1657,48 @@ def scrape():
                         print(f"[scrape] HTML fetch for siblings failed: {e}")
                         html_text = ''
                 sibling_handles = _find_color_sibling_handles(html_text or '', base_handle, color_slug)
-
-                siblings_method = 'html-anchor' if sibling_handles else None
-
-                # Catalog fallback for shops whose colour pickers don't put
-                # direct /products/<sibling> links in the HTML (Babyboo et al.).
-                if not sibling_handles:
-                    if base_handle.endswith('-' + color_slug):
-                        base_prefix = base_handle[:-(len(color_slug) + 1)]
-                        if len(base_prefix) >= 3:
-                            print(f"[scrape] HTML found no siblings — trying catalog fallback for prefix '{base_prefix}'")
-                            sibling_handles = _find_siblings_via_catalog(
-                                scheme, parsed.netloc, base_prefix, base_handle,
-                                base_title=base.get('title'),
-                                base_color=color_values[0] if color_values else None,
-                                base_product_type=base.get('product_type'),
-                            )
-                            if sibling_handles:
-                                siblings_method = 'catalog'
-                                print(f"[scrape] Catalog fallback found {len(sibling_handles)} siblings")
-
                 if sibling_handles:
-                    print(f"[scrape] Found {len(sibling_handles)} sibling colour-products for '{base_handle}'")
-                    sibs = []
-                    for sh in sibling_handles[:25]:   # cap to avoid runaway fetches
-                        sib_product = _fetch_product_json(scheme, parsed.netloc, sh)
-                        if sib_product:
-                            sibs.append(sib_product)
-                    if sibs:
-                        merged = _merge_sibling_color_products(base, sibs)
-                        merged['_debug'] = {
-                            'path': scrape_path,
-                            'siblings_method': siblings_method,
-                            'siblings_found': len(sibs) + 1,
-                            'colors': (merged.get('options') or [{}])[0].get('values', []),
-                        }
-                        return jsonify({'product': merged})
+                    siblings_method = 'html-anchor'
+
+            # Catalog fallback: shops whose colour pickers don't embed direct
+            # /products/<sibling> links (Babyboo et al.). Runs for the ends-with
+            # case when HTML found nothing, AND for the mid-handle case — which
+            # has no reliable handle prefix, so it leans on title-similarity
+            # only and caps pages low to keep latency down.
+            if not sibling_handles and (ends_with_color or color_mid_handle):
+                base_prefix = (base_handle[:-(len(color_slug) + 1)]
+                               if ends_with_color else '')
+                if len(base_prefix) >= 3 or base.get('title'):
+                    max_pages = 5 if ends_with_color else 2
+                    print(f"[scrape] Trying catalog fallback for '{base_handle}' "
+                          f"(prefix='{base_prefix}', max_pages={max_pages})")
+                    sibling_handles = _find_siblings_via_catalog(
+                        scheme, parsed.netloc, base_prefix, base_handle,
+                        base_title=base.get('title'),
+                        base_color=color_values[0] if color_values else None,
+                        base_product_type=base.get('product_type'),
+                        max_pages=max_pages,
+                    )
+                    if sibling_handles:
+                        siblings_method = 'catalog'
+                        print(f"[scrape] Catalog fallback found {len(sibling_handles)} siblings")
+
+            if sibling_handles:
+                print(f"[scrape] Found {len(sibling_handles)} sibling colour-products for '{base_handle}'")
+                sibs = []
+                for sh in sibling_handles[:25]:   # cap to avoid runaway fetches
+                    sib_product = _fetch_product_json(scheme, parsed.netloc, sh)
+                    if sib_product:
+                        sibs.append(sib_product)
+                if sibs:
+                    merged = _merge_sibling_color_products(base, sibs)
+                    merged['_debug'] = {
+                        'path': scrape_path,
+                        'siblings_method': siblings_method,
+                        'siblings_found': len(sibs) + 1,
+                        'colors': (merged.get('options') or [{}])[0].get('values', []),
+                    }
+                    return jsonify({'product': merged})
     except Exception as e:
         print(f"[scrape] sibling-merge step failed (continuing with base only): {e}")
 
