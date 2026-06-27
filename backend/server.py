@@ -3154,6 +3154,125 @@ def _job_fix_titles_apply(jid, store, hdrs):
     _fix_collection_titles(jid, store, hdrs, dry_run=False)
 
 
+# ── One-off catalogue cleanup (mis-detected colours, reviewed via product photos
+#    on 2026-06-27). Each entry: (store, product_id, action, value)
+#      'cutline' → set theme.cutline = value (relabel a wrongly-detected swatch)
+#      'archive' → set product status = 'archived' (a duplicate copy, or an
+#                  accidentally-imported accessory: handbag/sunglasses/scarf/etc.)
+#    Both actions are REVERSIBLE in Shopify. Safe to delete this list once run.
+_FLAGGED_FIXES = [
+    ('dk', 15221381824861, 'cutline', "Rosa"),
+    ('dk', 15573281964381, 'archive', None),
+    ('dk', 15846299533661, 'archive', None),
+    ('dk', 15976124023133, 'cutline', "Multicolor"),
+    ('dk', 15976135393629, 'archive', None),
+    ('dk', 16224198558045, 'cutline', "Petrol Blomstret"),
+    ('dk', 16271122497885, 'cutline', "Bordeaux"),
+    ('dk', 16271260189021, 'cutline', "Sort"),
+    ('dk', 16271295545693, 'archive', None),
+    ('dk', 16275314245981, 'archive', None),
+    ('dk', 16275363299677, 'cutline', "Bordeaux"),
+    ('dk', 16275447873885, 'archive', None),
+    ('dk', 16275508298077, 'archive', None),
+    ('dk', 16275530383709, 'archive', None),
+    ('dk', 16275750224221, 'cutline', "Marineblå"),
+    ('dk', 16275780632925, 'archive', None),
+    ('dk', 16275788071261, 'archive', None),
+    ('dk', 16275795968349, 'archive', None),
+    ('fr', 9718381773147, 'cutline', "Vert"),
+    ('fr', 9890464137563, 'cutline', "Lilas"),
+    ('fr', 10431770296667, 'archive', None),
+    ('fr', 10431771902299, 'archive', None),
+    ('fr', 10431774490971, 'archive', None),
+    ('fr', 10431775342939, 'archive', None),
+    ('fr', 10431777702235, 'archive', None),
+    ('fr', 10431837143387, 'archive', None),
+    ('fr', 10431837864283, 'archive', None),
+    ('fr', 10431839076699, 'archive', None),
+    ('fr', 10431840321883, 'archive', None),
+    ('fr', 10431840878939, 'archive', None),
+    ('fr', 10431889736027, 'archive', None),
+    ('fr', 10434742616411, 'archive', None),
+    ('fr', 10489682231643, 'cutline', "Floral Pétrole"),
+    ('fr', 10497793491291, 'cutline', "Floral Pétrole"),
+    ('fr', 10544873046363, 'cutline', "Bordeaux"),
+    ('fr', 10544918757723, 'archive', None),
+    ('fr', 10544934453595, 'archive', None),
+    ('fr', 10544939434331, 'archive', None),
+    ('fr', 10544945267035, 'archive', None),
+    ('fr', 10544946479451, 'archive', None),
+    ('fr', 10544947495259, 'archive', None),
+    ('fr', 10544947724635, 'archive', None),
+    ('fr', 10544949920091, 'archive', None),
+    ('fr', 10544984228187, 'cutline', "Noir"),
+    ('fr', 10544992780635, 'archive', None),
+    ('fr', 10550467035483, 'archive', None),
+    ('fr', 10550522806619, 'cutline', "Bordeaux"),
+    ('fr', 10550601089371, 'archive', None),
+    ('fr', 10550683369819, 'archive', None),
+    ('fr', 10550705422683, 'archive', None),
+    ('fr', 10550871720283, 'cutline', "Marine"),
+    ('fr', 10550908715355, 'archive', None),
+    ('fr', 10550922281307, 'archive', None),
+    ('fr', 10550937256283, 'archive', None),
+    ('fi', 10837596897607, 'cutline', "Petroli Kukkakuvio"),
+    ('fi', 10837682880839, 'cutline', "Vaaleansininen"),
+    ('fi', 10868019036487, 'cutline', "Viininpunainen"),
+    ('fi', 10868157874503, 'cutline', "Musta"),
+    ('fi', 10868168393031, 'archive', None),
+    ('fi', 10871558766919, 'archive', None),
+    ('fi', 10871586423111, 'cutline', "Viininpunainen"),
+    ('fi', 10871712547143, 'archive', None),
+    ('fi', 10871805280583, 'archive', None),
+    ('fi', 10871838933319, 'archive', None),
+    ('fi', 10871963451719, 'cutline', "Laivastonsininen"),
+    ('fi', 10871976493383, 'archive', None),
+    ('fi', 10871983374663, 'archive', None),
+    ('fi', 10871994581319, 'archive', None),
+]
+
+
+def _job_fix_flagged(jid, store, hdrs):
+    """Apply the reviewed one-off colour fixes for this store: relabel mis-detected
+    cutlines to the real colour, and archive duplicate copies + accidentally-imported
+    accessories. Reversible (cutlines stay editable, archived products un-archivable)."""
+    fixes = [(pid, act, val) for (st, pid, act, val) in _FLAGGED_FIXES if st == store]
+    _job_set(jid, total=len(fixes))
+    for pid, act, val in fixes:
+        _job_inc(jid, processed=1)
+        try:
+            if act == 'archive':
+                pr = _shopify_call('put', shopify_url(store, f'products/{pid}.json'), hdrs,
+                                   json={'product': {'id': pid, 'status': 'archived'}}, timeout=20)
+                if pr is not None and pr.status_code in (200, 201):
+                    _job_inc(jid, changed=1)
+                else:
+                    _job_error(jid, f"{pid} archive: HTTP {getattr(pr, 'status_code', '—')}")
+            elif act == 'cutline':
+                q = ('mutation{metafieldsSet(metafields:[{ownerId:"gid://shopify/Product/%d",'
+                     'namespace:"theme",key:"cutline",type:"single_line_text_field",value:%s}])'
+                     '{userErrors{message}}}') % (pid, json.dumps(val))
+                pr = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                                   json={'query': q}, timeout=20)
+                errs = []
+                if pr is not None and pr.status_code == 200:
+                    errs = (((pr.json().get('data') or {}).get('metafieldsSet') or {}).get('userErrors')) or []
+                if pr is not None and pr.status_code == 200 and not errs:
+                    _job_inc(jid, changed=1)
+                else:
+                    msg = errs[0].get('message') if errs else f"HTTP {getattr(pr, 'status_code', '—')}"
+                    _job_error(jid, f"{pid} cutline: {msg}")
+            else:
+                _job_inc(jid, skipped=1)
+        except Exception as ex:
+            _job_error(jid, f"{pid} {act}: {ex}")
+    with _JOBS_LOCK:
+        j = _JOBS[jid]
+        _job_summary(jid, f"Applied {j['changed']} fix(es) on Store {store.upper()} "
+                          f"(relabelled cutlines + archived duplicates/accessories); "
+                          f"{len(j.get('errors', []))} error(s). All reversible in Shopify.")
+
+
 _JOB_TYPES = {
     'bold_cleanup':     _job_bold_cleanup,
     'channels':         _job_channels,
@@ -3162,6 +3281,7 @@ _JOB_TYPES = {
     'dedup':            _job_dedup,
     'fix_titles_scan':  _job_fix_titles_scan,
     'fix_titles_apply': _job_fix_titles_apply,
+    'fix_flagged':      _job_fix_flagged,
 }
 
 

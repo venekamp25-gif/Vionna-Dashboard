@@ -73,6 +73,19 @@ const JOB_DEFS: JobDef[] = [
       `Handles/URLs are NOT changed, so storefront links stay intact, and it's reversible.\n` +
       `Run the Scan first if you haven't. Continue?`,
   },
+  {
+    type: "fix_flagged",
+    title: "Fix mis-detected colours (one-off cleanup)",
+    desc: "Applies the reviewed June-2026 cleanup: relabels wrongly-detected colour swatches to the real colour (e.g. Flora 'Sommer' → Marineblå) and archives duplicate copies + accidentally-imported accessories (handbag, sunglasses, scarf…). Everything is reversible in Shopify. Run it once per store.",
+    cta: "Apply fixes",
+    danger: true,
+    excludeFromRunAll: true,
+    confirm: (s) =>
+      `Apply the reviewed colour cleanup on Store ${s}?\n\n` +
+      `• Relabels mis-detected colour swatches to the real colour.\n` +
+      `• Archives duplicate copies and accidentally-imported accessories.\n\n` +
+      `All reversible in Shopify (cutlines stay editable; archived products can be un-archived). Continue?`,
+  },
 ];
 
 export function CatalogMaintenanceModal({ open, onClose }: Props) {

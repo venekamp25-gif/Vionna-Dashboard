@@ -259,7 +259,8 @@ export type CatalogJobType =
   | "dedup"
   | "relink"
   | "fix_titles_scan"
-  | "fix_titles_apply";
+  | "fix_titles_apply"
+  | "fix_flagged";
 export interface CatalogJob {
   id: string;
   type: CatalogJobType;
