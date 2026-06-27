@@ -2,6 +2,7 @@ import os, sys, json, re, hashlib, hmac, base64, urllib.parse, subprocess, tempf
 from functools import wraps
 from flask import Flask, request, redirect, session, jsonify, send_from_directory
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
 import requests as req
 from dotenv import load_dotenv
 
@@ -31,6 +32,11 @@ CORS(app, resources={r'/api/*': {'origins': [o for o in _allowed_origins if o]}}
 
 @app.errorhandler(Exception)
 def handle_error(e):
+    # Let Flask's own HTTP errors keep their real status code — a wrong method
+    # (405), a missing route (404) or an explicit abort(400) should not be
+    # masked as a 500. Only genuine unhandled crashes fall through to 500.
+    if isinstance(e, HTTPException):
+        return jsonify({'error': e.description, 'code': e.code}), e.code
     return jsonify({'error': str(e)}), 500
 
 ANTHROPIC_KEY  = os.getenv('ANTHROPIC_API_KEY')
