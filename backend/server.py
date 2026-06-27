@@ -649,15 +649,17 @@ def catalog_cutlines():
     try:
         for n in _paginate_gql_products(
             store,
-            'id handle title status '
+            'id handle title status featuredImage{url} '
             'cutline: metafield(namespace:"theme",key:"cutline"){value}',
             hdrs,
         ):
             out.append({
+                'id': (n.get('id') or '').rsplit('/', 1)[-1],
                 'handle': n.get('handle', ''),
                 'title': n.get('title', ''),
                 'status': (n.get('status') or '').upper(),
                 'cutline': ((n.get('cutline') or {}) or {}).get('value') or '',
+                'image': ((n.get('featuredImage') or {}) or {}).get('url') or '',
             })
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
