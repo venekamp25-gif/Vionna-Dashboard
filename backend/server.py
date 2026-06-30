@@ -5393,19 +5393,30 @@ def hf_help():
     if not HIGGSFIELD_EXE or not os.path.isfile(HIGGSFIELD_EXE):
         return jsonify({'error': 'hf binary not found'}), 500
     out = {}
-    candidates = [
-        ('model_list_help',  f'"{HIGGSFIELD_EXE}" model list --help'),
-        ('model_list',       f'"{HIGGSFIELD_EXE}" model list --image'),
-        ('model_list_all',   f'"{HIGGSFIELD_EXE}" model list'),
-        ('account_help',     f'"{HIGGSFIELD_EXE}" account --help'),
-        ('account',          f'"{HIGGSFIELD_EXE}" account'),
-    ]
-    for label, cmd in candidates:
+    def _run(cmd, t=30):
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=20, shell=True)
-            out[label] = {'stdout': (r.stdout or '')[-4000:], 'stderr': (r.stderr or '')[-1500:]}
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=t, shell=True)
+            return (r.stdout or ''), (r.stderr or '')
         except Exception as e:
-            out[label] = {'error': str(e)[:200]}
+            return '', str(e)[:200]
+    for label, cmd in [
+        ('model_help',      f'"{HIGGSFIELD_EXE}" model --help'),
+        ('account_status',  f'"{HIGGSFIELD_EXE}" account status'),
+        ('cost_nb2',        f'"{HIGGSFIELD_EXE}" generate cost nano_banana_2 --prompt "test"'),
+    ]:
+        so, se = _run(cmd)
+        out[label] = {'stdout': so[-2500:], 'stderr': se[-1000:]}
+    # nano-banana models in JSON form — reveals each model's accepted params
+    so, se = _run(f'"{HIGGSFIELD_EXE}" model list --image --json')
+    out['model_json_raw_head'] = so[:1200]
+    out['model_json_stderr'] = se[-500:]
+    try:
+        data = json.loads(so)
+        items = data if isinstance(data, list) else (data.get('models') or data.get('data') or [])
+        out['nano_models'] = [m for m in items
+                              if 'nano_banana_2' in str(m.get('job_set_type') or m.get('jobSetType') or '')]
+    except Exception as e:
+        out['model_json_parse_error'] = str(e)[:200]
     return jsonify(out)
 
 
