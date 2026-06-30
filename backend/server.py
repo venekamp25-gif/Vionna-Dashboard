@@ -5400,23 +5400,12 @@ def hf_help():
         except Exception as e:
             return '', str(e)[:200]
     for label, cmd in [
-        ('model_help',      f'"{HIGGSFIELD_EXE}" model --help'),
-        ('account_status',  f'"{HIGGSFIELD_EXE}" account status'),
-        ('cost_nb2',        f'"{HIGGSFIELD_EXE}" generate cost nano_banana_2 --prompt "test"'),
+        ('model_get',       f'"{HIGGSFIELD_EXE}" model get nano_banana_2'),
+        ('model_get_json',  f'"{HIGGSFIELD_EXE}" model get nano_banana_2 --json'),
+        ('cost_nb2_json',   f'"{HIGGSFIELD_EXE}" generate cost nano_banana_2 --prompt "test" --json'),
     ]:
         so, se = _run(cmd)
-        out[label] = {'stdout': so[-2500:], 'stderr': se[-1000:]}
-    # nano-banana models in JSON form — reveals each model's accepted params
-    so, se = _run(f'"{HIGGSFIELD_EXE}" model list --image --json')
-    out['model_json_raw_head'] = so[:1200]
-    out['model_json_stderr'] = se[-500:]
-    try:
-        data = json.loads(so)
-        items = data if isinstance(data, list) else (data.get('models') or data.get('data') or [])
-        out['nano_models'] = [m for m in items
-                              if 'nano_banana_2' in str(m.get('job_set_type') or m.get('jobSetType') or '')]
-    except Exception as e:
-        out['model_json_parse_error'] = str(e)[:200]
+        out[label] = {'stdout': so[-6000:], 'stderr': se[-1000:]}
     return jsonify(out)
 
 
