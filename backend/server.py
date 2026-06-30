@@ -5394,12 +5394,11 @@ def hf_help():
         return jsonify({'error': 'hf binary not found'}), 500
     out = {}
     candidates = [
-        ('version',        f'"{HIGGSFIELD_EXE}" --version'),
-        ('help',           f'"{HIGGSFIELD_EXE}" --help'),
-        ('generate_help',  f'"{HIGGSFIELD_EXE}" generate --help'),
-        ('create_help',    f'"{HIGGSFIELD_EXE}" generate create --help'),
-        ('models',         f'"{HIGGSFIELD_EXE}" models'),
-        ('models_list',    f'"{HIGGSFIELD_EXE}" models list'),
+        ('model_list_help',  f'"{HIGGSFIELD_EXE}" model list --help'),
+        ('model_list',       f'"{HIGGSFIELD_EXE}" model list --image'),
+        ('model_list_all',   f'"{HIGGSFIELD_EXE}" model list'),
+        ('account_help',     f'"{HIGGSFIELD_EXE}" account --help'),
+        ('account',          f'"{HIGGSFIELD_EXE}" account'),
     ]
     for label, cmd in candidates:
         try:
