@@ -4803,6 +4803,7 @@ def publish_create_variant():
     images           = data.get('images', []) or []
     collection_id    = data.get('collection_id')
     actual_handle    = data.get('actual_handle', '') or data.get('siblings_handle', '')
+    source_url       = (data.get('competitorUrl') or data.get('source_url') or '').strip()
 
     hdrs = shopify_headers(store)
     base = shopify_url(store, '')
@@ -4834,6 +4835,7 @@ def publish_create_variant():
         'color':         color,
         'product_id':    result.get('product_id'),
         'product_url':   result.get('product_url'),
+        'source_url':    source_url,
         'collection_handle': actual_handle,
         'image_count':   len(images),
         'metafield_errors': result.get('metafield_errors') or [],

@@ -490,6 +490,8 @@ export const api = {
     images: string[];
     collection_id?: number | null;
     actual_handle: string;
+    /** Competitor source URL this product was imported from — logged in publish history. */
+    competitorUrl?: string;
   }) => call<PublishCreateVariantResponse>("/api/publish/create_variant", { method: "POST", body: params, authed: true }),
 
   /** Keyword backfill: list a store's products grouped per dress, with current
