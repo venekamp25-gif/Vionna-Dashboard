@@ -5386,6 +5386,30 @@ NANO_BANANA_PROMPTS = {
 
 
 # --- Higgsfield image generation ---
+@app.route('/api/hf_help')
+def hf_help():
+    """Read-only: dump the Higgsfield CLI help so we can see available models + flags
+    (to switch Nano Banana to the 'unlimited' / Pro setting). Harmless — no generation."""
+    if not HIGGSFIELD_EXE or not os.path.isfile(HIGGSFIELD_EXE):
+        return jsonify({'error': 'hf binary not found'}), 500
+    out = {}
+    candidates = [
+        ('version',        f'"{HIGGSFIELD_EXE}" --version'),
+        ('help',           f'"{HIGGSFIELD_EXE}" --help'),
+        ('generate_help',  f'"{HIGGSFIELD_EXE}" generate --help'),
+        ('create_help',    f'"{HIGGSFIELD_EXE}" generate create --help'),
+        ('models',         f'"{HIGGSFIELD_EXE}" models'),
+        ('models_list',    f'"{HIGGSFIELD_EXE}" models list'),
+    ]
+    for label, cmd in candidates:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=20, shell=True)
+            out[label] = {'stdout': (r.stdout or '')[-4000:], 'stderr': (r.stderr or '')[-1500:]}
+        except Exception as e:
+            out[label] = {'error': str(e)[:200]}
+    return jsonify(out)
+
+
 @app.route('/api/higgsfield', methods=['POST'])
 def higgsfield_generate():
     data         = request.json
