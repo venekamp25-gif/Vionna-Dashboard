@@ -10,6 +10,7 @@ import { randomName } from "@/lib/names";
 import { slugify } from "@/lib/slug";
 import { useUsedNames } from "@/lib/useUsedNames";
 import { translateColor } from "@/lib/colors";
+import { api } from "@/lib/api";
 
 const COLOR_DOTS: Record<string, string> = {
   // English canonical keys
@@ -236,6 +237,55 @@ export function ProductInfoCard() {
     setNewColor("");
   };
 
+  // Re-translate the colours into every selected store's language and refresh the
+  // chips + cutline. Fixes a resumed draft that was generated BEFORE per-store
+  // colour translation existed (its labels are still the competitor's language).
+  const [retranslating, setRetranslating] = useState(false);
+  const retranslateColors = async () => {
+    if (retranslating || data.canonicalColors.length === 0) return;
+    setRetranslating(true);
+    try {
+      const stores = data.selectedStores;
+      const labelsByStore: Partial<Record<StoreKey, Record<string, string>>> = {};
+      for (const store of stores) {
+        let translated: string[] | null = null;
+        try {
+          const tr = await api.translateColors({ store, colors: data.canonicalColors });
+          if (Array.isArray(tr.colors) && tr.colors.length === data.canonicalColors.length) {
+            translated = tr.colors;
+          }
+        } catch { /* fall back to the static table below */ }
+        const labels: Record<string, string> = {};
+        data.canonicalColors.forEach((c, i) => {
+          labels[c] = translated?.[i]?.trim() || translateColor(c, store);
+        });
+        labelsByStore[store] = labels;
+      }
+      setData((prev) => {
+        const newContent: Record<StoreKey, StoreContent> = { ...prev.contentByStore };
+        for (const store of stores) {
+          const labels = labelsByStore[store];
+          if (!labels || !newContent[store]) continue;
+          newContent[store] = {
+            ...newContent[store],
+            colorLabels: labels,
+            cutline: prev.canonicalColors.map((c) => labels[c] ?? c).join(", "),
+          };
+        }
+        const active = prev.activeViewStore;
+        const activeLabels = labelsByStore[active] ?? newContent[active]?.colorLabels ?? {};
+        return {
+          ...prev,
+          contentByStore: newContent,
+          colors: prev.canonicalColors.map((c) => activeLabels[c] ?? c),
+          cutline: newContent[active]?.cutline ?? prev.cutline,
+        };
+      });
+    } finally {
+      setRetranslating(false);
+    }
+  };
+
   return (
     <Card title="Product info">
       <Field>
@@ -260,7 +310,18 @@ export function ProductInfoCard() {
       </Field>
 
       <Field>
-        <Label>Colors (from competitor)</Label>
+        <div className="flex items-center justify-between gap-2">
+          <Label>Colors (from competitor)</Label>
+          <button
+            type="button"
+            onClick={() => void retranslateColors()}
+            disabled={retranslating || data.canonicalColors.length === 0}
+            title="Re-translate the colours into each store's language (fixes a resumed draft made before per-store translation)"
+            className="text-[11px] text-text-dim hover:text-accent disabled:opacity-50 transition whitespace-nowrap"
+          >
+            {retranslating ? "⟳ Vertalen…" : "↻ Vertaal per store"}
+          </button>
+        </div>
         <div className="flex flex-wrap gap-2">
           {data.canonicalColors.map((canonical, i) => {
             const display = data.colors[i] ?? canonical;
