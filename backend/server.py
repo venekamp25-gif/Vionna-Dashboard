@@ -1445,6 +1445,45 @@ def _merge_sibling_color_products(base, siblings):
     return merged
 
 
+def _extract_size_chart(html):
+    """Find the best size-chart <table> in a competitor product PAGE (the size
+    guide usually lives in a modal, not in the .json). Returns
+    {'headers': [...], 'rows': [[...], ...]} or None. Best-effort, never raises."""
+    try:
+        UNIT    = re.compile(r'\b(cm|mm|inch|in|")\b', re.I)
+        SIZEROW = re.compile(r'^(xxs|xs|s|m|l|xl|xxl|xxxl|[2-5]xl|\d{1,3})$', re.I)
+        KW      = re.compile(r'taille|size|maat|gr[öo]sse|bust|poitrine|chest|waist|'
+                             r'hip|hanche|length|longueur|shoulder|sleeve|manche|lengte|'
+                             r'størrelse|koko|rinta', re.I)
+        best, best_score = None, 0
+        for t in re.findall(r'<table[\s\S]*?</table>', html, re.I):
+            rows = []
+            for tr in re.findall(r'<tr[\s\S]*?</tr>', t, re.I):
+                cells = [re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', c)).strip()
+                         for c in re.findall(r'<t[dh][\s\S]*?</t[dh]>', tr, re.I)]
+                if any(cells):
+                    rows.append(cells)
+            if len(rows) < 2:
+                continue
+            flat = ' '.join(' '.join(r) for r in rows).lower()
+            score = 0
+            if UNIT.search(flat):
+                score += 2
+            score += sum(1 for r in rows if r and SIZEROW.match((r[0] or '').strip()))
+            if KW.search(flat):
+                score += 2
+            if score > best_score:
+                best_score, best = score, rows
+        if not best or best_score < 3:
+            return None
+        w = len(best[0])
+        norm_rows = [(r + [''] * w)[:w] for r in best[1:]]
+        return {'headers': [c.strip() for c in best[0]], 'rows': norm_rows}
+    except Exception as e:
+        print(f"[size-chart] extract error: {e}")
+        return None
+
+
 @app.route('/api/scrape', methods=['POST'])
 def scrape():
     raw_input = (request.json.get('url') or '').strip()
@@ -1618,6 +1657,21 @@ def scrape():
             'url_tried': json_url,
         }), 400
 
+    # Size chart: pull the competitor's measurement table from the product PAGE
+    # html (it lives in a 'size guide' modal, not in the .json). Best-effort —
+    # never fail the scrape over it. Caches the HTML into fallback_html so the
+    # sibling discovery below reuses it instead of fetching the page twice.
+    size_chart = None
+    try:
+        if fallback_html is None:
+            sc_r = _scrape_get(html_url, timeout=10)
+            if sc_r.status_code == 200:
+                fallback_html = sc_r.text
+        if fallback_html:
+            size_chart = _extract_size_chart(fallback_html)
+    except Exception as e:
+        print(f"[scrape] size-chart fetch failed: {e}")
+
     # Detect the "one-product-per-colour" pattern (Billy J etc.) and merge sibling
     # colour-products into the result so the dashboard sees ONE multi-colour product.
     try:
@@ -1698,7 +1752,7 @@ def scrape():
                         'siblings_found': len(sibs) + 1,
                         'colors': (merged.get('options') or [{}])[0].get('values', []),
                     }
-                    return jsonify({'product': merged})
+                    return jsonify({'product': merged, 'size_chart': size_chart})
     except Exception as e:
         print(f"[scrape] sibling-merge step failed (continuing with base only): {e}")
 
@@ -1710,7 +1764,7 @@ def scrape():
         'siblings_found': 1,
         'colors': (base.get('options') or [{}])[0].get('values', []),
     }
-    return jsonify({'product': base})
+    return jsonify({'product': base, 'size_chart': size_chart})
 
 
 @app.route('/api/scrape_manual', methods=['POST'])
@@ -4169,6 +4223,62 @@ def translate_colors():
 
 # --- Publish history (append-only JSONL log of every variant created) ---
 
+# Localised labels for a scraped competitor size-chart header. Values stay (cm),
+# only the column headers are translated; unknown headers keep their original text.
+_SIZE_HEADER_MAP = {
+    'taille':           {'dk': 'Størrelse', 'fr': 'Taille',           'fi': 'Koko'},
+    'size':             {'dk': 'Størrelse', 'fr': 'Taille',           'fi': 'Koko'},
+    'maat':             {'dk': 'Størrelse', 'fr': 'Taille',           'fi': 'Koko'},
+    'tour de poitrine': {'dk': 'Bryst',     'fr': 'Tour de poitrine', 'fi': 'Rinta'},
+    'poitrine':         {'dk': 'Bryst',     'fr': 'Poitrine',         'fi': 'Rinta'},
+    'bust':             {'dk': 'Bryst',     'fr': 'Poitrine',         'fi': 'Rinta'},
+    'chest':            {'dk': 'Bryst',     'fr': 'Poitrine',         'fi': 'Rinta'},
+    'tour de taille':   {'dk': 'Talje',     'fr': 'Tour de taille',   'fi': 'Vyötärö'},
+    'waist':            {'dk': 'Talje',     'fr': 'Tour de taille',   'fi': 'Vyötärö'},
+    'hanches':          {'dk': 'Hofte',     'fr': 'Hanches',          'fi': 'Lantio'},
+    'hips':             {'dk': 'Hofte',     'fr': 'Hanches',          'fi': 'Lantio'},
+    'longueur':         {'dk': 'Længde',    'fr': 'Longueur',         'fi': 'Pituus'},
+    'length':           {'dk': 'Længde',    'fr': 'Longueur',         'fi': 'Pituus'},
+    'épaule':           {'dk': 'Skulder',   'fr': 'Épaule',           'fi': 'Olkapää'},
+    'shoulder':         {'dk': 'Skulder',   'fr': 'Épaule',           'fi': 'Olkapää'},
+    'manche':           {'dk': 'Ærme',      'fr': 'Manche',           'fi': 'Hiha'},
+    'sleeve':           {'dk': 'Ærme',      'fr': 'Manche',           'fi': 'Hiha'},
+    'entrejambe':       {'dk': 'Skridtlængde', 'fr': 'Entrejambe',    'fi': 'Sisäpituus'},
+    'inseam':           {'dk': 'Skridtlængde', 'fr': 'Entrejambe',    'fi': 'Sisäpituus'},
+}
+_SIZE_CHART_TITLE = {'dk': 'Størrelsesguide', 'fr': 'Guide des tailles', 'fi': 'Kokotaulukko'}
+
+
+def _esc_html(s):
+    return (str(s if s is not None else '').replace('&', '&amp;')
+            .replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;'))
+
+
+def _translate_size_header(h, store):
+    m = _SIZE_HEADER_MAP.get(re.sub(r'\s+', ' ', (h or '').strip().lower()))
+    return m.get(store, h) if m else h
+
+
+def _size_chart_html(chart, store):
+    """Render a scraped size chart to an HTML table for the product description,
+    headers localised to `store`. Returns '' when there's no usable chart."""
+    if not isinstance(chart, dict) or not chart.get('rows'):
+        return ''
+    headers = chart.get('headers') or []
+    th = ''.join(
+        '<th style="padding:6px 10px;border:1px solid #ddd;text-align:left;">'
+        f'{_esc_html(_translate_size_header(h, store))}</th>' for h in headers)
+    body = ''
+    for row in chart['rows']:
+        tds = ''.join(
+            f'<td style="padding:6px 10px;border:1px solid #ddd;">{_esc_html(c)}</td>'
+            for c in row)
+        body += f'<tr>{tds}</tr>'
+    return (f'<h4>{_esc_html(_SIZE_CHART_TITLE.get(store, "Size guide"))}</h4>'
+            '<table style="border-collapse:collapse;font-size:14px;margin-top:6px;">'
+            f'<thead><tr>{th}</tr></thead><tbody>{body}</tbody></table>')
+
+
 def _append_history(entry):
     """Best-effort write to publish_history.jsonl. Never raise — history is observability."""
     try:
@@ -4788,6 +4898,12 @@ def publish_create_variant():
     color            = data.get('color', '')
     sizes            = data.get('sizes', ['XS', 'S', 'M', 'L', 'XL'])
     description_html = _publish_to_html(data.get('description', ''))
+    # Append the scraped competitor size chart (if any) to the description, with
+    # headers localised to this store. Kept in the description (not a metafield)
+    # so it's Google-feed-safe and needs no theme support.
+    _chart_html = _size_chart_html(data.get('size_chart'), store)
+    if _chart_html:
+        description_html += _chart_html
     meta_description = data.get('meta_description', '')
     m_title_specs    = data.get('m_title_specs', '')
     product_type     = data.get('product_type', '')

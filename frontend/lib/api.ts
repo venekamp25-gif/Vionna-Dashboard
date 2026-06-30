@@ -146,7 +146,16 @@ export interface ScrapedProduct {
       position?: number;
     }[];
   };
+  /** Competitor's size chart scraped from the product page (headers + rows of cm
+   *  values), or null when none was found. Headers are localised at publish. */
+  size_chart?: SizeChart | null;
   error?: string;
+}
+
+/** A scraped size chart: column headers + measurement rows (e.g. ["XS","92 cm","88 cm"]). */
+export interface SizeChart {
+  headers: string[];
+  rows: string[][];
 }
 
 export interface NamesResponse {
@@ -492,6 +501,8 @@ export const api = {
     actual_handle: string;
     /** Competitor source URL this product was imported from — logged in publish history. */
     competitorUrl?: string;
+    /** Scraped competitor size chart — appended (localised) to the description. */
+    size_chart?: SizeChart | null;
   }) => call<PublishCreateVariantResponse>("/api/publish/create_variant", { method: "POST", body: params, authed: true }),
 
   /** Keyword backfill: list a store's products grouped per dress, with current

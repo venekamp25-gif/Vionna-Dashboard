@@ -232,6 +232,9 @@ export function GenerateStep() {
         const scraped = await api.scrape(data.competitorUrl);
         if (scraped.error || !scraped.product) throw new Error(scraped.error || "Scrape failed");
         await processProduct(scraped.product);
+        // Carry the competitor's size chart through to publish (appended, localised,
+        // to the description). null when the competitor page had no usable table.
+        patch({ sizeChart: scraped.size_chart ?? null });
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         setError(msg);

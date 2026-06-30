@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useState, useCallback, useEffect, useRef, ReactNode } from "react";
 import { StoreKey } from "./store";
-import { draftsApi, fetchCurrentUser } from "./api";
+import { draftsApi, fetchCurrentUser, type SizeChart } from "./api";
 
 /**
  * Current ProductData schema version. Bump this any time we make a
@@ -176,6 +176,9 @@ export interface ProductData {
    * `competitorImages` used in the ImagesCard).
    */
   competitorImagesByColor: Record<string, string[]>;
+  /** Competitor size chart scraped at import (headers + cm rows), or null. Carried
+   *  through to publish where it's localised + appended to the description. */
+  sizeChart: SizeChart | null;
   bgReferenceUrl: string;
   productType: string;
   nbResults: Record<number, NbResult[]>;
@@ -224,6 +227,7 @@ const DEFAULT_DATA: ProductData = {
   competitorImages: [],
   competitorVariantsByColor: {},
   competitorImagesByColor: {},
+  sizeChart: null,
   // Initial bg-reference is picked randomly from BG_REFERENCE_OPTIONS at module
   // load (= per page open). resetForNewProduct re-rolls it so each new product
   // started without a reload also gets a fresh model.

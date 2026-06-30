@@ -207,6 +207,7 @@ export function ReviewStep() {
             collection_id: collectionId,
             actual_handle: actualHandle,
             competitorUrl: data.competitorUrl,
+            size_chart: data.sizeChart,
           });
 
           if (!variantRes.success || variantRes.error) {
