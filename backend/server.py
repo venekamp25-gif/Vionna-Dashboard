@@ -4783,6 +4783,7 @@ def _publish_one_variant(
     images,            # list of image URLs for THIS variant
     collection_id,     # may be None (skip the collects.json POST)
     actual_handle,     # value to write into theme.siblings metafield
+    size_chart_html='',  # localised HTML size chart → custom.size_chart metafield
     hdrs, base,
 ):
     """Create one colour-variant product. Returns dict:
@@ -4870,6 +4871,7 @@ def _publish_one_variant(
         {'namespace': 'theme',  'key': 'cutline',                       'value': color,            'type': 'single_line_text_field'},
         {'namespace': 'theme',  'key': 'siblings',                      'value': actual_handle,    'type': 'single_line_text_field'},
         {'namespace': 'custom', 'key': 'm_title_specs_multi_line_text_','value': m_title_specs,    'type': 'multi_line_text_field'},
+        {'namespace': 'custom', 'key': 'size_chart',                    'value': size_chart_html,  'type': 'multi_line_text_field'},
         {'namespace': 'global', 'key': 'description_tag',               'value': meta_description, 'type': 'single_line_text_field'},
     ]
     mf_errors = []
@@ -4977,12 +4979,10 @@ def publish_create_variant():
     color            = data.get('color', '')
     sizes            = data.get('sizes', ['XS', 'S', 'M', 'L', 'XL'])
     description_html = _publish_to_html(data.get('description', ''))
-    # Append the scraped competitor size chart (if any) to the description, with
-    # headers localised to this store. Kept in the description (not a metafield)
-    # so it's Google-feed-safe and needs no theme support.
-    _chart_html = _size_chart_html(data.get('size_chart'), store)
-    if _chart_html:
-        description_html += _chart_html
+    # Competitor size chart → the custom.size_chart metafield (shown via a theme
+    # popup), localised to this store. Kept OUT of the description so there's no
+    # duplicate display.
+    size_chart_html = _size_chart_html(data.get('size_chart'), store)
     meta_description = data.get('meta_description', '')
     m_title_specs    = data.get('m_title_specs', '')
     product_type     = data.get('product_type', '')
@@ -5017,6 +5017,7 @@ def publish_create_variant():
         images=images,
         collection_id=collection_id,
         actual_handle=actual_handle,
+        size_chart_html=size_chart_html,
         hdrs=hdrs,
         base=base,
     )
