@@ -1,8 +1,10 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { api, HistoryEntry } from "@/lib/api";
-import { StoreKey, STORE_CONFIG, STORE_KEYS } from "@/lib/store";
+import { api, HistoryEntry, ProductSnapshotMeta } from "@/lib/api";
+import { StoreKey, STORE_CONFIG, STORE_KEYS, useStore } from "@/lib/store";
+import { useProduct, listProductSnapshots, loadProductSnapshot } from "@/lib/product";
+import { useStep } from "@/lib/step";
 
 interface Props {
   open: boolean;
@@ -26,6 +28,32 @@ export function HistoryModal({ open, onClose }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [storeFilter, setStoreFilter] = useState<StoreFilter>("all");
   const [search, setSearch] = useState("");
+
+  // ── Re-openable product snapshots (full saved state of recent publishes) ──
+  const { setData } = useProduct();
+  const { setStore } = useStore();
+  const { setStep } = useStep();
+  const [snapshots, setSnapshots] = useState<ProductSnapshotMeta[]>([]);
+  const [reopening, setReopening] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    listProductSnapshots().then(setSnapshots).catch(() => setSnapshots([]));
+  }, [open]);
+
+  const reopen = async (id: string) => {
+    setReopening(id);
+    try {
+      const snap = await loadProductSnapshot(id);
+      if (!snap) return;
+      setData(snap);
+      setStore(snap.activeViewStore);
+      onClose();
+      setStep(3); // land on Review so the user can edit / re-publish
+    } finally {
+      setReopening(null);
+    }
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -104,6 +132,39 @@ export function HistoryModal({ open, onClose }: Props) {
         </div>
 
         <div className="px-6 py-4 max-h-[60vh] overflow-y-auto">
+          {snapshots.length > 0 && (
+            <div className="mb-4">
+              <h3 className="text-[12px] font-semibold text-text-dim uppercase tracking-wider mb-2">
+                ↩ Reopen a recent product
+              </h3>
+              <div className="space-y-1.5">
+                {snapshots.map((s) => (
+                  <div
+                    key={s.id}
+                    className="flex items-center gap-3 px-3 py-2 rounded-[10px] bg-bg-elev-2 border border-border"
+                  >
+                    <div className="flex-1 min-w-0">
+                      <div className="text-[13px] font-medium text-text truncate">{s.name}</div>
+                      <div className="text-[11px] text-text-faint">
+                        {(s.stores ?? []).map((x) => x.toUpperCase()).join(" · ") || "—"} ·{" "}
+                        {s.color_count} colour{s.color_count === 1 ? "" : "s"} ·{" "}
+                        {new Date(s.saved_at).toLocaleDateString()}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void reopen(s.id)}
+                      disabled={reopening !== null}
+                      className="text-[12px] font-semibold px-3 py-1.5 rounded-md bg-accent text-on-accent hover:bg-accent-hover disabled:opacity-50 whitespace-nowrap"
+                    >
+                      {reopening === s.id ? "Opening…" : "↩ Reopen"}
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <div className="border-b border-border mt-4" />
+            </div>
+          )}
           {loading ? (
             <p className="text-[13px] text-text-faint text-center py-8">Loading…</p>
           ) : error ? (

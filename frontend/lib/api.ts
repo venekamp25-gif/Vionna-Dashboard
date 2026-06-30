@@ -707,3 +707,28 @@ export const draftsApi = {
       credentials: "include",
     }).catch(() => {}),
 };
+
+/** One re-openable past product in the history (metadata only — full data fetched on open). */
+export interface ProductSnapshotMeta {
+  id: string;
+  name: string;
+  saved_at: string;
+  stores: string[];
+  color_count: number;
+}
+
+export const snapshotsApi = {
+  list: (owner: string) =>
+    call<{ snapshots: ProductSnapshotMeta[]; error?: string }>(
+      `/api/product_snapshots?owner=${encodeURIComponent(owner)}`
+    ),
+  save: <T = unknown>(owner: string, data: T) =>
+    call<{ success: boolean; id: string; error?: string }>(
+      `/api/product_snapshots?owner=${encodeURIComponent(owner)}`,
+      { method: "POST", body: data as unknown }
+    ),
+  get: <T = unknown>(owner: string, id: string) =>
+    call<{ snapshot: T | null; error?: string }>(
+      `/api/product_snapshots/${encodeURIComponent(id)}?owner=${encodeURIComponent(owner)}`
+    ),
+};

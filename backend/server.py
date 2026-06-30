@@ -3481,6 +3481,85 @@ def drafts_save():
     return jsonify({'success': True, 'saved_at': payload['_saved_at']})
 
 
+# ── Re-openable product snapshots (full ProductData of recent publishes, per user) ──
+SNAPSHOTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'product_snapshots')
+_SNAPSHOTS_MAX = 12  # keep only the most recent N per owner
+
+
+def _snapshots_path(owner_slug):
+    return os.path.join(SNAPSHOTS_DIR, f'{owner_slug}.json')
+
+
+def _load_snapshots(owner_slug):
+    path = _snapshots_path(owner_slug)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        return d if isinstance(d, list) else []
+    except Exception:
+        return []
+
+
+@app.route('/api/product_snapshots', methods=['GET'])
+def product_snapshots_list():
+    """List recent re-openable product snapshots for ?owner=<email> (metadata only)."""
+    owner = _sanitize_owner(request.args.get('owner', ''))
+    if not owner:
+        return jsonify({'snapshots': []})
+    meta = [{k: it.get(k) for k in ('id', 'name', 'saved_at', 'stores', 'color_count')}
+            for it in _load_snapshots(owner)]
+    return jsonify({'snapshots': meta})
+
+
+@app.route('/api/product_snapshots', methods=['POST'])
+def product_snapshots_save():
+    """Save a full product snapshot (body = ProductData) so it can be re-opened later
+    from the History. Keeps only the most recent _SNAPSHOTS_MAX per owner, de-duped by name."""
+    owner = _sanitize_owner(request.args.get('owner', ''))
+    if not owner:
+        return jsonify({'error': 'owner query param required'}), 400
+    data = request.json or {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'expected a JSON object body'}), 400
+    now = datetime.datetime.utcnow().isoformat() + 'Z'
+    sid = re.sub(r'\D', '', now)[:17] or now
+    stores = data.get('selectedStores')
+    item = {
+        'id': sid,
+        'name': data.get('name') or '(unnamed)',
+        'saved_at': now,
+        'stores': stores if isinstance(stores, list) else [],
+        'color_count': len(data.get('canonicalColors') or []),
+        'data': data,
+    }
+    items = [it for it in _load_snapshots(owner) if (it.get('name') or '') != item['name']]
+    items.insert(0, item)
+    items = items[:_SNAPSHOTS_MAX]
+    try:
+        os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
+        tmp = _snapshots_path(owner) + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(items, f, ensure_ascii=False)
+        os.replace(tmp, _snapshots_path(owner))
+    except Exception as e:
+        return jsonify({'error': f'Could not save snapshot: {e}'}), 500
+    return jsonify({'success': True, 'id': sid})
+
+
+@app.route('/api/product_snapshots/<sid>', methods=['GET'])
+def product_snapshot_get(sid):
+    """Return one snapshot's full ProductData for ?owner=<email>."""
+    owner = _sanitize_owner(request.args.get('owner', ''))
+    if not owner:
+        return jsonify({'error': 'owner query param required'}), 400
+    for it in _load_snapshots(owner):
+        if str(it.get('id')) == str(sid):
+            return jsonify({'snapshot': it.get('data')})
+    return jsonify({'snapshot': None}), 404
+
+
 @app.route('/api/drafts/debug', methods=['GET'])
 def drafts_debug():
     """Inspect what's actually in a saved draft without exposing PII / image URLs.

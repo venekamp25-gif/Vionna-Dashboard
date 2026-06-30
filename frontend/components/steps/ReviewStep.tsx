@@ -18,7 +18,7 @@ import {
 import { Button } from "@/components/ui/Button";
 import { Spinner } from "@/components/ui/Spinner";
 import { useStep } from "@/lib/step";
-import { useProduct, PublishResult, colorLabelFor } from "@/lib/product";
+import { useProduct, PublishResult, colorLabelFor, saveProductSnapshot } from "@/lib/product";
 import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
 import { api } from "@/lib/api";
 import { calcComparePrice } from "@/lib/pricing";
@@ -275,6 +275,9 @@ export function ReviewStep() {
 
       // All stores published successfully — drop the auto-saved draft
       clearDraft();
+      // Stash a re-openable snapshot so this product can be reopened later from the
+      // History (best-effort, fire-and-forget).
+      void saveProductSnapshot(data);
       notify(
         `${data.name} published`,
         `${data.canonicalColors.length} colour duplicates × ${targetStores.length} ${targetStores.length === 1 ? "store" : "stores"}.`,

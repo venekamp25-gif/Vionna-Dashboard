@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useState, useCallback, useEffect, useRef, ReactNode } from "react";
 import { StoreKey } from "./store";
-import { draftsApi, fetchCurrentUser, type SizeChart } from "./api";
+import { draftsApi, fetchCurrentUser, snapshotsApi, type SizeChart, type ProductSnapshotMeta } from "./api";
 
 /**
  * Current ProductData schema version. Bump this any time we make a
@@ -385,6 +385,47 @@ export function loadLastProduct(): ProductData | null {
     const raw = window.localStorage.getItem(LAST_PRODUCT_KEY);
     if (!raw) return null;
     return stripInternalKeys(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+/** Save a re-openable snapshot of a published product (server-side, per user) so
+ *  it can be re-opened later from the History. Best-effort — never throws.
+ *  Trims the heavy competitor-image fields (not needed to re-edit/re-publish). */
+export async function saveProductSnapshot(d: ProductData): Promise<void> {
+  try {
+    const me = await fetchCurrentUser();
+    const owner = (me.email ?? "").trim();
+    if (!owner) return;
+    const slim: ProductData = { ...d, competitorImages: [], competitorImagesByColor: {} };
+    await snapshotsApi.save(owner, withSchemaVersion(slim));
+  } catch {
+    /* non-fatal */
+  }
+}
+
+/** List the recent re-openable product snapshots for the current user. */
+export async function listProductSnapshots(): Promise<ProductSnapshotMeta[]> {
+  try {
+    const me = await fetchCurrentUser();
+    const owner = (me.email ?? "").trim();
+    if (!owner) return [];
+    const r = await snapshotsApi.list(owner);
+    return r.snapshots ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/** Fetch one snapshot's full ProductData (backfilled + cleaned), or null. */
+export async function loadProductSnapshot(id: string): Promise<ProductData | null> {
+  try {
+    const me = await fetchCurrentUser();
+    const owner = (me.email ?? "").trim();
+    if (!owner) return null;
+    const r = await snapshotsApi.get<ProductData & { _schema_version?: number }>(owner, id);
+    return r.snapshot ? stripInternalKeys(r.snapshot) : null;
   } catch {
     return null;
   }
