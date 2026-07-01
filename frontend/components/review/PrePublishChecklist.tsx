@@ -99,7 +99,25 @@ export function buildPrePublishChecks(
     }
   }
 
-  // 5. Per-store content checks
+  // 5. Size chart present (scraped from competitor → custom.size_chart metafield)
+  const chartRows = data.sizeChart?.rows?.length ?? 0;
+  if (chartRows === 0) {
+    out.push({
+      id: "size-chart",
+      label: "No size chart found for this product",
+      level: "warn",
+      detail:
+        "The scrape found no size table — the size guide won't appear on the product page. Add one manually if this product needs sizing.",
+    });
+  } else {
+    out.push({
+      id: "size-chart",
+      label: `Size chart ready (${chartRows} ${chartRows === 1 ? "row" : "rows"})`,
+      level: "ok",
+    });
+  }
+
+  // 6. Per-store content checks
   for (const store of stores) {
     const content = data.contentByStore[store];
     const isActive = store === data.activeViewStore;
