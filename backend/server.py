@@ -1067,6 +1067,29 @@ def _sane_image_url(u):
     return True
 
 
+def _shopify_full_res(u):
+    """Upgrade a Shopify CDN image URL to its master (full-resolution) form so
+    imported photos aren't blurry when a section shows them large. Strips the
+    _WIDTHxHEIGHT size suffix and width/height/crop query params; keeps ?v=.
+    Non-Shopify URLs are returned unchanged (Shopify serves right-sized
+    derivatives per srcset on the storefront, so a hi-res master costs nothing)."""
+    if not isinstance(u, str):
+        return u
+    if 'cdn.shopify.com' not in u and '/s/files/' not in u:
+        return u
+    try:
+        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+        parts = urlsplit(u)
+        path = re.sub(
+            r'_(\d+)x(\d+)?(?:_crop_\w+)?(?=\.(?:jpe?g|png|webp|gif)$)',
+            '', parts.path, flags=re.I)
+        keep = [(k, v) for (k, v) in parse_qsl(parts.query, keep_blank_values=True)
+                if k.lower() not in ('width', 'height', 'crop', 'pad_color')]
+        return urlunsplit((parts.scheme, parts.netloc, path, urlencode(keep), parts.fragment))
+    except Exception:
+        return u
+
+
 def _scrape_slugify(text):
     """Lowercase + diacritic-strip + dash-separated — matches how shops slug colours into handles."""
     normalized = unicodedata.normalize('NFKD', text or '')
@@ -1286,6 +1309,7 @@ def _scrape_product_from_html(scheme, netloc, handle, html_text=None):
         if not u or not isinstance(u, str): return
         u = u.rstrip('\\').strip()
         u = u.replace('\\/', '/')
+        u = _shopify_full_res(u)
         if u in seen: return
         seen.add(u)
         img_urls.append(u)
@@ -4762,6 +4786,7 @@ def _build_image_payload(urls, max_images=10):
     for url in urls:
         if not isinstance(url, str) or not url.startswith('http'):
             continue
+        url = _shopify_full_res(url)
         if url in seen:
             continue
         seen.add(url)
