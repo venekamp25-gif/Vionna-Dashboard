@@ -5385,6 +5385,49 @@ NANO_BANANA_PROMPTS = {
 }
 
 
+@app.route('/api/theme_export')
+def theme_export():
+    """Read-only: export the store's live (main) theme assets so they can be pushed
+    to GitHub. Returns {theme_id, theme_name, assets:[{key, value?, attachment?}]}."""
+    store = request.args.get('store', 'dk')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()}.'}), 401
+    hdrs = shopify_headers(store)
+    tr = req.get(shopify_url(store, 'themes.json'), headers=hdrs, timeout=20)
+    themes = (tr.json() or {}).get('themes', []) if tr.status_code == 200 else []
+    main = next((t for t in themes if t.get('role') == 'main'), None)
+    if not main:
+        return jsonify({'error': 'no main (published) theme found'}), 404
+    tid = main['id']
+    ar = req.get(shopify_url(store, f'themes/{tid}/assets.json'), headers=hdrs, timeout=30)
+    keys = [a['key'] for a in (ar.json() or {}).get('assets', [])] if ar.status_code == 200 else []
+
+    def fetch(key):
+        for attempt in range(3):
+            try:
+                r = req.get(shopify_url(store, f'themes/{tid}/assets.json'),
+                            headers=hdrs, params={'asset[key]': key}, timeout=25)
+                if r.status_code == 429:
+                    time.sleep(2); continue
+                if r.status_code == 200:
+                    a = (r.json() or {}).get('asset', {})
+                    return {'key': key, 'value': a.get('value'), 'attachment': a.get('attachment')}
+                return {'key': key, 'error': r.status_code}
+            except Exception as e:
+                if attempt == 2:
+                    return {'key': key, 'error': str(e)[:60]}
+                time.sleep(1)
+        return {'key': key, 'error': 'retries exhausted'}
+
+    assets = []
+    with _cf.ThreadPoolExecutor(max_workers=3) as pool:
+        for res in pool.map(fetch, keys):
+            assets.append(res)
+    return jsonify({'theme_id': tid, 'theme_name': main.get('name'),
+                    'count': len(assets), 'errors': len([a for a in assets if a.get('error')]),
+                    'assets': assets})
+
+
 @app.route('/api/theme_probe')
 def theme_probe():
     """Read-only: check whether a store's Admin token can read themes/assets
