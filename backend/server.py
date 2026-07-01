@@ -5419,6 +5419,7 @@ def theme_export():
                 time.sleep(1)
         return {'key': key, 'error': 'retries exhausted'}
 
+    import concurrent.futures as _cf
     assets = []
     with _cf.ThreadPoolExecutor(max_workers=3) as pool:
         for res in pool.map(fetch, keys):
