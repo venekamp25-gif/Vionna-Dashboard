@@ -5385,6 +5385,38 @@ NANO_BANANA_PROMPTS = {
 }
 
 
+@app.route('/api/theme_probe')
+def theme_probe():
+    """Read-only: check whether a store's Admin token can read themes/assets
+    (needed to export the live theme to GitHub). No writes."""
+    store = request.args.get('store', 'dk')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()}.'}), 401
+    hdrs = shopify_headers(store)
+    out = {'store': store}
+    try:
+        r = req.get(shopify_url(store, 'themes.json'), headers=hdrs, timeout=20)
+        out['themes_status'] = r.status_code
+        if r.status_code == 200:
+            themes = (r.json() or {}).get('themes', [])
+            out['themes'] = [{'id': t.get('id'), 'name': t.get('name'), 'role': t.get('role')} for t in themes]
+            main = next((t for t in themes if t.get('role') == 'main'), None)
+            if main:
+                ar = req.get(shopify_url(store, f"themes/{main['id']}/assets.json"), headers=hdrs, timeout=30)
+                out['assets_status'] = ar.status_code
+                if ar.status_code == 200:
+                    assets = (ar.json() or {}).get('assets', [])
+                    out['asset_count'] = len(assets)
+                    out['asset_sample'] = [a.get('key') for a in assets[:8]]
+                else:
+                    out['assets_body'] = ar.text[:200]
+        else:
+            out['themes_body'] = r.text[:300]
+    except Exception as e:
+        out['error'] = str(e)[:200]
+    return jsonify(out)
+
+
 # --- Higgsfield image generation ---
 @app.route('/api/higgsfield', methods=['POST'])
 def higgsfield_generate():
