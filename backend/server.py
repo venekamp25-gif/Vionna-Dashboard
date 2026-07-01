@@ -1978,6 +1978,41 @@ def debug_metafields():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/ensure_size_chart_definition')
+def ensure_size_chart_definition():
+    """One-time setup: create the custom.size_chart PRODUCT metafield definition
+    (multi_line_text_field) so it shows + is editable in the Shopify admin.
+    Idempotent — an existing definition (userError code TAKEN) counts as success.
+    The theme renders the metafield with or without a definition; this is purely
+    for admin visibility/editing. Not gated: it only ever creates this one narrow,
+    harmless definition."""
+    store = request.args.get('store', 'dk')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store}'}), 401
+    name = {'dk': 'Størrelsesguide', 'fr': 'Guide des tailles',
+            'fi': 'Kokotaulukko'}.get(store, 'Size chart')
+    query = ('mutation { metafieldDefinitionCreate(definition: {'
+             ' name: "' + name + '", namespace: "custom", key: "size_chart",'
+             ' description: "Per-product size chart shown via the theme size-guide popup.",'
+             ' type: "multi_line_text_field", ownerType: PRODUCT'
+             ' }) { createdDefinition { id name } userErrors { field message code } } }')
+    try:
+        r = req.post(shopify_url(store, 'graphql.json'),
+                     headers=shopify_headers(store), json={'query': query}, timeout=20)
+        data = r.json()
+        res = (data.get('data') or {}).get('metafieldDefinitionCreate') or {}
+        if res.get('createdDefinition'):
+            return jsonify({'store': store, 'status': 'created',
+                            'definition': res['createdDefinition']})
+        errs = res.get('userErrors') or []
+        if any(e.get('code') == 'TAKEN' for e in errs):
+            return jsonify({'store': store, 'status': 'already_exists'})
+        return jsonify({'store': store, 'status': 'error', 'userErrors': errs,
+                        'http': r.status_code, 'raw': data}), 400
+    except Exception as e:
+        return jsonify({'store': store, 'error': str(e)}), 500
+
+
 # --- Backfill: ensure every existing product is on Online Store + Facebook + Google ---
 
 @app.route('/api/backfill_sales_channels', methods=['POST'])
