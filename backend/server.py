@@ -5400,14 +5400,11 @@ def hf_help():
         except Exception as e:
             return '', str(e)[:200]
     for label, cmd in [
-        ('cost_1k',     f'"{HIGGSFIELD_EXE}" generate cost nano_banana_2 --prompt "test" --resolution 1k --json'),
-        ('cost_2k',     f'"{HIGGSFIELD_EXE}" generate cost nano_banana_2 --prompt "test" --resolution 2k --json'),
-        ('cost_4k',     f'"{HIGGSFIELD_EXE}" generate cost nano_banana_2 --prompt "test" --resolution 4k --json'),
-        ('nb_lite_get', f'"{HIGGSFIELD_EXE}" model get nano_banana_2_lite'),
-        ('cost_lite',   f'"{HIGGSFIELD_EXE}" generate cost nano_banana_2_lite --prompt "test" --json'),
+        ('status',        f'"{HIGGSFIELD_EXE}" account status --json'),
+        ('transactions',  f'"{HIGGSFIELD_EXE}" account transactions --size 40 --json'),
     ]:
         so, se = _run(cmd)
-        out[label] = {'stdout': so[-2500:], 'stderr': se[-800:]}
+        out[label] = {'stdout': so[-8000:], 'stderr': se[-800:]}
     return jsonify(out)
 
 
