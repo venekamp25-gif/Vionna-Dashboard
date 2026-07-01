@@ -4324,8 +4324,31 @@ _SIZE_HEADER_MAP = {
     'sleeve':           {'dk': 'Ærme',      'fr': 'Manche',           'fi': 'Hiha'},
     'entrejambe':       {'dk': 'Skridtlængde', 'fr': 'Entrejambe',    'fi': 'Sisäpituus'},
     'inseam':           {'dk': 'Skridtlængde', 'fr': 'Entrejambe',    'fi': 'Sisäpituus'},
+    'binnenbeenlengte': {'dk': 'Indvendig benlængde', 'fr': "Longueur d'entrejambe", 'fi': 'Sisäpituus'},
+    'rise':             {'dk': 'Skridthøjde', 'fr': "Hauteur d'entrejambe", 'fi': 'Haaran korkeus'},
+    'kruishoogte':      {'dk': 'Skridthøjde', 'fr': "Hauteur d'entrejambe", 'fi': 'Haaran korkeus'},
+    'heupbreedte':      {'dk': 'Hoftevidde',  'fr': 'Largeur de hanches', 'fi': 'Lantion leveys'},
+    'hip width':        {'dk': 'Hoftevidde',  'fr': 'Largeur de hanches', 'fi': 'Lantion leveys'},
+    'heupen':           {'dk': 'Hofte',       'fr': 'Hanches',            'fi': 'Lantio'},
+    'dijbreedte':       {'dk': 'Lårvidde',    'fr': 'Largeur de cuisse',  'fi': 'Reiden leveys'},
+    'thigh':            {'dk': 'Lårvidde',    'fr': 'Largeur de cuisse',  'fi': 'Reiden leveys'},
+    'kniebreedte':      {'dk': 'Knævidde',    'fr': 'Largeur au genou',   'fi': 'Polven leveys'},
+    'knee':             {'dk': 'Knævidde',    'fr': 'Largeur au genou',   'fi': 'Polven leveys'},
+    'beenopening':      {'dk': 'Benåbning',   'fr': 'Ouverture de jambe', 'fi': 'Lahkeen suu'},
+    'leg opening':      {'dk': 'Benåbning',   'fr': 'Ouverture de jambe', 'fi': 'Lahkeen suu'},
+    'lengte':           {'dk': 'Længde',      'fr': 'Longueur',           'fi': 'Pituus'},
+    'borst':            {'dk': 'Bryst',       'fr': 'Poitrine',           'fi': 'Rinta'},
+    'borstwijdte':      {'dk': 'Bryst',       'fr': 'Poitrine',           'fi': 'Rinta'},
+    'schouderbreedte':  {'dk': 'Skulder',     'fr': 'Épaule',             'fi': 'Olkapää'},
+    'mouwlengte':       {'dk': 'Ærme',        'fr': 'Manche',             'fi': 'Hiha'},
 }
 _SIZE_CHART_TITLE = {'dk': 'Størrelsesguide', 'fr': 'Guide des tailles', 'fi': 'Kokotaulukko'}
+
+# 'taille' means SIZE as a column header but WAIST as a measurement row label;
+# this override applies only to first-column measurement labels, not headers.
+_MEASURE_OVERRIDE = {
+    'taille': {'dk': 'Talje', 'fr': 'Tour de taille', 'fi': 'Vyötärö'},
+}
 
 
 def _esc_html(s):
@@ -4338,24 +4361,41 @@ def _translate_size_header(h, store):
     return m.get(store, h) if m else h
 
 
+def _strip_lead_num(s):
+    """Drop a leading "1. " / "2) " numbering prefix from a measurement label."""
+    return re.sub(r'^\s*\d+\s*[.)]\s*', '', str(s if s is not None else '')).strip()
+
+
+def _translate_measure_label(h, store):
+    """Translate a first-column measurement label. Falls back to the header map,
+    but overrides size/waist-ambiguous terms to their measurement meaning."""
+    key = re.sub(r'\s+', ' ', (h or '').strip().lower())
+    m = _MEASURE_OVERRIDE.get(key)
+    if m:
+        return m.get(store, h)
+    return _translate_size_header(h, store)
+
+
 def _size_chart_html(chart, store):
-    """Render a scraped size chart to an HTML table for the product description,
-    headers localised to `store`. Returns '' when there's no usable chart."""
+    """Render a scraped size chart to a clean, style-less HTML <table>, localised
+    to `store`: column headers AND first-column measurement labels are translated,
+    and leading "1./2." numbering is stripped. Styling and the heading are the
+    theme's job. Returns '' when there's no usable chart."""
     if not isinstance(chart, dict) or not chart.get('rows'):
         return ''
     headers = chart.get('headers') or []
     th = ''.join(
-        '<th style="padding:6px 10px;border:1px solid #ddd;text-align:left;">'
-        f'{_esc_html(_translate_size_header(h, store))}</th>' for h in headers)
+        f'<th>{_esc_html(_translate_size_header(_strip_lead_num(h), store))}</th>'
+        for h in headers)
     body = ''
     for row in chart['rows']:
-        tds = ''.join(
-            f'<td style="padding:6px 10px;border:1px solid #ddd;">{_esc_html(c)}</td>'
-            for c in row)
+        cells = list(row)
+        if cells:
+            cells[0] = _translate_measure_label(_strip_lead_num(cells[0]), store)
+        tds = ''.join(f'<td>{_esc_html(c)}</td>' for c in cells)
         body += f'<tr>{tds}</tr>'
-    return (f'<h4>{_esc_html(_SIZE_CHART_TITLE.get(store, "Size guide"))}</h4>'
-            '<table style="border-collapse:collapse;font-size:14px;margin-top:6px;">'
-            f'<thead><tr>{th}</tr></thead><tbody>{body}</tbody></table>')
+    thead = f'<thead><tr>{th}</tr></thead>' if headers else ''
+    return f'<table>{thead}<tbody>{body}</tbody></table>'
 
 
 def _append_history(entry):
