@@ -3392,6 +3392,38 @@ def api_keyword_research_status():
                     'locations': DFS_LOCATION, 'languages': DFS_LANGUAGE})
 
 
+@app.route('/api/debug_dfs')
+def api_debug_dfs():
+    """Debug: one raw DataForSEO keyword_ideas call → surfaces API status/cost/errors."""
+    if not _dfs_configured():
+        return jsonify({'configured': False})
+    seed = request.args.get('seed', 'midikjole')
+    store = request.args.get('store', 'dk')
+    use_filter = request.args.get('filter', '1') == '1'
+    task = {'keywords': [seed], 'location_code': DFS_LOCATION.get(store, 2208),
+            'language_code': DFS_LANGUAGE.get(store, 'da'), 'limit': 10,
+            'order_by': ['keyword_info.search_volume,desc']}
+    if use_filter:
+        task['filters'] = [['keyword_info.search_volume', '>', 10]]
+    try:
+        r = req.post(DFS_ENDPOINT, headers=_dfs_headers(), json=[task], timeout=30)
+        d = r.json()
+    except Exception as e:
+        return jsonify({'error': str(e)[:150], 'http': getattr(r, 'status_code', None) if 'r' in dir() else None})
+    t = (d.get('tasks') or [{}])[0]
+    res = (t.get('result') or [])
+    r0 = (res[0] or {}) if res else {}
+    return jsonify({
+        'http': r.status_code,
+        'api_status_code': d.get('status_code'), 'api_status_message': d.get('status_message'),
+        'cost': d.get('cost'),
+        'task_status_code': t.get('status_code'), 'task_status_message': t.get('status_message'),
+        'result_count': r0.get('total_count'), 'items_len': len(r0.get('items') or []),
+        'sample': [{'k': it.get('keyword'), 'v': (it.get('keyword_info') or {}).get('search_volume')}
+                   for it in (r0.get('items') or [])[:5]],
+    })
+
+
 @app.route('/api/save_dataforseo_credentials', methods=['POST'])
 @require_droplet_token
 def api_save_dataforseo_credentials():
