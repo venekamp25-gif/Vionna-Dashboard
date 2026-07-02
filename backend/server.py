@@ -2116,7 +2116,16 @@ def debug_product_metafield():
             out.append({'handle': n.get('handle'), 'title': n.get('title'),
                         'has_metafield': bool(mf), 'type': (mf or {}).get('type'),
                         'value_preview': ((mf or {}).get('value') or '')[:200]})
-        return jsonify({'store': store, 'results': out})
+        resp = {'store': store, 'results': out}
+        if request.args.get('defs'):
+            dq = ('{metafieldDefinitions(first:10,ownerType:PRODUCT,namespace:"custom",key:"' + key + '")'
+                  '{edges{node{name namespace key ownerType type{name} '
+                  'access{storefront admin customerAccount}}}}}')
+            dr = req.post(shopify_url(store, 'graphql.json'), headers=shopify_headers(store),
+                          json={'query': dq}, timeout=20)
+            resp['definitions'] = [x['node'] for x in
+                ((((dr.json() or {}).get('data') or {}).get('metafieldDefinitions') or {}).get('edges') or [])]
+        return jsonify(resp)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
