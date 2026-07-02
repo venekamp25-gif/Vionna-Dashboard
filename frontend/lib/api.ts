@@ -482,12 +482,15 @@ export const api = {
 
   /** "What to list": product-TYPE view for a market — each type has an English
    *  label + localized term + demand/season + its top keywords. Gated. */
-  whatToList: (params: { store: "dk" | "fr" | "fi"; per_type?: number }) =>
+  whatToList: (params: { store: "dk" | "fr" | "fi"; per_type?: number; force?: boolean }) =>
     call<{
       configured: boolean;
       store?: string;
       per_type?: number;
       count?: number;
+      from_cache?: boolean;
+      cached_at?: string;
+      cache_age_seconds?: number;
       recent_total?: number;
       recent_window_days?: number;
       recent_counts?: Record<string, number>;

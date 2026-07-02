@@ -13,9 +13,18 @@ type StoreResult = {
   types?: TypeRow[];
   recentTotal?: number;
   recentWindowDays?: number;
+  cacheAgeSeconds?: number;
+  fromCache?: boolean;
   error?: string;
   notConfigured?: boolean;
 };
+
+function agoText(seconds: number): string {
+  if (seconds < 60) return "just now";
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600)}h ago`;
+  return `${Math.round(seconds / 86400)}d ago`;
+}
 
 const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
 const MONTH_FULL = ["", "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
@@ -97,7 +106,7 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
     }
   };
 
-  const run = async () => {
+  const run = async (force = false) => {
     if (selectedStores.length === 0) return;
     setBusy(true);
     setError(null);
@@ -107,9 +116,19 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
       const entries = await Promise.all(
         selectedStores.map(async (s): Promise<[StoreKey, StoreResult]> => {
           try {
-            const r = await api.whatToList({ store: s });
+            const r = await api.whatToList({ store: s, force });
             if (!r.configured) return [s, { notConfigured: true }];
-            return [s, { count: r.count ?? 0, types: r.types ?? [], recentTotal: r.recent_total, recentWindowDays: r.recent_window_days }];
+            return [
+              s,
+              {
+                count: r.count ?? 0,
+                types: r.types ?? [],
+                recentTotal: r.recent_total,
+                recentWindowDays: r.recent_window_days,
+                fromCache: r.from_cache,
+                cacheAgeSeconds: r.cache_age_seconds,
+              },
+            ];
           } catch (e) {
             return [s, { error: e instanceof Error ? e.message : "failed" }];
           }
@@ -259,8 +278,8 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
             </Button>
           </div>
           <p className="text-[11px] text-text-faint">
-            Scans ~19 categories + your recent listings per market (~15–25s). Uses about $0.25 of research budget per
-            market, so avoid re-running it needlessly.
+            Scans ~19 categories + your recent listings per market (~15–25s, ~$0.25 of research budget per market). The
+            result is saved for 12 hours, so re-opening is free — use <strong>Refresh</strong> for a new scan.
           </p>
         </div>
 
@@ -310,6 +329,25 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
                     . Each name is a product type (with the local search word in brackets); the keywords under it show
                     why.
                   </p>
+
+                  <div className="flex items-center gap-2 flex-wrap -mt-1.5">
+                    {active.fromCache && typeof active.cacheAgeSeconds === "number" ? (
+                      <span className="text-[11px] text-text-faint">
+                        Saved result · updated {agoText(active.cacheAgeSeconds)}
+                      </span>
+                    ) : (
+                      <span className="text-[11px] text-text-faint">Fresh scan · just updated</span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => void run(true)}
+                      disabled={busy}
+                      className="text-[11px] text-accent hover:underline disabled:opacity-50"
+                      title="Run a new paid scan for the selected market(s)"
+                    >
+                      ↻ Refresh
+                    </button>
+                  </div>
 
                   {/* Ranked recommendation */}
                   <div className="space-y-2.5">

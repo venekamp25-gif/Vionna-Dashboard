@@ -3748,13 +3748,20 @@ def api_keyword_research_niche():
                     'keywords': ranked, 'errors': errors[:3]})
 
 
+# Cache the (paid) What-to-list sweep per market so opening the tab doesn't
+# re-spend DataForSEO credits every time. In-memory → cleared on restart, which
+# is fine (a cache miss just re-fetches). `force` bypasses it (Refresh button).
+_WTL_CACHE = {}
+_WTL_TTL = 12 * 3600  # seconds
+
+
 @app.route('/api/what_to_list', methods=['POST'])
 @require_droplet_token
 def api_what_to_list():
     """Product-TYPE view for the "What to list" tab: for each womenswear category
     in a market, return an English label + the localized search term + the type's
     demand/seasonality + its top-N keywords. Lets a researcher see WHICH types to
-    list now, grouped and readable. Body: {store, per_type?}."""
+    list now, grouped and readable. Body: {store, per_type?, force?}."""
     body = request.get_json(silent=True) or {}
     store = body.get('store', 'dk')
     if not _dfs_configured():
@@ -3762,6 +3769,15 @@ def api_what_to_list():
     if store not in DFS_LOCATION:
         return jsonify({'error': 'unknown store'}), 400
     per_type = max(1, min(int(body.get('per_type') or 5), 10))
+    ckey = f'{store}:{per_type}'
+    now_ts = time.time()
+    cached = _WTL_CACHE.get(ckey)
+    if not body.get('force') and cached and (now_ts - cached['ts']) < _WTL_TTL:
+        p = dict(cached['payload'])
+        p['from_cache'] = True
+        p['cached_at'] = cached['at']
+        p['cache_age_seconds'] = int(now_ts - cached['ts'])
+        return jsonify(p)
     floor = max(200, DFS_MIN_VOLUME.get(store, 1000) // 4)
     labels = DFS_SEED_LABELS.get(store, {})
     seeds = list(labels.keys())
@@ -3853,10 +3869,20 @@ def api_what_to_list():
     types.sort(key=lambda x: -(x.get('score') or 0))
     for i, t in enumerate(types):
         t['recommended'] = i < top_n
-    return jsonify({'configured': True, 'store': store, 'per_type': per_type, 'floor': floor,
-                    'count': len(types), 'recent_total': recent_total, 'recent_window_days': 45,
-                    'recent_counts': recent_counts, 'live_counts': live_counts, 'types': types,
-                    'errors': errors[:3]})
+    payload = {'configured': True, 'store': store, 'per_type': per_type, 'floor': floor,
+               'count': len(types), 'recent_total': recent_total, 'recent_window_days': 45,
+               'recent_counts': recent_counts, 'live_counts': live_counts, 'types': types,
+               'errors': errors[:3]}
+    at = datetime.datetime.utcnow().isoformat() + 'Z'
+    # Only cache a real result — an empty types list is almost always a transient
+    # DataForSEO failure, which we don't want to pin for 12h.
+    if types:
+        _WTL_CACHE[ckey] = {'ts': now_ts, 'at': at, 'payload': payload}
+    out = dict(payload)
+    out['from_cache'] = False
+    out['cached_at'] = at
+    out['cache_age_seconds'] = 0
+    return jsonify(out)
 
 
 @app.route('/api/research_keywords', methods=['POST'])
@@ -5804,7 +5830,7 @@ Antwoord ALLEEN als geldig JSON:
         elif only_field == 'meta_description':
             sub_prompt = f"""{context_block}
 
-Schrijf ALLEEN een nieuwe meta_description (max 155 tekens, SEO-geoptimaliseerd voor {language}).
+Schrijf ALLEEN een nieuwe meta_description (max 155 tekens, SEO-geoptimaliseerd voor {language}). Verwerk 1-2 van de keywords hierboven op een natuurlijke, leesbare manier.
 
 Bestaande description (gebruik dezelfde toon + key benefits):
 ---
@@ -5818,7 +5844,7 @@ Antwoord ALLEEN als geldig JSON:
         else:  # m_title_specs
             sub_prompt = f"""{context_block}
 
-Schrijf ALLEEN een nieuwe m_title_specs: één beschrijvende zin voor Google Shopping. Wordt gebruikt als: {product_name} | m_title_specs
+Schrijf ALLEEN een nieuwe m_title_specs: één korte beschrijvende zin voor Google Shopping. Wordt gebruikt als: {product_name} | m_title_specs. Begin met of verwerk het belangrijkste producttype-keyword uit de lijst hierboven.
 
 Bestaande description (haal de hoofdkenmerken hieruit):
 ---
@@ -5859,9 +5885,9 @@ Regels:
 - Slotszin over hoe het voelt om te dragen
 - Rustige toon, geen hype, geen superlatieven
 
-Geef ook:
-- meta_description: max 155 tekens, SEO-geoptimaliseerd voor {language}
-- m_title_specs: één beschrijvende zin voor Google Shopping (wordt gebruikt als: {product_name} | m_title_specs)
+Geef ook (dit zijn de velden die het zwaarst meetellen voor Google — verwerk hierin de belangrijkste keywords uit de lijst hierboven, natuurlijk en leesbaar):
+- meta_description: max 155 tekens, SEO-geoptimaliseerd voor {language}. Verwerk 1-2 van de belangrijkste keywords op een natuurlijke manier.
+- m_title_specs: één korte beschrijvende zin voor Google Shopping (wordt gebruikt als: {product_name} | m_title_specs). Begin met of verwerk het belangrijkste producttype-keyword.
 
 Antwoord uitsluitend als geldig JSON zonder extra tekst:
 {{"description": "...", "meta_description": "...", "m_title_specs": "..."}}"""
@@ -8315,6 +8341,550 @@ def meta_create_draft_job():
 
     threading.Thread(target=_runner, daemon=True).start()
     return jsonify({'job_id': jid, 'status': 'running'})
+
+
+# ============================================================================
+# Blog engine — 2×/week SEO blog posts per store
+# ----------------------------------------------------------------------------
+# Pipeline: DataForSEO (hot topic + keyword cluster, reusing the seasonality
+# scoring already built above) → match on-catalogue products via `cat:<x>` tags
+# → Claude writes an SEO article in the store's language → publish as a DRAFT
+# Shopify article (review in Shopify admin, one click to go live). A small
+# JSON-lines history file prevents the same topic being written twice.
+# ----------------------------------------------------------------------------
+BLOG_TITLE   = {'dk': 'Vionna Journal', 'fr': 'Le Journal Vionna', 'fi': 'Vionna Journal'}
+BLOG_HANDLE  = 'journal'
+BLOG_AUTHOR  = 'Vionna'
+BLOG_HISTORY_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blog_history.jsonl')
+BLOG_PERF_PATH      = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blog_performance.jsonl')
+BLOG_PLAYBOOK_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blog_playbook.json')
+# What the feedback loop optimises for (user chose sales/product-clicks). The
+# score prefers GA4 conversions when available, then GSC clicks, then ranking.
+BLOG_OPTIMIZE_FOR = os.getenv('BLOG_OPTIMIZE_FOR', 'sales')   # sales | traffic | ranking
+DFS_RANKED_ENDPOINT = 'https://api.dataforseo.com/v3/dataforseo_labs/google/ranked_keywords/live'
+
+# Brand voice per market — feminine, elegant, chic womenswear. Written in-language.
+BLOG_BRAND_VOICE = (
+    "Vionna is an elegant, feminine womenswear brand — chic, refined, effortless. "
+    "The tone is warm, stylish and confident, like a well-dressed friend giving advice. "
+    "Never salesy or clickbaity; helpful and tasteful."
+)
+
+# Evergreen fallback topics per store, used when DataForSEO returns nothing (creds
+# not set yet, or no fresh candidates). Keeps the system producing quality drafts
+# regardless. Local-language keyword + the catalogue category to link products from.
+BLOG_FALLBACK_TOPICS = {
+    'dk': [
+        {'keyword': 'sommerkjole', 'category': 'dress', 'cluster': ['blomstret kjole', 'lang kjole', 'maxikjole']},
+        {'keyword': 'strik til efteråret', 'category': 'knitwear', 'cluster': ['cardigan', 'sweater', 'strikbluse']},
+        {'keyword': 'den perfekte blazer', 'category': 'outerwear', 'cluster': ['oversized blazer', 'blazer til kvinder']},
+        {'keyword': 'nederdel styling', 'category': 'skirt', 'cluster': ['lang nederdel', 'plisseret nederdel']},
+        {'keyword': 'bukser til kontoret', 'category': 'pants', 'cluster': ['habitbukser', 'vide bukser']},
+        {'keyword': 'sådan styler du en hvid skjorte', 'category': 'top', 'cluster': ['hvid bluse', 'skjorte outfit']},
+    ],
+    'fr': [
+        {'keyword': "robe d'été", 'category': 'dress', 'cluster': ['robe fleurie', 'robe longue', 'robe légère']},
+        {'keyword': "la maille pour l'automne", 'category': 'knitwear', 'cluster': ['cardigan', 'pull', 'gilet']},
+        {'keyword': 'le blazer parfait', 'category': 'outerwear', 'cluster': ['blazer oversize', 'veste femme']},
+        {'keyword': 'comment porter la jupe longue', 'category': 'skirt', 'cluster': ['jupe plissée', 'jupe midi']},
+        {'keyword': 'le pantalon de bureau', 'category': 'pants', 'cluster': ['pantalon large', 'pantalon tailleur']},
+        {'keyword': 'la chemise blanche', 'category': 'top', 'cluster': ['blouse blanche', 'chemise femme']},
+    ],
+    'fi': [
+        {'keyword': 'kesämekko', 'category': 'dress', 'cluster': ['kukkamekko', 'pitkä mekko', 'maksimekko']},
+        {'keyword': 'neuleet syksyyn', 'category': 'knitwear', 'cluster': ['neuletakki', 'villapaita', 'neulepusero']},
+        {'keyword': 'täydellinen bleiseri', 'category': 'outerwear', 'cluster': ['oversize bleiseri', 'naisten jakku']},
+        {'keyword': 'hameen tyylivinkit', 'category': 'skirt', 'cluster': ['pitkä hame', 'pliseehame']},
+        {'keyword': 'housut töihin', 'category': 'pants', 'cluster': ['leveälahkeiset housut', 'puvunhousut']},
+        {'keyword': 'valkoinen paita', 'category': 'top', 'cluster': ['valkoinen pusero', 'paita asu']},
+    ],
+}
+
+
+def _blog_fallback_topic(store):
+    """Pick an evergreen topic for the store that hasn't been blogged recently."""
+    pool = BLOG_FALLBACK_TOPICS.get(store, [])
+    if not pool:
+        return None
+    recent = _blog_recent_sigs(store)
+    for t in pool:
+        if _kw_signature(t['keyword']) not in recent:
+            return {**t, 'source': 'fallback', 'seasonality': None,
+                    'intent': 'commercial', 'label': None, 'seed': None, 'volume': None}
+    # all used recently → reuse the oldest anyway
+    t = pool[0]
+    return {**t, 'source': 'fallback', 'seasonality': None, 'intent': 'commercial',
+            'label': None, 'seed': None, 'volume': None}
+
+
+def _blog_recent_sigs(store, days=120):
+    """Content-word signatures of topics already blogged for this store recently,
+    so _blog_hot_topics never repeats a subject. Reads blog_history.jsonl."""
+    sigs = set()
+    try:
+        cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+        with open(BLOG_HISTORY_PATH, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if row.get('store') != store:
+                    continue
+                ts = row.get('ts')
+                if ts:
+                    try:
+                        if datetime.datetime.fromisoformat(ts.replace('Z', '')) < cutoff:
+                            continue
+                    except Exception:
+                        pass
+                kw = row.get('keyword') or ''
+                if kw:
+                    sigs.add(_kw_signature(kw))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[blog] history read failed: {e}")
+    return sigs
+
+
+def _blog_log(store, topic, article):
+    """Append one line per created article so topics aren't repeated."""
+    try:
+        with open(BLOG_HISTORY_PATH, 'a', encoding='utf-8') as f:
+            f.write(json.dumps({
+                'ts': datetime.datetime.utcnow().isoformat() + 'Z',
+                'store': store,
+                'keyword': topic.get('keyword'),
+                'category': topic.get('category'),
+                'article_id': article.get('id'),
+                'article_handle': article.get('handle'),
+                'title': article.get('title'),
+                'published': article.get('published'),
+            }, ensure_ascii=False) + '\n')
+    except Exception as e:
+        print(f"[blog] history write failed: {e}")
+
+
+def _blog_ensure(store, hdrs):
+    """Get the store's journal blog id, creating the blog resource if absent."""
+    r = _shopify_call('get', shopify_url(store, 'blogs.json?limit=50'), hdrs, timeout=20)
+    if r.status_code == 200:
+        for b in (r.json().get('blogs') or []):
+            if (b.get('handle') or '').lower() == BLOG_HANDLE:
+                return b.get('id')
+        # fall back to any existing blog if a 'journal' handle isn't there yet
+        existing = (r.json().get('blogs') or [])
+        # only reuse an existing blog if it's literally our title (avoid hijacking
+        # some other blog the store might use); otherwise create ours.
+        for b in existing:
+            if (b.get('title') or '') == BLOG_TITLE.get(store):
+                return b.get('id')
+    payload = {'blog': {'title': BLOG_TITLE.get(store, 'Journal'), 'handle': BLOG_HANDLE}}
+    cr = _shopify_call('post', shopify_url(store, 'blogs.json'), hdrs, json=payload, timeout=20)
+    if cr.status_code not in (200, 201):
+        raise RuntimeError(f'blog create failed HTTP {cr.status_code}: {cr.text[:200]}')
+    return cr.json()['blog']['id']
+
+
+def _blog_hot_topics(store, k=3):
+    """Rank the hottest blog subjects for a market. Reuses _dfs_keyword_suggestions
+    (which attaches seasonality) + _recommend_keywords (volume + in-season + intent
+    scoring), dedupes word-order/plural variants, and drops subjects already blogged
+    recently. Returns up to k topic dicts with a supporting keyword cluster."""
+    if not _dfs_configured() or store not in DFS_LOCATION:
+        return []
+    seeds = DFS_NICHE_SEEDS.get(store, [])
+    floor = max(150, DFS_MIN_VOLUME.get(store, 1000) // 6)
+    import concurrent.futures as _cf
+    by_seed = {}
+    with _cf.ThreadPoolExecutor(max_workers=6) as pool:
+        futs = {pool.submit(_dfs_keyword_suggestions, s, store, 0, 25): s for s in seeds}
+        for f in _cf.as_completed(futs):
+            s = futs[f]
+            try:
+                res = f.result()
+            except Exception:
+                continue
+            by_seed[s] = [x for x in res if isinstance(x, dict) and 'error' not in x
+                          and x.get('keyword') and (x.get('volume') or 0) >= floor]
+    # flatten + collapse near-duplicate variants, keep highest volume per signature
+    best = {}
+    for s, rows in by_seed.items():
+        for x in rows:
+            x['seed'] = s
+            sig = _kw_signature(x.get('keyword') or '')
+            if not sig:
+                continue
+            if sig not in best or (x.get('volume') or 0) > (best[sig].get('volume') or 0):
+                best[sig] = x
+    cands = list(best.values())
+    if not cands:
+        return []
+    _recommend_keywords(cands, store, top_n=len(cands))   # attaches 'score'
+    cands.sort(key=lambda x: -(x.get('score') or 0))
+    recent = _blog_recent_sigs(store)
+    topics = []
+    for x in cands:
+        sig = _kw_signature(x.get('keyword') or '')
+        if sig in recent:
+            continue
+        seed = x.get('seed')
+        label = DFS_SEED_LABELS.get(store, {}).get(seed, seed)
+        cat = DFS_TYPE_CATEGORY.get(label)
+        cluster = [r.get('keyword') for r in sorted(by_seed.get(seed, []),
+                   key=lambda r: -(r.get('volume') or 0))
+                   if r.get('keyword') and r.get('keyword') != x.get('keyword')][:6]
+        topics.append({
+            'keyword': x.get('keyword'), 'volume': x.get('volume'), 'intent': x.get('intent'),
+            'seasonality': x.get('seasonality'), 'score': x.get('score'),
+            'seed': seed, 'label': label, 'category': cat, 'cluster': cluster,
+        })
+        if len(topics) >= k:
+            break
+    return topics
+
+
+def _blog_match_products(store, category, hdrs, n=6, keyword=None):
+    """Return up to n on-catalogue products to link, matched by the topic's
+    `cat:<x>` tag (best-sellers first). Falls back to newest active products."""
+    def _run(q):
+        query = ('{ products(first:%d, query:%s, sortKey:BEST_SELLING) { edges { node { '
+                 'id title handle featuredImage{url} '
+                 'priceRangeV2{minVariantPrice{amount currencyCode}} } } } }'
+                 % (n, json.dumps(q)))
+        try:
+            r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                              json={'query': query}, timeout=30)
+            edges = (((r.json().get('data') or {}).get('products') or {}).get('edges') or [])
+        except Exception as e:
+            print(f"[blog] product match failed: {e}")
+            return []
+        out = []
+        for e in edges:
+            nd = e.get('node') or {}
+            price = (((nd.get('priceRangeV2') or {}).get('minVariantPrice') or {}))
+            out.append({
+                'id': nd.get('id'), 'title': nd.get('title'), 'handle': nd.get('handle'),
+                'url': '/products/' + (nd.get('handle') or ''),
+                'image': (nd.get('featuredImage') or {}).get('url'),
+                'price': price.get('amount'), 'currency': price.get('currencyCode'),
+            })
+        return out
+    prods = []
+    if category:
+        prods = _run(f"tag:'cat:{category}' AND status:active")
+    if not prods:
+        prods = _run("status:active")
+    return prods[:n]
+
+
+def _blog_write(store, topic, products):
+    """Claude writes the SEO article in the store's language. Returns a dict:
+    {title, handle, meta_description, excerpt, tags[], body_html}. None on failure."""
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        return None
+    lang = DFS_LANG_NAME.get(store, 'Danish')
+    kw = topic.get('keyword') or ''
+    cluster = [c for c in (topic.get('cluster') or []) if c]
+    prod_lines = []
+    for p in products:
+        price = f" — {p['price']} {p.get('currency') or ''}".rstrip() if p.get('price') else ''
+        prod_lines.append(f"- {p.get('title')} (link: {p.get('url')}{price})")
+    prod_block = '\n'.join(prod_lines) if prod_lines else '(no products available — write without product links)'
+    seas = topic.get('seasonality') or {}
+    season_hint = ''
+    if seas.get('seasonal'):
+        season_hint = (f"\nSeasonality: this subject peaks around month {seas.get('peak_month')}; "
+                       f"trend is {seas.get('trend')}. Write for the current/upcoming season, "
+                       "reference it naturally, do NOT hard-code a specific year in the URL handle.")
+    # Evolving playbook — concrete guidance learned from what actually ranks/sells.
+    pb = _blog_playbook_text()
+    pb_block = (f"\n\nLEARNED PLAYBOOK (apply these — derived from our best-performing past articles):\n{pb}\n"
+                if pb else "")
+    prompt = (
+        f"You are the content writer for Vionna, writing an SEO blog article. {BLOG_BRAND_VOICE}\n\n"
+        f"Write the ENTIRE article in {lang}. Native, fluent, elegant {lang} — not translated-sounding.\n\n"
+        f"PRIMARY SEO KEYWORD (must rank for this): \"{kw}\"\n"
+        f"Supporting keywords to weave in naturally: {', '.join(cluster) if cluster else '(none)'}"
+        f"{season_hint}{pb_block}\n\n"
+        f"Products from our shop to feature (link them inline with <a href> using the given relative links):\n"
+        f"{prod_block}\n\n"
+        "REQUIREMENTS:\n"
+        f"1. Title: compelling, contains the primary keyword, max ~60 chars, in {lang}.\n"
+        "2. Body: valid HTML (no <html>/<head>/<body> wrappers). 700-1100 words. Use <h2>/<h3> "
+        "subheadings, <p>, and <ul> where useful. Put the primary keyword in the first paragraph "
+        "and in at least one <h2>.\n"
+        "3. Naturally recommend 3-6 of the products above with inline <a href=\"/products/...\"> links "
+        "on the product name. Add one styling/care tip context around each — never a bare list dump.\n"
+        "4. End with a short call-to-action paragraph linking to <a href=\"/collections/all\">the shop</a>.\n"
+        "5. meta_description: max 155 chars, contains the keyword, enticing.\n"
+        "6. excerpt: 1 short sentence summary.\n"
+        f"7. tags: 4-6 short {lang} topical tags.\n"
+        "8. handle: url slug from the title, lowercase, ascii, hyphens, NO year.\n\n"
+        "Return ONLY compact JSON with EXACTLY these keys: "
+        '{"title": "...", "handle": "...", "meta_description": "...", "excerpt": "...", '
+        '"tags": ["..."], "body_html": "..."}'
+    )
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=4500,
+                                      messages=[{'role': 'user', 'content': prompt}])
+        txt = (msg.content[0].text if msg.content else '') or ''
+        m = re.search(r'\{.*\}', txt, re.S)
+        if not m:
+            print(f"[blog] writer returned no JSON: {txt[:150]}")
+            return None
+        data = json.loads(m.group(0))
+    except Exception as e:
+        print(f"[blog] writer failed: {e}")
+        return None
+    # sanitise
+    tags = data.get('tags') or []
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(',') if t.strip()]
+    handle = re.sub(r'[^a-z0-9]+', '-', (data.get('handle') or data.get('title') or 'post').lower()).strip('-')[:80]
+    return {
+        'title': (data.get('title') or '').strip()[:120],
+        'handle': handle or None,
+        'meta_description': (data.get('meta_description') or '').strip()[:160],
+        'excerpt': (data.get('excerpt') or '').strip(),
+        'tags': [str(t).strip() for t in tags][:6],
+        'body_html': data.get('body_html') or '',
+    }
+
+
+def _blog_create_article(store, blog_id, art, hdrs, published=False, featured_img=None):
+    """Create the Shopify article (DRAFT by default) with SEO metafields + image."""
+    article = {
+        'title': art['title'],
+        'author': BLOG_AUTHOR,
+        'body_html': art['body_html'],
+        'published': bool(published),
+        'metafields': [
+            {'namespace': 'global', 'key': 'title_tag',
+             'value': art['title'][:70], 'type': 'single_line_text_field'},
+            {'namespace': 'global', 'key': 'description_tag',
+             'value': art.get('meta_description') or '', 'type': 'single_line_text_field'},
+        ],
+    }
+    if art.get('handle'):
+        article['handle'] = art['handle']
+    if art.get('excerpt'):
+        article['summary_html'] = f"<p>{art['excerpt']}</p>"
+    if art.get('tags'):
+        article['tags'] = ', '.join(art['tags'])
+    if featured_img:
+        article['image'] = {'src': featured_img, 'alt': art['title']}
+    r = _shopify_call('post', shopify_url(store, f'blogs/{blog_id}/articles.json'), hdrs,
+                      json={'article': article}, timeout=30)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f'article create failed HTTP {r.status_code}: {r.text[:300]}')
+    a = r.json().get('article') or {}
+    shop = tokens.get(store, {}).get('shop') or STORES.get(store)
+    return {
+        'id': a.get('id'), 'handle': a.get('handle'), 'title': a.get('title'),
+        'published': a.get('published_at') is not None,
+        'storefront_url': f"https://{shop}/blogs/{BLOG_HANDLE}/{a.get('handle')}",
+        'admin_hint': 'Shopify admin → Online Store → Blog posts',
+    }
+
+
+def _blog_generate_one(store, topic=None, published=False):
+    """Full pipeline for one store → one draft article. Returns a result dict."""
+    hdrs = shopify_headers(store)
+    if not hdrs.get('X-Shopify-Access-Token'):
+        return {'store': store, 'error': 'no Shopify token for this store'}
+    if topic is None:
+        topics = _blog_hot_topics(store, k=3)
+        if topics:
+            topic = {**topics[0], 'source': 'dataforseo'}
+        else:
+            topic = _blog_fallback_topic(store)
+            if not topic:
+                return {'store': store, 'error': 'no topics available (no DataForSEO + no fallback)'}
+    products = _blog_match_products(store, topic.get('category'), hdrs, n=6, keyword=topic.get('keyword'))
+    art = _blog_write(store, topic, products)
+    if not art or not art.get('title') or not art.get('body_html'):
+        return {'store': store, 'topic': topic, 'error': 'writer failed'}
+    blog_id = _blog_ensure(store, hdrs)
+    featured = next((p.get('image') for p in products if p.get('image')), None)
+    created = _blog_create_article(store, blog_id, art, hdrs, published=published, featured_img=featured)
+    _blog_log(store, topic, {**created, 'published': published})
+    return {'store': store, 'topic': topic, 'products_linked': len(products),
+            'article': created, 'preview': {'title': art['title'],
+            'meta_description': art['meta_description'], 'excerpt': art['excerpt'],
+            'tags': art['tags'], 'body_html': art['body_html']}}
+
+
+@app.route('/api/blog/topics', methods=['POST'])
+@require_droplet_token
+def api_blog_topics():
+    """Dry-run: the hottest blog subjects for a store, no writes. Body: {store, k?}."""
+    body = request.get_json(silent=True) or {}
+    store = body.get('store', 'dk')
+    if store not in DFS_LOCATION:
+        return jsonify({'error': 'unknown store'}), 400
+    if not _dfs_configured():
+        return jsonify({'configured': False, 'message': 'DataForSEO not configured.'})
+    topics = _blog_hot_topics(store, k=int(body.get('k') or 5))
+    return jsonify({'configured': True, 'store': store, 'count': len(topics), 'topics': topics})
+
+
+@app.route('/api/blog/generate', methods=['POST'])
+@require_droplet_token
+def api_blog_generate():
+    """Generate ONE blog article for a store and save it as a DRAFT (default).
+    Body: {store, published?, topic?}. Returns the created article + preview."""
+    body = request.get_json(silent=True) or {}
+    store = body.get('store', 'dk')
+    if store not in STORES:
+        return jsonify({'error': 'unknown store'}), 400
+    res = _blog_generate_one(store, topic=body.get('topic'),
+                             published=bool(body.get('published')))
+    code = 200 if not res.get('error') else 400
+    return jsonify(res), code
+
+
+@app.route('/api/blog/run', methods=['POST'])
+@require_droplet_token
+def api_blog_run():
+    """Batch entry point for the 2×/week scheduler. Body: {stores?, per_store?,
+    published?}. Generates drafts across stores. Returns per-article results."""
+    body = request.get_json(silent=True) or {}
+    stores = body.get('stores') or ['dk', 'fr', 'fi']
+    per_store = max(1, min(int(body.get('per_store') or 1), 3))
+    published = bool(body.get('published'))
+    results = []
+    for st in stores:
+        if st not in STORES:
+            results.append({'store': st, 'error': 'unknown store'})
+            continue
+        for _ in range(per_store):
+            try:
+                results.append(_blog_generate_one(st, published=published))
+            except Exception as e:
+                results.append({'store': st, 'error': str(e)[:200]})
+    ok = sum(1 for r in results if r.get('article'))
+    return jsonify({'generated': ok, 'total': len(results), 'published': published,
+                    'results': results})
+
+
+@app.route('/api/blog/status', methods=['GET'])
+def api_blog_status():
+    """Read-only health/status for the blog engine (no secrets, no auth): recent
+    generated articles + scheduler config + whether DataForSEO is configured.
+    Lets the schedule be verified without a session token."""
+    recent = []
+    try:
+        with open(BLOG_HISTORY_PATH, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    recent.append(json.loads(line))
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        return jsonify({'error': str(e)[:120]}), 500
+    return jsonify({
+        'dataforseo_configured': _dfs_configured(),
+        'scheduler': {
+            'enabled': os.getenv('BLOG_SCHEDULER', '1') != '0',
+            'bootstrap': os.getenv('BLOG_BOOTSTRAP', '1') != '0',
+            'days': sorted(BLOG_SCHED_DAYS), 'hour': BLOG_SCHED_HOUR,
+            'stores': BLOG_SCHED_STORES,
+        },
+        'count': len(recent),
+        'recent': recent[-20:],
+    })
+
+
+# ----------------------------------------------------------------------------
+# Scheduler: generate DRAFT blog posts 2×/week (Tue + Fri, ~09:00 droplet time)
+# per store, plus a one-shot bootstrap draft ~90s after the first deploy so a real
+# article is ready to review immediately. Runs in-process on the droplet (which
+# holds the Shopify tokens) so no auth token is needed — unlike the HTTP endpoints.
+# Env toggles: BLOG_SCHEDULER=0 (pause recurring), BLOG_BOOTSTRAP=0 (skip first
+# draft), BLOG_STORES=dk,fr,fi (which stores the recurring schedule covers).
+# ----------------------------------------------------------------------------
+BLOG_SCHED_DAYS   = {1, 4}          # Mon=0 … Tue=1, Fri=4  → 2×/week
+BLOG_SCHED_HOUR   = 9               # local droplet time
+BLOG_SCHED_STORES = [s.strip() for s in os.getenv('BLOG_STORES', 'dk,fr,fi').split(',') if s.strip()]
+
+
+def _blog_store_posted_on(store, date_str):
+    """True if a draft was already logged for this store on date_str (YYYY-MM-DD).
+    Pass '' to test 'has this store ever had a post' (used by the bootstrap guard)."""
+    try:
+        with open(BLOG_HISTORY_PATH, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if row.get('store') == store and (row.get('ts') or '').startswith(date_str):
+                    return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+    return False
+
+
+def _blog_scheduler_loop():
+    # One-shot bootstrap: first real draft (DK) shortly after the first deploy.
+    if os.getenv('BLOG_BOOTSTRAP', '1') != '0':
+        time.sleep(90)
+        try:
+            if not _blog_store_posted_on('dk', ''):    # DK never posted → first run
+                if shopify_headers('dk').get('X-Shopify-Access-Token'):
+                    print('[blog] bootstrap: generating first DK draft…')
+                    res = _blog_generate_one('dk', published=False)
+                    art = (res.get('article') or {})
+                    print(f"[blog] bootstrap: {res.get('error') or art.get('storefront_url')}")
+        except Exception as e:
+            print(f"[blog] bootstrap failed: {e}")
+
+    if os.getenv('BLOG_SCHEDULER', '1') == '0':
+        return
+    # Recurring: check every 10 min; fire at most once per store per scheduled day.
+    while True:
+        try:
+            now = datetime.datetime.now()
+            if now.weekday() in BLOG_SCHED_DAYS and now.hour == BLOG_SCHED_HOUR:
+                today = now.strftime('%Y-%m-%d')
+                for st in BLOG_SCHED_STORES:
+                    if st not in STORES or _blog_store_posted_on(st, today):
+                        continue
+                    if not shopify_headers(st).get('X-Shopify-Access-Token'):
+                        continue
+                    try:
+                        print(f'[blog] scheduled draft for {st}…')
+                        res = _blog_generate_one(st, published=False)
+                        art = (res.get('article') or {})
+                        print(f"[blog] {st}: {res.get('error') or art.get('storefront_url')}")
+                    except Exception as e:
+                        print(f'[blog] scheduled {st} failed: {e}')
+        except Exception as e:
+            print(f'[blog] scheduler error: {e}')
+        time.sleep(600)
+
+
+try:
+    threading.Thread(target=_blog_scheduler_loop, daemon=True, name='blog-scheduler').start()
+except Exception as _e:
+    print(f'[blog] could not start scheduler thread: {_e}')
 
 
 if __name__ == '__main__':
