@@ -3357,8 +3357,23 @@ def _dfs_keyword_ideas(seeds, store, min_volume=30, limit=12):
 
 # scaled per-market minimum monthly search volume (DK/FI are small markets;
 # the ≥20k rule is for big markets like DE/UK). Overridable per request.
-DFS_MIN_VOLUME = {'dk': 2500, 'fr': 10000, 'fi': 1200}
+DFS_MIN_VOLUME = {'dk': 1800, 'fr': 4000, 'fi': 800}
 DFS_SUGGEST_ENDPOINT = 'https://api.dataforseo.com/v3/dataforseo_labs/google/keyword_suggestions/live'
+
+# stopwords + gender words (deaccented) to collapse near-duplicate variants
+# ("chaussures femme" == "chaussures des femmes" == "femmes chaussures").
+_KW_STOP = {'de', 'du', 'des', 'la', 'le', 'les', 'pour', 'et', 'a', 'en', 'un', 'une', 'the', 'og', 'til',
+            'for', 'i', 'ja', 'femme', 'femmes', 'dame', 'damer', 'dames', 'women', 'woman', 'womens',
+            'naisten', 'naiset', 'nainen', 'til', 'kvinder', 'kvinde'}
+
+
+def _kw_signature(kw):
+    """Normalised content-word signature to dedupe word-order / plural / gender
+    variants while keeping genuine style variants (robe été vs robe soirée)."""
+    s = ''.join(c for c in unicodedata.normalize('NFKD', (kw or '').lower()) if not unicodedata.combining(c))
+    words = [w for w in re.split(r'[^a-z0-9]+', s) if w and w not in _KW_STOP]
+    words = [w[:-1] if len(w) > 3 and w.endswith('s') else w for w in words]
+    return ' '.join(sorted(set(words)))
 
 # core womenswear category seeds per market (the "trending niche keywords" base).
 DFS_NICHE_SEEDS = {
@@ -3503,8 +3518,21 @@ def api_keyword_research_niche():
                 if k not in best or v > (best[k].get('volume') or 0):
                     kw['seed'] = seed
                     best[k] = kw
+    # collapse near-duplicate variants (word-order/plural/gender), keep the
+    # highest-volume + shortest representative
+    sig_best = {}
+    for kw in best.values():
+        sig = _kw_signature(kw.get('keyword') or '')
+        if not sig:
+            continue
+        cur = sig_best.get(sig)
+        v = kw.get('volume') or 0
+        if (not cur or v > (cur.get('volume') or 0)
+                or (v == (cur.get('volume') or 0)
+                    and len(kw.get('keyword') or '') < len(cur.get('keyword') or ''))):
+            sig_best[sig] = kw
     # rank a wide pool, drop brand/off-topic noise via LLM, then take the target
-    pool_ranked = sorted(best.values(), key=lambda x: -(x.get('volume') or 0))[:max(target * 2, 80)]
+    pool_ranked = sorted(sig_best.values(), key=lambda x: -(x.get('volume') or 0))[:max(target * 2, 80)]
     cleaned = pool_ranked if body.get('no_clean') else _dfs_clean_keywords_llm(pool_ranked, store)
     ranked = cleaned[:target]
     return jsonify({'configured': True, 'store': store, 'min_volume': min_vol,
