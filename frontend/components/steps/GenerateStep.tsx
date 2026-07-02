@@ -181,10 +181,11 @@ export function GenerateStep() {
       // Merge the worker's manual keywords (pre-ticked) with the researched ones.
       const byStore: Partial<Record<StoreKey, ReviewKw[]>> = {};
       for (const st of selectedStores) {
-        const manual =
-          (data.parsedKeywordsByStore?.[st]?.length
-            ? data.parsedKeywordsByStore[st]
-            : data.parsedKeywords) ?? [];
+        // ONLY this store's own typed keywords count as "manual". Never fall back
+        // to the legacy flat list (data.parsedKeywords = the PRIMARY store's
+        // keywords) — that would leak e.g. Danish keywords into an empty French
+        // store and wrongly block its auto-research.
+        const manual = data.parsedKeywordsByStore?.[st] ?? [];
         const seen = new Set<string>();
         const list: ReviewKw[] = [];
         manual.forEach((kw) => {
@@ -262,14 +263,11 @@ export function GenerateStep() {
 
       for (const store of selectedStores) {
         setSubStage(`${STORE_CONFIG[store].language} — ${STORE_CONFIG[store].label}`);
-        // Priority: approved keywords (from the review popup) → manual → legacy.
+        // Approved keywords from the review popup, else THIS store's own manual
+        // keywords. Never the legacy flat mirror (primary store) — that would
+        // leak the primary store's keywords into other languages.
         const confirmed = selectedByStore?.[store];
-        const storeKeywords =
-          confirmed !== undefined
-            ? confirmed
-            : (data.parsedKeywordsByStore?.[store]?.length ?? 0) > 0
-              ? data.parsedKeywordsByStore![store]
-              : data.parsedKeywords;
+        const storeKeywords = confirmed !== undefined ? confirmed : (data.parsedKeywordsByStore?.[store] ?? []);
         const gen = await api.generate({
           store,
           product_name: chosenName,

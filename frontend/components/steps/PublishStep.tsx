@@ -183,10 +183,10 @@ export function PublishStep() {
 
       <div className="bg-bg-elev border border-border rounded-2xl px-6 py-4 space-y-2.5">
         <div className="flex items-center justify-between gap-3 flex-wrap">
-          <span className="text-[13px] text-text-dim">Klaar — wat nu?</span>
+          <span className="text-[13px] text-text-dim">Done — what now?</span>
           <div className="flex gap-2 flex-wrap">
             <Button variant="secondary" onClick={keepForLater} disabled={kept}>
-              {kept ? "✓ Bewaard" : "↩ Bewaar om terug te komen"}
+              {kept ? "✓ Saved" : "↩ Save to come back to"}
             </Button>
             <Button variant="primary" onClick={resetForNewProduct}>
               ← Create another product
@@ -195,9 +195,9 @@ export function PublishStep() {
         </div>
         {kept && (
           <p className="text-[11px] text-text-faint leading-relaxed">
-            ✓ Bewaard! Je kunt nu veilig <strong>refreshen</strong> (Ctrl+Shift+R) — daarna haal je
-            dit product terug via <strong>&ldquo;↩ Terug naar product&rdquo;</strong> op het
-            startscherm, om snel campagnes te (her)maken zonder opnieuw te importeren.
+            ✓ Saved! You can now safely <strong>refresh</strong> (Ctrl+Shift+R) — after that, bring this
+            product back via <strong>&ldquo;↩ Back to product&rdquo;</strong> on the start screen, to quickly
+            (re)build campaigns without importing again.
           </p>
         )}
       </div>
@@ -484,10 +484,10 @@ function StoreResultCard({
         .map((p) => `${p.title}: ${(p.issues ?? []).map((i) => i.msg).join(", ")}`)
         .join("\n");
       await api.reportBug({
-        title: `Post-publish check blijft falen na retry — ${name} (${store.toUpperCase()})`,
+        title: `Post-publish check keeps failing after retry — ${name} (${store.toUpperCase()})`,
         description:
-          `Na "Retry fix" bleven deze post-publish issues openstaan:\n\n${issuesText}\n\n` +
-          `Product: ${name} · Store: ${store.toUpperCase()} · ${productIds?.length ?? 0} producten.`,
+          `After "Retry fix" these post-publish issues remained open:\n\n${issuesText}\n\n` +
+          `Product: ${name} · Store: ${store.toUpperCase()} · ${productIds?.length ?? 0} products.`,
         store,
       });
       setBugState("sent");

@@ -41,7 +41,7 @@ function isHot(k: Kw, minVolume: number): boolean {
 
 function seasonText(k: Kw): string {
   const s = k.seasonality;
-  if (s?.seasonal && s.peak_month) return `peak ${s.peak_month} → push ${s.push_from_month}`;
+  if (s?.seasonal && s.peak_month) return `peak ${s.peak_month} → start ${s.push_from_month}`;
   if (s?.trend && s.trend !== "flat") return s.trend === "rising" ? "↑ rising" : "↓ falling";
   return "—";
 }
@@ -64,8 +64,18 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
 
   const canRun = productType.trim().length > 0 && selectedStores.length > 0 && !busy;
 
-  const toggleStore = (s: StoreKey) =>
+  const toggleStore = (s: StoreKey) => {
     setSelectedStores((prev) => (prev.includes(s) ? prev.filter((x) => x !== s) : [...prev, s]));
+    // Changing which markets to research invalidates the results already on
+    // screen (they belong to the PREVIOUS selection). Clear them so old-market
+    // keywords — e.g. Danish while you've now picked France — never linger.
+    // Switch between already-researched markets with the result tabs instead.
+    if (results) {
+      setResults(null);
+      setSelected({});
+      setError(null);
+    }
+  };
 
   const run = async () => {
     if (!productType.trim() || selectedStores.length === 0) return;
@@ -159,7 +169,8 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
           <div>
             <h2 className="text-[16px] font-semibold text-text">Keyword research</h2>
             <p className="text-[12px] text-text-faint mt-0.5">
-              Trending, high-volume keywords for one product type per market — with search volume and seasonality.
+              Already know the product type? Get its best keywords per market — with monthly search volume and
+              season. (To discover <em>which</em> types to list, use the 💡 What-to-list tool.)
             </p>
           </div>
           <button type="button" onClick={onClose} className="text-text-dim hover:text-text text-xl leading-none">
@@ -214,6 +225,10 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
               {busy ? "Researching…" : `Run research${selectedStores.length > 1 ? ` (${selectedStores.length})` : ""}`}
             </Button>
           </div>
+          <p className="text-[11px] text-text-faint">
+            Pick one or more markets. After results load, switch between them with the tabs — changing the market
+            buttons here starts a fresh search.
+          </p>
         </div>
 
         {/* Body */}
@@ -379,11 +394,11 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
                         </tbody>
                       </table>
                       <p className="text-[11px] text-text-faint mt-3 leading-relaxed">
-                        <span className="text-amber-500">★</span> = recommended to use (best mix of volume,
-                        buying intent and timing — pre-ticked for you).{" "}
-                        <span className="text-green-600 dark:text-green-400">● green</span> = above your volume
-                        threshold AND currently in season (push→peak window — good time to push now). “push” =
-                        start ~5–6 weeks before the peak.
+                        <span className="text-amber-500">★</span> = recommended (best mix of search volume, buyers
+                        and timing — pre-ticked for you).{" "}
+                        <span className="text-green-600 dark:text-green-400">● green</span> = lots of people search
+                        for it AND it&apos;s in season now — a good time to list it. “Season” shows the yearly high
+                        point (peak) and the month to start listing (about 1–2 months before the peak).
                       </p>
                     </>
                   )}

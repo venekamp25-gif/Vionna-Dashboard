@@ -11,6 +11,7 @@ import { HistoryModal } from "./HistoryModal";
 import { ReportBugModal } from "./ReportBugModal";
 import { KeywordBackfillModal } from "./KeywordBackfillModal";
 import { KeywordResearchModal } from "./KeywordResearchModal";
+import { WhatToListModal } from "./WhatToListModal";
 import { CatalogMaintenanceModal } from "./CatalogMaintenanceModal";
 import { useCatalogJobs } from "@/lib/catalogJobs";
 
@@ -20,6 +21,7 @@ export function Header() {
   const [bugOpen, setBugOpen]           = useState(false);
   const [backfillOpen, setBackfillOpen] = useState(false);
   const [researchOpen, setResearchOpen] = useState(false);
+  const [whatToListOpen, setWhatToListOpen] = useState(false);
   const [maintenanceOpen, setMaintenanceOpen] = useState(false);
   const maintenanceRunning = useCatalogJobs().some((j) => j.status === "running");
 
@@ -50,8 +52,17 @@ export function Header() {
           </button>
           <button
             type="button"
+            onClick={() => setWhatToListOpen(true)}
+            title="What to list — discover which product types to list now (per market)"
+            aria-label="Open what to list"
+            className="w-9 h-9 flex items-center justify-center rounded-md bg-bg-elev-2 text-text-dim hover:text-accent hover:border-accent border border-border transition-colors text-[14px]"
+          >
+            💡
+          </button>
+          <button
+            type="button"
             onClick={() => setResearchOpen(true)}
-            title="Keyword research — trending high-volume keywords per market (with seasonality)"
+            title="Keyword research — best keywords for a product type you already picked (with season)"
             aria-label="Open keyword research"
             className="w-9 h-9 flex items-center justify-center rounded-md bg-bg-elev-2 text-text-dim hover:text-accent hover:border-accent border border-border transition-colors text-[14px]"
           >
@@ -96,6 +107,7 @@ export function Header() {
       <ReportBugModal open={bugOpen} onClose={() => setBugOpen(false)} />
       <KeywordBackfillModal open={backfillOpen} onClose={() => setBackfillOpen(false)} />
       <KeywordResearchModal open={researchOpen} onClose={() => setResearchOpen(false)} />
+      <WhatToListModal open={whatToListOpen} onClose={() => setWhatToListOpen(false)} />
       <CatalogMaintenanceModal open={maintenanceOpen} onClose={() => setMaintenanceOpen(false)} />
     </>
   );

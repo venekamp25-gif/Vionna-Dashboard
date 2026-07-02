@@ -33,7 +33,7 @@ function inSeasonNow(k: ReviewKw): boolean {
 
 function seasonText(k: ReviewKw): string {
   const s = k.seasonality;
-  if (s?.seasonal && s.peak_month) return `peak ${s.peak_month} → push ${s.push_from_month}`;
+  if (s?.seasonal && s.peak_month) return `peak ${s.peak_month} → start ${s.push_from_month}`;
   if (s?.trend && s.trend !== "flat") return s.trend === "rising" ? "↑ rising" : "↓ falling";
   return "";
 }
@@ -72,8 +72,14 @@ export function KeywordReviewModal({
     stores.forEach((s) => {
       const list = byStore[s] ?? [];
       initRows[s] = list;
+      // If the worker typed keywords for this store on the import screen, keep
+      // ONLY those pre-selected — never silently overwrite or add to their work.
+      // The researched keywords still show below as OPTIONAL extras (unticked).
+      // If they left it empty, pre-tick the recommended research keywords.
+      const hasManual = list.some((k) => k.source === "manual");
       list.forEach((k) => {
-        if (k.recommended || k.source === "manual") initSel[`${s}:${k.keyword}`] = true;
+        const pick = hasManual ? k.source === "manual" : k.recommended;
+        if (pick) initSel[`${s}:${k.keyword}`] = true;
       });
     });
     setRows(initRows);
@@ -124,9 +130,11 @@ export function KeywordReviewModal({
         {/* Header */}
         <div className="px-6 py-4 border-b border-border shrink-0">
           <h2 className="text-[16px] font-semibold text-text">Review keywords</h2>
-          <p className="text-[12px] text-text-faint mt-0.5">
-            These keywords will seed the copy for <strong className="text-text-dim">{productName}</strong>.{" "}
-            <span className="text-amber-500">★</span> recommended are pre-ticked — adjust, then generate.
+          <p className="text-[12px] text-text-faint mt-0.5 leading-relaxed">
+            Before the product text is written, check the keywords it will be built from for{" "}
+            <strong className="text-text-dim">{productName}</strong>. Tick the ones to use, untick the rest, or add
+            your own. <span className="text-amber-500">★</span> = recommended (already ticked). Nothing is written
+            until you press <strong>Generate copy</strong>.
           </p>
         </div>
 
@@ -151,10 +159,16 @@ export function KeywordReviewModal({
 
         {/* Body */}
         <div className="flex-1 overflow-auto px-6 py-4">
+          {viewRows.some((k) => k.source === "manual") && (
+            <div className="text-[11px] text-accent bg-[var(--accent-soft)] rounded-[8px] px-3 py-2 mb-3 leading-relaxed">
+              ✓ Your own keywords for {STORE_CONFIG[viewStore].label} are marked <em>(yours)</em> and kept ticked —
+              the researched ones below are optional extras you can add if you want.
+            </div>
+          )}
           {viewRows.length === 0 ? (
             <p className="text-[13px] text-text-faint">
-              No keywords found for {STORE_CONFIG[viewStore].label}. Add one or two below, or continue and the
-              copy will be generated without seeded keywords.
+              No keywords found for {STORE_CONFIG[viewStore].label}. Add one or two below, or just continue — the
+              product text will still be written, it just won&apos;t be guided by any keywords.
             </p>
           ) : (
             <table className="w-full text-[12px] border-collapse">

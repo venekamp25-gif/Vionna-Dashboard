@@ -171,7 +171,7 @@ export function InputStep() {
       }
     } catch {
       // Classifier unreachable → treat as 'unknown' so the user is still warned.
-      setShippingWarn({ label: "Onbekend", detail: "", source: "none", confidence: "none" });
+      setShippingWarn({ label: "unknown", detail: "", source: "none", confidence: "none" });
     } finally {
       setChecking(false);
     }
@@ -247,16 +247,15 @@ export function InputStep() {
       {lastProduct && (
         <div className="mb-4 flex items-center justify-between gap-3 px-4 py-3 rounded-[10px] bg-bg-elev border border-border">
           <div className="flex-1 text-[12px] text-text-dim leading-relaxed">
-            <span className="text-text font-semibold">↩ {lastProduct.name || "Vorig product"}</span>{" "}
-            — ga terug naar je laatst geïmporteerde product (bijv. om Meta-campagnes te testen),
-            zonder opnieuw te importeren.
+            <span className="text-text font-semibold">↩ {lastProduct.name || "Previous product"}</span>{" "}
+            — go back to your last imported product (e.g. to test Meta campaigns), without importing it again.
           </div>
           <button
             type="button"
             onClick={() => setConfirmBack(true)}
             className="shrink-0 text-[11px] font-semibold tracking-wider uppercase px-3 py-1.5 rounded-md border border-border bg-bg-elev-2 text-text-dim hover:border-accent hover:text-accent"
           >
-            Terug naar product →
+            Back to product →
           </button>
         </div>
       )}
@@ -271,16 +270,16 @@ export function InputStep() {
             onClick={(e) => e.stopPropagation()}
           >
             <div className="text-[15px] font-semibold text-text mb-2">
-              ⚠ Terug naar een geïmporteerd product
+              ⚠ Back to an imported product
             </div>
             <p className="text-[13px] text-text-dim leading-relaxed mb-4">
-              Je gaat terug naar <strong className="text-text">{lastProduct.name || "je vorige product"}</strong>,
-              dat al is geïmporteerd. Handig om bijvoorbeeld de Meta-campagnes opnieuw te bekijken of te maken.
+              You&apos;re going back to <strong className="text-text">{lastProduct.name || "your previous product"}</strong>,
+              which is already imported. Handy for, say, reviewing or creating the Meta campaigns again.
               <br />
               <br />
-              <span className="text-warning font-semibold">Let op:</span> als je in deze flow nogmaals op{" "}
-              <strong>publiceren</strong> klikt, maak je <strong>duplicaten</strong> aan in je stores. Gebruik
-              dit dus alleen om te bekijken of campagnes te maken — niet om opnieuw te publiceren.
+              <span className="text-warning font-semibold">Heads-up:</span> if you click{" "}
+              <strong>publish</strong> again in this flow, you&apos;ll create <strong>duplicates</strong> in your
+              stores. So use this only to view or to build campaigns — not to publish again.
             </p>
             <div className="flex justify-end gap-2">
               <button
@@ -288,7 +287,7 @@ export function InputStep() {
                 onClick={() => setConfirmBack(false)}
                 className="text-[12px] font-semibold px-4 py-2 rounded-md border border-border bg-bg-elev-2 text-text-dim hover:text-text"
               >
-                Annuleer
+                Cancel
               </button>
               <button
                 type="button"
@@ -301,7 +300,7 @@ export function InputStep() {
                 }}
                 className="text-[12px] font-semibold px-4 py-2 rounded-md bg-accent text-on-accent hover:bg-accent-hover"
               >
-                Ja, ga terug →
+                Yes, go back →
               </button>
             </div>
           </div>
@@ -363,15 +362,22 @@ export function InputStep() {
           />
         </Field>
 
+        <div className="text-[12px] text-text-dim leading-relaxed bg-bg-elev-2 rounded-[10px] px-3.5 py-3 border border-border mb-3">
+          <strong className="text-text">Keywords are optional.</strong> Leave a box empty and the tool
+          researches the best keywords for you automatically — you&apos;ll get a pop-up to review and approve them
+          before any text is written. If you <strong>do</strong> type your own keywords here, they are kept and{" "}
+          <strong>never overwritten</strong> (one keyword per line).
+        </div>
+
         {data.selectedStores.length <= 1 ? (
           <Field>
-            <Label hint="(one per line, from Ubersuggest/Trends sheet)">Keywords</Label>
+            <Label hint="(optional — one per line; left empty = auto-researched)">Keywords</Label>
             <Textarea
               rows={6}
               value={data.keywordsByStore[data.selectedStores[0] ?? "dk"] ?? ""}
               onChange={(e) => setKeywordsForStore(data.selectedStores[0] ?? "dk", e.target.value)}
               placeholder={
-                "Put keywords researched for this product here...\n(one per line, e.g. from Ubersuggest or Google Trends)"
+                "Optional — leave empty to auto-research, or paste your own keywords here (one per line)."
               }
             />
           </Field>
@@ -442,6 +448,10 @@ export function InputStep() {
                     {shippingWarn.confidence === "low" ? " — low confidence, worth a quick check." : "."}
                   </p>
                 )}
+                <p className="text-[12px] text-text-dim mt-2 leading-relaxed">
+                  We usually only import from <strong>dropshippers</strong> (fast shipping, no stock to hold). If
+                  you&apos;re not sure this store is one, check with your manager before importing.
+                </p>
                 <p className="text-[12px] text-text-faint mt-2">Import anyway?</p>
               </div>
             </div>
