@@ -1614,6 +1614,7 @@ def _extract_size_chart_full(page_html, page_url=''):
 
 
 @app.route('/api/debug_extract_chart')
+@require_droplet_token
 def api_debug_extract_chart():
     """Debug: run the full size-chart extraction on any URL, reporting which
     method succeeded (html / kiwi / ocr)."""
@@ -1968,6 +1969,7 @@ def scrape_manual():
 
 # --- Debug: inspect siblings setup for a given product name ---
 @app.route('/api/debug_siblings')
+@require_droplet_token
 def debug_siblings():
     """Diagnose why Pipeline-theme siblings might not be working for a given product."""
     store = request.args.get('store', 'dk')
@@ -2078,6 +2080,7 @@ def debug_siblings():
 
 # --- Debug: list metafield definitions for products ---
 @app.route('/api/debug_metafields')
+@require_droplet_token
 def debug_metafields():
     store = request.args.get('store', 'dk')
     if store not in tokens:
@@ -2364,6 +2367,7 @@ def api_set_product_size_chart():
 
 
 @app.route('/api/debug_product_metafield')
+@require_droplet_token
 def debug_product_metafield():
     """Read a product's custom.<key> metafield by handle (debug)."""
     store = request.args.get('store', 'fr')
@@ -3951,6 +3955,7 @@ def api_keyword_research_status():
 
 
 @app.route('/api/debug_dfs')
+@require_droplet_token
 def api_debug_dfs():
     """Debug: one raw DataForSEO keyword_ideas call → surfaces API status/cost/errors."""
     if not _dfs_configured():
@@ -4025,6 +4030,7 @@ def api_save_dataforseo_credentials():
 
 
 @app.route('/api/debug_classify')
+@require_droplet_token
 def api_debug_classify():
     """Debug: test the import-time category classifier. ?title=&desc="""
     title = request.args.get('title', '')
@@ -4241,6 +4247,7 @@ def api_manage_category_collections():
 
 
 @app.route('/api/debug_sample_products')
+@require_droplet_token
 def api_debug_sample_products():
     """Read-only: sample products with product_type, tags, standard category
     (taxonomy), a description snippet, and current CATEGORY collection memberships.
@@ -4287,6 +4294,7 @@ def api_debug_sample_products():
 
 
 @app.route('/api/debug_collection_rules')
+@require_droplet_token
 def api_debug_collection_rules():
     """Read-only: every collection with its FULL smart-collection ruleSet
     (column/relation/condition + appliedDisjunctively) and product count.
@@ -5220,6 +5228,7 @@ def product_snapshot_get(sid):
 
 
 @app.route('/api/drafts/debug', methods=['GET'])
+@require_droplet_token
 def drafts_debug():
     """Inspect what's actually in a saved draft without exposing PII / image URLs.
     Returns shape + counts of each major field — useful for diagnosing
@@ -7101,6 +7110,7 @@ NANO_BANANA_PROMPTS = {
 
 
 @app.route('/api/theme_export')
+@require_droplet_token
 def theme_export():
     """Read-only: export the store's live (main) theme assets so they can be pushed
     to GitHub. Returns {theme_id, theme_name, assets:[{key, value?, attachment?}]}."""
@@ -7158,6 +7168,7 @@ def theme_export():
 
 
 @app.route('/api/theme_probe')
+@require_droplet_token
 def theme_probe():
     """Read-only: check whether a store's Admin token can read themes/assets
     (needed to export the live theme to GitHub). No writes."""
@@ -7659,6 +7670,7 @@ def meta_storefront_test():
 
 
 @app.route('/api/meta/lifestyle_debug')
+@require_droplet_token
 def meta_lifestyle_debug():
     """Read-only: show the EXACT lifestyle prompt the job sends to Higgsfield (prompt_type 0) +
     optionally run that exact call on ?image_url= to prove the deployed job path produces a
@@ -7682,6 +7694,7 @@ def meta_lifestyle_debug():
 
 
 @app.route('/api/meta/channels_debug')
+@require_droplet_token
 def meta_channels_debug():
     """Read-only: for a product (by ?handle=), show its sales-channel publications counted both
     ways — onlyPublished:true (LIVE) vs false (ASSIGNED) — + the publication list. Tells us if a
