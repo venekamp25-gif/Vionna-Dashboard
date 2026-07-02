@@ -2141,11 +2141,14 @@ def touch_product():
             return jsonify({'error': 'not found', 'handle': handle}), 404
         n = edges[0]['node']
         before = n['updatedAt']
-        u = gql('mutation($id:ID!,$t:String!){productUpdate(input:{id:$id,title:$t}){product{updatedAt}userErrors{message}}}',
-                {'id': n['id'], 't': n['title']})
-        pr = (u.get('data') or {}).get('productUpdate') or {}
-        return jsonify({'handle': handle, 'before': before,
-                        'after': (pr.get('product') or {}).get('updatedAt'),
+        tag = request.args.get('tag', 'vsg-cache-purge')
+        act = request.args.get('act', 'add')  # add | remove
+        mut = 'tagsAdd' if act == 'add' else 'tagsRemove'
+        u = gql('mutation($id:ID!,$t:[String!]!){%s(id:$id,tags:$t){node{... on Product{updatedAt}}userErrors{message}}}' % mut,
+                {'id': n['id'], 't': [tag]})
+        pr = (u.get('data') or {}).get(mut) or {}
+        return jsonify({'handle': handle, 'act': act, 'before': before,
+                        'after': ((pr.get('node') or {}).get('updatedAt')),
                         'userErrors': pr.get('userErrors')})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
