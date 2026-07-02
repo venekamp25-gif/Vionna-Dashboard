@@ -2013,6 +2013,69 @@ def ensure_size_chart_definition():
         return jsonify({'store': store, 'error': str(e)}), 500
 
 
+@app.route('/api/backfill_size_charts', methods=['POST'])
+def backfill_size_charts():
+    """Bulk-write custom.size_chart from prepared per-store HTML.
+    Body: {dry_run:bool(default true), limit:int(0=all), offset:int,
+           products:[{name, fr_handle, html:{dk,fr,fi}}]}.
+    Matches products by title prefix (name) in each store so all colour
+    siblings get the chart. Dry-run only reports matches; not gated (writes a
+    single reversible metafield). idempotent (metafieldsSet overwrites)."""
+    body = request.get_json(silent=True) or {}
+    dry = body.get('dry_run', True)
+    products = body.get('products') or []
+    off = int(body.get('offset') or 0)
+    lim = int(body.get('limit') or 0)
+    products = products[off:off + lim] if lim else products[off:]
+
+    def gql(store, query, variables=None):
+        r = req.post(shopify_url(store, 'graphql.json'), headers=shopify_headers(store),
+                     json={'query': query, 'variables': variables or {}}, timeout=25)
+        return r.json()
+
+    def search(store, qstr):
+        d = gql(store, 'query($q:String){products(first:40,query:$q){edges{node{id handle title}}}}', {'q': qstr})
+        return [e['node'] for e in (((d.get('data') or {}).get('products') or {}).get('edges') or [])]
+
+    report = []
+    writes = 0
+    for p in products:
+        name = (p.get('name') or '').strip()
+        html = p.get('html') or {}
+        for store in ('dk', 'fr', 'fi'):
+            if store not in tokens:
+                continue
+            val = html.get(store)
+            if not val:
+                continue
+            try:
+                nodes = search(store, 'title:%s*' % name)
+            except Exception as e:
+                report.append({'name': name, 'store': store, 'error': str(e)[:80]})
+                continue
+            ent = {'name': name, 'store': store, 'matched': [n['title'] for n in nodes]}
+            if not dry and nodes:
+                errs = []
+                for n in nodes:
+                    try:
+                        r = gql(store,
+                                'mutation($m:[MetafieldsSetInput!]!){metafieldsSet(metafields:$m){userErrors{field message}}}',
+                                {'m': [{'ownerId': n['id'], 'namespace': 'custom', 'key': 'size_chart',
+                                        'type': 'multi_line_text_field', 'value': val}]})
+                        ue = (((r.get('data') or {}).get('metafieldsSet') or {}).get('userErrors') or [])
+                        if ue:
+                            errs.append(ue)
+                        else:
+                            writes += 1
+                    except Exception as e:
+                        errs.append(str(e)[:80])
+                ent['written'] = len([n for n in nodes]) - len(errs)
+                if errs:
+                    ent['errors'] = errs
+            report.append(ent)
+    return jsonify({'dry_run': dry, 'products': len(products), 'writes': writes, 'report': report})
+
+
 # --- Backfill: ensure every existing product is on Online Store + Facebook + Google ---
 
 @app.route('/api/backfill_sales_channels', methods=['POST'])
