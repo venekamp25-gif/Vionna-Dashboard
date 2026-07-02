@@ -43,9 +43,9 @@ function seasonText(s: Seasonality): string {
   return "in demand all year";
 }
 
-/** The two reasons behind a recommendation: when to push it, and how much of it
- *  the store has already listed lately. */
-function why(t: TypeRow): { season: string; tone: string; recency: string } {
+/** The reasoning behind a recommendation: when to push it, and how saturated the
+ *  category already is (total live + how many added in the last 45 days). */
+function why(t: TypeRow): { season: string; tone: string; stock: string } {
   const b = (t.bucket ?? bucketOf(t.seasonality)) as Bucket;
   const s = t.seasonality;
   const season =
@@ -57,9 +57,10 @@ function why(t: TypeRow): { season: string; tone: string; recency: string } {
           ? "in demand all year"
           : `out of season${s?.peak_month ? ` (peak ${s.peak_month})` : ""}`;
   const tone = b === "now" ? "text-green-600 dark:text-green-400" : b === "soon" ? "text-amber-500" : "text-text-dim";
+  const live = (t.total_live ?? 0).toLocaleString("en-US");
   const r = t.recent_listed ?? 0;
-  const recency = r === 0 ? "none listed recently" : `${r} listed recently`;
-  return { season, tone, recency };
+  const stock = `${live} live · ${r === 0 ? "none added recently" : `${r} added in last 45d`}`;
+  return { season, tone, stock };
 }
 
 const BUCKETS: { key: Bucket; title: string; tone: string }[] = [
@@ -328,7 +329,7 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
                             <div className="text-[11px] mt-0.5 flex items-center gap-1.5 flex-wrap">
                               <span className={w.tone}>● {w.season}</span>
                               <span className="text-text-faint">·</span>
-                              <span className="text-text-faint">{w.recency}</span>
+                              <span className="text-text-faint">{w.stock}</span>
                             </div>
                             {keywordPills(t)}
                           </div>
@@ -338,9 +339,9 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
                   </div>
 
                   <p className="text-[11px] text-text-faint leading-relaxed">
-                    Ranked by demand + season timing, minus how much of that category you&apos;ve listed lately. Numbers
-                    are monthly searches. Next: use the bestseller finder below to check real competitors are already
-                    selling these.
+                    Ranked by demand + season timing, minus how saturated the category already is (total products live
+                    + how many you added in the last 45 days). Keyword numbers are monthly searches. Next: use the
+                    bestseller finder below to check real competitors are already selling these.
                   </p>
 
                   {/* Full breakdown */}
@@ -366,7 +367,7 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
                                 {list.map((t) => (
                                   <span
                                     key={t.seed}
-                                    title={`${seasonText(t.seasonality)} · ${t.recent_listed ?? 0} listed recently`}
+                                    title={`${seasonText(t.seasonality)} · ${t.total_live ?? 0} live · ${t.recent_listed ?? 0} added in last 45d`}
                                     className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-border bg-bg-elev-2 text-[11px] text-text-dim"
                                   >
                                     {t.recommended && <span className="text-amber-500">★</span>}

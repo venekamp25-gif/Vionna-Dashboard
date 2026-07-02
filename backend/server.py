@@ -3519,6 +3519,38 @@ def _recent_cat_counts(store, days=45):
     return dict(cnt), total
 
 
+def _live_cat_counts(store):
+    """Total LIVE (status:active) products per cat:<category> for a store, in one
+    aliased `productsCount` query. Best-effort → {} on failure/unauth."""
+    if store not in tokens:
+        return {}
+    cats = sorted(set(DFS_TYPE_CATEGORY.values()))
+    alias = {}
+    parts = []
+    for i, c in enumerate(cats):
+        a = f'c{i}'
+        alias[a] = c
+        parts.append(f'{a}: productsCount(query: "tag:\'cat:{c}\' status:active") {{ count }}')
+    q = '{ ' + ' '.join(parts) + ' }'
+    try:
+        r = _shopify_call('post', shopify_url(store, 'graphql.json'), shopify_headers(store),
+                          json={'query': q}, timeout=45)
+        body = r.json() or {}
+    except Exception as e:
+        print(f"[what_to_list] live counts failed for {store}: {e}")
+        return {}
+    if body.get('errors'):
+        print(f"[what_to_list] live counts gql errors for {store}: {str(body['errors'])[:160]}")
+        return {}
+    data = body.get('data') or {}
+    out = {}
+    for a, c in alias.items():
+        cnt = (data.get(a) or {}).get('count')
+        if isinstance(cnt, int):
+            out[c] = cnt
+    return out
+
+
 def _recommend_keywords(keywords, store, top_n=8):
     """Mark the strongest keywords to actually USE in copy. Score = relative
     search volume + a bonus for being in season right now (or trending up) + a
@@ -3770,11 +3802,13 @@ def api_what_to_list():
                               'seasonality': k.get('seasonality'), 'intent': k.get('intent')} for k in top],
             })
 
-    # Recommendation score = demand (volume) + season timing − how much of this
-    # category the store has ALREADY listed lately. Favours in/near-season types
-    # the store hasn't covered recently, so the researcher fills real gaps.
+    # Recommendation score = demand (volume) + season timing − how saturated the
+    # category already is (recently listed in the last 45 days AND total live).
+    # Favours in/near-season types the store hasn't covered, so it fills gaps.
     recent_counts, recent_total = _recent_cat_counts(store)
+    live_counts = _live_cat_counts(store)
     max_recent = max(recent_counts.values()) if recent_counts else 0
+    max_live = max(live_counts.values()) if live_counts else 0
     max_vol = max((t.get('volume') or 0) for t in types) if types else 1
     top_n = int(body.get('recommend_count') or 8)
     season_bonus = {'now': 0.6, 'soon': 0.4, 'evergreen': 0.1, 'off': -0.3}
@@ -3782,25 +3816,26 @@ def api_what_to_list():
         cat = DFS_TYPE_CATEGORY.get(t['label'])
         t['category'] = cat
         t['recent_listed'] = int(recent_counts.get(cat, 0)) if cat else 0
+        t['total_live'] = int(live_counts.get(cat, 0)) if cat else 0
         bucket = _season_bucket(t.get('seasonality'))
         t['bucket'] = bucket
         score = (t.get('volume') or 0) / (max_vol or 1)
         score += season_bonus.get(bucket, 0)
         if bucket not in ('now', 'soon') and (t.get('seasonality') or {}).get('trend') == 'rising':
             score += 0.2
-        # recency: full bonus when nothing listed lately, ~0 for the most-listed
-        # category. Neutral nudge when we have no recency data.
-        if max_recent > 0:
-            score += 0.35 * (1 - (t['recent_listed'] / max_recent))
-        else:
-            score += 0.2
+        # saturation: full bonus when the category is empty/untouched, ~0 for the
+        # most-covered one. Recent activity (45d) weighs a bit more than the total
+        # live catalogue. Neutral nudge when a signal is unavailable.
+        score += (0.35 * (1 - (t['recent_listed'] / max_recent))) if max_recent > 0 else 0.2
+        score += (0.25 * (1 - (t['total_live'] / max_live))) if max_live > 0 else 0.12
         t['score'] = round(score, 3)
     types.sort(key=lambda x: -(x.get('score') or 0))
     for i, t in enumerate(types):
         t['recommended'] = i < top_n
     return jsonify({'configured': True, 'store': store, 'per_type': per_type, 'floor': floor,
                     'count': len(types), 'recent_total': recent_total, 'recent_window_days': 45,
-                    'recent_counts': recent_counts, 'types': types, 'errors': errors[:3]})
+                    'recent_counts': recent_counts, 'live_counts': live_counts, 'types': types,
+                    'errors': errors[:3]})
 
 
 @app.route('/api/research_keywords', methods=['POST'])
