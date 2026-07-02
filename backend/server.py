@@ -3420,6 +3420,52 @@ def _seasonality(monthly):
             'peak_volume': peak[2], 'avg_volume': round(avg)}
 
 
+def _in_season_now(seasonality):
+    """Is the current month inside this keyword's push→peak window (year-wrapping)?
+    i.e. is now a good time to actually push this keyword."""
+    if not seasonality or not seasonality.get('seasonal'):
+        return False
+    try:
+        push = _SEASON_MONTHS.index(seasonality.get('push_from_month'))
+        peak = _SEASON_MONTHS.index(seasonality.get('peak_month'))
+    except (ValueError, TypeError):
+        return False
+    if not push or not peak:
+        return False
+    now = datetime.datetime.now().month
+    return (push <= now <= peak) if push <= peak else (now >= push or now <= peak)
+
+
+def _recommend_keywords(keywords, store, top_n=8):
+    """Mark the strongest keywords to actually USE in copy. Score = relative
+    search volume + a bonus for being in season right now (or trending up) + a
+    bonus for buying intent. Mutates each keyword in place, adding 'score' and
+    'recommended' (bool). Returns the same list, order unchanged. The top
+    `top_n` by score are flagged recommended (but only ones with real volume)."""
+    real = [k for k in keywords if isinstance(k, dict) and k.get('keyword') and 'error' not in k]
+    if not real:
+        return keywords
+    max_vol = max((k.get('volume') or 0) for k in real) or 1
+    for k in real:
+        vol = k.get('volume') or 0
+        score = vol / max_vol  # 0..1 volume component
+        seas = k.get('seasonality') or {}
+        if _in_season_now(seas):
+            score += 0.6                       # in the push→peak window now → prioritise
+        elif seas.get('trend') == 'rising':
+            score += 0.25                      # heading up → worth using
+        elif seas.get('seasonal') and not _in_season_now(seas):
+            score -= 0.15                       # seasonal but out of season → deprioritise a bit
+        if (k.get('intent') or '').lower() in ('transactional', 'commercial'):
+            score += 0.3                       # buyer intent
+        k['score'] = round(score, 3)
+        k['recommended'] = False
+    ranked = sorted(real, key=lambda x: -(x.get('score') or 0))
+    for k in ranked[:max(0, top_n)]:
+        k['recommended'] = True
+    return keywords
+
+
 def _dfs_clean_keywords_llm(keywords, store):
     """LLM cleanup: from a keyword list keep only ones relevant to a WOMEN'S fashion
     store (drop other brand names, menswear, kids, off-topic). Keeps the objects,
@@ -3576,9 +3622,12 @@ def api_keyword_research_niche():
     pool_ranked = sorted(sig_best.values(), key=lambda x: -(x.get('volume') or 0))[:max(target * 2, 80)]
     cleaned = pool_ranked if body.get('no_clean') else _dfs_clean_keywords_llm(pool_ranked, store)
     ranked = cleaned[:target]
+    _recommend_keywords(ranked, store, top_n=int(body.get('recommend_count') or 10))
+    rec_count = sum(1 for k in ranked if k.get('recommended'))
     return jsonify({'configured': True, 'store': store, 'min_volume': min_vol,
                     'product_type': product_type, 'seeds': seeds, 'seeds_used': len(seeds),
-                    'found': len(ranked), 'keywords': ranked, 'errors': errors[:3]})
+                    'found': len(ranked), 'recommended_count': rec_count,
+                    'keywords': ranked, 'errors': errors[:3]})
 
 
 @app.route('/api/research_keywords', methods=['POST'])
@@ -3629,7 +3678,11 @@ def api_research_keywords():
                 sig_best[sig] = kw
         pool = sorted(sig_best.values(), key=lambda x: -(x.get('volume') or 0))[:max(limit * 2, 24)]
         cleaned = _dfs_clean_keywords_llm(pool, st) if pool else pool
-        results[st] = {'seeds': st_seeds, 'min_volume': mv, 'keywords': cleaned[:limit]}
+        kws = cleaned[:limit]
+        # Recommend a focused set (≈6) — these feed the copy, so fewer is better.
+        _recommend_keywords(kws, st, top_n=int(body.get('recommend_count') or 6))
+        results[st] = {'seeds': st_seeds, 'min_volume': mv, 'keywords': kws,
+                       'recommended_count': sum(1 for k in kws if k.get('recommended'))}
     return jsonify({'configured': True, 'results': results})
 
 
