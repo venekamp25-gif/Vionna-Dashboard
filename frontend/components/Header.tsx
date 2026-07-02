@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 import { Logo } from "./Logo";
 import { StoreToggle } from "./StoreToggle";
 import { ThemeToggle } from "./ThemeToggle";
@@ -23,7 +23,44 @@ export function Header() {
   const [researchOpen, setResearchOpen] = useState(false);
   const [whatToListOpen, setWhatToListOpen] = useState(false);
   const [maintenanceOpen, setMaintenanceOpen] = useState(false);
+  const [toolsOpen, setToolsOpen] = useState(false);
   const maintenanceRunning = useCatalogJobs().some((j) => j.status === "running");
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  // Close the Tools menu on outside click or Escape.
+  useEffect(() => {
+    if (!toolsOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setToolsOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setToolsOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [toolsOpen]);
+
+  // Each entry becomes a text row in the Tools dropdown. `divider` starts a new
+  // group above the item; `running` shows a live indicator (catalogue jobs).
+  const tools: {
+    label: string;
+    desc: string;
+    action: () => void;
+    running?: boolean;
+    divider?: boolean;
+  }[] = [
+    { label: "What to list", desc: "Discover which product types to list now", action: () => setWhatToListOpen(true) },
+    { label: "Keyword research", desc: "Best keywords for a type you already picked", action: () => setResearchOpen(true) },
+    { label: "Keyword backfill", desc: "Regenerate copy for already-listed products", action: () => setBackfillOpen(true) },
+    { label: "Catalogue maintenance", desc: "Bulk fixes (bold, channels, cutlines, duplicates)", action: () => setMaintenanceOpen(true), running: maintenanceRunning },
+    { label: "Publish history", desc: "Products you recently published", action: () => setHistoryOpen(true) },
+    { label: "Report a bug", desc: "Something not working? Let us know", action: () => setBugOpen(true), divider: true },
+    { label: "Settings", desc: "API keys & preferences", action: () => setSettingsOpen(true) },
+  ];
 
   return (
     <>
@@ -32,72 +69,63 @@ export function Header() {
         <div className="flex items-center gap-3">
           <BackendStatusBadge />
           <StoreToggle />
-          <button
-            type="button"
-            onClick={() => setBugOpen(true)}
-            title="Report a bug"
-            aria-label="Report a bug"
-            className="w-9 h-9 flex items-center justify-center rounded-md bg-bg-elev-2 text-text-dim hover:text-warning hover:border-warning border border-border transition-colors text-[14px]"
-          >
-            🐛
-          </button>
-          <button
-            type="button"
-            onClick={() => setBackfillOpen(true)}
-            title="Keyword backfill — regenerate copy for already-listed products"
-            aria-label="Open keyword backfill"
-            className="w-9 h-9 flex items-center justify-center rounded-md bg-bg-elev-2 text-text-dim hover:text-accent hover:border-accent border border-border transition-colors text-[14px]"
-          >
-            🔑
-          </button>
-          <button
-            type="button"
-            onClick={() => setWhatToListOpen(true)}
-            title="What to list — discover which product types to list now (per market)"
-            aria-label="Open what to list"
-            className="w-9 h-9 flex items-center justify-center rounded-md bg-bg-elev-2 text-text-dim hover:text-accent hover:border-accent border border-border transition-colors text-[14px]"
-          >
-            💡
-          </button>
-          <button
-            type="button"
-            onClick={() => setResearchOpen(true)}
-            title="Keyword research — best keywords for a product type you already picked (with season)"
-            aria-label="Open keyword research"
-            className="w-9 h-9 flex items-center justify-center rounded-md bg-bg-elev-2 text-text-dim hover:text-accent hover:border-accent border border-border transition-colors text-[14px]"
-          >
-            📊
-          </button>
-          <button
-            type="button"
-            onClick={() => setMaintenanceOpen(true)}
-            title={maintenanceRunning ? "Catalogue maintenance — a job is running" : "Catalogue maintenance — bulk fixes (bold, channels, cutlines, duplicates)"}
-            aria-label="Open catalogue maintenance"
-            className="relative w-9 h-9 flex items-center justify-center rounded-md bg-bg-elev-2 text-text-dim hover:text-accent hover:border-accent border border-border transition-colors text-[14px]"
-          >
-            🧹
-            {maintenanceRunning && (
-              <span className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-accent border border-bg-elev animate-pulse" />
+
+          {/* Tools dropdown — text labels instead of a row of emoji buttons */}
+          <div className="relative" ref={menuRef}>
+            <button
+              type="button"
+              onClick={() => setToolsOpen((o) => !o)}
+              aria-haspopup="menu"
+              aria-expanded={toolsOpen}
+              className={[
+                "relative inline-flex items-center gap-1.5 h-9 px-3 rounded-md border text-[13px] font-medium transition-colors",
+                toolsOpen
+                  ? "border-accent text-accent bg-[var(--accent-soft)]"
+                  : "bg-bg-elev-2 border-border text-text-dim hover:text-accent hover:border-accent",
+              ].join(" ")}
+            >
+              Tools
+              <span className={`text-[9px] transition-transform ${toolsOpen ? "rotate-180" : ""}`}>▼</span>
+              {maintenanceRunning && (
+                <span className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-accent border border-bg-elev animate-pulse" />
+              )}
+            </button>
+
+            {toolsOpen && (
+              <div
+                role="menu"
+                className="absolute right-0 top-full mt-2 w-72 rounded-lg border border-border bg-bg-elev shadow-xl py-1.5 z-[60]"
+              >
+                {tools.map((t) => (
+                  <button
+                    key={t.label}
+                    role="menuitem"
+                    type="button"
+                    onClick={() => {
+                      setToolsOpen(false);
+                      t.action();
+                    }}
+                    className={[
+                      "w-full text-left px-3.5 py-2 hover:bg-bg-elev-2 transition-colors",
+                      t.divider ? "border-t border-border mt-1.5 pt-2.5" : "",
+                    ].join(" ")}
+                  >
+                    <span className="flex items-center gap-1.5 text-[13px] text-text font-medium">
+                      {t.label}
+                      {t.running && (
+                        <span className="inline-flex items-center gap-1 text-[10px] text-accent">
+                          <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
+                          running
+                        </span>
+                      )}
+                    </span>
+                    <span className="block text-[11px] text-text-faint leading-snug mt-0.5">{t.desc}</span>
+                  </button>
+                ))}
+              </div>
             )}
-          </button>
-          <button
-            type="button"
-            onClick={() => setHistoryOpen(true)}
-            title="Publish history"
-            aria-label="Open publish history"
-            className="w-9 h-9 flex items-center justify-center rounded-md bg-bg-elev-2 text-text-dim hover:text-accent hover:border-accent border border-border transition-colors text-[14px]"
-          >
-            ⌚
-          </button>
-          <button
-            type="button"
-            onClick={() => setSettingsOpen(true)}
-            title="Settings"
-            aria-label="Open settings"
-            className="w-9 h-9 flex items-center justify-center rounded-md bg-bg-elev-2 text-text-dim hover:text-accent hover:border-accent border border-border transition-colors text-[14px]"
-          >
-            ⚙
-          </button>
+          </div>
+
           <ThemeToggle />
           <LogoutButton />
         </div>
