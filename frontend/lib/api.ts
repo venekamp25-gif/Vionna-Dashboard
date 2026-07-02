@@ -488,6 +488,9 @@ export const api = {
       store?: string;
       per_type?: number;
       count?: number;
+      recent_total?: number;
+      recent_window_days?: number;
+      recent_counts?: Record<string, number>;
       types?: {
         seed: string;
         label: string;
@@ -495,6 +498,9 @@ export const api = {
         intent: string | null;
         recommended?: boolean;
         score?: number;
+        category?: string | null;
+        recent_listed?: number;
+        bucket?: "now" | "soon" | "evergreen" | "off";
         seasonality?: {
           peak_month?: string;
           trough_month?: string;

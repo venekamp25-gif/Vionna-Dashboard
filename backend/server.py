@@ -3406,6 +3406,19 @@ DFS_SEED_LABELS = {
            'sandaalit': 'Sandals', 'laukku': 'Bags', 'uimapuku': 'Swimwear', 'haalari': 'Jumpsuits'},
 }
 
+# Maps each What-to-list product-type label → the coarse `cat:<x>` category the
+# catalogue is tagged with, so "how much of this have we listed recently?" can be
+# read from recent products. Several fine types share one category (e.g. all
+# knitwear-family types map to `knitwear`).
+DFS_TYPE_CATEGORY = {
+    'Dresses': 'dress', 'Skirts': 'skirt', 'Tops': 'top', 'Blouses': 'top',
+    'Knitwear': 'knitwear', 'Cardigans': 'knitwear', 'Sweaters': 'knitwear',
+    'Blazers': 'outerwear', 'Jackets': 'outerwear', 'Coats': 'outerwear', 'Jackets & coats': 'outerwear',
+    'Trousers': 'pants', 'Jeans': 'pants', 'Shorts': 'pants',
+    'Jumpsuits': 'jumpsuit', 'Swimwear': 'swimwear',
+    'Shoes': 'shoes', 'Boots': 'shoes', 'Sandals': 'shoes', 'Bags': 'accessory',
+}
+
 _SEASON_MONTHS = ['', 'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
 
 
@@ -3452,6 +3465,58 @@ def _in_season_now(seasonality):
         return False
     now = datetime.datetime.now().month
     return (push <= now <= peak) if push <= peak else (now >= push or now <= peak)
+
+
+def _season_bucket(seasonality):
+    """'now' | 'soon' | 'evergreen' | 'off' — where a type sits in its year, from
+    today. 'now' = in the start→peak window; 'soon' = window starts within 2 months."""
+    s = seasonality or {}
+    if not s.get('seasonal') or not s.get('peak_month') or not s.get('push_from_month'):
+        return 'evergreen'
+    try:
+        push = _SEASON_MONTHS.index(s.get('push_from_month'))
+        peak = _SEASON_MONTHS.index(s.get('peak_month'))
+    except (ValueError, TypeError):
+        return 'evergreen'
+    if not push or not peak:
+        return 'evergreen'
+    now = datetime.datetime.now().month
+    in_window = (push <= now <= peak) if push <= peak else (now >= push or now <= peak)
+    if in_window:
+        return 'now'
+    return 'soon' if (((push - now) + 12) % 12) <= 2 else 'off'
+
+
+def _recent_cat_counts(store, days=45):
+    """Count recently-created products per `cat:<category>` tag for a store — the
+    'what have we listed lately' signal. Best-effort: {} if not authenticated or
+    the Shopify call fails. Returns (counts_by_category, total_products_seen)."""
+    if store not in tokens:
+        return {}, 0
+    since = (datetime.datetime.utcnow() - datetime.timedelta(days=days)).strftime('%Y-%m-%d')
+    q = ('query($q:String){ products(first:250, query:$q, sortKey:CREATED_AT, reverse:true){ '
+         'edges{ node{ tags } } } }')
+    try:
+        r = _shopify_call('post', shopify_url(store, 'graphql.json'), shopify_headers(store),
+                          json={'query': q, 'variables': {'q': f'created_at:>={since}'}}, timeout=45)
+        body = r.json() or {}
+    except Exception as e:
+        print(f"[what_to_list] recent counts failed for {store}: {e}")
+        return {}, 0
+    edges = (((body.get('data') or {}).get('products') or {}).get('edges') or [])
+    from collections import Counter
+    cnt = Counter()
+    total = 0
+    for e in edges:
+        tags = ((e.get('node') or {}).get('tags')) or []
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(',')]
+        cats = {t.split(':', 1)[1].strip().lower() for t in tags if str(t).lower().startswith('cat:') and ':' in t}
+        if cats:
+            total += 1
+            for c in cats:
+                cnt[c] += 1
+    return dict(cnt), total
 
 
 def _recommend_keywords(keywords, store, top_n=8):
@@ -3698,19 +3763,44 @@ def api_what_to_list():
             types.append({
                 'seed': seed,
                 'label': labels.get(seed, seed),
-                'keyword': labels.get(seed, seed),  # alias so _recommend_keywords can score types
                 'volume': max((k.get('volume') or 0) for k in ranked),
                 'intent': rep.get('intent'),
                 'seasonality': rep.get('seasonality'),
                 'keywords': [{'keyword': k.get('keyword'), 'volume': k.get('volume'),
                               'seasonality': k.get('seasonality'), 'intent': k.get('intent')} for k in top],
             })
-    _recommend_keywords(types, store, top_n=int(body.get('recommend_count') or 8))
-    types.sort(key=lambda x: -(x.get('score') or 0))
+
+    # Recommendation score = demand (volume) + season timing − how much of this
+    # category the store has ALREADY listed lately. Favours in/near-season types
+    # the store hasn't covered recently, so the researcher fills real gaps.
+    recent_counts, recent_total = _recent_cat_counts(store)
+    max_recent = max(recent_counts.values()) if recent_counts else 0
+    max_vol = max((t.get('volume') or 0) for t in types) if types else 1
+    top_n = int(body.get('recommend_count') or 8)
+    season_bonus = {'now': 0.6, 'soon': 0.4, 'evergreen': 0.1, 'off': -0.3}
     for t in types:
-        t.pop('keyword', None)  # drop the scoring alias; frontend uses 'label'
-    return jsonify({'configured': True, 'store': store, 'per_type': per_type,
-                    'floor': floor, 'count': len(types), 'types': types, 'errors': errors[:3]})
+        cat = DFS_TYPE_CATEGORY.get(t['label'])
+        t['category'] = cat
+        t['recent_listed'] = int(recent_counts.get(cat, 0)) if cat else 0
+        bucket = _season_bucket(t.get('seasonality'))
+        t['bucket'] = bucket
+        score = (t.get('volume') or 0) / (max_vol or 1)
+        score += season_bonus.get(bucket, 0)
+        if bucket not in ('now', 'soon') and (t.get('seasonality') or {}).get('trend') == 'rising':
+            score += 0.2
+        # recency: full bonus when nothing listed lately, ~0 for the most-listed
+        # category. Neutral nudge when we have no recency data.
+        if max_recent > 0:
+            score += 0.35 * (1 - (t['recent_listed'] / max_recent))
+        else:
+            score += 0.2
+        t['score'] = round(score, 3)
+    types.sort(key=lambda x: -(x.get('score') or 0))
+    for i, t in enumerate(types):
+        t['recommended'] = i < top_n
+    return jsonify({'configured': True, 'store': store, 'per_type': per_type, 'floor': floor,
+                    'count': len(types), 'recent_total': recent_total, 'recent_window_days': 45,
+                    'recent_counts': recent_counts, 'types': types, 'errors': errors[:3]})
 
 
 @app.route('/api/research_keywords', methods=['POST'])
