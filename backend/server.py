@@ -2935,6 +2935,52 @@ def api_list_collections():
     return jsonify({'store': store, 'count': len(cols), 'collections': cols})
 
 
+@app.route('/api/debug_sample_products')
+def api_debug_sample_products():
+    """Read-only: sample products with product_type, tags, standard category
+    (taxonomy), a description snippet, and current CATEGORY collection memberships.
+    Grounds the collection-categorisation design/backfill."""
+    store = request.args.get('store', 'dk')
+    limit = int(request.args.get('limit', 40))
+    qfilter = request.args.get('q', '')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()}.'}), 401
+    hdrs = shopify_headers(store)
+    q = ('query($q:String){ products(first:%d, query:$q){ edges{ node{ '
+         'title handle productType tags '
+         'category{ fullName } '
+         'description '
+         'collections(first:30){ edges{ node{ title handle } } } } } } }' % max(1, min(limit, 100)))
+    try:
+        r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                          json={'query': q, 'variables': {'q': qfilter}}, timeout=45)
+        body = r.json() or {}
+    except Exception as e:
+        return jsonify({'error': str(e)[:120]}), 502
+    if body.get('errors'):
+        return jsonify({'error': 'gql', 'detail': body['errors']}), 502
+    edges = (((body.get('data') or {}).get('products') or {}).get('edges') or [])
+    out = []
+    from collections import Counter
+    type_cnt = Counter(); cat_cnt = Counter()
+    for e in edges:
+        n = e['node']
+        cols = [ (c['node'].get('title') or '') for c in ((n.get('collections') or {}).get('edges') or []) ]
+        out.append({
+            'title': n.get('title'), 'handle': n.get('handle'),
+            'product_type': n.get('productType'),
+            'category': (n.get('category') or {}).get('fullName'),
+            'tags': n.get('tags') or [],
+            'desc': (n.get('description') or '')[:220],
+            'collections': cols,
+        })
+        type_cnt[n.get('productType') or '∅'] += 1
+        cat_cnt[(n.get('category') or {}).get('fullName') or '∅'] += 1
+    return jsonify({'store': store, 'n': len(out),
+                    'product_type_dist': dict(type_cnt), 'category_dist': dict(cat_cnt),
+                    'products': out})
+
+
 @app.route('/api/debug_collection_rules')
 def api_debug_collection_rules():
     """Read-only: every collection with its FULL smart-collection ruleSet
