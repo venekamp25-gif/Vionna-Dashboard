@@ -3084,31 +3084,51 @@ def api_apply_category_tags():
         return req.post(shopify_url(store, 'graphql.json'), headers=hdrs,
                         json={'query': qs, 'variables': v or {}}, timeout=25).json()
 
-    added = 0; errors = []
     by_cat = {}
+    valid = []
     for a in assigns:
         gid = a.get('id'); cat = (a.get('category') or '').strip().lower()
         if not gid or cat not in CATEGORY_TAGS:
             continue
         by_cat[cat] = by_cat.get(cat, 0) + 1
-        if dry:
-            continue
-        try:
-            r = gql('mutation($id:ID!,$t:[String!]!){tagsAdd(id:$id,tags:$t){userErrors{message}}}',
-                    {'id': gid, 't': ['cat:%s' % cat]})
-            ue = (((r.get('data') or {}).get('tagsAdd') or {}).get('userErrors') or [])
-            if ue:
-                errors.append({'id': gid, 'e': ue})
-            else:
-                added += 1
-            if replace:
-                others = ['cat:%s' % c for c in CATEGORY_TAGS if c != cat]
-                gql('mutation($id:ID!,$t:[String!]!){tagsRemove(id:$id,tags:$t){userErrors{message}}}',
-                    {'id': gid, 't': others})
-        except Exception as e:
-            errors.append({'id': gid, 'e': str(e)[:80]})
+        valid.append((gid, cat))
+    if dry:
+        return jsonify({'store': store, 'dry_run': True, 'assignments': len(assigns),
+                        'by_category': by_cat, 'added': 0, 'errors': [], 'error_count': 0})
+
+    import threading as _th
+    errors = []; added = [0]
+    lock = _th.Lock()
+
+    def _one(item):
+        gid, cat = item
+        for attempt in range(3):
+            try:
+                r = gql('mutation($id:ID!,$t:[String!]!){tagsAdd(id:$id,tags:$t){userErrors{message}}}',
+                        {'id': gid, 't': ['cat:%s' % cat]})
+                if r.get('errors') and attempt < 2:
+                    time.sleep(1.5); continue
+                ue = (((r.get('data') or {}).get('tagsAdd') or {}).get('userErrors') or [])
+                if ue:
+                    with lock: errors.append({'id': gid, 'e': ue})
+                else:
+                    with lock: added[0] += 1
+                if replace:
+                    others = ['cat:%s' % c for c in CATEGORY_TAGS if c != cat]
+                    gql('mutation($id:ID!,$t:[String!]!){tagsRemove(id:$id,tags:$t){userErrors{message}}}',
+                        {'id': gid, 't': others})
+                return
+            except Exception as e:
+                if attempt == 2:
+                    with lock: errors.append({'id': gid, 'e': str(e)[:80]})
+                else:
+                    time.sleep(1.5)
+
+    import concurrent.futures as _cf
+    with _cf.ThreadPoolExecutor(max_workers=5) as pool:
+        list(pool.map(_one, valid))
     return jsonify({'store': store, 'dry_run': dry, 'assignments': len(assigns),
-                    'by_category': by_cat, 'added': added, 'errors': errors[:20], 'error_count': len(errors)})
+                    'by_category': by_cat, 'added': added[0], 'errors': errors[:20], 'error_count': len(errors)})
 
 
 @app.route('/api/manage_category_collections', methods=['POST'])
