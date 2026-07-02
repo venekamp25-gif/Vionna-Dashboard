@@ -3588,8 +3588,9 @@ def api_research_keywords():
                 continue
             if sig not in sig_best or (kw.get('volume') or 0) > (sig_best[sig].get('volume') or 0):
                 sig_best[sig] = kw
-        ranked = sorted(sig_best.values(), key=lambda x: -(x.get('volume') or 0))[:limit]
-        results[st] = {'seeds': st_seeds, 'min_volume': mv, 'keywords': ranked}
+        pool = sorted(sig_best.values(), key=lambda x: -(x.get('volume') or 0))[:max(limit * 2, 24)]
+        cleaned = _dfs_clean_keywords_llm(pool, st) if pool else pool
+        results[st] = {'seeds': st_seeds, 'min_volume': mv, 'keywords': cleaned[:limit]}
     return jsonify({'configured': True, 'results': results})
 
 
