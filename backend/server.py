@@ -3160,9 +3160,8 @@ def api_manage_category_collections():
 
     report = []
 
-    # 1. the 6 smart category collections → single clean tag rule
-    for handle, cat in [('kjoler', 'dress'), ('trojer-cardigans', 'knitwear'), ('toppe', 'top'),
-                        ('underdele', 'skirt'), ('bukser', 'pants'), ('smykker-tilbehor', 'accessory')]:
+    # 1. the 6 smart category collections → single clean tag rule (per-store handles)
+    for cat, handle in CAT_COLLECTION_HANDLES.get(store, CAT_COLLECTION_HANDLES['dk']).items():
         node = by_handle(handle)
         if not node:
             report.append({'handle': handle, 'cat': cat, 'status': 'MISSING'})
