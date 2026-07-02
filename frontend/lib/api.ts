@@ -422,12 +422,23 @@ export const api = {
           "dk" | "fr" | "fi",
           {
             seeds: string[];
+            min_volume?: number;
+            recommended_count?: number;
             keywords: {
               keyword: string;
               volume: number | null;
               cpc: number | null;
               competition: string | null;
               intent: string | null;
+              recommended?: boolean;
+              score?: number;
+              seasonality?: {
+                peak_month?: string;
+                trough_month?: string;
+                push_from_month?: string;
+                trend?: string;
+                seasonal?: boolean;
+              } | null;
             }[];
           }
         >
@@ -449,6 +460,7 @@ export const api = {
       seeds?: string[];
       min_volume?: number;
       found?: number;
+      recommended_count?: number;
       keywords?: {
         keyword: string;
         volume: number | null;
@@ -456,6 +468,8 @@ export const api = {
         competition: string | null;
         intent: string | null;
         seed?: string;
+        recommended?: boolean;
+        score?: number;
         seasonality: {
           peak_month?: string;
           trough_month?: string;

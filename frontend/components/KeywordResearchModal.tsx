@@ -96,10 +96,17 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
         })
       );
       const res: Partial<Record<StoreKey, StoreResult>> = {};
+      const initSel: Record<string, boolean> = {};
       entries.forEach(([s, v]) => {
         res[s] = v;
+        // Pre-tick the recommended keywords so "Copy selected" gives the
+        // suggested set out of the box (the worker can still adjust).
+        (v.keywords ?? []).forEach((k) => {
+          if (k.recommended) initSel[`${s}:${k.keyword}`] = true;
+        });
       });
       setResults(res);
+      setSelected(initSel);
       setViewStore(selectedStores[0]);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Research failed");
@@ -325,6 +332,11 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
                                   />
                                 </td>
                                 <td className={`py-2 pr-3 ${hot ? "text-green-600 dark:text-green-400 font-medium" : "text-text"}`}>
+                                  {k.recommended && (
+                                    <span className="mr-1 text-amber-500" title="Recommended to use">
+                                      ★
+                                    </span>
+                                  )}
                                   {k.keyword}
                                   {hot && <span className="ml-1.5 text-[10px] text-green-600 dark:text-green-400">● in season</span>}
                                 </td>
@@ -366,7 +378,9 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
                           })}
                         </tbody>
                       </table>
-                      <p className="text-[11px] text-text-faint mt-3">
+                      <p className="text-[11px] text-text-faint mt-3 leading-relaxed">
+                        <span className="text-amber-500">★</span> = recommended to use (best mix of volume,
+                        buying intent and timing — pre-ticked for you).{" "}
                         <span className="text-green-600 dark:text-green-400">● green</span> = above your volume
                         threshold AND currently in season (push→peak window — good time to push now). “push” =
                         start ~5–6 weeks before the peak.

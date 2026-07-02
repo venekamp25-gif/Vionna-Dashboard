@@ -9,6 +9,7 @@ import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
 import { api, ScrapedProduct } from "@/lib/api";
 import { notify } from "@/lib/notifications";
 import { ManualPasteModal } from "./ManualPasteModal";
+import { KeywordReviewModal, ReviewKw } from "./KeywordReviewModal";
 import {
   extractColors,
   extractVariantsByColor,
@@ -22,13 +23,30 @@ import { randomName } from "@/lib/names";
 import { autoSiblingsHandle } from "@/lib/slug";
 import { loadToneReferences } from "@/lib/toneReference";
 
-type Stage = "scraping" | "names" | "generating" | "done";
+type Stage = "scraping" | "names" | "researching" | "review" | "generating" | "done";
 
 const STAGE_LABELS: Record<Stage, { main: string; sub: string; pct: number }> = {
-  scraping:   { main: "Fetching competitor product…",       sub: "Scraping product details",                          pct: 20 },
-  names:      { main: "Generating product name…",           sub: "Checking uniqueness against Shopify catalogue",     pct: 40 },
-  generating: { main: "Generating content via Claude…",     sub: "Style: calm, practical, comfort-oriented",          pct: 80 },
-  done:       { main: "Preparing review…",                  sub: "Almost there",                                      pct: 100 },
+  scraping:    { main: "Fetching competitor product…",       sub: "Scraping product details",                          pct: 20 },
+  names:       { main: "Generating product name…",           sub: "Checking uniqueness against Shopify catalogue",     pct: 40 },
+  researching: { main: "Researching keywords…",              sub: "Finding high-volume keywords per market",           pct: 55 },
+  review:      { main: "Waiting for keyword review…",        sub: "Confirm the keywords to continue",                  pct: 60 },
+  generating:  { main: "Generating content via Claude…",     sub: "Style: calm, practical, comfort-oriented",          pct: 85 },
+  done:        { main: "Preparing review…",                  sub: "Almost there",                                      pct: 100 },
+};
+
+/** Everything computed before the keyword-review gate, carried across to the
+ *  generation phase once the worker confirms the keywords. */
+type PendingCtx = {
+  product: NonNullable<ScrapedProduct["product"]>;
+  selectedStores: StoreKey[];
+  primary: StoreKey;
+  chosenName: string;
+  canonicalColors: string[];
+  productType: string;
+  competitor: { title: string; hostname: string; variants: number; price: string };
+  images: { url: string; selected: boolean; variantIds: number[] }[];
+  variantsByColor: ReturnType<typeof extractVariantsByColor>;
+  imagesByColor: ReturnType<typeof groupImagesByColor>;
 };
 
 /** Title-case a colour string for use as a canonical key. */
@@ -50,15 +68,22 @@ export function GenerateStep() {
   const [subStage, setSubStage] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [manualPasteOpen, setManualPasteOpen] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [pending, setPending] = useState<PendingCtx | null>(null);
+  const [reviewByStore, setReviewByStore] = useState<Partial<Record<StoreKey, ReviewKw[]>>>({});
   const started = useRef(false);
 
   /**
-   * Process a scraped (or manually-pasted) product through Generate. Extracted
-   * so the manual-paste fallback can call into the same flow as the automatic
-   * scrape — once the product is in hand the rest of Generate is identical.
+   * PHASE 1 — scrape → name → keyword research, then STOP at the keyword-review
+   * gate. Nothing is generated yet: the worker confirms the (recommended)
+   * keywords in a popup first, then {@link finishGeneration} writes the copy.
+   * When DataForSEO is dormant (configured:false) there's nothing to review, so
+   * we skip straight to generation with the manual/legacy keywords (today's
+   * behaviour). Shared by the auto-scrape and the manual-paste fallback.
    */
-  const processProduct = async (product: NonNullable<ScrapedProduct["product"]>) => {
+  const prepareProduct = async (product: NonNullable<ScrapedProduct["product"]>) => {
     setError(null);
+    setReviewOpen(false);
     setStage("scraping");
     try {
       const selectedStores = data.selectedStores.length
@@ -66,193 +91,122 @@ export function GenerateStep() {
         : (["dk"] as StoreKey[]);
       const primary = selectedStores[0];
 
-        const competitor = {
-          title: product?.title ?? "Unknown product",
-          hostname: safeHostname(data.competitorUrl),
-          variants: product?.variants?.length ?? 0,
-          price: product?.variants?.[0]?.price ? `€${product.variants[0].price}` : "—",
-        };
-        const productType = guessProductType(product);
-        const rawColors = extractColors(product);
-        const canonicalColors = rawColors.map(canonicalize);
+      const competitor = {
+        title: product?.title ?? "Unknown product",
+        hostname: safeHostname(data.competitorUrl),
+        variants: product?.variants?.length ?? 0,
+        price: product?.variants?.[0]?.price ? `€${product.variants[0].price}` : "—",
+      };
+      const productType = guessProductType(product);
+      const canonicalColors = extractColors(product).map(canonicalize);
 
-        // ImagesCard "From competitor" shows just 8 thumbnails — enough for the
-        // user to pick a reference for steps 1-4. Nothing is pre-selected.
-        const images = (product?.images ?? [])
-          .slice(0, 8)
-          .map((img) => ({
-            url: normalizeImageUrl(img.src),
-            selected: false,
-            variantIds: img.variant_ids ?? [],
-          }));
+      // ImagesCard "From competitor" shows just 8 thumbnails — enough for the
+      // user to pick a reference for steps 1-4. Nothing is pre-selected.
+      const images = (product?.images ?? [])
+        .slice(0, 8)
+        .map((img) => ({
+          url: normalizeImageUrl(img.src),
+          selected: false,
+          variantIds: img.variant_ids ?? [],
+        }));
 
-        const variantsByColor = extractVariantsByColor(product, canonicalColors);
-        // Compute per-colour image groups from the FULL scraped image set so the
-        // ColorRefPicker has every back/detail shot — not just the cap-of-8.
-        const imagesByColor = groupImagesByColor(product, canonicalColors);
+      const variantsByColor = extractVariantsByColor(product, canonicalColors);
+      // Compute per-colour image groups from the FULL scraped image set so the
+      // ColorRefPicker has every back/detail shot — not just the cap-of-8.
+      const imagesByColor = groupImagesByColor(product, canonicalColors);
 
-        // ── 2. Pick unique product name (checked against ALL selected stores) ──
-        // Multi-store products must have a name that's free in EVERY catalogue we'll
-        // publish to — otherwise the user has to rename after the fact.
-        setStage("names");
-        const usedFromShopify = new Set<string>();
-        await Promise.all(
-          selectedStores.map(async (s) => {
-            try {
-              const r = await api.names(s);
-              (r.names ?? []).forEach((n) => usedFromShopify.add(n.toLowerCase()));
-            } catch {
-              // non-fatal for that one store
-            }
-          })
-        );
-        const chosenName = randomName(Array.from(usedFromShopify));
-
-        // ── 3. Generate content for EACH selected store ──
-        setStage("generating");
-        const contentByStore: Record<StoreKey, StoreContent> = {
-          ...data.contentByStore,
-        };
-
-        const defaultPriceByStore: Record<StoreKey, string> = {
-          dk: "349,00 DKK",
-          fr: "49,00 EUR",
-          fi: "49,00 EUR",
-        };
-
-        const toneRefs = loadToneReferences();
-
-        // ── Auto keyword research (DataForSEO) ──
-        // Derive per-market keywords from the product so the worker no longer
-        // researches by hand. Only fills stores where NO manual keywords were
-        // typed (manual always wins). Dormant (configured:false) until the server
-        // has DataForSEO credentials → this is a safe no-op that keeps today's
-        // behaviour (empty/legacy keywords).
-        const researchedByStore: Partial<Record<StoreKey, string[]>> = {};
-        try {
-          setSubStage("keyword research");
-          const kr = await api.researchKeywords({
-            stores: selectedStores,
-            product_name: chosenName,
-            competitor_title: product?.title ?? "",
-          });
-          if (kr.configured && kr.results) {
-            const kwByStore = { ...data.keywordsByStore };
-            const parsedByStore = { ...data.parsedKeywordsByStore };
-            for (const st of selectedStores) {
-              const kws = (kr.results[st]?.keywords ?? [])
-                .map((k) => k.keyword)
-                .filter((k): k is string => Boolean(k));
-              const manual = data.parsedKeywordsByStore?.[st] ?? [];
-              if (kws.length > 0 && manual.length === 0) {
-                researchedByStore[st] = kws;
-                kwByStore[st] = kws.join("\n");
-                parsedByStore[st] = kws;
-              }
-            }
-            patch({ keywordsByStore: kwByStore, parsedKeywordsByStore: parsedByStore });
+      // ── 2. Pick unique product name (checked against ALL selected stores) ──
+      setStage("names");
+      const usedFromShopify = new Set<string>();
+      await Promise.all(
+        selectedStores.map(async (s) => {
+          try {
+            const r = await api.names(s);
+            (r.names ?? []).forEach((n) => usedFromShopify.add(n.toLowerCase()));
+          } catch {
+            // non-fatal for that one store
           }
-        } catch {
-          /* dormant / network error → keep manual/legacy keywords */
-        }
+        })
+      );
+      const chosenName = randomName(Array.from(usedFromShopify));
 
-        for (const store of selectedStores) {
-          setSubStage(`${STORE_CONFIG[store].language} — ${STORE_CONFIG[store].label}`);
-          // Each store ships its OWN keyword list (parsed at Input). The Danish
-          // copy should never be seeded by French SEO research and vice versa.
-          // Priority: manual keywords → auto-researched → legacy flat list.
-          const perStore = data.parsedKeywordsByStore?.[store] ?? [];
-          const auto = researchedByStore[store] ?? [];
-          const storeKeywords =
-            perStore.length > 0 ? perStore : auto.length > 0 ? auto : data.parsedKeywords;
-          const gen = await api.generate({
-            store,
-            product_name: chosenName,
-            product_title: product?.title ?? "",
-            keywords: storeKeywords,
-            tone_references: toneRefs[store],
-          });
-          if (gen.error) throw new Error(`${store.toUpperCase()}: ${gen.error}`);
+      const ctx: PendingCtx = {
+        product,
+        selectedStores,
+        primary,
+        chosenName,
+        canonicalColors,
+        productType,
+        competitor,
+        images,
+        variantsByColor,
+        imagesByColor,
+      };
 
-          // Localise the colour names into this store's language via a dedicated,
-          // reliable call (robust for ANY source language — e.g. a French
-          // competitor's "Marron Café" / "Bleu Ciel"). Falls back to the static
-          // table → canonical if the call fails or returns a short list, so a
-          // colour is never garbled or dropped.
-          let translated: string[] | null = null;
-          if (canonicalColors.length > 0) {
-            try {
-              const tr = await api.translateColors({ store, colors: canonicalColors });
-              if (Array.isArray(tr.colors) && tr.colors.length === canonicalColors.length) {
-                translated = tr.colors;
-              }
-            } catch {
-              /* fall back below */
-            }
-          }
-          const colorLabels: Record<string, string> = {};
-          canonicalColors.forEach((canonical, i) => {
-            const t = translated?.[i]?.trim();
-            colorLabels[canonical] = t || translateColor(canonical, store);
-          });
-          const cutline = canonicalColors
-            .map((c) => colorLabels[c])
-            .join(", ");
-
-          // Preserve any existing price the user may have already set for this store;
-          // otherwise default to the currency-appropriate value.
-          const existingPrice = data.contentByStore[store]?.price;
-          contentByStore[store] = {
-            description: gen.description ?? "",
-            metaDescription: gen.meta_description ?? "",
-            mTitleSpecs: gen.m_title_specs ?? "",
-            cutline,
-            price: existingPrice || defaultPriceByStore[store],
-            colorLabels,
-          };
-        }
-
-        // ── 4. Done — patch everything ──
-        setStage("done");
-        setSubStage("");
-        const primaryContent = contentByStore[primary];
-        const primaryColors = canonicalColors.map(
-          (c) => primaryContent.colorLabels[c] ?? c
-        );
-
-        // Make global useStore.store track the primary store so name validation etc. work
-        setStore(primary);
-
-        patch({
-          competitor,
-          name: chosenName,
-          canonicalColors,
-          colors: primaryColors,
-          siblingsHandle: autoSiblingsHandle(chosenName),
-          productType,
-          competitorImages: images,
-          competitorVariantsByColor: variantsByColor,
-          competitorImagesByColor: imagesByColor,
-          contentByStore,
-          activeViewStore: primary,
-          // Active-view mirrors
-          description: primaryContent.description,
-          metaDescription: primaryContent.metaDescription,
-          mTitleSpecs: primaryContent.mTitleSpecs,
-          cutline: primaryContent.cutline,
-          price: primaryContent.price,
+      // ── 3. Keyword research (DataForSEO) ── build the review candidates.
+      setStage("researching");
+      let configured = false;
+      const research: Partial<Record<StoreKey, ReviewKw[]>> = {};
+      try {
+        const kr = await api.researchKeywords({
+          stores: selectedStores,
+          product_name: chosenName,
+          competitor_title: product?.title ?? "",
         });
+        if (kr.configured && kr.results) {
+          configured = true;
+          for (const st of selectedStores) {
+            research[st] = (kr.results[st]?.keywords ?? [])
+              .filter((k) => k.keyword)
+              .map((k) => ({
+                keyword: k.keyword,
+                volume: k.volume ?? null,
+                intent: k.intent ?? null,
+                recommended: !!k.recommended,
+                source: "research" as const,
+                seasonality: k.seasonality ?? null,
+              }));
+          }
+        }
+      } catch {
+        /* dormant / network error → generate with manual/legacy keywords */
+      }
 
-        // brief pause so user sees "Preparing review…"
-        notify(
-          `${chosenName} ready for review`,
-          `Scraped + ${selectedStores.length === 1 ? "1 language" : `${selectedStores.length} languages`} generated.`,
-          "generate-done"
-        );
-        // Force-flush so a crash between Generate and Review never costs the
-        // scraped data + Claude-generated copy.
-        setTimeout(() => flushDraft(), 0);
-        setTimeout(() => setStep(3), 500);
+      if (!configured) {
+        // DataForSEO off → nothing to review, keep today's behaviour.
+        await finishGeneration(ctx, null);
+        return;
+      }
+
+      // Merge the worker's manual keywords (pre-ticked) with the researched ones.
+      const byStore: Partial<Record<StoreKey, ReviewKw[]>> = {};
+      for (const st of selectedStores) {
+        const manual =
+          (data.parsedKeywordsByStore?.[st]?.length
+            ? data.parsedKeywordsByStore[st]
+            : data.parsedKeywords) ?? [];
+        const seen = new Set<string>();
+        const list: ReviewKw[] = [];
+        manual.forEach((kw) => {
+          const k = (kw || "").trim();
+          const low = k.toLowerCase();
+          if (!k || seen.has(low)) return;
+          seen.add(low);
+          list.push({ keyword: k, volume: null, intent: null, recommended: false, source: "manual", seasonality: null });
+        });
+        (research[st] ?? []).forEach((k) => {
+          const low = k.keyword.toLowerCase();
+          if (seen.has(low)) return;
+          seen.add(low);
+          list.push(k);
+        });
+        byStore[st] = list;
+      }
+
+      setPending(ctx);
+      setReviewByStore(byStore);
+      setStage("review");
+      setReviewOpen(true);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
@@ -260,7 +214,151 @@ export function GenerateStep() {
     }
   };
 
-  // Initial fire: scrape the competitor URL and feed it through processProduct.
+  /**
+   * PHASE 2 — generate the copy for each store using the confirmed keywords, then
+   * patch everything and advance to Review. `selectedByStore` is the worker's
+   * approved keyword set per store (null when the review gate was skipped, e.g.
+   * DataForSEO dormant → fall back to manual/legacy keywords).
+   */
+  const finishGeneration = async (
+    ctx: PendingCtx,
+    selectedByStore: Partial<Record<StoreKey, string[]>> | null
+  ) => {
+    const {
+      product,
+      selectedStores,
+      primary,
+      chosenName,
+      canonicalColors,
+      productType,
+      competitor,
+      images,
+      variantsByColor,
+      imagesByColor,
+    } = ctx;
+    try {
+      setReviewOpen(false);
+      setStage("generating");
+      const contentByStore: Record<StoreKey, StoreContent> = { ...data.contentByStore };
+      const defaultPriceByStore: Record<StoreKey, string> = {
+        dk: "349,00 DKK",
+        fr: "49,00 EUR",
+        fi: "49,00 EUR",
+      };
+      const toneRefs = loadToneReferences();
+
+      // Persist the approved keywords into the per-store boxes so the Review step
+      // shows exactly what the copy was built from (and survives a reload).
+      if (selectedByStore) {
+        const kwByStore = { ...data.keywordsByStore };
+        const parsedByStore = { ...data.parsedKeywordsByStore };
+        for (const st of selectedStores) {
+          const kws = selectedByStore[st] ?? [];
+          kwByStore[st] = kws.join("\n");
+          parsedByStore[st] = kws;
+        }
+        patch({ keywordsByStore: kwByStore, parsedKeywordsByStore: parsedByStore });
+      }
+
+      for (const store of selectedStores) {
+        setSubStage(`${STORE_CONFIG[store].language} — ${STORE_CONFIG[store].label}`);
+        // Priority: approved keywords (from the review popup) → manual → legacy.
+        const confirmed = selectedByStore?.[store];
+        const storeKeywords =
+          confirmed !== undefined
+            ? confirmed
+            : (data.parsedKeywordsByStore?.[store]?.length ?? 0) > 0
+              ? data.parsedKeywordsByStore![store]
+              : data.parsedKeywords;
+        const gen = await api.generate({
+          store,
+          product_name: chosenName,
+          product_title: product?.title ?? "",
+          keywords: storeKeywords,
+          tone_references: toneRefs[store],
+        });
+        if (gen.error) throw new Error(`${store.toUpperCase()}: ${gen.error}`);
+
+        // Localise the colour names into this store's language via a dedicated,
+        // reliable call (robust for ANY source language). Falls back to the
+        // static table → canonical if the call fails or returns a short list.
+        let translated: string[] | null = null;
+        if (canonicalColors.length > 0) {
+          try {
+            const tr = await api.translateColors({ store, colors: canonicalColors });
+            if (Array.isArray(tr.colors) && tr.colors.length === canonicalColors.length) {
+              translated = tr.colors;
+            }
+          } catch {
+            /* fall back below */
+          }
+        }
+        const colorLabels: Record<string, string> = {};
+        canonicalColors.forEach((canonical, i) => {
+          const t = translated?.[i]?.trim();
+          colorLabels[canonical] = t || translateColor(canonical, store);
+        });
+        const cutline = canonicalColors.map((c) => colorLabels[c]).join(", ");
+
+        // Preserve any existing price the user may have already set for this store;
+        // otherwise default to the currency-appropriate value.
+        const existingPrice = data.contentByStore[store]?.price;
+        contentByStore[store] = {
+          description: gen.description ?? "",
+          metaDescription: gen.meta_description ?? "",
+          mTitleSpecs: gen.m_title_specs ?? "",
+          cutline,
+          price: existingPrice || defaultPriceByStore[store],
+          colorLabels,
+        };
+      }
+
+      // ── 4. Done — patch everything ──
+      setStage("done");
+      setSubStage("");
+      const primaryContent = contentByStore[primary];
+      const primaryColors = canonicalColors.map((c) => primaryContent.colorLabels[c] ?? c);
+
+      // Make global useStore.store track the primary store so name validation etc. work
+      setStore(primary);
+
+      patch({
+        competitor,
+        name: chosenName,
+        canonicalColors,
+        colors: primaryColors,
+        siblingsHandle: autoSiblingsHandle(chosenName),
+        productType,
+        competitorImages: images,
+        competitorVariantsByColor: variantsByColor,
+        competitorImagesByColor: imagesByColor,
+        contentByStore,
+        activeViewStore: primary,
+        // Active-view mirrors
+        description: primaryContent.description,
+        metaDescription: primaryContent.metaDescription,
+        mTitleSpecs: primaryContent.mTitleSpecs,
+        cutline: primaryContent.cutline,
+        price: primaryContent.price,
+      });
+
+      notify(
+        `${chosenName} ready for review`,
+        `Scraped + ${selectedStores.length === 1 ? "1 language" : `${selectedStores.length} languages`} generated.`,
+        "generate-done"
+      );
+      // Force-flush so a crash between Generate and Review never costs the
+      // scraped data + Claude-generated copy.
+      setTimeout(() => flushDraft(), 0);
+      setTimeout(() => setStep(3), 500);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      started.current = false; // allow retry
+    }
+  };
+
+  // Initial fire: scrape the competitor URL and feed it through prepareProduct.
   useEffect(() => {
     if (started.current) return;
     started.current = true;
@@ -268,10 +366,11 @@ export function GenerateStep() {
       try {
         const scraped = await api.scrape(data.competitorUrl);
         if (scraped.error || !scraped.product) throw new Error(scraped.error || "Scrape failed");
-        await processProduct(scraped.product);
         // Carry the competitor's size chart through to publish (appended, localised,
-        // to the description). null when the competitor page had no usable table.
+        // to the description). Patch it BEFORE prepareProduct so it survives the
+        // keyword-review pause. null when the page had no usable table.
         patch({ sizeChart: scraped.size_chart ?? null });
+        await prepareProduct(scraped.product);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         setError(msg);
@@ -363,41 +462,72 @@ export function GenerateStep() {
           onSuccess={(product) => {
             setManualPasteOpen(false);
             // Re-run the flow with the manually-pasted product
-            void processProduct(product);
+            void prepareProduct(product);
           }}
         />
       </>
     );
   }
 
+  const inReview = stage === "review";
+
   return (
-    <div className="max-w-xl mx-auto">
-      <div className="bg-bg-elev border border-border rounded-2xl px-8 py-16 flex flex-col items-center gap-6 text-center shadow-md">
-        <Spinner size={48} />
-        <div className="flex flex-col gap-2 min-h-[58px]">
-          <p className="text-sm font-medium text-text">{currentLabel.main}</p>
-          <p className="text-xs text-text-faint">
-            {stage === "generating" && subStage ? subStage : currentLabel.sub}
-          </p>
-        </div>
-        <div className="w-full max-w-xs mt-2">
-          <div className="h-1 rounded-full bg-bg-elev-2 overflow-hidden">
-            <div
-              className="h-full bg-accent transition-all duration-700 ease-out"
-              style={{ width: `${currentLabel.pct}%` }}
-            />
+    <>
+      <div className="max-w-xl mx-auto">
+        <div className="bg-bg-elev border border-border rounded-2xl px-8 py-16 flex flex-col items-center gap-6 text-center shadow-md">
+          {inReview ? (
+            <div className="w-12 h-12 rounded-full bg-[var(--accent-soft)] text-accent text-2xl flex items-center justify-center">
+              🔑
+            </div>
+          ) : (
+            <Spinner size={48} />
+          )}
+          <div className="flex flex-col gap-2 min-h-[58px]">
+            <p className="text-sm font-medium text-text">{currentLabel.main}</p>
+            <p className="text-xs text-text-faint">
+              {stage === "generating" && subStage ? subStage : currentLabel.sub}
+            </p>
           </div>
-        </div>
-        {data.selectedStores.length > 1 && (
-          <div className="text-[11px] text-text-faint">
-            Generating {data.selectedStores.length} languages:{" "}
-            {data.selectedStores.map((s) => STORE_CONFIG[s].label).join(" · ")}
+          <div className="w-full max-w-xs mt-2">
+            <div className="h-1 rounded-full bg-bg-elev-2 overflow-hidden">
+              <div
+                className="h-full bg-accent transition-all duration-700 ease-out"
+                style={{ width: `${currentLabel.pct}%` }}
+              />
+            </div>
           </div>
-        )}
-        <Button variant="ghost" size="sm" onClick={() => setStep(1)}>
-          ✕ Cancel
-        </Button>
+          {data.selectedStores.length > 1 && !inReview && (
+            <div className="text-[11px] text-text-faint">
+              Generating {data.selectedStores.length} languages:{" "}
+              {data.selectedStores.map((s) => STORE_CONFIG[s].label).join(" · ")}
+            </div>
+          )}
+          {inReview ? (
+            <Button variant="secondary" size="sm" onClick={() => setReviewOpen(true)}>
+              Review keywords
+            </Button>
+          ) : (
+            <Button variant="ghost" size="sm" onClick={() => setStep(1)}>
+              ✕ Cancel
+            </Button>
+          )}
+        </div>
       </div>
-    </div>
+
+      <KeywordReviewModal
+        open={reviewOpen && !!pending}
+        stores={pending?.selectedStores ?? []}
+        byStore={reviewByStore}
+        productName={pending?.chosenName ?? ""}
+        onCancel={() => {
+          setReviewOpen(false);
+          started.current = false;
+          setStep(1);
+        }}
+        onConfirm={(selectedByStore) => {
+          if (pending) void finishGeneration(pending, selectedByStore);
+        }}
+      />
+    </>
   );
 }
