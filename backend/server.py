@@ -5589,10 +5589,23 @@ def theme_export():
     hdrs = shopify_headers(store)
     tr = req.get(shopify_url(store, 'themes.json'), headers=hdrs, timeout=20)
     themes = (tr.json() or {}).get('themes', []) if tr.status_code == 200 else []
-    main = next((t for t in themes if t.get('role') == 'main'), None)
+    want_id = request.args.get('theme_id')
+    if want_id:
+        main = next((t for t in themes if str(t.get('id')) == str(want_id)), None)
+    else:
+        main = next((t for t in themes if t.get('role') == 'main'), None)
     if not main:
-        return jsonify({'error': 'no main (published) theme found'}), 404
+        return jsonify({'error': 'no matching theme found', 'themes_status': tr.status_code,
+                        'roles': [t.get('role') for t in themes]}), 404
     tid = main['id']
+    # Fast path: read a single asset if ?path= is given (no full export).
+    one = request.args.get('path')
+    if one:
+        r = req.get(shopify_url(store, f'themes/{tid}/assets.json'), headers=hdrs,
+                    params={'asset[key]': one}, timeout=25)
+        a = (r.json() or {}).get('asset', {}) if r.status_code == 200 else {}
+        return jsonify({'theme_id': tid, 'theme_name': main.get('name'), 'status': r.status_code,
+                        'key': one, 'value': a.get('value'), 'attachment': a.get('attachment')})
     ar = req.get(shopify_url(store, f'themes/{tid}/assets.json'), headers=hdrs, timeout=30)
     keys = [a['key'] for a in (ar.json() or {}).get('assets', [])] if ar.status_code == 200 else []
 
