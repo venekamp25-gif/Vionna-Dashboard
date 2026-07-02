@@ -2123,6 +2123,32 @@ def backfill_size_charts():
     return jsonify({'dry_run': dry, 'products': len(products), 'writes': writes, 'report': report})
 
 
+@app.route('/api/theme_put_asset', methods=['POST'])
+def theme_put_asset():
+    """Debug: PUT a theme asset via Admin Asset API (forces recompile of JSON
+    templates that GitHub sync leaves stale). Body: {store, path, value}."""
+    body = request.get_json(silent=True) or {}
+    store = body.get('store', 'dk')
+    path = body.get('path', '')
+    value = body.get('value', '')
+    if store not in tokens:
+        return jsonify({'error': 'not authed'}), 401
+    hdrs = shopify_headers(store)
+    tr = req.get(shopify_url(store, 'themes.json'), headers=hdrs, timeout=20)
+    themes = (tr.json() or {}).get('themes', []) if tr.status_code == 200 else []
+    main = next((t for t in themes if t.get('role') == 'main'), None)
+    if not main:
+        return jsonify({'error': 'no main theme', 'roles': [t.get('role') for t in themes]}), 404
+    tid = main['id']
+    try:
+        r = req.put(shopify_url(store, f'themes/{tid}/assets.json'), headers=hdrs,
+                    json={'asset': {'key': path, 'value': value}}, timeout=30)
+        return jsonify({'theme_id': tid, 'status': r.status_code,
+                        'body': (r.json() if r.headers.get('content-type', '').startswith('application/json') else r.text[:300])})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/touch_product')
 def touch_product():
     """Debug: bump a product's updatedAt (productUpdate title->itself) to purge the
