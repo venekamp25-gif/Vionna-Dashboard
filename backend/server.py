@@ -3079,6 +3079,130 @@ def _category_for_publish(data, title):
     return _classify_category(title, raw)[0]
 
 
+# ============================================================================
+# DataForSEO keyword research (auto per-market keyword ideas at import time)
+# ----------------------------------------------------------------------------
+DFS_LOCATION = {'dk': 2208, 'fr': 2250, 'fi': 2246}   # Google location codes: Denmark/France/Finland
+DFS_LANGUAGE = {'dk': 'da', 'fr': 'fr', 'fi': 'fi'}
+DFS_LANG_NAME = {'dk': 'Danish', 'fr': 'French', 'fi': 'Finnish'}
+DFS_ENDPOINT = 'https://api.dataforseo.com/v3/dataforseo_labs/google/keyword_ideas/live'
+
+
+def _dfs_creds():
+    return os.getenv('DATAFORSEO_LOGIN', '').strip(), os.getenv('DATAFORSEO_PASSWORD', '').strip()
+
+
+def _dfs_configured():
+    lo, pw = _dfs_creds()
+    return bool(lo and pw)
+
+
+def _dfs_headers():
+    import base64
+    lo, pw = _dfs_creds()
+    tok = base64.b64encode(f"{lo}:{pw}".encode()).decode()
+    return {'Authorization': 'Basic ' + tok, 'Content-Type': 'application/json'}
+
+
+def _derive_seeds_llm(competitor_title, product_name, category, description):
+    """Claude → 2-3 local-language search seed phrases per store from the product.
+    Returns {'dk':[...], 'fr':[...], 'fi':[...]}. Falls back to {} on failure."""
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        return {}
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        prompt = (
+            "You are a fashion e-commerce SEO researcher. For the product below, output the SEARCH SEED "
+            "phrases a shopper would type into Google, in the LOCAL language of each market. Focus on the "
+            "garment type + at most one key attribute (colour/style/length). 2-3 short seeds per market.\n"
+            "Return ONLY compact JSON: {\"dk\":[..],\"fr\":[..],\"fi\":[..]} (dk=Danish, fr=French, fi=Finnish).\n\n"
+            f"Product name: {product_name}\nCompetitor title: {competitor_title}\n"
+            f"Category: {category}\nDescription: {(description or '')[:500]}\n"
+        )
+        msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=200,
+                                     messages=[{'role': 'user', 'content': prompt}])
+        txt = (msg.content[0].text if msg.content else '') or ''
+        m = re.search(r'\{.*\}', txt, re.S)
+        data = json.loads(m.group(0)) if m else {}
+        out = {}
+        for st in ('dk', 'fr', 'fi'):
+            v = data.get(st) or []
+            out[st] = [str(s).strip() for s in v if str(s).strip()][:3]
+        return out
+    except Exception as e:
+        print(f"[keywords] seed derivation failed: {e}")
+        return {}
+
+
+def _dfs_keyword_ideas(seeds, store, min_volume=30, limit=12):
+    """DataForSEO Labs keyword_ideas for one market. Returns [{keyword, volume,
+    cpc, competition, intent}] sorted by volume desc, ≥min_volume. Never raises."""
+    if not seeds or store not in DFS_LOCATION:
+        return []
+    payload = [{
+        'keywords': seeds[:20],
+        'location_code': DFS_LOCATION[store],
+        'language_code': DFS_LANGUAGE[store],
+        'limit': max(limit * 4, 60),
+        'filters': [['keyword_info.search_volume', '>', int(min_volume)]],
+        'order_by': ['keyword_info.search_volume,desc'],
+    }]
+    try:
+        r = req.post(DFS_ENDPOINT, headers=_dfs_headers(), json=payload, timeout=30)
+        d = r.json()
+    except Exception as e:
+        return [{'error': str(e)[:100]}]
+    task = (d.get('tasks') or [{}])[0]
+    if task.get('status_code') not in (20000, None) and not task.get('result'):
+        return [{'error': task.get('status_message', 'dfs error'), 'code': task.get('status_code')}]
+    res = (task.get('result') or [{}])[0] or {}
+    items = res.get('items') or []
+    out = []
+    for it in items:
+        ki = it.get('keyword_info') or {}
+        out.append({
+            'keyword': it.get('keyword'),
+            'volume': ki.get('search_volume'),
+            'cpc': ki.get('cpc'),
+            'competition': ki.get('competition_level'),
+            'intent': ((it.get('search_intent_info') or {}) or {}).get('main_intent'),
+        })
+    return out[:limit]
+
+
+@app.route('/api/research_keywords', methods=['POST'])
+def api_research_keywords():
+    """Auto keyword research at import. Body: {stores, product_name, competitor_title,
+    category, description, min_volume, limit}. Derives local-language seeds (Claude) →
+    DataForSEO keyword ideas per market, filtered by search volume. Dormant (returns
+    configured:false) until DATAFORSEO_LOGIN/PASSWORD are set on the server."""
+    body = request.get_json(silent=True) or {}
+    stores = body.get('stores') or ['dk', 'fr', 'fi']
+    seeds = _derive_seeds_llm(body.get('competitor_title', ''), body.get('product_name', ''),
+                              body.get('category', ''), body.get('description', ''))
+    if not _dfs_configured():
+        return jsonify({'configured': False, 'seeds': seeds,
+                        'message': 'DataForSEO not configured — set DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD env vars. '
+                                   'Seeds shown are what would be researched.'})
+    min_vol = int(body.get('min_volume', 30))
+    limit = int(body.get('limit', 12))
+    results = {}
+    for st in stores:
+        if st not in DFS_LOCATION:
+            continue
+        st_seeds = seeds.get(st) or ([body.get('product_name')] if body.get('product_name') else [])
+        results[st] = {'seeds': st_seeds, 'keywords': _dfs_keyword_ideas(st_seeds, st, min_vol, limit)}
+    return jsonify({'configured': True, 'min_volume': min_vol, 'results': results})
+
+
+@app.route('/api/keyword_research_status')
+def api_keyword_research_status():
+    """Whether DataForSEO keyword research is live (creds present). Non-secret."""
+    return jsonify({'configured': _dfs_configured(),
+                    'locations': DFS_LOCATION, 'languages': DFS_LANGUAGE})
+
+
 @app.route('/api/debug_classify')
 def api_debug_classify():
     """Debug: test the import-time category classifier. ?title=&desc="""
