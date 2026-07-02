@@ -7469,28 +7469,6 @@ def _resolve_commit_sha():
     except Exception:
         return None
 
-@app.route('/api/_selftest_auth')
-def _selftest_auth():
-    """TEMP self-test: prove the droplet-token gate accepts a valid token and
-    rejects none, by self-calling a few GATED read endpoints. Returns status
-    codes only — no data. Remove after verification."""
-    base = f'http://127.0.0.1:{os.environ.get("PORT", "5000")}'
-    reads = ['/api/keyword_research_status', '/api/catalog_job/list', '/api/history?limit=1']
-    tok = _self_headers()
-    with_token, without_token = {}, {}
-    for ep in reads:
-        try:
-            with_token[ep] = req.get(base + ep, headers=tok, timeout=30).status_code
-        except Exception as e:
-            with_token[ep] = f'ERR {str(e)[:50]}'
-    try:
-        without_token[reads[0]] = req.get(base + reads[0], timeout=15).status_code
-    except Exception as e:
-        without_token[reads[0]] = f'ERR {str(e)[:50]}'
-    return jsonify({'secret_set': bool(DROPLET_TOKEN_SECRET),
-                    'with_token': with_token, 'without_token': without_token})
-
-
 @app.route('/api/version')
 def api_version():
     local = _read_local_version()
