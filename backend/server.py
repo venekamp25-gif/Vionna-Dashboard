@@ -3581,7 +3581,7 @@ def _recommend_keywords(keywords, store, top_n=8):
     return keywords
 
 
-def _dfs_clean_keywords_llm(keywords, store):
+def _dfs_clean_keywords_llm(keywords, store, max_tokens=2000):
     """LLM cleanup: from a keyword list keep only ones relevant to a WOMEN'S fashion
     store (drop other brand names, menswear, kids, off-topic). Keeps the objects,
     just filters. Falls back to the input on any failure."""
@@ -3595,13 +3595,16 @@ def _dfs_clean_keywords_llm(keywords, store):
                   "GENERIC keywords worth targeting: women's clothing / shoes / bags / accessories, or their "
                   "styles, materials and types (e.g. 'summer dress', 'leather bag', 'linen trousers'). "
                   "REMOVE, strictly:\n"
-                  "- ANY keyword containing a specific BRAND, LABEL, RETAILER or SHOP name — even ones not "
-                  "listed here (e.g. Nike, Adidas, Longchamp, Polène, Zalando, Marimekko, Carhartt, Salomon). "
-                  "If a keyword names a brand, drop it.\n"
+                  "- ANY keyword containing a specific BRAND, LABEL, RETAILER, DESIGNER or SHOP name — well-known "
+                  "OR lesser-known/local ones, even if not listed here (e.g. Nike, Adidas, Longchamp, Polène, "
+                  "Zalando, Marimekko, Carhartt, Salomon, Timberland, Moncler, Stone Island, Arc'teryx, Ralph "
+                  "Lauren, Dico, Billi Bi, Ichi, Bruun, Mont Clare). If ANY word in the keyword is a proper-noun "
+                  "brand/label/model name rather than a generic garment, material, colour, style, fit or occasion, "
+                  "DROP the whole keyword.\n"
                   "- men's-only or kids items, and anything unrelated to womenswear.\n"
                   "Reply with ONLY a JSON array of the kept keywords, exactly as written.\n\n"
                   + json.dumps(kws, ensure_ascii=False))
-        msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=2000,
+        msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=max_tokens,
                                      messages=[{'role': 'user', 'content': prompt}])
         txt = (msg.content[0].text if msg.content else '') or ''
         m = re.search(r'\[.*\]', txt, re.S)
@@ -3773,11 +3776,14 @@ def api_what_to_list():
             sig = _kw_signature(k.get('keyword') or '')
             if sig and sig not in sig_best:
                 sig_best[sig] = k
+        # over-fetch candidates (brand cleanup happens after, before slicing)
         ranked = [k for k in sorted(sig_best.values(), key=lambda x: -(x.get('volume') or 0))
                   if (k.get('volume') or 0) >= floor]
-        return seed, ranked
+        for k in ranked:
+            k['seed'] = seed
+        return seed, ranked[:12]
 
-    types = []
+    seed_ranked = {}
     errors = []
     with _cf.ThreadPoolExecutor(max_workers=6) as pool:
         futs = {pool.submit(_one, s): s for s in seeds}
@@ -3786,21 +3792,36 @@ def api_what_to_list():
                 seed, ranked = f.result()
             except Exception as e:
                 errors.append(str(e)[:80]); continue
-            if not ranked:
-                continue
-            top = ranked[:per_type]
-            # Represent the whole type by the seed's own row if present (most
-            # on-topic), else the biggest keyword — for the type-level season.
-            rep = next((k for k in ranked if (k.get('keyword') or '').strip().lower() == seed.lower()), top[0])
-            types.append({
-                'seed': seed,
-                'label': labels.get(seed, seed),
-                'volume': max((k.get('volume') or 0) for k in ranked),
-                'intent': rep.get('intent'),
-                'seasonality': rep.get('seasonality'),
-                'keywords': [{'keyword': k.get('keyword'), 'volume': k.get('volume'),
-                              'seasonality': k.get('seasonality'), 'intent': k.get('intent')} for k in top],
-            })
+            if ranked:
+                seed_ranked[seed] = ranked
+
+    # Drop brand / off-topic keywords (Nike, Adidas, local labels…) in ONE LLM
+    # pass over all candidates, THEN slice each type to its top-N clean keywords.
+    all_cands = [kw for ranked in seed_ranked.values() for kw in ranked]
+    cleaned = all_cands if body.get('no_clean') else _dfs_clean_keywords_llm(all_cands, store, max_tokens=4000)
+    from collections import defaultdict as _dd
+    by_seed = _dd(list)
+    for kw in cleaned:
+        by_seed[kw.get('seed')].append(kw)
+
+    types = []
+    for seed in seeds:
+        ranked = by_seed.get(seed) or []
+        if not ranked:
+            continue
+        top = ranked[:per_type]
+        # Represent the whole type by the seed's own row if present (most
+        # on-topic), else the biggest keyword — for the type-level season.
+        rep = next((k for k in ranked if (k.get('keyword') or '').strip().lower() == seed.lower()), top[0])
+        types.append({
+            'seed': seed,
+            'label': labels.get(seed, seed),
+            'volume': max((k.get('volume') or 0) for k in ranked),
+            'intent': rep.get('intent'),
+            'seasonality': rep.get('seasonality'),
+            'keywords': [{'keyword': k.get('keyword'), 'volume': k.get('volume'),
+                          'seasonality': k.get('seasonality'), 'intent': k.get('intent')} for k in top],
+        })
 
     # Recommendation score = demand (volume) + season timing − how saturated the
     # category already is (recently listed in the last 45 days AND total live).
