@@ -3413,9 +3413,13 @@ def _dfs_clean_keywords_llm(keywords, store):
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
         kws = [k.get('keyword') for k in keywords if k.get('keyword')]
         prompt = ("From this list of search keywords for a WOMEN'S online fashion store, return ONLY the "
-                  "keywords worth targeting: women's clothing / shoes / bags / accessories, or their styles "
-                  "and types (generic terms are fine). REMOVE: other brand names (e.g. Nike, Adidas, Zalando, "
-                  "Carhartt, Salomon, Marimekko), men's-only or kids items, and anything unrelated to womenswear. "
+                  "GENERIC keywords worth targeting: women's clothing / shoes / bags / accessories, or their "
+                  "styles, materials and types (e.g. 'summer dress', 'leather bag', 'linen trousers'). "
+                  "REMOVE, strictly:\n"
+                  "- ANY keyword containing a specific BRAND, LABEL, RETAILER or SHOP name — even ones not "
+                  "listed here (e.g. Nike, Adidas, Longchamp, Polène, Zalando, Marimekko, Carhartt, Salomon). "
+                  "If a keyword names a brand, drop it.\n"
+                  "- men's-only or kids items, and anything unrelated to womenswear.\n"
                   "Reply with ONLY a JSON array of the kept keywords, exactly as written.\n\n"
                   + json.dumps(kws, ensure_ascii=False))
         msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=2000,
