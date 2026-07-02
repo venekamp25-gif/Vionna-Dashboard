@@ -2123,6 +2123,34 @@ def backfill_size_charts():
     return jsonify({'dry_run': dry, 'products': len(products), 'writes': writes, 'report': report})
 
 
+@app.route('/api/touch_product')
+def touch_product():
+    """Debug: bump a product's updatedAt (productUpdate title->itself) to purge the
+    storefront page cache, so a freshly-written metafield renders. By handle."""
+    store = request.args.get('store', 'dk')
+    handle = request.args.get('handle', '')
+
+    def gql(q, v=None):
+        return req.post(shopify_url(store, 'graphql.json'), headers=shopify_headers(store),
+                        json={'query': q, 'variables': v or {}}, timeout=20).json()
+    try:
+        d = gql('query($q:String){products(first:1,query:$q){edges{node{id title updatedAt}}}}',
+                {'q': 'handle:%s' % handle})
+        edges = (((d.get('data') or {}).get('products') or {}).get('edges') or [])
+        if not edges:
+            return jsonify({'error': 'not found', 'handle': handle}), 404
+        n = edges[0]['node']
+        before = n['updatedAt']
+        u = gql('mutation($id:ID!,$t:String!){productUpdate(input:{id:$id,title:$t}){product{updatedAt}userErrors{message}}}',
+                {'id': n['id'], 't': n['title']})
+        pr = (u.get('data') or {}).get('productUpdate') or {}
+        return jsonify({'handle': handle, 'before': before,
+                        'after': (pr.get('product') or {}).get('updatedAt'),
+                        'userErrors': pr.get('userErrors')})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/debug_product_metafield')
 def debug_product_metafield():
     """Read a product's custom.<key> metafield by handle (debug)."""
