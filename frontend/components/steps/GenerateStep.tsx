@@ -121,13 +121,50 @@ export function GenerateStep() {
         };
 
         const toneRefs = loadToneReferences();
+
+        // ── Auto keyword research (DataForSEO) ──
+        // Derive per-market keywords from the product so the worker no longer
+        // researches by hand. Only fills stores where NO manual keywords were
+        // typed (manual always wins). Dormant (configured:false) until the server
+        // has DataForSEO credentials → this is a safe no-op that keeps today's
+        // behaviour (empty/legacy keywords).
+        const researchedByStore: Partial<Record<StoreKey, string[]>> = {};
+        try {
+          setSubStage("keyword research");
+          const kr = await api.researchKeywords({
+            stores: selectedStores,
+            product_name: chosenName,
+            competitor_title: product?.title ?? "",
+          });
+          if (kr.configured && kr.results) {
+            const kwByStore = { ...data.keywordsByStore };
+            const parsedByStore = { ...data.parsedKeywordsByStore };
+            for (const st of selectedStores) {
+              const kws = (kr.results[st]?.keywords ?? [])
+                .map((k) => k.keyword)
+                .filter((k): k is string => Boolean(k));
+              const manual = data.parsedKeywordsByStore?.[st] ?? [];
+              if (kws.length > 0 && manual.length === 0) {
+                researchedByStore[st] = kws;
+                kwByStore[st] = kws.join("\n");
+                parsedByStore[st] = kws;
+              }
+            }
+            patch({ keywordsByStore: kwByStore, parsedKeywordsByStore: parsedByStore });
+          }
+        } catch {
+          /* dormant / network error → keep manual/legacy keywords */
+        }
+
         for (const store of selectedStores) {
           setSubStage(`${STORE_CONFIG[store].language} — ${STORE_CONFIG[store].label}`);
           // Each store ships its OWN keyword list (parsed at Input). The Danish
           // copy should never be seeded by French SEO research and vice versa.
-          // Falls back to the legacy flat list for drafts that pre-date the split.
+          // Priority: manual keywords → auto-researched → legacy flat list.
           const perStore = data.parsedKeywordsByStore?.[store] ?? [];
-          const storeKeywords = perStore.length > 0 ? perStore : data.parsedKeywords;
+          const auto = researchedByStore[store] ?? [];
+          const storeKeywords =
+            perStore.length > 0 ? perStore : auto.length > 0 ? auto : data.parsedKeywords;
           const gen = await api.generate({
             store,
             product_name: chosenName,

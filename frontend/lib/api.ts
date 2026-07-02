@@ -400,6 +400,40 @@ export const api = {
       body: params,
     }),
 
+  /** Auto keyword research (DataForSEO) per market, from the product. Derives
+   *  local-language seeds (Claude) → keyword ideas + monthly search volume per
+   *  store. DORMANT until DATAFORSEO_LOGIN/PASSWORD are set on the server →
+   *  returns { configured: false } and callers keep the manual/legacy keywords. */
+  researchKeywords: (params: {
+    stores: ("dk" | "fr" | "fi")[];
+    product_name: string;
+    competitor_title: string;
+    category?: string;
+    description?: string;
+    min_volume?: number;
+    limit?: number;
+  }) =>
+    call<{
+      configured: boolean;
+      message?: string;
+      seeds?: Partial<Record<"dk" | "fr" | "fi", string[]>>;
+      results?: Partial<
+        Record<
+          "dk" | "fr" | "fi",
+          {
+            seeds: string[];
+            keywords: {
+              keyword: string;
+              volume: number | null;
+              cpc: number | null;
+              competition: string | null;
+              intent: string | null;
+            }[];
+          }
+        >
+      >;
+    }>("/api/research_keywords", { method: "POST", body: params }),
+
   higgsfield: (params: {
     prompt_type: number;
     product_type: string;
