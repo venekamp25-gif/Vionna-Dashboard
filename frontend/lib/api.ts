@@ -480,6 +480,43 @@ export const api = {
       }[];
     }>("/api/keyword_research_niche", { method: "POST", body: params, authed: true }),
 
+  /** "What to list": product-TYPE view for a market — each type has an English
+   *  label + localized term + demand/season + its top keywords. Gated. */
+  whatToList: (params: { store: "dk" | "fr" | "fi"; per_type?: number }) =>
+    call<{
+      configured: boolean;
+      store?: string;
+      per_type?: number;
+      count?: number;
+      types?: {
+        seed: string;
+        label: string;
+        volume: number | null;
+        intent: string | null;
+        recommended?: boolean;
+        score?: number;
+        seasonality?: {
+          peak_month?: string;
+          trough_month?: string;
+          push_from_month?: string;
+          trend?: string;
+          seasonal?: boolean;
+        } | null;
+        keywords: {
+          keyword: string;
+          volume: number | null;
+          intent: string | null;
+          seasonality?: {
+            peak_month?: string;
+            trough_month?: string;
+            push_from_month?: string;
+            trend?: string;
+            seasonal?: boolean;
+          } | null;
+        }[];
+      }[];
+    }>("/api/what_to_list", { method: "POST", body: params, authed: true }),
+
   /** Whether DataForSEO keyword research is configured on the server (non-secret). */
   keywordResearchStatus: () =>
     call<{ configured: boolean; login_hint?: string }>("/api/keyword_research_status", {

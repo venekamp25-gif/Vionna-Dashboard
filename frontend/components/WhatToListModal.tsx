@@ -5,12 +5,12 @@ import { api } from "@/lib/api";
 import { StoreKey, STORE_CONFIG, STORE_KEYS } from "@/lib/store";
 import { Button } from "@/components/ui/Button";
 
-type Kw = NonNullable<Awaited<ReturnType<typeof api.keywordResearchNiche>>["keywords"]>[number];
+type TypeRow = NonNullable<Awaited<ReturnType<typeof api.whatToList>>["types"]>[number];
+type Seasonality = TypeRow["seasonality"];
 
 type StoreResult = {
-  found?: number;
-  minVolume?: number;
-  keywords?: Kw[];
+  count?: number;
+  types?: TypeRow[];
   error?: string;
   notConfigured?: boolean;
 };
@@ -24,11 +24,10 @@ function monthNum(name?: string): number {
 
 type Bucket = "now" | "soon" | "evergreen" | "off";
 
-/** Which "should I list this now?" bucket a keyword falls into, from its
+/** Which "should I list this now?" bucket a product type falls into, from its
  * seasonality + today's month. Mirrors the DSA method: list when a type is in
  * its start→peak window, prepare when that window is ~1–2 months out. */
-function bucketOf(k: Kw): Bucket {
-  const s = k.seasonality;
+function bucketOf(s: Seasonality): Bucket {
   if (!s?.seasonal || !s.peak_month || !s.push_from_month) return "evergreen";
   const now = new Date().getMonth() + 1;
   const push = monthNum(s.push_from_month);
@@ -40,11 +39,10 @@ function bucketOf(k: Kw): Bucket {
   return monthsUntilPush <= 2 ? "soon" : "off";
 }
 
-function seasonText(k: Kw): string {
-  const s = k.seasonality;
+function seasonText(s: Seasonality): string {
   if (s?.seasonal && s.peak_month) return `peak ${s.peak_month} → start ${s.push_from_month}`;
   if (s?.trend && s.trend !== "flat") return s.trend === "rising" ? "↑ rising" : "↓ falling";
-  return "evergreen";
+  return "in demand all year";
 }
 
 const BUCKETS: { key: Bucket; title: string; blurb: string; tone: string }[] = [
@@ -55,11 +53,11 @@ const BUCKETS: { key: Bucket; title: string; blurb: string; tone: string }[] = [
 ];
 
 /**
- * "What to list" — the DSA product-research method, automated. Instead of
- * researching a known product type (that's the 📊 tool), this answers the
- * reverse question a product researcher starts with: *which* product types are
- * worth listing right now in each market? It sweeps the womenswear categories,
- * then sorts them by seasonal timing (list now / coming up / evergreen / off).
+ * "What to list" — the DSA product-research method, automated. Answers the
+ * reverse question a researcher starts with: *which* product types are worth
+ * listing right now in each market? It sweeps the womenswear categories and
+ * shows each TYPE (with an English name + the local search term) grouped by
+ * seasonal timing, with the type's top keywords underneath.
  */
 export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [selectedStores, setSelectedStores] = useState<StoreKey[]>(["dk"]);
@@ -92,9 +90,9 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
       const entries = await Promise.all(
         selectedStores.map(async (s): Promise<[StoreKey, StoreResult]> => {
           try {
-            const r = await api.keywordResearchNiche({ store: s }); // no product_type → full category sweep
+            const r = await api.whatToList({ store: s });
             if (!r.configured) return [s, { notConfigured: true }];
-            return [s, { found: r.found ?? 0, minVolume: r.min_volume ?? 0, keywords: r.keywords ?? [] }];
+            return [s, { count: r.count ?? 0, types: r.types ?? [] }];
           } catch (e) {
             return [s, { error: e instanceof Error ? e.message : "failed" }];
           }
@@ -122,8 +120,8 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
 
   const resultStores = results ? (STORE_KEYS.filter((s) => results[s]) as StoreKey[]) : [];
   const active = results?.[viewStore];
-  const grouped: Record<Bucket, Kw[]> = { now: [], soon: [], evergreen: [], off: [] };
-  (active?.keywords ?? []).forEach((k) => grouped[bucketOf(k)].push(k));
+  const grouped: Record<Bucket, TypeRow[]> = { now: [], soon: [], evergreen: [], off: [] };
+  (active?.types ?? []).forEach((t) => grouped[bucketOf(t.seasonality)].push(t));
   (Object.keys(grouped) as Bucket[]).forEach((b) =>
     grouped[b].sort((a, c) => (c.volume ?? 0) - (a.volume ?? 0))
   );
@@ -131,10 +129,12 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
   const bestsellerUrl = (() => {
     const d = competitorDomain.trim();
     if (!d) return "";
-    let host = d.replace(/^https?:\/\//i, "").replace(/\/.*$/, "").replace(/\/+$/, "");
+    const host = d.replace(/^https?:\/\//i, "").replace(/\/.*$/, "").replace(/\/+$/, "");
     if (!host || !host.includes(".")) return "";
     return `https://${host}/collections/all?q=&sort_by=best-selling`;
   })();
+
+  const fmt = (v: number | null | undefined) => (v ?? 0).toLocaleString("en-US");
 
   return (
     <div
@@ -149,7 +149,7 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
           <div>
             <h2 className="text-[16px] font-semibold text-text">What to list</h2>
             <p className="text-[12px] text-text-faint mt-0.5">
-              Which product types are worth listing right now, per market — ranked by demand and season.
+              Which product types are worth listing right now, per market — grouped by demand and season.
             </p>
           </div>
           <button type="button" onClick={onClose} className="text-text-dim hover:text-text text-xl leading-none">
@@ -162,8 +162,8 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
           <div className="text-[12px] text-text-dim leading-relaxed bg-bg-elev-2 rounded-[10px] px-3.5 py-3 border border-border">
             <strong className="text-text">Not sure what to research?</strong> Pick a market and press{" "}
             <strong>Find what to list</strong>. The tool scans the top women&apos;s-fashion searches in that country
-            and sorts them by <strong>when it&apos;s the right season to list them</strong> — so you get a direct
-            answer to “what should I put in the store now?”.{" "}
+            and groups them into <strong>product types</strong> (with an English name), sorted by{" "}
+            <strong>when it&apos;s the right season to list them</strong>.{" "}
             <button
               type="button"
               onClick={() => setShowMethod((v) => !v)}
@@ -271,49 +271,62 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
               ) : active ? (
                 <div className="space-y-5">
                   <p className="text-[12px] text-text-dim">
-                    Today is <strong className="text-text">{MONTH_FULL[new Date().getMonth() + 1]}</strong>. Start at the
-                    top — the green group is what to list first.
+                    Today is <strong className="text-text">{MONTH_FULL[new Date().getMonth() + 1]}</strong>. Each card
+                    is a <strong className="text-text">product type</strong> (English name, with the local search word
+                    in brackets) and its top searches. Start at the top — the green group is what to list first.
                   </p>
                   {BUCKETS.map(({ key, title, blurb, tone }) => {
                     const list = grouped[key];
                     if (list.length === 0) return null;
                     return (
                       <div key={key}>
-                        <div className="flex items-baseline justify-between gap-2 mb-1">
-                          <h3 className={`text-[13px] font-semibold ${tone}`}>
-                            {title} <span className="text-text-faint font-normal">({list.length})</span>
-                          </h3>
-                        </div>
-                        <p className="text-[11px] text-text-faint mb-2">{blurb}</p>
-                        <div className="flex flex-wrap gap-1.5">
-                          {list.map((k, i) => (
-                            <button
-                              key={i}
-                              type="button"
-                              title={`${(k.volume ?? 0).toLocaleString("en-US")}/mo · ${seasonText(k)} — click to copy`}
-                              onClick={() => copyText(k.keyword, k.keyword)}
-                              className={`group inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[12px] transition ${
-                                key === "now"
-                                  ? "border-green-500/40 bg-green-500/[0.08] text-green-700 dark:text-green-300"
-                                  : "border-border bg-bg-elev-2 text-text-dim hover:border-accent"
+                        <h3 className={`text-[13px] font-semibold ${tone}`}>
+                          {title} <span className="text-text-faint font-normal">({list.length})</span>
+                        </h3>
+                        <p className="text-[11px] text-text-faint mb-2.5">{blurb}</p>
+                        <div className="space-y-2.5">
+                          {list.map((t) => (
+                            <div
+                              key={t.seed}
+                              className={`rounded-[10px] border px-3 py-2.5 ${
+                                key === "now" ? "border-green-500/40 bg-green-500/[0.06]" : "border-border bg-bg-elev-2"
                               }`}
                             >
-                              {k.recommended && <span className="text-amber-500">★</span>}
-                              <span>{k.keyword}</span>
-                              <span className="text-text-faint tabular-nums">{(k.volume ?? 0).toLocaleString("en-US")}</span>
-                              <span className="text-text-faint opacity-0 group-hover:opacity-100">
-                                {copied === k.keyword ? "✓" : "⧉"}
-                              </span>
-                            </button>
+                              <div className="flex items-baseline gap-2 flex-wrap">
+                                {t.recommended && <span className="text-amber-500" title="Recommended">★</span>}
+                                <span className="text-[13px] font-semibold text-text">{t.label}</span>
+                                <span className="text-[11px] text-text-faint">({t.seed})</span>
+                                <span className="text-[11px] text-text-dim tabular-nums">· up to {fmt(t.volume)}/mo</span>
+                                <span className="flex-1" />
+                                <span className="text-[11px] text-text-faint">{seasonText(t.seasonality)}</span>
+                              </div>
+                              <div className="flex flex-wrap gap-1.5 mt-2">
+                                {t.keywords.map((k, i) => (
+                                  <button
+                                    key={i}
+                                    type="button"
+                                    title={`${fmt(k.volume)}/mo — click to copy`}
+                                    onClick={() => copyText(k.keyword, `${t.seed}:${k.keyword}`)}
+                                    className="group inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full border border-border bg-bg-elev text-[11px] text-text-dim hover:border-accent transition"
+                                  >
+                                    <span>{k.keyword}</span>
+                                    <span className="text-text-faint tabular-nums">{fmt(k.volume)}</span>
+                                    <span className="text-text-faint opacity-0 group-hover:opacity-100">
+                                      {copied === `${t.seed}:${k.keyword}` ? "✓" : "⧉"}
+                                    </span>
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
                           ))}
                         </div>
                       </div>
                     );
                   })}
                   <p className="text-[11px] text-text-faint pt-1 border-t border-border">
-                    <span className="text-amber-500">★</span> = recommended (best mix of search volume, buyers and
-                    timing). Numbers are monthly searches. Next: use the bestseller finder below to confirm real
-                    competitors are already selling these.
+                    <span className="text-amber-500">★</span> = recommended (best mix of search volume and timing).
+                    Numbers are monthly searches. Next: use the bestseller finder below to confirm real competitors
+                    are already selling these.
                   </p>
                 </div>
               ) : null}
