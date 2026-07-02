@@ -3497,10 +3497,14 @@ def _niche_seeds_for_type(product_type, store):
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
         lang = DFS_LANG_NAME.get(store, 'Danish')
-        prompt = (f"A shopper searches for this women's fashion product type: \"{pt}\". "
-                  f"Give 2-3 SHORT broad search seed terms in {lang} that shoppers actually type "
-                  f"(the garment type + at most one common variant), 1-2 words each, single compound "
-                  f"words where the language uses them. Return ONLY a JSON array of strings.")
+        prompt = (f"A shopper searches for this women's fashion product type (given in Dutch or English): "
+                  f"\"{pt}\". TRANSLATE it into {lang} and return 2-3 short broad search terms that "
+                  f"{lang}-speaking shoppers actually type — the {lang} word for this garment, plus at most one "
+                  f"common {lang} variant. 1-2 words each; use single compound words where {lang} does. "
+                  f"The terms MUST be written in {lang}, NOT in the input language.\n"
+                  f"Examples: 'jurk'/'dress' -> Danish [\"kjole\",\"sommerkjole\"]; 'jas'/'coat' -> French "
+                  f"[\"manteau\",\"veste\"]; 'broek'/'pants' -> Finnish [\"housut\",\"farkut\"].\n"
+                  f"Return ONLY a JSON array of strings in {lang}.")
         msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=120,
                                      messages=[{'role': 'user', 'content': prompt}])
         txt = (msg.content[0].text if msg.content else '') or ''
