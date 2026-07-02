@@ -436,10 +436,17 @@ export const api = {
 
   /** Standalone niche keyword research (the DSA strategy): trending high-volume
    *  fashion keywords for a market, with seasonality. Gated (costs API credits). */
-  keywordResearchNiche: (params: { store: "dk" | "fr" | "fi"; min_volume?: number; target_count?: number }) =>
+  keywordResearchNiche: (params: {
+    store: "dk" | "fr" | "fi";
+    product_type?: string;
+    min_volume?: number;
+    target_count?: number;
+  }) =>
     call<{
       configured: boolean;
       store?: string;
+      product_type?: string;
+      seeds?: string[];
       min_volume?: number;
       found?: number;
       keywords?: {

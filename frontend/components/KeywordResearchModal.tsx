@@ -7,30 +7,50 @@ import { Button } from "@/components/ui/Button";
 
 type Kw = NonNullable<Awaited<ReturnType<typeof api.keywordResearchNiche>>["keywords"]>[number];
 
+function seasonText(k: Kw): string {
+  const s = k.seasonality;
+  if (s?.seasonal && s.peak_month) return `piek ${s.peak_month} → push ${s.push_from_month}`;
+  if (s?.trend && s.trend !== "flat") return s.trend === "rising" ? "↑ stijgend" : "↓ dalend";
+  return "—";
+}
+
 /**
  * Standalone keyword research (the DSA product-research strategy, automated):
- * pick a market → get trending high-volume womenswear keywords with monthly
- * search volume + seasonality (peak month + when to start pushing).
+ * enter a product type + pick a market → trending, high-volume keywords for that
+ * type with monthly search volume + seasonality.
  */
 export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [store, setStore] = useState<StoreKey>("dk");
+  const [productType, setProductType] = useState("");
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<{ store: StoreKey; found: number; minVolume: number; keywords: Kw[] } | null>(null);
+  const [result, setResult] = useState<
+    { store: StoreKey; type: string; seeds: string[]; found: number; minVolume: number; keywords: Kw[] } | null
+  >(null);
   const [notConfigured, setNotConfigured] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const canRun = productType.trim().length > 0 && !busy;
+
   const run = async () => {
+    if (!productType.trim()) return;
     setBusy(true);
     setError(null);
     setResult(null);
     setNotConfigured(false);
     try {
-      const r = await api.keywordResearchNiche({ store });
+      const r = await api.keywordResearchNiche({ store, product_type: productType.trim() });
       if (!r.configured) {
         setNotConfigured(true);
         return;
       }
-      setResult({ store, found: r.found ?? 0, minVolume: r.min_volume ?? 0, keywords: r.keywords ?? [] });
+      setResult({
+        store,
+        type: r.product_type ?? productType.trim(),
+        seeds: r.seeds ?? [],
+        found: r.found ?? 0,
+        minVolume: r.min_volume ?? 0,
+        keywords: r.keywords ?? [],
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Research failed");
     } finally {
@@ -53,12 +73,12 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
       }}
     >
       <div className="bg-bg-elev border border-border rounded-2xl w-full max-w-3xl max-h-[88vh] flex flex-col overflow-hidden shadow-xl">
-        <div className="flex items-start justify-between px-6 py-4 border-b border-border">
+        {/* Header */}
+        <div className="flex items-start justify-between px-6 py-4 border-b border-border shrink-0">
           <div>
             <h2 className="text-[16px] font-semibold text-text">Keyword research</h2>
             <p className="text-[12px] text-text-faint mt-0.5">
-              Trending, high-volume dameskleding-keywords per markt — met zoekvolume en seizoen (piek-maand +
-              wanneer te pushen).
+              Trending, high-volume keywords voor één producttype per markt — met zoekvolume en seizoen.
             </p>
           </div>
           <button type="button" onClick={onClose} className="text-text-dim hover:text-text text-xl leading-none">
@@ -66,27 +86,51 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
           </button>
         </div>
 
-        <div className="px-6 py-3 border-b border-border flex items-center gap-2 flex-wrap">
-          {STORE_KEYS.map((s) => (
-            <button
-              key={s}
-              type="button"
-              onClick={() => setStore(s)}
-              className={`px-3 h-8 rounded-[10px] text-[12px] border transition ${
-                store === s
-                  ? "border-accent text-accent bg-[var(--accent-soft)]"
-                  : "border-border text-text-dim hover:border-border-hover"
-              }`}
-            >
-              {STORE_CONFIG[s].label}
-            </button>
-          ))}
-          <span className="flex-1" />
-          <Button variant="primary" size="sm" onClick={() => void run()} disabled={busy}>
-            {busy ? "Onderzoeken…" : "Run research"}
-          </Button>
+        {/* Controls */}
+        <div className="px-6 py-4 border-b border-border shrink-0 space-y-3">
+          <div>
+            <label className="block text-[11px] font-medium tracking-wide uppercase text-text-faint mb-1.5">
+              Producttype
+            </label>
+            <input
+              type="text"
+              value={productType}
+              onChange={(e) => setProductType(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && canRun) void run();
+              }}
+              placeholder="bijv. jurk, jas, cardigan, laarzen, tas…"
+              autoFocus
+              className="w-full px-3 h-10 rounded-[10px] bg-bg-elev-2 border border-border text-[13px] focus:outline-none focus:border-accent focus:ring-3 focus:ring-[var(--accent-soft)]"
+            />
+            <p className="text-[11px] text-text-faint mt-1">
+              Typ in het Nederlands of Engels — het wordt automatisch naar de taal van de markt vertaald.
+            </p>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-[11px] text-text-faint mr-1">Markt:</span>
+            {STORE_KEYS.map((s) => (
+              <button
+                key={s}
+                type="button"
+                onClick={() => setStore(s)}
+                className={`px-3 h-8 rounded-[10px] text-[12px] border transition ${
+                  store === s
+                    ? "border-accent text-accent bg-[var(--accent-soft)]"
+                    : "border-border text-text-dim hover:border-border-hover"
+                }`}
+              >
+                {STORE_CONFIG[s].label}
+              </button>
+            ))}
+            <span className="flex-1" />
+            <Button variant="primary" size="sm" onClick={() => void run()} disabled={!canRun}>
+              {busy ? "Onderzoeken…" : "Run research"}
+            </Button>
+          </div>
         </div>
 
+        {/* Body */}
         <div className="flex-1 overflow-auto px-6 py-4">
           {notConfigured && (
             <p className="text-[13px] text-danger">
@@ -96,56 +140,84 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
           {error && <p className="text-[13px] text-danger">{error}</p>}
           {busy && (
             <p className="text-[13px] text-text-faint">
-              Bezig met zoeken over ~19 categorieën in {STORE_CONFIG[store].label}… dit duurt ~10–40s.
+              Bezig met zoeken naar “{productType.trim()}” in {STORE_CONFIG[store].label}… (~10–20s)
             </p>
           )}
+
           {result && (
             <>
-              <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
                 <span className="text-[12px] text-text-dim">
-                  <strong>{result.found}</strong> keywords · min. {result.minVolume.toLocaleString("nl-NL")}{" "}
-                  zoekopdrachten/mnd
+                  <strong className="text-text">{result.found}</strong> keywords voor{" "}
+                  <strong className="text-text">{result.type}</strong>
+                  {result.seeds.length > 0 && (
+                    <span className="text-text-faint"> ({result.seeds.join(", ")})</span>
+                  )}{" "}
+                  · ≥ {result.minVolume.toLocaleString("nl-NL")}/mnd
                 </span>
                 <button type="button" onClick={copyAll} className="text-[12px] text-accent hover:underline">
                   Copy all
                 </button>
               </div>
-              <table className="w-full text-[12px] border-collapse">
-                <thead>
-                  <tr className="text-text-faint text-left">
-                    <th className="py-1.5 font-medium">Keyword</th>
-                    <th className="py-1.5 font-medium text-right">Volume/mnd</th>
-                    <th className="py-1.5 font-medium">Seizoen</th>
-                    <th className="py-1.5 font-medium">Intentie</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {result.keywords.map((k, i) => (
-                    <tr key={i} className="border-t border-border">
-                      <td className="py-1.5 pr-2">{k.keyword}</td>
-                      <td className="py-1.5 text-right font-medium tabular-nums">
-                        {(k.volume ?? 0).toLocaleString("nl-NL")}
-                      </td>
-                      <td className="py-1.5 text-text-dim">
-                        {k.seasonality?.seasonal
-                          ? `piek ${k.seasonality.peak_month} · push ${k.seasonality.push_from_month}`
-                          : k.seasonality?.trend && k.seasonality.trend !== "flat"
-                            ? k.seasonality.trend
-                            : "—"}
-                      </td>
-                      <td className="py-1.5 text-text-faint">{k.intent ?? "—"}</td>
+
+              {result.keywords.length === 0 ? (
+                <p className="text-[13px] text-text-faint">
+                  Geen keywords boven de drempel voor dit type in deze markt. Probeer een breder type of een
+                  andere markt.
+                </p>
+              ) : (
+                <table className="w-full text-[12px] border-collapse">
+                  <colgroup>
+                    <col />
+                    <col className="w-[96px]" />
+                    <col className="w-[172px]" />
+                    <col className="w-[104px]" />
+                  </colgroup>
+                  <thead>
+                    <tr className="text-text-faint text-left border-b border-border">
+                      <th className="py-2 pr-3 font-medium">Keyword</th>
+                      <th className="py-2 px-3 font-medium text-right">Volume/mnd</th>
+                      <th className="py-2 px-3 font-medium">Seizoen</th>
+                      <th className="py-2 pl-3 font-medium">Intentie</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {result.keywords.map((k, i) => (
+                      <tr key={i} className="border-b border-border/60">
+                        <td className="py-2 pr-3 text-text">{k.keyword}</td>
+                        <td className="py-2 px-3 text-right font-medium tabular-nums text-text whitespace-nowrap">
+                          {(k.volume ?? 0).toLocaleString("nl-NL")}
+                        </td>
+                        <td className="py-2 px-3 text-text-dim whitespace-nowrap">{seasonText(k)}</td>
+                        <td className="py-2 pl-3">
+                          {k.intent ? (
+                            <span
+                              className={`inline-block px-1.5 py-0.5 rounded text-[10px] ${
+                                k.intent === "transactional" || k.intent === "commercial"
+                                  ? "bg-[var(--accent-soft)] text-accent"
+                                  : "bg-bg-elev-2 text-text-faint"
+                              }`}
+                            >
+                              {k.intent}
+                            </span>
+                          ) : (
+                            <span className="text-text-faint">—</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
               <p className="text-[11px] text-text-faint mt-3">
-                "push" = ~5–6 weken vóór de piek beginnen. Kosten: ~$0,25 per markt-onderzoek.
+                “push” = ~5–6 weken vóór de piek beginnen. Kosten: ~$0,10–0,25 per onderzoek.
               </p>
             </>
           )}
+
           {!result && !busy && !notConfigured && !error && (
             <p className="text-[13px] text-text-faint">
-              Kies een markt en klik <strong>Run research</strong> om de trending keywords + zoekvolume op te halen.
+              Vul een <strong>producttype</strong> in, kies een markt en klik <strong>Run research</strong>.
             </p>
           )}
         </div>
