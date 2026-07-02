@@ -3120,9 +3120,10 @@ def _derive_seeds_llm(competitor_title, product_name, category, description):
             f"Product name: {product_name}\nCompetitor title: {competitor_title}\n"
             f"Category: {category}\nDescription: {(description or '')[:500]}\n"
         )
-        msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=200,
+        msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=300,
                                      messages=[{'role': 'user', 'content': prompt}])
         txt = (msg.content[0].text if msg.content else '') or ''
+        globals()['_LAST_SEED_RAW'] = txt
         m = re.search(r'\{.*\}', txt, re.S)
         data = json.loads(m.group(0)) if m else {}
         out = {}
@@ -3182,9 +3183,12 @@ def api_research_keywords():
     seeds = _derive_seeds_llm(body.get('competitor_title', ''), body.get('product_name', ''),
                               body.get('category', ''), body.get('description', ''))
     if not _dfs_configured():
-        return jsonify({'configured': False, 'seeds': seeds,
-                        'message': 'DataForSEO not configured — set DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD env vars. '
-                                   'Seeds shown are what would be researched.'})
+        out = {'configured': False, 'seeds': seeds,
+               'message': 'DataForSEO not configured — set DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD env vars. '
+                          'Seeds shown are what would be researched.'}
+        if body.get('debug'):
+            out['raw_seed_output'] = globals().get('_LAST_SEED_RAW', '')
+        return jsonify(out)
     min_vol = int(body.get('min_volume', 30))
     limit = int(body.get('limit', 12))
     results = {}
