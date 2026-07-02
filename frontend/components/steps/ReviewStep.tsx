@@ -3,6 +3,7 @@
 import { useRef, useState } from "react";
 import { CompetitorPreview } from "@/components/review/CompetitorPreview";
 import { ProductInfoCard } from "@/components/review/ProductInfoCard";
+import { SizeChartCard } from "@/components/review/SizeChartCard";
 import { GeneratedContentCard } from "@/components/review/GeneratedContentCard";
 import { ColorVariantsCard } from "@/components/review/ColorVariantsCard";
 import { ImagesCard } from "@/components/review/ImagesCard";
@@ -353,6 +354,7 @@ export function ReviewStep() {
         {/* Left column */}
         <div className="flex flex-col gap-6 min-w-0">
           <ProductInfoCard />
+          <SizeChartCard />
           <GeneratedContentCard />
           <ColorVariantsCard />
         </div>
