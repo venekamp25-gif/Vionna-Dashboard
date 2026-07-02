@@ -2034,8 +2034,12 @@ def backfill_size_charts():
         return r.json()
 
     def search(store, qstr):
-        d = gql(store, 'query($q:String){products(first:40,query:$q){edges{node{id handle title}}}}', {'q': qstr})
+        d = gql(store, 'query($q:String){products(first:100,query:$q){edges{node{id handle title}}}}', {'q': qstr})
         return [e['node'] for e in (((d.get('data') or {}).get('products') or {}).get('edges') or [])]
+
+    def _norm(s):
+        return ''.join(c for c in unicodedata.normalize('NFKD', (s or '').strip().lower())
+                       if not unicodedata.combining(c))
 
     report = []
     writes = 0
@@ -2049,7 +2053,10 @@ def backfill_size_charts():
             if not val:
                 continue
             try:
-                nodes = search(store, 'title:%s*' % name)
+                nodes = search(store, 'title:%s' % name)
+                nb = _norm(name)
+                nodes = [n for n in nodes
+                         if _norm(re.split(r'[|\s]', (n.get('title') or '').strip(), 1)[0]) == nb]
             except Exception as e:
                 report.append({'name': name, 'store': store, 'error': str(e)[:80]})
                 continue
