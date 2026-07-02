@@ -414,7 +414,6 @@ def callback():
     return redirect(f'/?auth=success&store={store_key}')
 
 @app.route('/api/test_hf')
-@require_droplet_token
 def test_hf():
     import os as _os, glob as _glob
     exists  = _os.path.exists(HIGGSFIELD_EXE)
@@ -469,7 +468,6 @@ def health():
 
 
 @app.route('/api/classify_shipping')
-@require_droplet_token
 def classify_shipping():
     """Classify the source store of a product URL as dropshipper / own-stock /
     unknown, by parsing its shipping policy. Used at the import step to warn when
@@ -492,7 +490,6 @@ def classify_shipping():
 
 
 @app.route('/api/verify_products', methods=['POST'])
-@require_droplet_token
 def verify_products():
     """Post-publish verification: re-read freshly created products and confirm
     images attached / cutline set / on sales channels / variants present.
@@ -604,7 +601,6 @@ def retry_fix():
 
 
 @app.route('/api/audit')
-@require_droplet_token
 def audit_catalog():
     """Catalog-audit (#2): scan every product of a store and flag missing cutlines,
     missing images, duplicate products (same base-handle X + X-1/X-2), and active
@@ -668,7 +664,6 @@ def audit_catalog():
 
 
 @app.route('/api/catalog_cutlines')
-@require_droplet_token
 def catalog_cutlines():
     """Read-only: every product's handle/title/status/cutline for a store, so a
     catalog-wide cutline analysis (localisation + mis-detected colours) can run
@@ -699,7 +694,6 @@ def catalog_cutlines():
 
 
 @app.route('/api/duplicate_detail')
-@require_droplet_token
 def duplicate_detail():
     """Read-only diagnostic: for every base-handle group with numbered siblings
     (X + X-1/X-2...), return per-product detail (title, status, colour swatch,
@@ -1663,7 +1657,6 @@ def api_debug_extract_chart():
 
 
 @app.route('/api/scrape', methods=['POST'])
-@require_droplet_token
 def scrape():
     raw_input = (request.json.get('url') or '').strip()
     # Defensive: pluck the FIRST http(s):// URL out of arbitrary user text.
@@ -1947,7 +1940,6 @@ def scrape():
 
 
 @app.route('/api/scrape_manual', methods=['POST'])
-@require_droplet_token
 def scrape_manual():
     """Escape hatch for shops whose Cloudflare / WAF blocks our datacentre IP.
 
@@ -2137,7 +2129,6 @@ def debug_metafields():
 
 
 @app.route('/api/ensure_size_chart_definition')
-@require_droplet_token
 def ensure_size_chart_definition():
     """One-time setup: create the custom.size_chart PRODUCT metafield definition
     (multi_line_text_field) so it shows + is editable in the Shopify admin.
@@ -2199,7 +2190,6 @@ def ensure_size_chart_definition():
 
 
 @app.route('/api/backfill_size_charts', methods=['POST'])
-@require_droplet_token
 def backfill_size_charts():
     """Bulk-write custom.size_chart from prepared per-store HTML.
     Body: {dry_run:bool(default true), limit:int(0=all), offset:int,
@@ -2284,7 +2274,6 @@ def backfill_size_charts():
 
 
 @app.route('/api/theme_put_asset', methods=['POST'])
-@require_droplet_token
 def theme_put_asset():
     """Debug: PUT a theme asset via Admin Asset API (forces recompile of JSON
     templates that GitHub sync leaves stale). Body: {store, path, value}."""
@@ -2311,7 +2300,6 @@ def theme_put_asset():
 
 
 @app.route('/api/touch_product')
-@require_droplet_token
 def touch_product():
     """Debug: bump a product's updatedAt (productUpdate title->itself) to purge the
     storefront page cache, so a freshly-written metafield renders. By handle."""
@@ -2343,7 +2331,6 @@ def touch_product():
 
 
 @app.route('/api/set_product_size_chart', methods=['POST'])
-@require_droplet_token
 def api_set_product_size_chart():
     """Manually set a size chart on an EXISTING product across stores. Body:
     {name, chart:{headers,rows}, stores, dry_run}. Localises the chart via
@@ -2546,7 +2533,6 @@ def _strip_html_to_text(html):
 
 
 @app.route('/api/backfill/products')
-@require_droplet_token
 def backfill_list_products():
     """List a store's products grouped per dress, with current SEO copy, for the
     Keyword-backfill screen. ACTIVE only by default; pass include_drafts=1 to also
@@ -3145,7 +3131,6 @@ def _fetch_collections_with_members(store, hdrs):
 
 
 @app.route('/api/list_collections')
-@require_droplet_token
 def api_list_collections():
     """Read-only: list every collection on a store (handle, title, type). Used to sweep
     for odd / mangled sibling-collection handles."""
@@ -3982,7 +3967,6 @@ def api_research_keywords():
 
 
 @app.route('/api/keyword_research_status')
-@require_droplet_token
 def api_keyword_research_status():
     """Whether DataForSEO keyword research is live (creds present). Non-secret."""
     lo, _pw = _dfs_creds()
@@ -4078,7 +4062,6 @@ def api_debug_classify():
 
 
 @app.route('/api/list_products_for_categorization')
-@require_droplet_token
 def api_list_products_for_categorization():
     """Read-only paginated fetch of products for classification: id, title, handle,
     description snippet, tags, standard taxonomy category. Caller paginates via
@@ -4120,7 +4103,6 @@ def api_list_products_for_categorization():
 
 
 @app.route('/api/apply_category_tags', methods=['POST'])
-@require_droplet_token
 def api_apply_category_tags():
     """Write clean cat:<x> tags. Body: {store, dry_run(default true), replace(bool),
     assignments:[{id, category}]}. Adds cat:<category>; if replace, also strips the
@@ -4187,7 +4169,6 @@ def api_apply_category_tags():
 
 
 @app.route('/api/manage_category_collections', methods=['POST'])
-@require_droplet_token
 def api_manage_category_collections():
     """Normalise category collections to key on the clean cat:<x> tags.
     Body: {store, dry_run(default true)}. Repoints the 6 smart category collections
@@ -5106,7 +5087,6 @@ def catalog_job_start():
 
 
 @app.route('/api/catalog_job/status')
-@require_droplet_token
 def catalog_job_status():
     jid = request.args.get('id', '')
     with _JOBS_LOCK:
@@ -5117,7 +5097,6 @@ def catalog_job_status():
 
 
 @app.route('/api/catalog_job/list')
-@require_droplet_token
 def catalog_job_list():
     """All jobs (optionally filtered by store), newest first — lets the UI
     re-discover running jobs after the modal is closed or the page reloaded."""
@@ -5146,7 +5125,6 @@ def _draft_path(owner_slug):
 
 
 @app.route('/api/drafts', methods=['GET'])
-@require_droplet_token
 def drafts_load():
     """Return the saved draft for `?owner=<email>`, or 404 if none exists.
 
@@ -5170,7 +5148,6 @@ def drafts_load():
 
 
 @app.route('/api/drafts', methods=['POST'])
-@require_droplet_token
 def drafts_save():
     """Save the JSON body as the draft for `?owner=<email>`."""
     owner = _sanitize_owner(request.args.get('owner', ''))
@@ -5214,7 +5191,6 @@ def _load_snapshots(owner_slug):
 
 
 @app.route('/api/product_snapshots', methods=['GET'])
-@require_droplet_token
 def product_snapshots_list():
     """List recent re-openable product snapshots for ?owner=<email> (metadata only)."""
     owner = _sanitize_owner(request.args.get('owner', ''))
@@ -5226,7 +5202,6 @@ def product_snapshots_list():
 
 
 @app.route('/api/product_snapshots', methods=['POST'])
-@require_droplet_token
 def product_snapshots_save():
     """Save a full product snapshot (body = ProductData) so it can be re-opened later
     from the History. Keeps only the most recent _SNAPSHOTS_MAX per owner, de-duped by name."""
@@ -5262,7 +5237,6 @@ def product_snapshots_save():
 
 
 @app.route('/api/product_snapshots/<sid>', methods=['GET'])
-@require_droplet_token
 def product_snapshot_get(sid):
     """Return one snapshot's full ProductData for ?owner=<email>."""
     owner = _sanitize_owner(request.args.get('owner', ''))
@@ -5346,7 +5320,6 @@ def drafts_debug():
 
 
 @app.route('/api/drafts', methods=['DELETE'])
-@require_droplet_token
 def drafts_clear():
     """Delete the saved draft for `?owner=<email>`."""
     owner = _sanitize_owner(request.args.get('owner', ''))
@@ -5621,7 +5594,6 @@ def _fire_routine(entry):
 
 
 @app.route('/api/config/slack_webhook', methods=['POST'])
-@require_droplet_token
 def config_slack_webhook():
     """Store the Slack incoming-webhook URL for bug pings (gitignored file).
 
@@ -5695,7 +5667,6 @@ def bug_reports_screenshot(bug_id):
 # --- Recent product descriptions (used as tone references in Settings) ---
 
 @app.route('/api/recent_descriptions', methods=['GET'])
-@require_droplet_token
 def recent_descriptions():
     """Return the most recent ACTIVE products' body_html for a store, stripped of
     HTML tags so the dashboard can show them as plain-text tone examples.
@@ -5765,7 +5736,6 @@ def recent_descriptions():
 
 # --- Get existing product names to avoid duplicates ---
 @app.route('/api/names', methods=['POST'])
-@require_droplet_token
 def get_names():
     store = request.json.get('store', 'dk')
     if store not in tokens:
@@ -5801,7 +5771,6 @@ def get_names():
 
 # --- Generate content via Claude ---
 @app.route('/api/generate', methods=['POST'])
-@require_droplet_token
 def generate():
     if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
         return jsonify({'error': 'Anthropic API key missing — set ANTHROPIC_API_KEY in environment variables'}), 400
@@ -5967,7 +5936,6 @@ Antwoord uitsluitend als geldig JSON zonder extra tekst:
 
 
 @app.route('/api/translate_colors', methods=['POST'])
-@require_droplet_token
 def translate_colors():
     """Translate colour-variant names into a store's language.
 
@@ -6130,7 +6098,6 @@ def _append_history(entry):
 
 
 @app.route('/api/history')
-@require_droplet_token
 def history():
     """Return the publish log as a list of entries, most recent first.
 
@@ -7256,7 +7223,6 @@ def theme_probe():
 
 # --- Higgsfield image generation ---
 @app.route('/api/higgsfield', methods=['POST'])
-@require_droplet_token
 def higgsfield_generate():
     data         = request.json
     # Support both legacy single URL and new multi-image list
@@ -7591,7 +7557,6 @@ def _meta_get(node, params=None):
 
 
 @app.route('/api/meta/check')
-@require_droplet_token
 def meta_check():
     """Read-only: confirms the Meta .env config is present and that the token can reach
     the fashion ad account + the Vionna page. Never exposes secret values."""
@@ -7631,7 +7596,6 @@ def meta_check():
 
 
 @app.route('/api/meta/inspect')
-@require_droplet_token
 def meta_inspect():
     """Read-only: dump a campaign's structure (campaign + ad sets + ads + creatives) so we
     can mirror an existing campaign's settings. Never mutates anything."""
@@ -7664,7 +7628,6 @@ def meta_inspect():
 
 
 @app.route('/api/meta/campaigns')
-@require_droplet_token
 def meta_campaigns():
     """Read-only: list recent campaigns (id, name, status) for diagnostics + cleanup.
     Optional ?q= filters by name substring (case-insensitive)."""
@@ -7684,7 +7647,6 @@ def meta_campaigns():
 
 
 @app.route('/api/meta/storefront_test')
-@require_droplet_token
 def meta_storefront_test():
     """Read-only debug: show how _storefront_url resolves an admin product URL → storefront URL,
     including the raw Shopify lookup, so we can see why a link isn't converting."""
@@ -7934,7 +7896,6 @@ META_AD_COPY_TEMPLATE_NL = (
 
 
 @app.route('/api/generate_ad_copy', methods=['POST'])
-@require_droplet_token
 def generate_ad_copy():
     """Translate the Dutch ad-copy template into fluent, natural ad copy per store-language.
     Body: {stores:[...], product_name, product_url, template?}. Returns
@@ -8848,7 +8809,6 @@ def api_blog_run():
 
 
 @app.route('/api/blog/status', methods=['GET'])
-@require_droplet_token
 def api_blog_status():
     """Read-only health/status for the blog engine (no secrets, no auth): recent
     generated articles + scheduler config + whether DataForSEO is configured.

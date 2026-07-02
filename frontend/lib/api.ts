@@ -94,13 +94,8 @@ async function call<T>(
     throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   };
 
-  // The backend now gates almost everything behind the droplet token, so every
-  // call carries it by default (the token is cached ~4 min, so this is cheap).
-  // Pass authed:false only for the handful of anon endpoints (health/version);
-  // those ignore the token anyway, so it's harmless either way.
-  const useAuth = init?.authed !== false;
   let res: Response;
-  if (useAuth) {
+  if (init?.authed) {
     res = await fetchResilient(await getDropletToken());
     // A 401 means the gate rejected the token (missing/expired/stale cache).
     // Re-mint a fresh token once and retry before surfacing an error — this
