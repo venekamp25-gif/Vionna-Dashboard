@@ -9,8 +9,8 @@ type Kw = NonNullable<Awaited<ReturnType<typeof api.keywordResearchNiche>>["keyw
 
 function seasonText(k: Kw): string {
   const s = k.seasonality;
-  if (s?.seasonal && s.peak_month) return `piek ${s.peak_month} → push ${s.push_from_month}`;
-  if (s?.trend && s.trend !== "flat") return s.trend === "rising" ? "↑ stijgend" : "↓ dalend";
+  if (s?.seasonal && s.peak_month) return `peak ${s.peak_month} → push ${s.push_from_month}`;
+  if (s?.trend && s.trend !== "flat") return s.trend === "rising" ? "↑ rising" : "↓ falling";
   return "—";
 }
 
@@ -78,7 +78,7 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
           <div>
             <h2 className="text-[16px] font-semibold text-text">Keyword research</h2>
             <p className="text-[12px] text-text-faint mt-0.5">
-              Trending, high-volume keywords voor één producttype per markt — met zoekvolume en seizoen.
+              Trending, high-volume keywords for one product type per market — with search volume and seasonality.
             </p>
           </div>
           <button type="button" onClick={onClose} className="text-text-dim hover:text-text text-xl leading-none">
@@ -90,7 +90,7 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
         <div className="px-6 py-4 border-b border-border shrink-0 space-y-3">
           <div>
             <label className="block text-[11px] font-medium tracking-wide uppercase text-text-faint mb-1.5">
-              Producttype
+              Product type
             </label>
             <input
               type="text"
@@ -99,16 +99,16 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
               onKeyDown={(e) => {
                 if (e.key === "Enter" && canRun) void run();
               }}
-              placeholder="bijv. jurk, jas, cardigan, laarzen, tas…"
+              placeholder="e.g. dress, jacket, cardigan, boots, bag…"
               autoFocus
               className="w-full px-3 h-10 rounded-[10px] bg-bg-elev-2 border border-border text-[13px] focus:outline-none focus:border-accent focus:ring-3 focus:ring-[var(--accent-soft)]"
             />
             <p className="text-[11px] text-text-faint mt-1">
-              Typ in het Nederlands of Engels — het wordt automatisch naar de taal van de markt vertaald.
+              Type in any language — it&apos;s auto-translated to the market&apos;s language.
             </p>
           </div>
           <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-[11px] text-text-faint mr-1">Markt:</span>
+            <span className="text-[11px] text-text-faint mr-1">Market:</span>
             {STORE_KEYS.map((s) => (
               <button
                 key={s}
@@ -125,7 +125,7 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
             ))}
             <span className="flex-1" />
             <Button variant="primary" size="sm" onClick={() => void run()} disabled={!canRun}>
-              {busy ? "Onderzoeken…" : "Run research"}
+              {busy ? "Researching…" : "Run research"}
             </Button>
           </div>
         </div>
@@ -134,13 +134,13 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
         <div className="flex-1 overflow-auto px-6 py-4">
           {notConfigured && (
             <p className="text-[13px] text-danger">
-              DataForSEO is nog niet ingesteld — voeg je API-credentials toe in Settings.
+              DataForSEO isn&apos;t set up yet — add your API credentials in Settings.
             </p>
           )}
           {error && <p className="text-[13px] text-danger">{error}</p>}
           {busy && (
             <p className="text-[13px] text-text-faint">
-              Bezig met zoeken naar “{productType.trim()}” in {STORE_CONFIG[store].label}… (~10–20s)
+              Searching for “{productType.trim()}” in {STORE_CONFIG[store].label}… (~10–20s)
             </p>
           )}
 
@@ -148,12 +148,12 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
             <>
               <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
                 <span className="text-[12px] text-text-dim">
-                  <strong className="text-text">{result.found}</strong> keywords voor{" "}
+                  <strong className="text-text">{result.found}</strong> keywords for{" "}
                   <strong className="text-text">{result.type}</strong>
                   {result.seeds.length > 0 && (
                     <span className="text-text-faint"> ({result.seeds.join(", ")})</span>
                   )}{" "}
-                  · ≥ {result.minVolume.toLocaleString("nl-NL")}/mnd
+                  · ≥ {result.minVolume.toLocaleString("en-US")}/mo
                 </span>
                 <button type="button" onClick={copyAll} className="text-[12px] text-accent hover:underline">
                   Copy all
@@ -162,23 +162,22 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
 
               {result.keywords.length === 0 ? (
                 <p className="text-[13px] text-text-faint">
-                  Geen keywords boven de drempel voor dit type in deze markt. Probeer een breder type of een
-                  andere markt.
+                  No keywords above the threshold for this type in this market. Try a broader type or another market.
                 </p>
               ) : (
                 <table className="w-full text-[12px] border-collapse">
                   <colgroup>
                     <col />
                     <col className="w-[96px]" />
-                    <col className="w-[172px]" />
+                    <col className="w-[168px]" />
                     <col className="w-[104px]" />
                   </colgroup>
                   <thead>
                     <tr className="text-text-faint text-left border-b border-border">
                       <th className="py-2 pr-3 font-medium">Keyword</th>
-                      <th className="py-2 px-3 font-medium text-right">Volume/mnd</th>
-                      <th className="py-2 px-3 font-medium">Seizoen</th>
-                      <th className="py-2 pl-3 font-medium">Intentie</th>
+                      <th className="py-2 px-3 font-medium text-right">Volume/mo</th>
+                      <th className="py-2 px-3 font-medium">Season</th>
+                      <th className="py-2 pl-3 font-medium">Intent</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -186,7 +185,7 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
                       <tr key={i} className="border-b border-border/60">
                         <td className="py-2 pr-3 text-text">{k.keyword}</td>
                         <td className="py-2 px-3 text-right font-medium tabular-nums text-text whitespace-nowrap">
-                          {(k.volume ?? 0).toLocaleString("nl-NL")}
+                          {(k.volume ?? 0).toLocaleString("en-US")}
                         </td>
                         <td className="py-2 px-3 text-text-dim whitespace-nowrap">{seasonText(k)}</td>
                         <td className="py-2 pl-3">
@@ -210,14 +209,14 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
                 </table>
               )}
               <p className="text-[11px] text-text-faint mt-3">
-                “push” = ~5–6 weken vóór de piek beginnen. Kosten: ~$0,10–0,25 per onderzoek.
+                “push” = start ~5–6 weeks before the peak. Cost: ~$0.10–0.25 per research.
               </p>
             </>
           )}
 
           {!result && !busy && !notConfigured && !error && (
             <p className="text-[13px] text-text-faint">
-              Vul een <strong>producttype</strong> in, kies een markt en klik <strong>Run research</strong>.
+              Enter a <strong>product type</strong>, pick a market, and click <strong>Run research</strong>.
             </p>
           )}
         </div>
