@@ -2083,6 +2083,30 @@ def backfill_size_charts():
     return jsonify({'dry_run': dry, 'products': len(products), 'writes': writes, 'report': report})
 
 
+@app.route('/api/debug_product_metafield')
+def debug_product_metafield():
+    """Read a product's custom.<key> metafield by handle (debug)."""
+    store = request.args.get('store', 'fr')
+    handle = request.args.get('handle', '')
+    key = request.args.get('key', 'size_chart')
+    q = ('query($q:String){products(first:3,query:$q){edges{node{handle title '
+         'mf: metafield(namespace:"custom",key:"' + key + '"){value type}}}}}')
+    try:
+        r = req.post(shopify_url(store, 'graphql.json'), headers=shopify_headers(store),
+                     json={'query': q, 'variables': {'q': 'handle:%s' % handle}}, timeout=20)
+        d = r.json()
+        edges = (((d.get('data') or {}).get('products') or {}).get('edges') or [])
+        out = []
+        for e in edges:
+            n = e['node']; mf = n.get('mf')
+            out.append({'handle': n.get('handle'), 'title': n.get('title'),
+                        'has_metafield': bool(mf), 'type': (mf or {}).get('type'),
+                        'value_preview': ((mf or {}).get('value') or '')[:200]})
+        return jsonify({'store': store, 'results': out})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 # --- Backfill: ensure every existing product is on Online Store + Facebook + Google ---
 
 @app.route('/api/backfill_sales_channels', methods=['POST'])
