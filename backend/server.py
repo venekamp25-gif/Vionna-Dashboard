@@ -2935,6 +2935,55 @@ def api_list_collections():
     return jsonify({'store': store, 'count': len(cols), 'collections': cols})
 
 
+@app.route('/api/debug_collection_rules')
+def api_debug_collection_rules():
+    """Read-only: every collection with its FULL smart-collection ruleSet
+    (column/relation/condition + appliedDisjunctively) and product count.
+    Reveals exactly how categorisation works today (usually smart rules on
+    product_type or tag)."""
+    store = request.args.get('store', 'dk')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()}.'}), 401
+    hdrs = shopify_headers(store)
+    out = []
+    cursor = None
+    for _ in range(400):
+        after = f', after:"{cursor}"' if cursor else ''
+        q = ('{ collections(first:100%s){ pageInfo{hasNextPage endCursor} edges{ node{ '
+             'id handle title productsCount{count} '
+             'ruleSet{ appliedDisjunctively rules{ column relation condition } } } } } }') % after
+        try:
+            r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs, json={'query': q}, timeout=45)
+            body = r.json() or {}
+        except Exception as e:
+            return jsonify({'error': str(e)[:120]}), 502
+        if body.get('errors'):
+            return jsonify({'error': 'gql', 'detail': body['errors']}), 502
+        conn = (body.get('data') or {}).get('collections') or {}
+        for e in conn.get('edges', []):
+            n = e.get('node') or {}
+            rs = n.get('ruleSet')
+            out.append({
+                'handle': n.get('handle'), 'title': n.get('title'),
+                'count': ((n.get('productsCount') or {}) or {}).get('count'),
+                'smart': bool(rs),
+                'disjunctive': (rs or {}).get('appliedDisjunctively'),
+                'rules': (rs or {}).get('rules') or [],
+            })
+        page = conn.get('pageInfo') or {}
+        if not page.get('hasNextPage'):
+            break
+        cursor = page.get('endCursor')
+    # summarise which columns collections key on
+    from collections import Counter
+    colcnt = Counter()
+    for c in out:
+        for rl in c['rules']:
+            colcnt[rl.get('column')] += 1
+    return jsonify({'store': store, 'count': len(out),
+                    'rule_columns': dict(colcnt), 'collections': out})
+
+
 def _job_relink_siblings(jid, store, hdrs):
     """Relink colour-variant sets that lost their theme.siblings link (the numbered
     -1/-10 handles from the old empty-colour era). CONSERVATIVE: only acts on a
