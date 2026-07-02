@@ -3024,6 +3024,63 @@ def _classify_category(title, description, taxonomy=''):
     return None, None
 
 
+def _classify_category_llm(title, description):
+    """LLM-classify one product → canonical category (or None), reading the
+    description. Used at import time. Returns None on any failure so the caller
+    can fall back to the deterministic classifier."""
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        return None
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        prompt = (
+            "Classify this women's fashion product into EXACTLY ONE category. "
+            "Reply with ONLY the category word, nothing else.\n"
+            "Categories:\n"
+            "- dress (also jumpsuits, playsuits, matching co-ord SETS)\n"
+            "- knitwear (sweaters, cardigans, hoodies, sweatshirts, knitted jumpers, ponchos)\n"
+            "- top (blouses, shirts, t-shirts, tanks, camisoles, tunics, bodysuits)\n"
+            "- pants (trousers, jeans, leggings, chinos)\n"
+            "- skirt (skirts, shorts)\n"
+            "- outerwear (coats, jackets, blazers, parkas, gilets, suit jackets)\n"
+            "- accessory (jewellery, bags, belts, scarves, hats, sunglasses, gloves)\n"
+            "- shoes (any footwear)\n"
+            "- none (swimwear, lingerie, or anything that fits none)\n\n"
+            f"Title: {title}\nDescription: {(description or '')[:900]}\n\nCategory:"
+        )
+        msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=8,
+                                     messages=[{'role': 'user', 'content': prompt}])
+        out = (msg.content[0].text if msg.content else '') or ''
+        out = re.sub(r'[^a-z]', '', out.strip().lower())
+        return out if out in CATEGORY_TAGS else None
+    except Exception as e:
+        print(f"[categorize] LLM classify failed: {e}")
+        return None
+
+
+def _category_for_publish(data, title):
+    """Resolve the cat:<x> category at publish time: honour a frontend-supplied
+    `category`, else LLM-classify the description, else deterministic keyword."""
+    cat = (data.get('category') or '').strip().lower()
+    if cat in CATEGORY_TAGS:
+        return cat
+    raw = data.get('description', '') or ''
+    cat = _classify_category_llm(title, raw)
+    if cat:
+        return cat
+    return _classify_category(title, raw)[0]
+
+
+@app.route('/api/debug_classify')
+def api_debug_classify():
+    """Debug: test the import-time category classifier. ?title=&desc="""
+    title = request.args.get('title', '')
+    desc = request.args.get('desc', '')
+    det, src = _classify_category(title, desc, '')
+    return jsonify({'llm': _classify_category_llm(title, desc),
+                    'deterministic': det, 'det_source': src})
+
+
 @app.route('/api/list_products_for_categorization')
 def api_list_products_for_categorization():
     """Read-only paginated fetch of products for classification: id, title, handle,
@@ -5460,7 +5517,8 @@ def _publish_one_variant(
     store, product_name, color, sizes,
     description_html, meta_description, m_title_specs,
     price, compare_at_price, product_type,
-    images,            # list of image URLs for THIS variant
+    cat_tags=None,     # ['cat:<x>'] description-driven category tag(s)
+    images=None,       # list of image URLs for THIS variant
     collection_id,     # may be None (skip the collects.json POST)
     actual_handle,     # value to write into theme.siblings metafield
     size_chart_html='',  # localised HTML size chart → custom.size_chart metafield
@@ -5519,6 +5577,7 @@ def _publish_one_variant(
             'handle':       product_handle,
             'body_html':    description_html,
             'product_type': product_type,
+            'tags':         cat_tags or [],
             'status':       'draft',
             'variants': [
                 {
@@ -5680,6 +5739,11 @@ def publish_create_variant():
     actual_handle    = data.get('actual_handle', '') or data.get('siblings_handle', '')
     source_url       = (data.get('competitorUrl') or data.get('source_url') or '').strip()
 
+    # Description-driven category → cat:<x> tag (honours a frontend-supplied
+    # `category`, else classifies the description).
+    _pub_cat = _category_for_publish(data, product_name)
+    _cat_tags = ['cat:%s' % _pub_cat] if _pub_cat else []
+
     hdrs = shopify_headers(store)
     base = shopify_url(store, '')
 
@@ -5694,6 +5758,7 @@ def publish_create_variant():
         price=price,
         compare_at_price=compare_at_price,
         product_type=product_type,
+        cat_tags=_cat_tags,
         images=images,
         collection_id=collection_id,
         actual_handle=actual_handle,
@@ -5756,6 +5821,12 @@ def publish():
     # Convert plain-text description to body_html via the shared helper, which
     # handles bullets, inline **bold** → <strong>, and the 65535-char truncation.
     description = _publish_to_html(data.get('description', ''))
+
+    # Auto-categorise from the description → clean cat:<x> tag. This drives the
+    # category smart-collections (accurate, description-based, not product_type).
+    _pub_category = _category_for_publish(data, product_name)
+    _cat_tags = ['cat:%s' % _pub_category] if _pub_category else []
+    print(f"[publish] category='{_pub_category}' → tags {_cat_tags}")
 
     hdrs    = shopify_headers(store)
     base    = shopify_url(store, '')
@@ -5890,6 +5961,7 @@ def publish():
                 'handle':       product_handle,
                 'body_html':    description,
                 'product_type': product_type,
+                'tags':         _cat_tags,
                 'status':       'draft',
                 'variants': [
                     {
