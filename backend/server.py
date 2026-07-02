@@ -2306,6 +2306,63 @@ def touch_product():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/set_product_size_chart', methods=['POST'])
+def api_set_product_size_chart():
+    """Manually set a size chart on an EXISTING product across stores. Body:
+    {name, chart:{headers,rows}, stores, dry_run}. Localises the chart via
+    _size_chart_html per store and writes custom.size_chart to every product whose
+    title first-token matches `name`. Not gated (single reversible metafield)."""
+    body = request.get_json(silent=True) or {}
+    name = (body.get('name') or '').strip()
+    chart = body.get('chart') or {}
+    stores = body.get('stores') or ['dk', 'fr', 'fi']
+    dry = body.get('dry_run', False)
+    if not name or not (chart.get('rows')):
+        return jsonify({'error': 'need name + chart{headers,rows}'}), 400
+
+    def gql(store, q, v=None):
+        return req.post(shopify_url(store, 'graphql.json'), headers=shopify_headers(store),
+                        json={'query': q, 'variables': v or {}}, timeout=25).json()
+
+    def _norm(s):
+        return ''.join(c for c in unicodedata.normalize('NFKD', (s or '').strip().lower())
+                       if not unicodedata.combining(c))
+
+    nb = _norm(name)
+    report = []
+    writes = 0
+    for store in stores:
+        if store not in tokens:
+            continue
+        html = _size_chart_html(chart, store)
+        try:
+            d = gql(store, 'query($q:String){products(first:100,query:$q){edges{node{id title}}}}',
+                    {'q': 'title:%s' % name})
+            nodes = [e['node'] for e in (((d.get('data') or {}).get('products') or {}).get('edges') or [])]
+            nodes = [n for n in nodes
+                     if _norm(re.split(r'[|\s]', (n.get('title') or '').strip(), 1)[0]) == nb]
+        except Exception as e:
+            report.append({'store': store, 'error': str(e)[:80]})
+            continue
+        ent = {'store': store, 'matched': [n['title'] for n in nodes], 'written': 0}
+        if not dry:
+            for n in nodes:
+                try:
+                    r = gql(store,
+                            'mutation($m:[MetafieldsSetInput!]!){metafieldsSet(metafields:$m){userErrors{message}}}',
+                            {'m': [{'ownerId': n['id'], 'namespace': 'custom', 'key': 'size_chart',
+                                    'type': 'multi_line_text_field', 'value': html}]})
+                    ue = (((r.get('data') or {}).get('metafieldsSet') or {}).get('userErrors') or [])
+                    if not ue:
+                        writes += 1; ent['written'] += 1
+                    else:
+                        ent.setdefault('errors', []).append(ue)
+                except Exception as e:
+                    ent.setdefault('errors', []).append(str(e)[:80])
+        report.append(ent)
+    return jsonify({'dry_run': dry, 'name': name, 'writes': writes, 'report': report})
+
+
 @app.route('/api/debug_product_metafield')
 def debug_product_metafield():
     """Read a product's custom.<key> metafield by handle (debug)."""
