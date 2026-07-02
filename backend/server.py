@@ -1991,24 +1991,50 @@ def ensure_size_chart_definition():
         return jsonify({'error': f'Not authenticated for {store}'}), 401
     name = {'dk': 'Størrelsesguide', 'fr': 'Guide des tailles',
             'fi': 'Kokotaulukko'}.get(store, 'Size chart')
+
+    def _gql(q):
+        return req.post(shopify_url(store, 'graphql.json'),
+                        headers=shopify_headers(store), json={'query': q}, timeout=20).json()
+
+    # Create with storefront PUBLIC_READ so the metafield is readable in Liquid.
     query = ('mutation { metafieldDefinitionCreate(definition: {'
              ' name: "' + name + '", namespace: "custom", key: "size_chart",'
              ' description: "Per-product size chart shown via the theme size-guide popup.",'
-             ' type: "multi_line_text_field", ownerType: PRODUCT'
+             ' type: "multi_line_text_field", ownerType: PRODUCT,'
+             ' access: { storefront: PUBLIC_READ }'
              ' }) { createdDefinition { id name } userErrors { field message code } } }')
     try:
-        r = req.post(shopify_url(store, 'graphql.json'),
-                     headers=shopify_headers(store), json={'query': query}, timeout=20)
-        data = r.json()
+        data = _gql(query)
         res = (data.get('data') or {}).get('metafieldDefinitionCreate') or {}
         if res.get('createdDefinition'):
-            return jsonify({'store': store, 'status': 'created',
+            return jsonify({'store': store, 'status': 'created', 'storefront': 'PUBLIC_READ',
                             'definition': res['createdDefinition']})
         errs = res.get('userErrors') or []
         if any(e.get('code') == 'TAKEN' for e in errs):
-            return jsonify({'store': store, 'status': 'already_exists'})
+            # Already exists — ensure storefront access is PUBLIC_READ (update).
+            fq = ('{metafieldDefinitions(first:1,ownerType:PRODUCT,namespace:"custom",key:"size_chart")'
+                  '{edges{node{id access{storefront}}}}}')
+            fd = _gql(fq)
+            edges = ((((fd.get('data') or {}).get('metafieldDefinitions') or {}).get('edges')) or [])
+            if not edges:
+                return jsonify({'store': store, 'status': 'already_exists', 'note': 'no def id found'})
+            node = edges[0]['node']; did = node['id']
+            cur = ((node.get('access') or {}).get('storefront'))
+            if cur == 'PUBLIC_READ':
+                return jsonify({'store': store, 'status': 'already_exists', 'storefront': cur})
+            uq = ('mutation { metafieldDefinitionUpdate(definition: {'
+                  ' namespace: "custom", key: "size_chart", ownerType: PRODUCT,'
+                  ' access: { storefront: PUBLIC_READ } })'
+                  ' { updatedDefinition { id access { storefront } } userErrors { field message code } } }')
+            ud = _gql(uq)
+            ur = (ud.get('data') or {}).get('metafieldDefinitionUpdate') or {}
+            if ur.get('updatedDefinition'):
+                return jsonify({'store': store, 'status': 'updated_storefront_access',
+                                'storefront': (ur['updatedDefinition'].get('access') or {}).get('storefront')})
+            return jsonify({'store': store, 'status': 'update_error',
+                            'userErrors': ur.get('userErrors'), 'raw': ud}), 400
         return jsonify({'store': store, 'status': 'error', 'userErrors': errs,
-                        'http': r.status_code, 'raw': data}), 400
+                        'http': None, 'raw': data}), 400
     except Exception as e:
         return jsonify({'store': store, 'error': str(e)}), 500
 
