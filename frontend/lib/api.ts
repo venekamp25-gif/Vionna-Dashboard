@@ -434,6 +434,20 @@ export const api = {
       >;
     }>("/api/research_keywords", { method: "POST", body: params }),
 
+  /** Whether DataForSEO keyword research is configured on the server (non-secret). */
+  keywordResearchStatus: () =>
+    call<{ configured: boolean; login_hint?: string }>("/api/keyword_research_status", {
+      method: "GET",
+    }),
+
+  /** Save DataForSEO API credentials to the server .env (gated). The values are
+   *  written server-side and never returned; only { ok, configured } comes back. */
+  saveDataforseoCredentials: (params: { login: string; password: string }) =>
+    call<{ ok?: boolean; configured?: boolean; error?: string }>(
+      "/api/save_dataforseo_credentials",
+      { method: "POST", body: params, authed: true }
+    ),
+
   higgsfield: (params: {
     prompt_type: number;
     product_type: string;

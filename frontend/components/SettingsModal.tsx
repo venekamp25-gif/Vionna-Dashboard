@@ -26,6 +26,43 @@ export function SettingsModal({ open, onClose }: Props) {
   const [fetching, setFetching] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
 
+  // DataForSEO keyword-research credentials
+  const [dfsLogin, setDfsLogin] = useState("");
+  const [dfsPassword, setDfsPassword] = useState("");
+  const [dfsBusy, setDfsBusy] = useState(false);
+  const [dfsStatus, setDfsStatus] = useState<{ configured: boolean; login_hint?: string } | null>(null);
+  const [dfsMsg, setDfsMsg] = useState<string | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    void api.keywordResearchStatus().then(setDfsStatus).catch(() => {});
+  }, [open]);
+  const saveDfs = async () => {
+    if (!dfsLogin.trim() || !dfsPassword.trim()) {
+      setDfsMsg("Enter both login and password.");
+      return;
+    }
+    setDfsBusy(true);
+    setDfsMsg(null);
+    try {
+      const r = await api.saveDataforseoCredentials({
+        login: dfsLogin.trim(),
+        password: dfsPassword.trim(),
+      });
+      if (r.ok || r.configured) {
+        setDfsMsg("✓ Saved — keyword research is now active.");
+        setDfsLogin("");
+        setDfsPassword("");
+        setDfsStatus({ configured: true });
+      } else {
+        setDfsMsg(r.error || "Could not save.");
+      }
+    } catch (e) {
+      setDfsMsg(e instanceof Error ? e.message : "Could not save.");
+    } finally {
+      setDfsBusy(false);
+    }
+  };
+
   const handleResetDraft = () => {
     if (!confirm(
       "Discard the current product and wipe the saved draft (both in this browser AND on the cloud)? " +
@@ -527,6 +564,62 @@ export function SettingsModal({ open, onClose }: Props) {
                 {sysBusy === "export" ? "⟳ Preparing…" : "⬇ Download data backup"}
               </Button>
               {sysMsg && <span className="text-[11px] text-text-faint">{sysMsg}</span>}
+            </div>
+          </div>
+
+          {/* ── DataForSEO — keyword research ──────────────────────── */}
+          <div className="mt-8 pt-6 border-t border-border">
+            <div className="text-[14px] font-semibold text-text mb-1">
+              DataForSEO — keyword research
+              {dfsStatus?.configured && (
+                <span className="ml-2 text-[11px] text-accent align-middle">● connected</span>
+              )}
+            </div>
+            <p className="text-[12px] text-text-faint mb-3 leading-relaxed">
+              Powers the automatic per-market keyword research at import. Paste your DataForSEO API{" "}
+              <strong>login</strong> and <strong>password</strong> (DataForSEO dashboard → API access →
+              API credentials). They&apos;re written to your server only, applied immediately, and never
+              shown back.
+            </p>
+            {dfsStatus?.configured && (
+              <p className="text-[12px] text-accent mb-3">
+                ✓ Connected{dfsStatus.login_hint ? ` (${dfsStatus.login_hint})` : ""}. Enter new values to
+                replace.
+              </p>
+            )}
+            <div className="flex flex-col gap-2 max-w-[440px]">
+              <input
+                type="text"
+                value={dfsLogin}
+                onChange={(e) => setDfsLogin(e.target.value)}
+                placeholder="API login (usually your account email)"
+                autoComplete="off"
+                spellCheck={false}
+                className="w-full px-3 h-10 rounded-[10px] bg-bg-elev-2 border border-border text-[13px] focus:outline-none focus:border-accent focus:ring-3 focus:ring-[var(--accent-soft)]"
+              />
+              <input
+                type="password"
+                value={dfsPassword}
+                onChange={(e) => setDfsPassword(e.target.value)}
+                placeholder="API password"
+                autoComplete="new-password"
+                className="w-full px-3 h-10 rounded-[10px] bg-bg-elev-2 border border-border text-[13px] focus:outline-none focus:border-accent focus:ring-3 focus:ring-[var(--accent-soft)]"
+              />
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={dfsBusy || !dfsLogin.trim() || !dfsPassword.trim()}
+                  onClick={() => void saveDfs()}
+                >
+                  {dfsBusy ? "Saving…" : "Save credentials"}
+                </Button>
+                {dfsMsg && (
+                  <span className={`text-[11px] ${dfsMsg.startsWith("✓") ? "text-accent" : "text-danger"}`}>
+                    {dfsMsg}
+                  </span>
+                )}
+              </div>
             </div>
           </div>
 

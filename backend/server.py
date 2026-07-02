@@ -3386,8 +3386,44 @@ def api_research_keywords():
 @app.route('/api/keyword_research_status')
 def api_keyword_research_status():
     """Whether DataForSEO keyword research is live (creds present). Non-secret."""
+    lo, _pw = _dfs_creds()
     return jsonify({'configured': _dfs_configured(),
+                    'login_hint': (lo[:2] + '…' + lo[-6:]) if len(lo) > 8 else ('set' if lo else ''),
                     'locations': DFS_LOCATION, 'languages': DFS_LANGUAGE})
+
+
+@app.route('/api/save_dataforseo_credentials', methods=['POST'])
+@require_droplet_token
+def api_save_dataforseo_credentials():
+    """Store DataForSEO API creds (login + password) in backend/.env AND apply
+    them to the running process immediately. Gated. NEVER logs or returns the
+    values. The dashboard Settings form is the only caller."""
+    body = request.get_json(silent=True) or {}
+    login = (body.get('login') or '').replace('\n', '').replace('\r', '').strip()
+    password = (body.get('password') or '').replace('\n', '').replace('\r', '').strip()
+    if not login or not password:
+        return jsonify({'error': 'Both login and password are required.'}), 400
+    if len(login) > 300 or len(password) > 500:
+        return jsonify({'error': 'Value too long.'}), 400
+    try:
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+        lines = []
+        if os.path.exists(env_path):
+            with open(env_path, 'r', encoding='utf-8') as f:
+                lines = [ln.rstrip('\n') for ln in f]
+        lines = [ln for ln in lines
+                 if not ln.startswith('DATAFORSEO_LOGIN=') and not ln.startswith('DATAFORSEO_PASSWORD=')]
+        lines.append('DATAFORSEO_LOGIN=' + login)
+        lines.append('DATAFORSEO_PASSWORD=' + password)
+        with open(env_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines) + '\n')
+    except Exception as e:
+        return jsonify({'error': 'Could not write .env: ' + str(e)[:80]}), 500
+    # apply to the live process so it works without a restart; .env persists for future restarts
+    os.environ['DATAFORSEO_LOGIN'] = login
+    os.environ['DATAFORSEO_PASSWORD'] = password
+    print('[dataforseo] credentials saved (login length %d)' % len(login))  # never log the value
+    return jsonify({'ok': True, 'configured': True})
 
 
 @app.route('/api/debug_classify')
