@@ -3402,6 +3402,36 @@ def _seasonality(monthly):
             'peak_volume': peak[2], 'avg_volume': round(avg)}
 
 
+def _dfs_clean_keywords_llm(keywords, store):
+    """LLM cleanup: from a keyword list keep only ones relevant to a WOMEN'S fashion
+    store (drop other brand names, menswear, kids, off-topic). Keeps the objects,
+    just filters. Falls back to the input on any failure."""
+    if not keywords or not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        return keywords
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        kws = [k.get('keyword') for k in keywords if k.get('keyword')]
+        prompt = ("From this list of search keywords for a WOMEN'S online fashion store, return ONLY the "
+                  "keywords worth targeting: women's clothing / shoes / bags / accessories, or their styles "
+                  "and types (generic terms are fine). REMOVE: other brand names (e.g. Nike, Adidas, Zalando, "
+                  "Carhartt, Salomon, Marimekko), men's-only or kids items, and anything unrelated to womenswear. "
+                  "Reply with ONLY a JSON array of the kept keywords, exactly as written.\n\n"
+                  + json.dumps(kws, ensure_ascii=False))
+        msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=2000,
+                                     messages=[{'role': 'user', 'content': prompt}])
+        txt = (msg.content[0].text if msg.content else '') or ''
+        m = re.search(r'\[.*\]', txt, re.S)
+        if not m:
+            return keywords
+        keep = {str(x).strip().lower() for x in json.loads(m.group(0))}
+        filtered = [k for k in keywords if (k.get('keyword') or '').strip().lower() in keep]
+        return filtered or keywords
+    except Exception as e:
+        print(f"[keywords] clean failed: {e}")
+        return keywords
+
+
 def _dfs_keyword_suggestions(seed, store, min_volume=0, limit=25):
     """Keyword suggestions (variants CONTAINING the seed → on-topic) for one
     market. Returns [{keyword, volume, cpc, competition, intent, seasonality}].
@@ -3469,7 +3499,10 @@ def api_keyword_research_niche():
                 if k not in best or v > (best[k].get('volume') or 0):
                     kw['seed'] = seed
                     best[k] = kw
-    ranked = sorted(best.values(), key=lambda x: -(x.get('volume') or 0))[:target]
+    # rank a wide pool, drop brand/off-topic noise via LLM, then take the target
+    pool_ranked = sorted(best.values(), key=lambda x: -(x.get('volume') or 0))[:max(target * 2, 80)]
+    cleaned = pool_ranked if body.get('no_clean') else _dfs_clean_keywords_llm(pool_ranked, store)
+    ranked = cleaned[:target]
     return jsonify({'configured': True, 'store': store, 'min_volume': min_vol,
                     'seeds_used': len(seeds), 'found': len(ranked),
                     'keywords': ranked, 'errors': errors[:3]})
