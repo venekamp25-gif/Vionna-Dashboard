@@ -432,7 +432,32 @@ export const api = {
           }
         >
       >;
-    }>("/api/research_keywords", { method: "POST", body: params }),
+    }>("/api/research_keywords", { method: "POST", body: params, authed: true }),
+
+  /** Standalone niche keyword research (the DSA strategy): trending high-volume
+   *  fashion keywords for a market, with seasonality. Gated (costs API credits). */
+  keywordResearchNiche: (params: { store: "dk" | "fr" | "fi"; min_volume?: number; target_count?: number }) =>
+    call<{
+      configured: boolean;
+      store?: string;
+      min_volume?: number;
+      found?: number;
+      keywords?: {
+        keyword: string;
+        volume: number | null;
+        cpc: number | null;
+        competition: string | null;
+        intent: string | null;
+        seed?: string;
+        seasonality: {
+          peak_month?: string;
+          trough_month?: string;
+          push_from_month?: string;
+          trend?: string;
+          seasonal?: boolean;
+        } | null;
+      }[];
+    }>("/api/keyword_research_niche", { method: "POST", body: params, authed: true }),
 
   /** Whether DataForSEO keyword research is configured on the server (non-secret). */
   keywordResearchStatus: () =>

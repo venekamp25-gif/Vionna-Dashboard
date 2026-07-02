@@ -10,6 +10,7 @@ import { SettingsModal } from "./SettingsModal";
 import { HistoryModal } from "./HistoryModal";
 import { ReportBugModal } from "./ReportBugModal";
 import { KeywordBackfillModal } from "./KeywordBackfillModal";
+import { KeywordResearchModal } from "./KeywordResearchModal";
 import { CatalogMaintenanceModal } from "./CatalogMaintenanceModal";
 import { useCatalogJobs } from "@/lib/catalogJobs";
 
@@ -18,6 +19,7 @@ export function Header() {
   const [historyOpen, setHistoryOpen]   = useState(false);
   const [bugOpen, setBugOpen]           = useState(false);
   const [backfillOpen, setBackfillOpen] = useState(false);
+  const [researchOpen, setResearchOpen] = useState(false);
   const [maintenanceOpen, setMaintenanceOpen] = useState(false);
   const maintenanceRunning = useCatalogJobs().some((j) => j.status === "running");
 
@@ -45,6 +47,15 @@ export function Header() {
             className="w-9 h-9 flex items-center justify-center rounded-md bg-bg-elev-2 text-text-dim hover:text-accent hover:border-accent border border-border transition-colors text-[14px]"
           >
             🔑
+          </button>
+          <button
+            type="button"
+            onClick={() => setResearchOpen(true)}
+            title="Keyword research — trending high-volume keywords per market (met seizoen)"
+            aria-label="Open keyword research"
+            className="w-9 h-9 flex items-center justify-center rounded-md bg-bg-elev-2 text-text-dim hover:text-accent hover:border-accent border border-border transition-colors text-[14px]"
+          >
+            📊
           </button>
           <button
             type="button"
@@ -84,6 +95,7 @@ export function Header() {
       <HistoryModal open={historyOpen} onClose={() => setHistoryOpen(false)} />
       <ReportBugModal open={bugOpen} onClose={() => setBugOpen(false)} />
       <KeywordBackfillModal open={backfillOpen} onClose={() => setBackfillOpen(false)} />
+      <KeywordResearchModal open={researchOpen} onClose={() => setResearchOpen(false)} />
       <CatalogMaintenanceModal open={maintenanceOpen} onClose={() => setMaintenanceOpen(false)} />
     </>
   );

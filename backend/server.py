@@ -3486,6 +3486,7 @@ def _dfs_keyword_suggestions(seed, store, min_volume=0, limit=25):
 
 
 @app.route('/api/keyword_research_niche', methods=['POST'])
+@require_droplet_token
 def api_keyword_research_niche():
     """Standalone product-research (the DSA document's strategy, automated):
     for a market, pull keyword suggestions across the womenswear category seeds,
@@ -3544,6 +3545,7 @@ def api_keyword_research_niche():
 
 
 @app.route('/api/research_keywords', methods=['POST'])
+@require_droplet_token
 def api_research_keywords():
     """Auto keyword research at import. Body: {stores, product_name, competitor_title,
     category, description, min_volume, limit}. Derives local-language seeds (Claude) →
