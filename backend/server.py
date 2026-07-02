@@ -1508,6 +1508,132 @@ def _extract_size_chart(html):
         return None
 
 
+def _kiwi_size_chart(page_html):
+    """Competitors using the Kiwi Sizing app load the chart via JS (not in the
+    HTML). Fetch it from Kiwi's API using the shop + product context embedded in
+    the page. Returns {headers, rows} or None. Best-effort, never raises."""
+    try:
+        shop = re.search(r'KiwiSizing\.shop\s*=\s*"([^"]+)"', page_html)
+        blk = re.search(r'KiwiSizing\.data\s*=\s*\{(.*?)\};', page_html, re.S)
+        if not shop or not blk:
+            return None
+        ctx = {}
+        for k in ('collections', 'tags', 'product', 'vendor', 'type'):
+            m = re.search(k + r'\s*:\s*"([^"]*)"', blk.group(1))
+            ctx[k] = (m.group(1) if m else '')
+        if not ctx.get('product'):
+            return None
+        from urllib.parse import urlencode
+        url = 'https://app.kiwisizing.com/kiwiSizing/api/getSizingChart?' + urlencode({'shop': shop.group(1), **ctx})
+        r = _scrape_get(url, timeout=12)
+        if r.status_code != 200:
+            return None
+        api = r.json()
+        for s in (api.get('sizings') or []):
+            for _tid, tbl in (s.get('tables') or {}).items():
+                grid = [[(c.get('value', '') if isinstance(c, dict) else str(c)) for c in row]
+                        for row in (tbl.get('data') or []) if row]
+                grid = [g for g in grid if any(str(x).strip() for x in g)]
+                if len(grid) >= 2:
+                    return {'headers': [str(x).strip() for x in grid[0]],
+                            'rows': [[str(x).strip() for x in g] for g in grid[1:]]}
+        return None
+    except Exception as e:
+        print(f"[size-chart] kiwi failed: {e}")
+        return None
+
+
+_SIZE_IMG_RE = re.compile(r'size[\-_ ]?chart|size[\-_ ]?guide|sizing|measurement|maattabel|st(?:ø|oe)rrelse|'
+                          r'guide.?des.?tailles|kokotaulukko|size_?chart|maatschema', re.I)
+
+
+def _ocr_size_chart(page_html, page_url):
+    """Last resort: find a size-chart IMAGE on the page and OCR it with Claude
+    vision → {headers, rows}. Only fires on an image that looks size-related (so
+    we don't OCR random product photos). Best-effort, never raises."""
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        return None
+    try:
+        from urllib.parse import urljoin
+        cand = None
+        for tag in re.findall(r'<img\b[^>]*>', page_html, re.I):
+            src = (re.search(r'(?:data-src|data-original|data-lazy|src)\s*=\s*["\']([^"\']+)', tag, re.I) or [None, ''])[1]
+            alt = (re.search(r'alt\s*=\s*["\']([^"\']*)', tag, re.I) or [None, ''])[1]
+            cls = (re.search(r'class\s*=\s*["\']([^"\']*)', tag, re.I) or [None, ''])[1]
+            if src and _SIZE_IMG_RE.search(src + ' ' + alt + ' ' + cls):
+                cand = src
+                break
+        if not cand:
+            return None
+        if cand.startswith('//'):
+            img_url = 'https:' + cand
+        elif cand.startswith('http'):
+            img_url = cand
+        else:
+            img_url = urljoin(page_url, cand)
+        ir = _scrape_get(img_url, timeout=15)
+        if ir.status_code != 200 or not ir.content:
+            return None
+        import base64
+        mime = (ir.headers.get('content-type') or 'image/png').split(';')[0].strip()
+        if not mime.startswith('image/'):
+            mime = 'image/png'
+        b64 = base64.b64encode(ir.content).decode()
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        msg = client.messages.create(
+            model='claude-sonnet-4-5', max_tokens=1200,
+            messages=[{'role': 'user', 'content': [
+                {'type': 'image', 'source': {'type': 'base64', 'media_type': mime, 'data': b64}},
+                {'type': 'text', 'text':
+                    'This image may be a clothing SIZE / MEASUREMENT chart. If it IS one, extract it as compact '
+                    'JSON {"headers":[...],"rows":[[...],...]} — first array is the column headers, then one array '
+                    'per row; cells as strings, keep numbers + units. If it is NOT a size chart, reply exactly: null'},
+            ]}])
+        txt = (msg.content[0].text if msg.content else '') or ''
+        if '{' not in txt:
+            return None
+        obj = json.loads(re.search(r'\{.*\}', txt, re.S).group(0))
+        headers = obj.get('headers') or []
+        rows = obj.get('rows') or []
+        if len(headers) >= 2 and len(rows) >= 1:
+            return {'headers': [str(x).strip() for x in headers],
+                    'rows': [[str(x).strip() for x in r] for r in rows]}
+        return None
+    except Exception as e:
+        print(f"[size-chart] ocr failed: {e}")
+        return None
+
+
+def _extract_size_chart_full(page_html, page_url=''):
+    """Size chart from a competitor page, trying in order: HTML <table> →
+    Kiwi Sizing app API → image OCR. Returns {headers, rows} or None."""
+    return (_extract_size_chart(page_html)
+            or _kiwi_size_chart(page_html)
+            or _ocr_size_chart(page_html, page_url))
+
+
+@app.route('/api/debug_extract_chart')
+def api_debug_extract_chart():
+    """Debug: run the full size-chart extraction on any URL, reporting which
+    method succeeded (html / kiwi / ocr)."""
+    url = request.args.get('url', '')
+    try:
+        r = _scrape_get(url, timeout=15)
+    except Exception as e:
+        return jsonify({'error': str(e)[:100]}), 502
+    html = r.text if r.status_code == 200 else ''
+    out = {'url': url, 'status': r.status_code}
+    c = _extract_size_chart(html)
+    if c:
+        return jsonify({**out, 'method': 'html', 'chart': c})
+    c = _kiwi_size_chart(html)
+    if c:
+        return jsonify({**out, 'method': 'kiwi', 'chart': c})
+    c = _ocr_size_chart(html, url)
+    return jsonify({**out, 'method': ('ocr' if c else None), 'chart': c})
+
+
 @app.route('/api/scrape', methods=['POST'])
 def scrape():
     raw_input = (request.json.get('url') or '').strip()
@@ -1692,7 +1818,7 @@ def scrape():
             if sc_r.status_code == 200:
                 fallback_html = sc_r.text
         if fallback_html:
-            size_chart = _extract_size_chart(fallback_html)
+            size_chart = _extract_size_chart_full(fallback_html, html_url)
     except Exception as e:
         print(f"[scrape] size-chart fetch failed: {e}")
 
