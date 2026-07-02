@@ -3388,6 +3388,24 @@ DFS_NICHE_SEEDS = {
            'takki', 'bleiseri', 'kengät', 'saappaat', 'sandaalit', 'laukku', 'uimapuku', 'haalari'],
 }
 
+# English product-type label per market seed — so the "What to list" tab groups
+# results under clear names (e.g. "sac à main" → Handbags) that non-native staff
+# understand. Keys mirror DFS_NICHE_SEEDS.
+DFS_SEED_LABELS = {
+    'dk': {'kjole': 'Dresses', 'cardigan': 'Cardigans', 'sweater': 'Sweaters', 'strik': 'Knitwear',
+           'bukser': 'Trousers', 'jeans': 'Jeans', 'nederdel': 'Skirts', 'shorts': 'Shorts', 'bluse': 'Blouses',
+           'top': 'Tops', 'jakke': 'Jackets', 'frakke': 'Coats', 'blazer': 'Blazers', 'sko': 'Shoes',
+           'støvler': 'Boots', 'sandaler': 'Sandals', 'taske': 'Bags', 'badedragt': 'Swimwear', 'jumpsuit': 'Jumpsuits'},
+    'fr': {'robe': 'Dresses', 'cardigan': 'Cardigans', 'pull': 'Sweaters', 'maille': 'Knitwear',
+           'pantalon': 'Trousers', 'jean': 'Jeans', 'jupe': 'Skirts', 'short': 'Shorts', 'blouse': 'Blouses',
+           'top': 'Tops', 'veste': 'Jackets', 'manteau': 'Coats', 'blazer': 'Blazers', 'chaussures': 'Shoes',
+           'bottes': 'Boots', 'sandales': 'Sandals', 'sac': 'Bags', 'maillot de bain': 'Swimwear', 'combinaison': 'Jumpsuits'},
+    'fi': {'mekko': 'Dresses', 'neuletakki': 'Cardigans', 'neule': 'Knitwear', 'housut': 'Trousers',
+           'farkut': 'Jeans', 'hame': 'Skirts', 'shortsit': 'Shorts', 'pusero': 'Blouses', 'toppi': 'Tops',
+           'takki': 'Jackets & coats', 'bleiseri': 'Blazers', 'kengät': 'Shoes', 'saappaat': 'Boots',
+           'sandaalit': 'Sandals', 'laukku': 'Bags', 'uimapuku': 'Swimwear', 'haalari': 'Jumpsuits'},
+}
+
 _SEASON_MONTHS = ['', 'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
 
 
@@ -3628,6 +3646,71 @@ def api_keyword_research_niche():
                     'product_type': product_type, 'seeds': seeds, 'seeds_used': len(seeds),
                     'found': len(ranked), 'recommended_count': rec_count,
                     'keywords': ranked, 'errors': errors[:3]})
+
+
+@app.route('/api/what_to_list', methods=['POST'])
+@require_droplet_token
+def api_what_to_list():
+    """Product-TYPE view for the "What to list" tab: for each womenswear category
+    in a market, return an English label + the localized search term + the type's
+    demand/seasonality + its top-N keywords. Lets a researcher see WHICH types to
+    list now, grouped and readable. Body: {store, per_type?}."""
+    body = request.get_json(silent=True) or {}
+    store = body.get('store', 'dk')
+    if not _dfs_configured():
+        return jsonify({'configured': False, 'message': 'DataForSEO not configured.'})
+    if store not in DFS_LOCATION:
+        return jsonify({'error': 'unknown store'}), 400
+    per_type = max(1, min(int(body.get('per_type') or 5), 10))
+    floor = max(200, DFS_MIN_VOLUME.get(store, 1000) // 4)
+    labels = DFS_SEED_LABELS.get(store, {})
+    seeds = list(labels.keys())
+    import concurrent.futures as _cf
+
+    def _one(seed):
+        res = _dfs_keyword_suggestions(seed, store, min_volume=0, limit=30)
+        clean = [k for k in res if isinstance(k, dict) and 'error' not in k and k.get('keyword')]
+        # collapse plural/gender/word-order variants within this type
+        sig_best = {}
+        for k in sorted(clean, key=lambda x: -(x.get('volume') or 0)):
+            sig = _kw_signature(k.get('keyword') or '')
+            if sig and sig not in sig_best:
+                sig_best[sig] = k
+        ranked = [k for k in sorted(sig_best.values(), key=lambda x: -(x.get('volume') or 0))
+                  if (k.get('volume') or 0) >= floor]
+        return seed, ranked
+
+    types = []
+    errors = []
+    with _cf.ThreadPoolExecutor(max_workers=6) as pool:
+        futs = {pool.submit(_one, s): s for s in seeds}
+        for f in _cf.as_completed(futs):
+            try:
+                seed, ranked = f.result()
+            except Exception as e:
+                errors.append(str(e)[:80]); continue
+            if not ranked:
+                continue
+            top = ranked[:per_type]
+            # Represent the whole type by the seed's own row if present (most
+            # on-topic), else the biggest keyword — for the type-level season.
+            rep = next((k for k in ranked if (k.get('keyword') or '').strip().lower() == seed.lower()), top[0])
+            types.append({
+                'seed': seed,
+                'label': labels.get(seed, seed),
+                'keyword': labels.get(seed, seed),  # alias so _recommend_keywords can score types
+                'volume': max((k.get('volume') or 0) for k in ranked),
+                'intent': rep.get('intent'),
+                'seasonality': rep.get('seasonality'),
+                'keywords': [{'keyword': k.get('keyword'), 'volume': k.get('volume'),
+                              'seasonality': k.get('seasonality'), 'intent': k.get('intent')} for k in top],
+            })
+    _recommend_keywords(types, store, top_n=int(body.get('recommend_count') or 8))
+    types.sort(key=lambda x: -(x.get('score') or 0))
+    for t in types:
+        t.pop('keyword', None)  # drop the scoring alias; frontend uses 'label'
+    return jsonify({'configured': True, 'store': store, 'per_type': per_type,
+                    'floor': floor, 'count': len(types), 'types': types, 'errors': errors[:3]})
 
 
 @app.route('/api/research_keywords', methods=['POST'])
