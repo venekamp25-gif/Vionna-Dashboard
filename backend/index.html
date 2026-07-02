@@ -2738,6 +2738,8 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
                                parseInt(document.getElementById('discountSelect').value)
                              ),
           product_type:    guessShopifyProductType(),
+          keywords:        (document.getElementById('keywordsInput')?.value || '')
+                             .split('\n').map(k => k.trim()).filter(Boolean),
           colors,
           siblings_handle: handle,
           images_by_color: imagesByColor,

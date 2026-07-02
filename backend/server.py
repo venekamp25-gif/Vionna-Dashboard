@@ -6773,6 +6773,13 @@ def publish_create_variant():
         'collection_handle': actual_handle,
         'image_count':   len(images),
         'metafield_errors': result.get('metafield_errors') or [],
+        # --- join-key: de listing-BESLISSING (inputs) meeloggen zodat ze later
+        # aan de outcome (verkoop/ad-ROAS) gekoppeld kunnen worden. ---
+        'keywords':           data.get('keywords') or [],
+        'category':           _pub_cat or None,
+        'product_type':       product_type or None,
+        'size_chart_applied': bool(data.get('size_chart')),
+        'dfs_recommended':    data.get('dfs_recommended'),
     })
     return jsonify({'success': True, **result})
 
@@ -7037,6 +7044,26 @@ def publish():
                 req.post(f"{base}collects.json", headers=hdrs, json={
                     'collect': {'product_id': prod_id, 'collection_id': collection_id}
                 })
+
+            # Join-key: log de listing-BESLISSING (inputs -> outcome) per product
+            # zodat latere feedback loops (keyword-efficacy, ad-results, bestseller)
+            # input aan uitkomst kunnen koppelen. Best-effort; _append_history raise't nooit.
+            _append_history({
+                'store':              store,
+                'product_name':       product_name,
+                'color':              color,
+                'product_id':         prod_id,
+                'source_url':         (data.get('competitorUrl') or data.get('source_url') or ''),
+                'collection_handle':  actual_handle,
+                'image_count':        len(img_payload),
+                'metafield_errors':   mf_errors,
+                # --- join-key velden ---
+                'keywords':           data.get('keywords') or [],
+                'category':           _pub_category or None,
+                'product_type':       product_type or None,
+                'size_chart_applied': bool(data.get('size_chart')),
+                'dfs_recommended':    data.get('dfs_recommended'),
+            })
 
     # Build Shopify admin URLs for created products
     shop_domain = tokens.get(store, {}).get('shop', '')
