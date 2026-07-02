@@ -2938,7 +2938,7 @@ def api_list_collections():
 # ============================================================================
 # Description-driven product categorisation (→ clean cat:<x> tags → collections)
 # ----------------------------------------------------------------------------
-CATEGORY_TAGS = ['dress', 'knitwear', 'top', 'pants', 'skirt', 'outerwear', 'accessory', 'shoes']
+CATEGORY_TAGS = ['dress', 'knitwear', 'top', 'pants', 'skirt', 'outerwear', 'accessory', 'shoes', 'swim']
 
 # category → the collection HANDLE it drives (same handles across stores; shoes
 # handle differs per store; outerwear is created). underdele is repurposed to skirts.
@@ -2948,7 +2948,10 @@ CAT_TO_COLLECTION_HANDLE = {
 }
 SHOES_HANDLE = {'dk': 'fodtoj', 'fr': 'chaussures', 'fi': 'fodtoj'}
 OUTERWEAR_HANDLE = 'overtoj'
-OUTERWEAR_TITLE = {'dk': 'OVERTØJ', 'fr': 'VESTES / MANTEAUX', 'fi': 'TAKIT'}
+# clearer "jackets & coats" style names (matches the store's other collections)
+OUTERWEAR_TITLE = {'dk': 'JAKKER / FRAKKER', 'fr': 'VESTES / MANTEAUX', 'fi': 'TAKIT'}
+SWIM_HANDLE = 'badetoj'
+SWIM_TITLE = {'dk': 'BADETØJ', 'fr': 'MAILLOTS DE BAIN', 'fi': 'UIMAPUVUT'}
 
 # per-store category-collection handles (DK/FI share; FR is localised)
 CAT_COLLECTION_HANDLES = {
@@ -2967,6 +2970,8 @@ def _cat_from_taxonomy(tax):
     t = (tax or '').lower()
     if not t:
         return None
+    if any(k in t for k in ('bikini', 'swimsuit', 'swimwear', 'swim ', 'one-piece swim', 'cover-up')):
+        return 'swim'
     if 'dress' in t:
         return 'dress'
     if 'skirt' in t or 'shorts' in t:
@@ -2991,6 +2996,8 @@ def _cat_from_taxonomy(tax):
 
 # multilingual (EN/NL/DA/FR/FI) description/title keywords, checked in this order.
 _DESC_KW = [
+    ('swim',      ['badedragt', 'bikini', 'maillot de bain', 'badpak', 'uimapuku', 'swimsuit', 'swimwear',
+                   'badetøj', 'badetoj', 'strandtøj']),
     ('shoes',     ['sandal', 'støvle', 'stovle', 'boot', 'sneaker', 'loafer', 'chaussure', 'kenk', 'schoen',
                    'hæl', 'hael', 'espadrille', 'ballerina', 'pumps', 'mule', 'sko ', ' sko', 'jalkine', 'saapas']),
     ('outerwear', ['frakke', 'jakke', 'blazer', ' coat', 'jacket', 'manteau', 'veste', 'takki', ' jas', 'mantel',
@@ -3045,7 +3052,8 @@ def _classify_category_llm(title, description):
             "- outerwear (coats, jackets, blazers, parkas, gilets, suit jackets)\n"
             "- accessory (jewellery, bags, belts, scarves, hats, sunglasses, gloves)\n"
             "- shoes (any footwear)\n"
-            "- none (swimwear, lingerie, or anything that fits none)\n\n"
+            "- swim (swimwear, bikinis, swimsuits, beach cover-ups)\n"
+            "- none (lingerie, homeware, non-products, or anything that fits none)\n\n"
             f"Title: {title}\nDescription: {(description or '')[:900]}\n\nCategory:"
         )
         msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=8,
@@ -3237,23 +3245,33 @@ def api_manage_category_collections():
             ent['status'] = 'SKIP_manual (needs delete+recreate)'
         report.append(ent)
 
-    # 2. Outerwear — create smart if missing
-    ow = by_handle(OUTERWEAR_HANDLE)
-    if ow:
-        ent = {'handle': OUTERWEAR_HANDLE, 'cat': 'outerwear', 'status': 'exists'}
-        if not dry and ow.get('ruleSet'):
-            set_rule(ow['id'], 'outerwear'); ent['status'] = 'repointed'
-    else:
-        ent = {'handle': OUTERWEAR_HANDLE, 'cat': 'outerwear', 'status': 'would_create' if dry else 'creating'}
+    # 2. Extra smart collections created/owned by us: outerwear + swim.
+    #    create if missing, else repoint + rename to the clear title.
+    def _ensure(handle, cat, title):
+        node = by_handle(handle)
+        if node:
+            ent = {'handle': handle, 'cat': cat, 'title': title, 'status': 'exists'}
+            if not dry:
+                r = gql('mutation($id:ID!,$t:String!,$rs:CollectionRuleSetInput!){collectionUpdate(input:{id:$id,title:$t,ruleSet:$rs}){collection{id} userErrors{field message}}}',
+                        {'id': node['id'], 't': title,
+                         'rs': {'appliedDisjunctively': True,
+                                'rules': [{'column': 'TAG', 'relation': 'EQUALS', 'condition': 'cat:%s' % cat}]}})
+                ue = (((r.get('data') or {}).get('collectionUpdate') or {}).get('userErrors') or [])
+                ent['status'] = 'repointed+renamed' if not ue else 'ERROR'
+                if ue: ent['errors'] = ue
+            return ent
+        ent = {'handle': handle, 'cat': cat, 'title': title, 'status': 'would_create' if dry else 'creating'}
         if not dry:
             r = gql('mutation($in:CollectionInput!){collectionCreate(input:$in){collection{id handle} userErrors{field message}}}',
-                    {'in': {'title': OUTERWEAR_TITLE.get(store, 'Outerwear'), 'handle': OUTERWEAR_HANDLE,
+                    {'in': {'title': title, 'handle': handle,
                             'ruleSet': {'appliedDisjunctively': True,
-                                        'rules': [{'column': 'TAG', 'relation': 'EQUALS', 'condition': 'cat:outerwear'}]}}})
+                                        'rules': [{'column': 'TAG', 'relation': 'EQUALS', 'condition': 'cat:%s' % cat}]}}})
             cc = (r.get('data') or {}).get('collectionCreate') or {}
             ent['status'] = 'created' if cc.get('collection') else 'ERROR'
-            ent['result'] = cc
-    report.append(ent)
+            if not cc.get('collection'): ent['result'] = cc
+        return ent
+    report.append(_ensure(OUTERWEAR_HANDLE, 'outerwear', OUTERWEAR_TITLE.get(store, 'Outerwear')))
+    report.append(_ensure(SWIM_HANDLE, 'swim', SWIM_TITLE.get(store, 'Swimwear')))
 
     # 3. Footwear — try to make it smart on cat:shoes
     sh_handle = SHOES_HANDLE.get(store, 'fodtoj')
