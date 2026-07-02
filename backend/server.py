@@ -2023,6 +2023,7 @@ def backfill_size_charts():
     single reversible metafield). idempotent (metafieldsSet overwrites)."""
     body = request.get_json(silent=True) or {}
     dry = body.get('dry_run', True)
+    clear = bool(body.get('clear'))
     products = body.get('products') or []
     off = int(body.get('offset') or 0)
     lim = int(body.get('limit') or 0)
@@ -2050,7 +2051,7 @@ def backfill_size_charts():
             if store not in tokens:
                 continue
             val = html.get(store)
-            if not val:
+            if not val and not clear:
                 continue
             try:
                 nodes = search(store, 'title:%s' % name)
@@ -2061,6 +2062,19 @@ def backfill_size_charts():
                 report.append({'name': name, 'store': store, 'error': str(e)[:80]})
                 continue
             ent = {'name': name, 'store': store, 'matched': [n['title'] for n in nodes]}
+            if clear and nodes:
+                dels = 0
+                for n in nodes:
+                    try:
+                        r = gql(store,
+                                'mutation($m:[MetafieldIdentifierInput!]!){metafieldsDelete(metafields:$m){deletedMetafields{key} userErrors{message}}}',
+                                {'m': [{'ownerId': n['id'], 'namespace': 'custom', 'key': 'size_chart'}]})
+                        dels += 1
+                    except Exception as e:
+                        ent.setdefault('errors', []).append(str(e)[:80])
+                ent['cleared'] = dels
+                report.append(ent)
+                continue
             if not dry and nodes:
                 errs = []
                 for n in nodes:
