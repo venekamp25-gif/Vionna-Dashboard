@@ -3399,28 +3399,34 @@ def api_debug_dfs():
         return jsonify({'configured': False})
     seed = request.args.get('seed', 'midikjole')
     store = request.args.get('store', 'dk')
-    use_filter = request.args.get('filter', '1') == '1'
-    task = {'keywords': [seed], 'location_code': DFS_LOCATION.get(store, 2208),
-            'language_code': DFS_LANGUAGE.get(store, 'da'), 'limit': 10,
-            'order_by': ['keyword_info.search_volume,desc']}
-    if use_filter:
-        task['filters'] = [['keyword_info.search_volume', '>', 10]]
+    ep = request.args.get('ep', 'suggestions')  # suggestions | ideas
+    if ep == 'suggestions':
+        url = 'https://api.dataforseo.com/v3/dataforseo_labs/google/keyword_suggestions/live'
+        task = {'keyword': seed, 'location_code': DFS_LOCATION.get(store, 2208),
+                'language_code': DFS_LANGUAGE.get(store, 'da'), 'limit': 15,
+                'order_by': ['keyword_info.search_volume,desc']}
+    else:
+        url = DFS_ENDPOINT
+        task = {'keywords': [seed], 'location_code': DFS_LOCATION.get(store, 2208),
+                'language_code': DFS_LANGUAGE.get(store, 'da'), 'limit': 15,
+                'order_by': ['keyword_info.search_volume,desc']}
     try:
-        r = req.post(DFS_ENDPOINT, headers=_dfs_headers(), json=[task], timeout=30)
+        r = req.post(url, headers=_dfs_headers(), json=[task], timeout=30)
         d = r.json()
     except Exception as e:
-        return jsonify({'error': str(e)[:150], 'http': getattr(r, 'status_code', None) if 'r' in dir() else None})
+        return jsonify({'error': str(e)[:150]})
     t = (d.get('tasks') or [{}])[0]
     res = (t.get('result') or [])
     r0 = (res[0] or {}) if res else {}
+    items = r0.get('items') or []
+    first_hist = ((items[0] or {}).get('keyword_info') or {}).get('monthly_searches') if items else None
     return jsonify({
-        'http': r.status_code,
+        'endpoint': ep, 'http': r.status_code,
         'api_status_code': d.get('status_code'), 'api_status_message': d.get('status_message'),
-        'cost': d.get('cost'),
-        'task_status_code': t.get('status_code'), 'task_status_message': t.get('status_message'),
-        'result_count': r0.get('total_count'), 'items_len': len(r0.get('items') or []),
+        'cost': d.get('cost'), 'items_len': len(items),
+        'has_monthly_history': bool(first_hist), 'monthly_history_len': len(first_hist or []),
         'sample': [{'k': it.get('keyword'), 'v': (it.get('keyword_info') or {}).get('search_volume')}
-                   for it in (r0.get('items') or [])[:5]],
+                   for it in items[:8]],
     })
 
 
