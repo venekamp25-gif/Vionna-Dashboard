@@ -2950,6 +2950,16 @@ SHOES_HANDLE = {'dk': 'fodtoj', 'fr': 'chaussures', 'fi': 'fodtoj'}
 OUTERWEAR_HANDLE = 'overtoj'
 OUTERWEAR_TITLE = {'dk': 'OVERTØJ', 'fr': 'VESTES / MANTEAUX', 'fi': 'TAKIT'}
 
+# per-store category-collection handles (DK/FI share; FR is localised)
+CAT_COLLECTION_HANDLES = {
+    'dk': {'dress': 'kjoler', 'knitwear': 'trojer-cardigans', 'top': 'toppe',
+           'skirt': 'underdele', 'pants': 'bukser', 'accessory': 'smykker-tilbehor'},
+    'fi': {'dress': 'kjoler', 'knitwear': 'trojer-cardigans', 'top': 'toppe',
+           'skirt': 'underdele', 'pants': 'bukser', 'accessory': 'smykker-tilbehor'},
+    'fr': {'dress': 'kjoler', 'knitwear': 'pulls-cardigans', 'top': 'hautes',
+           'skirt': 'bas', 'pants': 'pantalons', 'accessory': 'bijoux-accessoires'},
+}
+
 
 def _cat_from_taxonomy(tax):
     """Map a Shopify standard-category fullName → our canonical category. High
