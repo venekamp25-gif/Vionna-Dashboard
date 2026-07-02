@@ -17,6 +17,28 @@ type StoreResult = {
   notConfigured?: boolean;
 };
 
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+
+function monthNum(name?: string): number {
+  return name ? MONTHS.indexOf(name) + 1 : 0;
+}
+
+/** Is the current month inside this keyword's push → peak window (with year wrap)? */
+function inSeasonNow(k: Kw): boolean {
+  const s = k.seasonality;
+  if (!s?.seasonal) return false;
+  const push = monthNum(s.push_from_month);
+  const peak = monthNum(s.peak_month);
+  if (!push || !peak) return false;
+  const now = new Date().getMonth() + 1;
+  return push <= peak ? now >= push && now <= peak : now >= push || now <= peak;
+}
+
+/** Green = above the volume threshold AND currently in season (good time to push). */
+function isHot(k: Kw, minVolume: number): boolean {
+  return (k.volume ?? 0) >= minVolume && inSeasonNow(k);
+}
+
 function seasonText(k: Kw): string {
   const s = k.seasonality;
   if (s?.seasonal && s.peak_month) return `peak ${s.peak_month} → push ${s.push_from_month}`;
@@ -27,7 +49,8 @@ function seasonText(k: Kw): string {
 /**
  * Standalone keyword research (the DSA product-research strategy, automated):
  * enter a product type + pick one or more markets → trending, high-volume
- * keywords for that type with monthly search volume + seasonality.
+ * keywords for that type with search volume + seasonality. Keywords that are
+ * high-volume AND currently in season are highlighted green.
  */
 export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [selectedStores, setSelectedStores] = useState<StoreKey[]>([...STORE_KEYS]);
@@ -36,6 +59,8 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
   const [results, setResults] = useState<Partial<Record<StoreKey, StoreResult>> | null>(null);
   const [viewStore, setViewStore] = useState<StoreKey>("dk");
   const [error, setError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Record<string, boolean>>({});
+  const [copied, setCopied] = useState<string | null>(null);
 
   const canRun = productType.trim().length > 0 && selectedStores.length > 0 && !busy;
 
@@ -47,6 +72,7 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
     setBusy(true);
     setError(null);
     setResults(null);
+    setSelected({});
     const type = productType.trim();
     try {
       const entries = await Promise.all(
@@ -82,15 +108,36 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
     }
   };
 
-  const copyView = () => {
-    const kws = results?.[viewStore]?.keywords ?? [];
-    if (kws.length) void navigator.clipboard?.writeText(kws.map((k) => k.keyword).join("\n"));
+  const copyText = (text: string, tag: string) => {
+    if (!text) return;
+    void navigator.clipboard?.writeText(text);
+    setCopied(tag);
+    window.setTimeout(() => setCopied((c) => (c === tag ? null : c)), 1200);
   };
 
   if (!open) return null;
 
   const resultStores = results ? (STORE_KEYS.filter((s) => results[s]) as StoreKey[]) : [];
   const active = results?.[viewStore];
+  const minVolume = active?.minVolume ?? 0;
+  const viewKeywords = active?.keywords ?? [];
+  const selKey = (kw: string) => `${viewStore}:${kw}`;
+  const viewSelected = viewKeywords.filter((k) => selected[selKey(k.keyword)]);
+  const allChecked = viewKeywords.length > 0 && viewKeywords.every((k) => selected[selKey(k.keyword)]);
+
+  const toggleSel = (kw: string) => setSelected((p) => ({ ...p, [selKey(kw)]: !p[selKey(kw)] }));
+  const toggleAll = () => {
+    const on = !allChecked;
+    setSelected((p) => {
+      const n = { ...p };
+      viewKeywords.forEach((k) => (n[selKey(k.keyword)] = on));
+      return n;
+    });
+  };
+  const copyMany = () => {
+    const list = viewSelected.length > 0 ? viewSelected : viewKeywords;
+    copyText(list.map((k) => k.keyword).join("\n"), "many");
+  };
 
   return (
     <div
@@ -174,7 +221,6 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
 
           {results && !busy && (
             <>
-              {/* Result market tabs */}
               {resultStores.length > 1 && (
                 <div className="flex items-center gap-1 mb-3 border-b border-border">
                   {resultStores.map((s) => (
@@ -205,17 +251,25 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
                 <p className="text-[13px] text-danger">{active.error}</p>
               ) : active ? (
                 <>
-                  <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
+                  <div className="flex items-center justify-between gap-3 mb-2 flex-wrap">
                     <span className="text-[12px] text-text-dim">
                       <strong className="text-text">{active.found}</strong> keywords for{" "}
                       <strong className="text-text">{active.type}</strong>
                       {active.seeds && active.seeds.length > 0 && (
                         <span className="text-text-faint"> ({active.seeds.join(", ")})</span>
                       )}{" "}
-                      · ≥ {(active.minVolume ?? 0).toLocaleString("en-US")}/mo
+                      · ≥ {minVolume.toLocaleString("en-US")}/mo
                     </span>
-                    <button type="button" onClick={copyView} className="text-[12px] text-accent hover:underline">
-                      Copy all
+                    <button
+                      type="button"
+                      onClick={copyMany}
+                      className="text-[12px] text-accent hover:underline whitespace-nowrap"
+                    >
+                      {copied === "many"
+                        ? "✓ Copied"
+                        : viewSelected.length > 0
+                          ? `Copy selected (${viewSelected.length})`
+                          : "Copy all"}
                     </button>
                   </div>
 
@@ -224,52 +278,101 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
                       No keywords above the threshold for this type in this market. Try a broader type.
                     </p>
                   ) : (
-                    <table className="w-full text-[12px] border-collapse">
-                      <colgroup>
-                        <col />
-                        <col className="w-[96px]" />
-                        <col className="w-[168px]" />
-                        <col className="w-[104px]" />
-                      </colgroup>
-                      <thead>
-                        <tr className="text-text-faint text-left border-b border-border">
-                          <th className="py-2 pr-3 font-medium">Keyword</th>
-                          <th className="py-2 px-3 font-medium text-right">Volume/mo</th>
-                          <th className="py-2 px-3 font-medium">Season</th>
-                          <th className="py-2 pl-3 font-medium">Intent</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {(active.keywords ?? []).map((k, i) => (
-                          <tr key={i} className="border-b border-border/60">
-                            <td className="py-2 pr-3 text-text">{k.keyword}</td>
-                            <td className="py-2 px-3 text-right font-medium tabular-nums text-text whitespace-nowrap">
-                              {(k.volume ?? 0).toLocaleString("en-US")}
-                            </td>
-                            <td className="py-2 px-3 text-text-dim whitespace-nowrap">{seasonText(k)}</td>
-                            <td className="py-2 pl-3">
-                              {k.intent ? (
-                                <span
-                                  className={`inline-block px-1.5 py-0.5 rounded text-[10px] ${
-                                    k.intent === "transactional" || k.intent === "commercial"
-                                      ? "bg-[var(--accent-soft)] text-accent"
-                                      : "bg-bg-elev-2 text-text-faint"
+                    <>
+                      <table className="w-full text-[12px] border-collapse">
+                        <colgroup>
+                          <col className="w-[30px]" />
+                          <col />
+                          <col className="w-[92px]" />
+                          <col className="w-[160px]" />
+                          <col className="w-[96px]" />
+                          <col className="w-[34px]" />
+                        </colgroup>
+                        <thead>
+                          <tr className="text-text-faint text-left border-b border-border">
+                            <th className="py-2">
+                              <input
+                                type="checkbox"
+                                checked={allChecked}
+                                onChange={toggleAll}
+                                className="align-middle accent-[var(--accent)] cursor-pointer"
+                                aria-label="Select all"
+                              />
+                            </th>
+                            <th className="py-2 pr-3 font-medium">Keyword</th>
+                            <th className="py-2 px-2 font-medium text-right">Volume/mo</th>
+                            <th className="py-2 px-2 font-medium">Season</th>
+                            <th className="py-2 px-2 font-medium">Intent</th>
+                            <th className="py-2" />
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(active.keywords ?? []).map((k, i) => {
+                            const hot = isHot(k, minVolume);
+                            const checked = !!selected[selKey(k.keyword)];
+                            return (
+                              <tr
+                                key={i}
+                                className={`border-b border-border/60 ${hot ? "bg-green-500/[0.08]" : ""}`}
+                              >
+                                <td className="py-2">
+                                  <input
+                                    type="checkbox"
+                                    checked={checked}
+                                    onChange={() => toggleSel(k.keyword)}
+                                    className="align-middle accent-[var(--accent)] cursor-pointer"
+                                    aria-label={`Select ${k.keyword}`}
+                                  />
+                                </td>
+                                <td className={`py-2 pr-3 ${hot ? "text-green-600 dark:text-green-400 font-medium" : "text-text"}`}>
+                                  {k.keyword}
+                                  {hot && <span className="ml-1.5 text-[10px] text-green-600 dark:text-green-400">● in season</span>}
+                                </td>
+                                <td
+                                  className={`py-2 px-2 text-right font-medium tabular-nums whitespace-nowrap ${
+                                    hot ? "text-green-600 dark:text-green-400" : "text-text"
                                   }`}
                                 >
-                                  {k.intent}
-                                </span>
-                              ) : (
-                                <span className="text-text-faint">—</span>
-                              )}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                                  {(k.volume ?? 0).toLocaleString("en-US")}
+                                </td>
+                                <td className="py-2 px-2 text-text-dim whitespace-nowrap">{seasonText(k)}</td>
+                                <td className="py-2 px-2">
+                                  {k.intent ? (
+                                    <span
+                                      className={`inline-block px-1.5 py-0.5 rounded text-[10px] ${
+                                        k.intent === "transactional" || k.intent === "commercial"
+                                          ? "bg-[var(--accent-soft)] text-accent"
+                                          : "bg-bg-elev-2 text-text-faint"
+                                      }`}
+                                    >
+                                      {k.intent}
+                                    </span>
+                                  ) : (
+                                    <span className="text-text-faint">—</span>
+                                  )}
+                                </td>
+                                <td className="py-2 text-right">
+                                  <button
+                                    type="button"
+                                    title="Copy this keyword"
+                                    onClick={() => copyText(k.keyword, k.keyword)}
+                                    className="text-text-faint hover:text-accent transition text-[13px]"
+                                  >
+                                    {copied === k.keyword ? "✓" : "⧉"}
+                                  </button>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                      <p className="text-[11px] text-text-faint mt-3">
+                        <span className="text-green-600 dark:text-green-400">● green</span> = above your volume
+                        threshold AND currently in season (push→peak window — good time to push now). “push” =
+                        start ~5–6 weeks before the peak.
+                      </p>
+                    </>
                   )}
-                  <p className="text-[11px] text-text-faint mt-3">
-                    “push” = start ~5–6 weeks before the peak. Cost: ~$0.10–0.25 per market.
-                  </p>
                 </>
               ) : null}
             </>
