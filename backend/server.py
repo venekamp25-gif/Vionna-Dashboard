@@ -2935,6 +2935,262 @@ def api_list_collections():
     return jsonify({'store': store, 'count': len(cols), 'collections': cols})
 
 
+# ============================================================================
+# Description-driven product categorisation (→ clean cat:<x> tags → collections)
+# ----------------------------------------------------------------------------
+CATEGORY_TAGS = ['dress', 'knitwear', 'top', 'pants', 'skirt', 'outerwear', 'accessory', 'shoes']
+
+# category → the collection HANDLE it drives (same handles across stores; shoes
+# handle differs per store; outerwear is created). underdele is repurposed to skirts.
+CAT_TO_COLLECTION_HANDLE = {
+    'dress': 'kjoler', 'knitwear': 'trojer-cardigans', 'top': 'toppe',
+    'skirt': 'underdele', 'pants': 'bukser', 'accessory': 'smykker-tilbehor',
+}
+SHOES_HANDLE = {'dk': 'fodtoj', 'fr': 'chaussures', 'fi': 'fodtoj'}
+OUTERWEAR_HANDLE = 'overtoj'
+OUTERWEAR_TITLE = {'dk': 'OVERTØJ', 'fr': 'VESTES / MANTEAUX', 'fi': 'TAKIT'}
+
+
+def _cat_from_taxonomy(tax):
+    """Map a Shopify standard-category fullName → our canonical category. High
+    confidence when present; None when the taxonomy is empty/unmappable."""
+    t = (tax or '').lower()
+    if not t:
+        return None
+    if 'dress' in t:
+        return 'dress'
+    if 'skirt' in t or 'shorts' in t:
+        return 'skirt'
+    if any(k in t for k in ('sweater', 'cardigan', 'hoodie', 'sweatshirt')):
+        return 'knitwear'
+    if any(k in t for k in ('trouser', 'pants', 'jean', 'legging')):
+        return 'pants'
+    if 'swimsuit' not in t and any(k in t for k in ('coat', 'jacket', 'blazer', ' suit', 'outerwear', 'parka')):
+        return 'outerwear'
+    if any(k in t for k in ('blouse', 'shirt', 'top', 'tank', 'tunic', 'cami', 'tee', 'bodysuit')):
+        return 'top'
+    if any(k in t for k in ('shoe', 'boot', 'sandal', 'sneaker', 'flats', 'flat', 'loafer', 'heel', 'footwear', 'pump', 'espadrille', 'mule', 'clog')):
+        return 'shoes'
+    if any(k in t for k in ('handbag', ' bag', 'wallet', 'jewelry', 'jewellery', 'earring', 'necklace',
+                            'bracelet', 'ring', 'belt', 'scarf', 'hat', 'sunglass', 'accessor', 'glove', 'purse')):
+        return 'accessory'
+    if 'outfit set' in t:
+        return 'dress'
+    return None
+
+
+# multilingual (EN/NL/DA/FR/FI) description/title keywords, checked in this order.
+_DESC_KW = [
+    ('shoes',     ['sandal', 'støvle', 'stovle', 'boot', 'sneaker', 'loafer', 'chaussure', 'kenk', 'schoen',
+                   'hæl', 'hael', 'espadrille', 'ballerina', 'pumps', 'mule', 'sko ', ' sko', 'jalkine', 'saapas']),
+    ('outerwear', ['frakke', 'jakke', 'blazer', ' coat', 'jacket', 'manteau', 'veste', 'takki', ' jas', 'mantel',
+                   'parka', 'trench', 'puffer', 'windbreaker', 'overtøj', 'overcoat', 'gilet', 'bodywarmer']),
+    ('dress',     ['kjole', 'robe ', ' robe', 'mekko', 'jurk', 'gown', 'midikjole', 'maxikjole', 'midi-kjole',
+                   'midi dress', 'maxi dress', 'jumpsuit', 'playsuit']),
+    ('skirt',     ['nederdel', 'jupe', 'hame', 'skirt', ' rok', 'shorts', 'short ']),
+    ('knitwear',  ['sweater', 'cardigan', 'strik', 'trøje', 'troje', 'pull', 'neule', 'knit', 'jumper', 'hoodie',
+                   'sweatshirt', 'gebreid', 'strikket', 'poncho']),
+    ('pants',     ['bukser', 'pantalon', 'housut', 'trouser', 'jeans', 'broek', 'legging', ' pants', 'chino',
+                   'wide leg', 'palazzo']),
+    ('accessory', ['taske', ' bag', 'handbag', 'smykke', 'ørering', 'orering', 'halskæde', 'armbånd', ' ring',
+                   ' sac', 'bijoux', 'collier', 'boucle', 'laukku', 'koru', ' tas', 'ketting', 'oorbel', 'belt',
+                   'bælte', 'tørklæde', 'scarf', ' hat', 'hoed', 'sjaal', 'sunglass', 'solbrille', 'huivi']),
+    ('top',       ['bluse', 'blouse', 'shirt', ' top', 't-shirt', ' tee', 'tank', 'tunika', 'tunic', 'camisole',
+                   'singlet', 'bodysuit', 'paita', 'overdel', 'topje', 'peplum']),
+]
+
+
+def _classify_category(title, description, taxonomy=''):
+    """Deterministic classifier: taxonomy first (Shopify's own, accurate), else
+    multilingual keyword match on title+description. Returns (category, source)
+    where source ∈ {'taxonomy','keyword',None}. None category = unclassifiable."""
+    c = _cat_from_taxonomy(taxonomy)
+    if c:
+        return c, 'taxonomy'
+    hay = ((title or '') + ' ' + (description or '')).lower()
+    for cat, kws in _DESC_KW:
+        if any(k in hay for k in kws):
+            return cat, 'keyword'
+    return None, None
+
+
+@app.route('/api/list_products_for_categorization')
+def api_list_products_for_categorization():
+    """Read-only paginated fetch of products for classification: id, title, handle,
+    description snippet, tags, standard taxonomy category. Caller paginates via
+    ?cursor=. Also runs the deterministic classifier so callers can see it."""
+    store = request.args.get('store', 'dk')
+    cursor = request.args.get('cursor', '')
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()}.'}), 401
+    hdrs = shopify_headers(store)
+    after = f', after:"{cursor}"' if cursor else ''
+    q = ('{ products(first:100%s){ pageInfo{hasNextPage endCursor} edges{ node{ '
+         'id handle title productType tags category{ fullName } description } } } }') % after
+    try:
+        r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs, json={'query': q}, timeout=45)
+        body = r.json() or {}
+    except Exception as e:
+        return jsonify({'error': str(e)[:120]}), 502
+    if body.get('errors'):
+        return jsonify({'error': 'gql', 'detail': body['errors']}), 502
+    conn = ((body.get('data') or {}).get('products') or {})
+    out = []
+    for e in conn.get('edges', []):
+        n = e['node']
+        gid = n['id']
+        num = gid.rsplit('/', 1)[-1]
+        cat, src = _classify_category(n.get('title'), n.get('description'), (n.get('category') or {}).get('fullName'))
+        out.append({
+            'id': gid, 'num_id': num, 'title': n.get('title'), 'handle': n.get('handle'),
+            'product_type': n.get('productType'),
+            'taxonomy': (n.get('category') or {}).get('fullName'),
+            'tags': n.get('tags') or [],
+            'desc': (n.get('description') or '')[:600],
+            'det_cat': cat, 'det_src': src,
+        })
+    page = conn.get('pageInfo') or {}
+    return jsonify({'store': store, 'count': len(out),
+                    'next_cursor': page.get('endCursor') if page.get('hasNextPage') else None,
+                    'has_more': bool(page.get('hasNextPage')), 'products': out})
+
+
+@app.route('/api/apply_category_tags', methods=['POST'])
+def api_apply_category_tags():
+    """Write clean cat:<x> tags. Body: {store, dry_run(default true), replace(bool),
+    assignments:[{id, category}]}. Adds cat:<category>; if replace, also strips the
+    other 7 cat:* tags (keeps exactly one). Idempotent. Not gated (tags are
+    reversible)."""
+    body = request.get_json(silent=True) or {}
+    store = body.get('store', 'dk')
+    dry = body.get('dry_run', True)
+    replace = bool(body.get('replace'))
+    assigns = body.get('assignments') or []
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()}.'}), 401
+    hdrs = shopify_headers(store)
+
+    def gql(qs, v=None):
+        return req.post(shopify_url(store, 'graphql.json'), headers=hdrs,
+                        json={'query': qs, 'variables': v or {}}, timeout=25).json()
+
+    added = 0; errors = []
+    by_cat = {}
+    for a in assigns:
+        gid = a.get('id'); cat = (a.get('category') or '').strip().lower()
+        if not gid or cat not in CATEGORY_TAGS:
+            continue
+        by_cat[cat] = by_cat.get(cat, 0) + 1
+        if dry:
+            continue
+        try:
+            r = gql('mutation($id:ID!,$t:[String!]!){tagsAdd(id:$id,tags:$t){userErrors{message}}}',
+                    {'id': gid, 't': ['cat:%s' % cat]})
+            ue = (((r.get('data') or {}).get('tagsAdd') or {}).get('userErrors') or [])
+            if ue:
+                errors.append({'id': gid, 'e': ue})
+            else:
+                added += 1
+            if replace:
+                others = ['cat:%s' % c for c in CATEGORY_TAGS if c != cat]
+                gql('mutation($id:ID!,$t:[String!]!){tagsRemove(id:$id,tags:$t){userErrors{message}}}',
+                    {'id': gid, 't': others})
+        except Exception as e:
+            errors.append({'id': gid, 'e': str(e)[:80]})
+    return jsonify({'store': store, 'dry_run': dry, 'assignments': len(assigns),
+                    'by_category': by_cat, 'added': added, 'errors': errors[:20], 'error_count': len(errors)})
+
+
+@app.route('/api/manage_category_collections', methods=['POST'])
+def api_manage_category_collections():
+    """Normalise category collections to key on the clean cat:<x> tags.
+    Body: {store, dry_run(default true)}. Repoints the 6 smart category collections
+    to a single `TAG EQUALS cat:<x>` rule, creates the Outerwear collection, and
+    converts the manual Footwear collection to smart (delete+recreate at same handle
+    if the API won't convert in place). Run this ONLY AFTER products are tagged."""
+    body = request.get_json(silent=True) or {}
+    store = body.get('store', 'dk')
+    dry = body.get('dry_run', True)
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()}.'}), 401
+    hdrs = shopify_headers(store)
+
+    def gql(qs, v=None):
+        return req.post(shopify_url(store, 'graphql.json'), headers=hdrs,
+                        json={'query': qs, 'variables': v or {}}, timeout=25).json()
+
+    def by_handle(h):
+        d = gql('query($h:String!){collectionByHandle(handle:$h){id handle title ruleSet{appliedDisjunctively rules{column relation condition}}}}', {'h': h})
+        return (d.get('data') or {}).get('collectionByHandle')
+
+    def set_rule(cid, cat):
+        return gql('mutation($id:ID!,$rs:CollectionRuleSetInput!){collectionUpdate(input:{id:$id,ruleSet:$rs}){collection{id} userErrors{field message}}}',
+                   {'id': cid, 'rs': {'appliedDisjunctively': True,
+                                      'rules': [{'column': 'TAG', 'relation': 'EQUALS', 'condition': 'cat:%s' % cat}]}})
+
+    report = []
+
+    # 1. the 6 smart category collections → single clean tag rule
+    for handle, cat in [('kjoler', 'dress'), ('trojer-cardigans', 'knitwear'), ('toppe', 'top'),
+                        ('underdele', 'skirt'), ('bukser', 'pants'), ('smykker-tilbehor', 'accessory')]:
+        node = by_handle(handle)
+        if not node:
+            report.append({'handle': handle, 'cat': cat, 'status': 'MISSING'})
+            continue
+        smart = bool(node.get('ruleSet'))
+        ent = {'handle': handle, 'cat': cat, 'was_smart': smart,
+               'old_rules': [f"{r['column']}={r['condition']}" for r in ((node.get('ruleSet') or {}).get('rules') or [])]}
+        if dry:
+            ent['status'] = 'would_repoint → TAG EQUALS cat:%s' % cat
+        elif smart:
+            r = set_rule(node['id'], cat)
+            ue = (((r.get('data') or {}).get('collectionUpdate') or {}).get('userErrors') or [])
+            ent['status'] = 'repointed' if not ue else 'ERROR'
+            if ue: ent['errors'] = ue
+        else:
+            ent['status'] = 'SKIP_manual (needs delete+recreate)'
+        report.append(ent)
+
+    # 2. Outerwear — create smart if missing
+    ow = by_handle(OUTERWEAR_HANDLE)
+    if ow:
+        ent = {'handle': OUTERWEAR_HANDLE, 'cat': 'outerwear', 'status': 'exists'}
+        if not dry and ow.get('ruleSet'):
+            set_rule(ow['id'], 'outerwear'); ent['status'] = 'repointed'
+    else:
+        ent = {'handle': OUTERWEAR_HANDLE, 'cat': 'outerwear', 'status': 'would_create' if dry else 'creating'}
+        if not dry:
+            r = gql('mutation($in:CollectionInput!){collectionCreate(input:$in){collection{id handle} userErrors{field message}}}',
+                    {'in': {'title': OUTERWEAR_TITLE.get(store, 'Outerwear'), 'handle': OUTERWEAR_HANDLE,
+                            'ruleSet': {'appliedDisjunctively': True,
+                                        'rules': [{'column': 'TAG', 'relation': 'EQUALS', 'condition': 'cat:outerwear'}]}}})
+            cc = (r.get('data') or {}).get('collectionCreate') or {}
+            ent['status'] = 'created' if cc.get('collection') else 'ERROR'
+            ent['result'] = cc
+    report.append(ent)
+
+    # 3. Footwear — try to make it smart on cat:shoes
+    sh_handle = SHOES_HANDLE.get(store, 'fodtoj')
+    sh = by_handle(sh_handle)
+    if not sh:
+        report.append({'handle': sh_handle, 'cat': 'shoes', 'status': 'MISSING'})
+    else:
+        ent = {'handle': sh_handle, 'cat': 'shoes', 'was_smart': bool(sh.get('ruleSet'))}
+        if dry:
+            ent['status'] = 'would_convert_to_smart(cat:shoes)'
+        elif sh.get('ruleSet'):
+            set_rule(sh['id'], 'shoes'); ent['status'] = 'repointed'
+        else:
+            # manual → try in-place convert; capture whether Shopify allows it
+            r = set_rule(sh['id'], 'shoes')
+            ue = (((r.get('data') or {}).get('collectionUpdate') or {}).get('userErrors') or [])
+            ent['status'] = 'converted_in_place' if not ue else 'CONVERT_FAILED'
+            if ue: ent['errors'] = ue
+        report.append(ent)
+
+    return jsonify({'store': store, 'dry_run': dry, 'report': report})
+
+
 @app.route('/api/debug_sample_products')
 def api_debug_sample_products():
     """Read-only: sample products with product_type, tags, standard category
