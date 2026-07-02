@@ -3355,6 +3355,126 @@ def _dfs_keyword_ideas(seeds, store, min_volume=30, limit=12):
     return out[:limit]
 
 
+# scaled per-market minimum monthly search volume (DK/FI are small markets;
+# the ≥20k rule is for big markets like DE/UK). Overridable per request.
+DFS_MIN_VOLUME = {'dk': 2500, 'fr': 10000, 'fi': 1200}
+DFS_SUGGEST_ENDPOINT = 'https://api.dataforseo.com/v3/dataforseo_labs/google/keyword_suggestions/live'
+
+# core womenswear category seeds per market (the "trending niche keywords" base).
+DFS_NICHE_SEEDS = {
+    'dk': ['kjole', 'cardigan', 'sweater', 'strik', 'bukser', 'jeans', 'nederdel', 'shorts', 'bluse',
+           'top', 'jakke', 'frakke', 'blazer', 'sko', 'støvler', 'sandaler', 'taske', 'badedragt', 'jumpsuit'],
+    'fr': ['robe', 'cardigan', 'pull', 'maille', 'pantalon', 'jean', 'jupe', 'short', 'blouse', 'top',
+           'veste', 'manteau', 'blazer', 'chaussures', 'bottes', 'sandales', 'sac', 'maillot de bain', 'combinaison'],
+    'fi': ['mekko', 'neuletakki', 'neule', 'housut', 'farkut', 'hame', 'shortsit', 'pusero', 'toppi',
+           'takki', 'bleiseri', 'kengät', 'saappaat', 'sandaalit', 'laukku', 'uimapuku', 'haalari'],
+}
+
+_SEASON_MONTHS = ['', 'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+
+
+def _seasonality(monthly):
+    """From DataForSEO monthly_searches (12-mo history) → peak/trough month, a
+    'start pushing ~5-6 weeks before the peak' hint, and recent trend. None if
+    not enough data / not seasonal."""
+    if not monthly or len(monthly) < 6:
+        return None
+    rows = [(m.get('year') or 0, m.get('month') or 0, m.get('search_volume') or 0) for m in monthly]
+    rows.sort(key=lambda x: (x[0], x[1]))
+    vols = [v for _, _, v in rows]
+    avg = sum(vols) / len(vols) if vols else 0
+    if not avg:
+        return None
+    peak = max(rows, key=lambda x: x[2])
+    trough = min(rows, key=lambda x: x[2])
+    peak_m = peak[1]
+    push_m = ((peak_m - 2 - 1) % 12) + 1  # ~1.5 months before the peak
+    recent = vols[-3:]
+    trend = 'flat'
+    if len(recent) >= 2 and recent[0]:
+        if recent[-1] > recent[0] * 1.15:
+            trend = 'rising'
+        elif recent[-1] < recent[0] * 0.85:
+            trend = 'falling'
+    seasonal = peak[2] > avg * 1.4 and trough[2] < avg * 0.7
+    return {'peak_month': _SEASON_MONTHS[peak_m], 'trough_month': _SEASON_MONTHS[trough[1]],
+            'push_from_month': _SEASON_MONTHS[push_m], 'trend': trend, 'seasonal': bool(seasonal),
+            'peak_volume': peak[2], 'avg_volume': round(avg)}
+
+
+def _dfs_keyword_suggestions(seed, store, min_volume=0, limit=25):
+    """Keyword suggestions (variants CONTAINING the seed → on-topic) for one
+    market. Returns [{keyword, volume, cpc, competition, intent, seasonality}].
+    Never raises."""
+    if not seed or store not in DFS_LOCATION:
+        return []
+    task = {'keyword': seed, 'location_code': DFS_LOCATION[store], 'language_code': DFS_LANGUAGE[store],
+            'limit': max(limit, 20), 'order_by': ['keyword_info.search_volume,desc']}
+    if min_volume:
+        task['filters'] = [['keyword_info.search_volume', '>', int(min_volume)]]
+    try:
+        r = req.post(DFS_SUGGEST_ENDPOINT, headers=_dfs_headers(), json=[task], timeout=30)
+        d = r.json()
+    except Exception as e:
+        return [{'error': str(e)[:100]}]
+    t = (d.get('tasks') or [{}])[0]
+    if t.get('status_code') not in (20000, None) and not t.get('result'):
+        return [{'error': t.get('status_message', 'dfs error'), 'code': t.get('status_code')}]
+    items = (((t.get('result') or [{}])[0]) or {}).get('items') or []
+    out = []
+    for it in items:
+        ki = it.get('keyword_info') or {}
+        out.append({
+            'keyword': it.get('keyword'), 'volume': ki.get('search_volume'),
+            'cpc': ki.get('cpc'), 'competition': ki.get('competition_level'),
+            'intent': ((it.get('search_intent_info') or {}) or {}).get('main_intent'),
+            'seasonality': _seasonality(ki.get('monthly_searches')),
+        })
+    return out[:limit]
+
+
+@app.route('/api/keyword_research_niche', methods=['POST'])
+def api_keyword_research_niche():
+    """Standalone product-research (the DSA document's strategy, automated):
+    for a market, pull keyword suggestions across the womenswear category seeds,
+    filter by the (scaled) volume threshold, dedupe + sort by volume, add
+    seasonality. Body: {store, min_volume?, target_count?, seeds?}."""
+    body = request.get_json(silent=True) or {}
+    store = body.get('store', 'dk')
+    if not _dfs_configured():
+        return jsonify({'configured': False, 'message': 'DataForSEO not configured.'})
+    if store not in DFS_LOCATION:
+        return jsonify({'error': 'unknown store'}), 400
+    min_vol = int(body.get('min_volume') or DFS_MIN_VOLUME.get(store, 2000))
+    target = int(body.get('target_count') or 40)
+    seeds = body.get('seeds') or DFS_NICHE_SEEDS.get(store, [])
+    best = {}
+    errors = []
+    import concurrent.futures as _cf
+    with _cf.ThreadPoolExecutor(max_workers=6) as pool:
+        futs = {pool.submit(_dfs_keyword_suggestions, s, store, min_vol, 25): s for s in seeds}
+        for f in _cf.as_completed(futs):
+            seed = futs[f]
+            try:
+                res = f.result()
+            except Exception as e:
+                errors.append({'error': str(e)[:80]}); continue
+            for kw in res:
+                if 'error' in kw:
+                    errors.append(kw); continue
+                k = (kw.get('keyword') or '').strip().lower()
+                v = kw.get('volume') or 0
+                if not k or v < min_vol:
+                    continue
+                if k not in best or v > (best[k].get('volume') or 0):
+                    kw['seed'] = seed
+                    best[k] = kw
+    ranked = sorted(best.values(), key=lambda x: -(x.get('volume') or 0))[:target]
+    return jsonify({'configured': True, 'store': store, 'min_volume': min_vol,
+                    'seeds_used': len(seeds), 'found': len(ranked),
+                    'keywords': ranked, 'errors': errors[:3]})
+
+
 @app.route('/api/research_keywords', methods=['POST'])
 def api_research_keywords():
     """Auto keyword research at import. Body: {stores, product_name, competitor_title,
