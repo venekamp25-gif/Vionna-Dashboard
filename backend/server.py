@@ -3296,9 +3296,12 @@ def _derive_seeds_llm(competitor_title, product_name, category, description):
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
         prompt = (
-            "You are a fashion e-commerce SEO researcher. For the product below, output the SEARCH SEED "
-            "phrases a shopper would type into Google, in the LOCAL language of each market. Focus on the "
-            "garment type + at most one key attribute (colour/style/length). 2-3 short seeds per market.\n"
+            "You are a fashion e-commerce SEO researcher. For the product below, output 3-4 SHORT, BROAD "
+            "search SEED terms in the LOCAL language of each market — the kind of common terms shoppers "
+            "actually type, that other keywords contain. Use the garment TYPE and type+ONE attribute, "
+            "each 1-2 words max. Prefer common single compound words where the language uses them.\n"
+            "Examples — dk: [\"kjole\",\"sommerkjole\",\"blomsterkjole\"]; fr: [\"robe\",\"robe été\",\"robe fleurie\"]; "
+            "fi: [\"mekko\",\"kesämekko\",\"kukkamekko\"].\n"
             "Return ONLY compact JSON: {\"dk\":[..],\"fr\":[..],\"fi\":[..]} (dk=Danish, fr=French, fi=Finnish).\n\n"
             f"Product name: {product_name}\nCompetitor title: {competitor_title}\n"
             f"Category: {category}\nDescription: {(description or '')[:500]}\n"
