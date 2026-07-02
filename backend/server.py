@@ -3557,15 +3557,37 @@ def api_research_keywords():
         if body.get('debug'):
             out['raw_seed_output'] = globals().get('_LAST_SEED_RAW', '')
         return jsonify(out)
-    min_vol = int(body.get('min_volume', 30))
     limit = int(body.get('limit', 12))
     results = {}
     for st in stores:
         if st not in DFS_LOCATION:
             continue
         st_seeds = seeds.get(st) or ([body.get('product_name')] if body.get('product_name') else [])
-        results[st] = {'seeds': st_seeds, 'keywords': _dfs_keyword_ideas(st_seeds, st, min_vol, limit)}
-    return jsonify({'configured': True, 'min_volume': min_vol, 'results': results})
+        # import = relevance-first: on-topic suggestions per seed, moderate scaled
+        # floor (¼ of the niche threshold), then dedup variants + rank by volume.
+        mv = int(body.get('min_volume') or max(150, DFS_MIN_VOLUME.get(st, 1000) // 4))
+        best = {}
+        for seed in st_seeds:
+            for kw in _dfs_keyword_suggestions(seed, st, min_volume=mv, limit=20):
+                if 'error' in kw:
+                    continue
+                k = (kw.get('keyword') or '').strip().lower()
+                v = kw.get('volume') or 0
+                if not k or v < mv:
+                    continue
+                if k not in best or v > (best[k].get('volume') or 0):
+                    kw['seed'] = seed
+                    best[k] = kw
+        sig_best = {}
+        for kw in best.values():
+            sig = _kw_signature(kw.get('keyword') or '')
+            if not sig:
+                continue
+            if sig not in sig_best or (kw.get('volume') or 0) > (sig_best[sig].get('volume') or 0):
+                sig_best[sig] = kw
+        ranked = sorted(sig_best.values(), key=lambda x: -(x.get('volume') or 0))[:limit]
+        results[st] = {'seeds': st_seeds, 'min_volume': mv, 'keywords': ranked}
+    return jsonify({'configured': True, 'results': results})
 
 
 @app.route('/api/keyword_research_status')
