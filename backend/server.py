@@ -3485,6 +3485,33 @@ def _dfs_keyword_suggestions(seed, store, min_volume=0, limit=25):
     return out[:limit]
 
 
+def _niche_seeds_for_type(product_type, store):
+    """Translate a product type (any language) → 1-3 broad search seeds in the
+    market's language for keyword_suggestions. Falls back to the raw type."""
+    pt = (product_type or '').strip()
+    if not pt:
+        return []
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        return [pt]
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        lang = DFS_LANG_NAME.get(store, 'Danish')
+        prompt = (f"A shopper searches for this women's fashion product type: \"{pt}\". "
+                  f"Give 2-3 SHORT broad search seed terms in {lang} that shoppers actually type "
+                  f"(the garment type + at most one common variant), 1-2 words each, single compound "
+                  f"words where the language uses them. Return ONLY a JSON array of strings.")
+        msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=120,
+                                     messages=[{'role': 'user', 'content': prompt}])
+        txt = (msg.content[0].text if msg.content else '') or ''
+        m = re.search(r'\[.*\]', txt, re.S)
+        seeds = [str(x).strip() for x in json.loads(m.group(0))] if m else [pt]
+        return [s for s in seeds if s][:3] or [pt]
+    except Exception as e:
+        print(f"[keywords] type translate failed: {e}")
+        return [pt]
+
+
 @app.route('/api/keyword_research_niche', methods=['POST'])
 @require_droplet_token
 def api_keyword_research_niche():
@@ -3500,7 +3527,13 @@ def api_keyword_research_niche():
         return jsonify({'error': 'unknown store'}), 400
     min_vol = int(body.get('min_volume') or DFS_MIN_VOLUME.get(store, 2000))
     target = int(body.get('target_count') or 40)
-    seeds = body.get('seeds') or DFS_NICHE_SEEDS.get(store, [])
+    product_type = (body.get('product_type') or '').strip()
+    seeds = body.get('seeds')
+    if not seeds:
+        seeds = _niche_seeds_for_type(product_type, store) if product_type else DFS_NICHE_SEEDS.get(store, [])
+    if not seeds:
+        return jsonify({'configured': True, 'store': store, 'found': 0, 'keywords': [],
+                        'product_type': product_type, 'seeds': []})
     best = {}
     errors = []
     import concurrent.futures as _cf
@@ -3540,8 +3573,8 @@ def api_keyword_research_niche():
     cleaned = pool_ranked if body.get('no_clean') else _dfs_clean_keywords_llm(pool_ranked, store)
     ranked = cleaned[:target]
     return jsonify({'configured': True, 'store': store, 'min_volume': min_vol,
-                    'seeds_used': len(seeds), 'found': len(ranked),
-                    'keywords': ranked, 'errors': errors[:3]})
+                    'product_type': product_type, 'seeds': seeds, 'seeds_used': len(seeds),
+                    'found': len(ranked), 'keywords': ranked, 'errors': errors[:3]})
 
 
 @app.route('/api/research_keywords', methods=['POST'])
@@ -3610,8 +3643,10 @@ def api_debug_dfs():
     """Debug: one raw DataForSEO keyword_ideas call → surfaces API status/cost/errors."""
     if not _dfs_configured():
         return jsonify({'configured': False})
-    seed = request.args.get('seed', 'midikjole')
     store = request.args.get('store', 'dk')
+    type_in = request.args.get('type')
+    translated = _niche_seeds_for_type(type_in, store) if type_in else None
+    seed = (translated[0] if translated else None) or request.args.get('seed', 'midikjole')
     ep = request.args.get('ep', 'suggestions')  # suggestions | ideas
     if ep == 'suggestions':
         url = 'https://api.dataforseo.com/v3/dataforseo_labs/google/keyword_suggestions/live'
@@ -3634,7 +3669,7 @@ def api_debug_dfs():
     items = r0.get('items') or []
     first_hist = ((items[0] or {}).get('keyword_info') or {}).get('monthly_searches') if items else None
     return jsonify({
-        'endpoint': ep, 'http': r.status_code,
+        'endpoint': ep, 'http': r.status_code, 'seed_used': seed, 'translated_seeds': translated,
         'api_status_code': d.get('status_code'), 'api_status_message': d.get('status_message'),
         'cost': d.get('cost'), 'items_len': len(items),
         'has_monthly_history': bool(first_hist), 'monthly_history_len': len(first_hist or []),
