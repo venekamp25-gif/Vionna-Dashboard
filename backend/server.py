@@ -8461,6 +8461,31 @@ BLOG_MEASURE_MIN_AGE_DAYS = int(os.getenv('BLOG_MEASURE_MIN_AGE_DAYS', '21'))
 # the unattended scheduler/bootstrap are visible without droplet log access.
 _BLOG_LAST = {'bootstrap': None, 'scheduled': None, 'learn': None, 'measure': None}
 _BLOG_DOMAIN_CACHE = {}
+_BLOG_SCOPE_CACHE = {}   # store -> {'ts': epoch, 'write_content': bool|None}
+
+
+def _blog_scope_check(store, max_age=600):
+    """Does this store's token carry write_content (required for blog articles)?
+    Cached; returns {'token': bool, 'write_content': bool|None}. Scope NAMES only —
+    never the token itself."""
+    tok = shopify_headers(store).get('X-Shopify-Access-Token')
+    if not tok:
+        return {'token': False, 'write_content': None}
+    c = _BLOG_SCOPE_CACHE.get(store)
+    if c and time.time() - c['ts'] < max_age:
+        return {'token': True, 'write_content': c['write_content']}
+    wc = None
+    try:
+        shop = tokens.get(store, {}).get('shop') or STORES.get(store)
+        r = _shopify_call('get', f"https://{shop}/admin/oauth/access_scopes.json",
+                          shopify_headers(store), timeout=15)
+        if r.status_code == 200:
+            handles = [s.get('handle') for s in (r.json().get('access_scopes') or [])]
+            wc = 'write_content' in handles
+    except Exception as e:
+        print(f"[blog] scope check {store} failed: {e}")
+    _BLOG_SCOPE_CACHE[store] = {'ts': time.time(), 'write_content': wc}
+    return {'token': True, 'write_content': wc}
 
 # Brand voice per market — feminine, elegant, chic womenswear. Written in-language.
 BLOG_BRAND_VOICE = (
@@ -8889,14 +8914,19 @@ def _blog_match_products(store, category, hdrs, n=6, keyword=None):
     """Return up to n on-catalogue products to link, matched by the topic's
     `cat:<x>` tag (best-sellers first). Falls back to newest active products."""
     def _run(q):
-        query = ('{ products(first:%d, query:%s, sortKey:BEST_SELLING) { edges { node { '
+        # NB: BEST_SELLING is a Storefront-API sort key only — the Admin API rejects
+        # it (and returns 200 + errors, silently yielding 0 products). Newest first.
+        query = ('{ products(first:%d, query:%s, sortKey:CREATED_AT, reverse:true) { edges { node { '
                  'id title handle featuredImage{url} '
                  'priceRangeV2{minVariantPrice{amount currencyCode}} } } } }'
-                 % (n, json.dumps(q)))
+                 % (min(n * 3, 50), json.dumps(q)))   # over-fetch: title-dedupe below shrinks the pool
         try:
             r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
                               json={'query': query}, timeout=30)
-            edges = (((r.json().get('data') or {}).get('products') or {}).get('edges') or [])
+            d = r.json()
+            if d.get('errors'):
+                print(f"[blog] product match GraphQL errors: {json.dumps(d['errors'])[:200]}")
+            edges = (((d.get('data') or {}).get('products') or {}).get('edges') or [])
         except Exception as e:
             print(f"[blog] product match failed: {e}")
             return []
@@ -8916,7 +8946,15 @@ def _blog_match_products(store, category, hdrs, n=6, keyword=None):
         prods = _run(f"tag:'cat:{category}' AND status:active")
     if not prods:
         prods = _run("status:active")
-    return prods[:n]
+    # Colour-siblings are separate products with the same title (flora-sommer-1/2/3);
+    # linking near-duplicates reads poorly — keep one per title.
+    seen, uniq = set(), []
+    for p in prods:
+        key = (p.get('title') or '').strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            uniq.append(p)
+    return uniq[:n]
 
 
 def _blog_write(store, topic, products):
@@ -8952,9 +8990,9 @@ def _blog_write(store, topic, products):
         f"{prod_block}\n\n"
         "REQUIREMENTS:\n"
         f"1. Title: compelling, contains the primary keyword, max ~60 chars, in {lang}.\n"
-        "2. Body: valid HTML (no <html>/<head>/<body> wrappers). 700-1100 words. Use <h2>/<h3> "
-        "subheadings, <p>, and <ul> where useful. Put the primary keyword in the first paragraph "
-        "and in at least one <h2>.\n"
+        "2. Body: valid HTML (no <html>/<head>/<body> wrappers). 800-1200 words — never fewer "
+        "than 750. Use <h2>/<h3> subheadings, <p>, and <ul> where useful. Put the primary keyword "
+        "in the first paragraph and in at least one <h2>.\n"
         "3. Naturally recommend 3-6 of the products above with inline <a href=\"/products/...\"> links "
         "on the product name. Add one styling/care tip context around each — never a bare list dump.\n"
         "4. End with a short call-to-action paragraph linking to <a href=\"/collections/all\">the shop</a>.\n"
@@ -9169,6 +9207,7 @@ def api_blog_status():
                      'est_traffic': p.get('est_traffic')} for p in perf_sorted[:5]],
         },
         'playbook': _blog_playbook_summary(),
+        'scopes': {st: _blog_scope_check(st) for st in BLOG_SCHED_STORES},
         'last': _BLOG_LAST,
     })
 
@@ -9243,23 +9282,29 @@ def _blog_run_learn_cycle():
 
 
 def _blog_scheduler_loop():
-    # One-shot bootstrap: first real draft (DK) shortly after the first deploy.
+    # One-shot bootstrap: a first real draft for every store that has never posted,
+    # shortly after each (re)start. Idempotent — stores with history are skipped, so
+    # a restart after fixing a store's token immediately produces its first draft.
     if os.getenv('BLOG_BOOTSTRAP', '1') != '0':
         time.sleep(90)
-        try:
-            if not _blog_store_posted_on('dk', ''):    # DK never posted → first run
-                if shopify_headers('dk').get('X-Shopify-Access-Token'):
-                    print('[blog] bootstrap: generating first DK draft…')
-                    res = _blog_generate_one('dk', published=False)
-                    art = (res.get('article') or {})
-                    _BLOG_LAST['bootstrap'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
-                                               'store': 'dk', 'error': res.get('error'),
-                                               'url': art.get('storefront_url')}
-                    print(f"[blog] bootstrap: {res.get('error') or art.get('storefront_url')}")
-        except Exception as e:
-            _BLOG_LAST['bootstrap'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
-                                       'store': 'dk', 'error': str(e)[:200]}
-            print(f"[blog] bootstrap failed: {e}")
+        boots = {}
+        for st in BLOG_SCHED_STORES:
+            try:
+                if st not in STORES or _blog_store_posted_on(st, ''):
+                    continue
+                if not shopify_headers(st).get('X-Shopify-Access-Token'):
+                    boots[st] = {'error': 'no token'}
+                    continue
+                print(f'[blog] bootstrap: generating first {st} draft…')
+                res = _blog_generate_one(st, published=False)
+                art = (res.get('article') or {})
+                boots[st] = {'error': res.get('error'), 'url': art.get('storefront_url')}
+                print(f"[blog] bootstrap {st}: {res.get('error') or art.get('storefront_url')}")
+            except Exception as e:
+                boots[st] = {'error': str(e)[:200]}
+                print(f"[blog] bootstrap {st} failed: {e}")
+        if boots:
+            _BLOG_LAST['bootstrap'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z', **boots}
 
     if os.getenv('BLOG_SCHEDULER', '1') == '0':
         return
