@@ -8564,46 +8564,75 @@ BLOG_STYLE = {
 # regardless. Local-language keyword + the catalogue category to link products from.
 BLOG_FALLBACK_TOPICS = {
     'dk': [
-        {'keyword': 'sommerkjole', 'category': 'dress', 'cluster': ['blomstret kjole', 'lang kjole', 'maxikjole']},
-        {'keyword': 'strik til efteråret', 'category': 'knitwear', 'cluster': ['cardigan', 'sweater', 'strikbluse']},
-        {'keyword': 'den perfekte blazer', 'category': 'outerwear', 'cluster': ['oversized blazer', 'blazer til kvinder']},
-        {'keyword': 'nederdel styling', 'category': 'skirt', 'cluster': ['lang nederdel', 'plisseret nederdel']},
-        {'keyword': 'bukser til kontoret', 'category': 'pants', 'cluster': ['habitbukser', 'vide bukser']},
-        {'keyword': 'sådan styler du en hvid skjorte', 'category': 'top', 'cluster': ['hvid bluse', 'skjorte outfit']},
+        {'keyword': 'sommerkjole', 'category': 'dress', 'months': [4, 5, 6, 7, 8],
+         'cluster': ['blomstret kjole', 'lang kjole', 'maxikjole']},
+        {'keyword': 'strik til efteråret', 'category': 'knitwear', 'months': [8, 9, 10, 11],
+         'cluster': ['cardigan', 'sweater', 'strikbluse']},
+        {'keyword': 'den perfekte blazer', 'category': 'outerwear',
+         'cluster': ['oversized blazer', 'blazer til kvinder']},
+        {'keyword': 'nederdel styling', 'category': 'skirt', 'months': [3, 4, 5, 6, 7, 8, 9],
+         'cluster': ['lang nederdel', 'plisseret nederdel']},
+        {'keyword': 'bukser til kontoret', 'category': 'pants',
+         'cluster': ['habitbukser', 'vide bukser']},
+        {'keyword': 'sådan styler du en hvid skjorte', 'category': 'top',
+         'cluster': ['hvid bluse', 'skjorte outfit']},
     ],
     'fr': [
-        {'keyword': "robe d'été", 'category': 'dress', 'cluster': ['robe fleurie', 'robe longue', 'robe légère']},
-        {'keyword': "la maille pour l'automne", 'category': 'knitwear', 'cluster': ['cardigan', 'pull', 'gilet']},
-        {'keyword': 'le blazer parfait', 'category': 'outerwear', 'cluster': ['blazer oversize', 'veste femme']},
-        {'keyword': 'comment porter la jupe longue', 'category': 'skirt', 'cluster': ['jupe plissée', 'jupe midi']},
-        {'keyword': 'le pantalon de bureau', 'category': 'pants', 'cluster': ['pantalon large', 'pantalon tailleur']},
-        {'keyword': 'la chemise blanche', 'category': 'top', 'cluster': ['blouse blanche', 'chemise femme']},
+        {'keyword': "robe d'été", 'category': 'dress', 'months': [4, 5, 6, 7, 8],
+         'cluster': ['robe fleurie', 'robe longue', 'robe légère']},
+        {'keyword': "la maille pour l'automne", 'category': 'knitwear', 'months': [8, 9, 10, 11],
+         'cluster': ['cardigan', 'pull', 'gilet']},
+        {'keyword': 'le blazer parfait', 'category': 'outerwear',
+         'cluster': ['blazer oversize', 'veste femme']},
+        {'keyword': 'comment porter la jupe longue', 'category': 'skirt', 'months': [3, 4, 5, 6, 7, 8, 9],
+         'cluster': ['jupe plissée', 'jupe midi']},
+        {'keyword': 'le pantalon de bureau', 'category': 'pants',
+         'cluster': ['pantalon large', 'pantalon tailleur']},
+        {'keyword': 'la chemise blanche', 'category': 'top',
+         'cluster': ['blouse blanche', 'chemise femme']},
     ],
     'fi': [
-        {'keyword': 'kesämekko', 'category': 'dress', 'cluster': ['kukkamekko', 'pitkä mekko', 'maksimekko']},
-        {'keyword': 'neuleet syksyyn', 'category': 'knitwear', 'cluster': ['neuletakki', 'villapaita', 'neulepusero']},
-        {'keyword': 'täydellinen bleiseri', 'category': 'outerwear', 'cluster': ['oversize bleiseri', 'naisten jakku']},
-        {'keyword': 'hameen tyylivinkit', 'category': 'skirt', 'cluster': ['pitkä hame', 'pliseehame']},
-        {'keyword': 'housut töihin', 'category': 'pants', 'cluster': ['leveälahkeiset housut', 'puvunhousut']},
-        {'keyword': 'valkoinen paita', 'category': 'top', 'cluster': ['valkoinen pusero', 'paita asu']},
+        {'keyword': 'kesämekko', 'category': 'dress', 'months': [4, 5, 6, 7, 8],
+         'cluster': ['kukkamekko', 'pitkä mekko', 'maksimekko']},
+        {'keyword': 'neuleet syksyyn', 'category': 'knitwear', 'months': [8, 9, 10, 11],
+         'cluster': ['neuletakki', 'villapaita', 'neulepusero']},
+        {'keyword': 'täydellinen bleiseri', 'category': 'outerwear',
+         'cluster': ['oversize bleiseri', 'naisten jakku']},
+        {'keyword': 'hameen tyylivinkit', 'category': 'skirt', 'months': [4, 5, 6, 7, 8, 9],
+         'cluster': ['pitkä hame', 'pliseehame']},
+        {'keyword': 'housut töihin', 'category': 'pants',
+         'cluster': ['leveälahkeiset housut', 'puvunhousut']},
+        {'keyword': 'valkoinen paita', 'category': 'top',
+         'cluster': ['valkoinen pusero', 'paita asu']},
     ],
 }
 
 
 def _blog_fallback_topic(store):
-    """Pick an evergreen topic for the store that hasn't been blogged recently."""
+    """Pick a fallback topic that (1) wasn't blogged recently, (2) fits the current
+    month ('months' absent = evergreen), (3) respects the category cooldown.
+    Constraints are relaxed in that order rather than returning nothing."""
     pool = BLOG_FALLBACK_TOPICS.get(store, [])
     if not pool:
         return None
+    month = datetime.datetime.utcnow().month
     recent = _blog_recent_sigs(store)
-    for t in pool:
-        if _kw_signature(t['keyword']) not in recent:
-            return {**t, 'source': 'fallback', 'seasonality': None,
-                    'intent': 'commercial', 'label': None, 'seed': None, 'volume': None}
-    # all used recently → reuse the oldest anyway
-    t = pool[0]
-    return {**t, 'source': 'fallback', 'seasonality': None, 'intent': 'commercial',
-            'label': None, 'seed': None, 'volume': None}
+    recent_cats = _blog_recent_categories(store)
+
+    def _pick(cooldown, season):
+        for t in pool:
+            if _kw_signature(t['keyword']) in recent:
+                continue
+            if season and t.get('months') and month not in t['months']:
+                continue
+            if cooldown and t.get('category') in recent_cats:
+                continue
+            return t
+        return None
+
+    t = _pick(True, True) or _pick(False, True) or _pick(False, False) or pool[0]
+    return {**{k: v for k, v in t.items() if k != 'months'}, 'source': 'fallback',
+            'seasonality': None, 'intent': 'commercial', 'label': None, 'seed': None, 'volume': None}
 
 
 def _blog_recent_sigs(store, days=120):
@@ -8638,6 +8667,23 @@ def _blog_recent_sigs(store, days=120):
     except Exception as e:
         print(f"[blog] history read failed: {e}")
     return sigs
+
+
+def _blog_recent_categories(store, days=21):
+    """Categories this store blogged about recently — cooldown so consecutive runs
+    don't both write about e.g. dresses, even with different keywords."""
+    cats = set()
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+    for row in _blog_read_jsonl(BLOG_HISTORY_PATH):
+        if row.get('store') != store or not row.get('category'):
+            continue
+        try:
+            if datetime.datetime.fromisoformat((row.get('ts') or '').replace('Z', '')) < cutoff:
+                continue
+        except Exception:
+            pass
+        cats.add(row['category'])
+    return cats
 
 
 def _blog_log(store, topic, article):
@@ -9075,26 +9121,40 @@ def _blog_hot_topics(store, k=3):
     _recommend_keywords(cands, store, top_n=len(cands))   # attaches 'score'
     cands.sort(key=lambda x: -(x.get('score') or 0))
     recent = _blog_recent_sigs(store)
-    topics = []
-    for x in cands:
-        sig = _kw_signature(x.get('keyword') or '')
-        if sig in recent:
-            continue
-        seed = x.get('seed')
-        label = DFS_SEED_LABELS.get(store, {}).get(seed, seed)
-        cat = DFS_TYPE_CATEGORY.get(label)
-        cluster = [r.get('keyword') for r in sorted(by_seed.get(seed, []),
-                   key=lambda r: -(r.get('volume') or 0))
-                   if r.get('keyword') and r.get('keyword') != x.get('keyword')
-                   and (r.get('keyword') or '').strip().lower() in clean_kws][:6]
-        topics.append({
-            'keyword': x.get('keyword'), 'volume': x.get('volume'), 'intent': x.get('intent'),
-            'seasonality': x.get('seasonality'), 'score': x.get('score'),
-            'seed': seed, 'label': label, 'category': cat, 'cluster': cluster,
-        })
-        if len(topics) >= k:
-            break
-    return topics
+    recent_cats = _blog_recent_categories(store)
+
+    def _collect(respect_cooldown):
+        out = []
+        for x in cands:
+            sig = _kw_signature(x.get('keyword') or '')
+            if sig in recent:
+                continue                      # exact/variant subject already blogged
+            bucket = _season_bucket(x.get('seasonality'))
+            if bucket == 'off':
+                continue                      # articles rank in ~3-6 weeks: skip out-of-season
+            seed = x.get('seed')
+            label = DFS_SEED_LABELS.get(store, {}).get(seed, seed)
+            cat = DFS_TYPE_CATEGORY.get(label)
+            if respect_cooldown and cat and cat in recent_cats:
+                continue                      # no two dress/pants/... articles back-to-back
+            cluster = [r.get('keyword') for r in sorted(by_seed.get(seed, []),
+                       key=lambda r: -(r.get('volume') or 0))
+                       if r.get('keyword') and r.get('keyword') != x.get('keyword')
+                       and (r.get('keyword') or '').strip().lower() in clean_kws][:6]
+            # blogs profit most from 'soon' (peak in 1-2 months = indexed right on time)
+            score = (x.get('score') or 0) + (0.35 if bucket == 'soon' else 0)
+            out.append({
+                'keyword': x.get('keyword'), 'volume': x.get('volume'), 'intent': x.get('intent'),
+                'seasonality': x.get('seasonality'), 'season_bucket': bucket,
+                'score': round(score, 3), 'seed': seed, 'label': label, 'category': cat,
+                'cluster': cluster,
+            })
+        return out
+
+    # category cooldown first; relax it rather than return nothing
+    topics = _collect(True) or _collect(False)
+    topics.sort(key=lambda t: -(t.get('score') or 0))
+    return topics[:k]
 
 
 def _blog_match_products(store, category, hdrs, n=6, keyword=None):
