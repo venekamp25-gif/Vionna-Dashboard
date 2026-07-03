@@ -8656,6 +8656,7 @@ def _blog_log(store, topic, article):
                 'url': article.get('storefront_url'),
                 'published': article.get('published'),
                 'levers': article.get('levers'),
+                'qa': article.get('qa'),
             }, ensure_ascii=False) + '\n')
     except Exception as e:
         print(f"[blog] history write failed: {e}")
@@ -9491,8 +9492,57 @@ def _blog_create_article(store, blog_id, art, hdrs, published=False, featured_im
     }
 
 
-def _blog_generate_one(store, topic=None, published=False):
-    """Full pipeline for one store → one draft article. Returns a result dict."""
+# Auto-publish (owner opt-in 2026-07-03): articles that pass the final QA gate go
+# live without review; anything below the bar stays a draft for manual review.
+BLOG_QA_MIN_SCORE = 8
+
+
+def _blog_qa_gate(store, art):
+    """Final independent pre-publication check: a strict native proofreader scores
+    the FINISHED article (post-editor) and lists real remaining errors. Returns
+    {'score', 'critical', 'minor'} or None on failure (callers must treat None as
+    NOT publishable — quality-first)."""
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        return None
+    lang = DFS_LANG_NAME.get(store, 'Danish')
+    prompt = (
+        f"You are a strict, independent NATIVE {lang} proofreader doing the FINAL pre-publication "
+        f"check of a fashion-blog article. It was already written and copy-edited; your only job is "
+        f"to catch anything that still slipped through. Report ONLY what is actually wrong — do not "
+        f"invent problems to look useful.\n\n"
+        f"CHECK: grammar, spelling, morphology/agreement, non-{lang} words, unidiomatic calques, "
+        f"broken or truncated sentences, verbatim keyword stuffing, competitor brand/retailer names "
+        f"(Vionna is the only brand allowed), title/meta sanity, dangling HTML.\n\n"
+        f"TITLE: {art.get('title')}\n"
+        f"META: {art.get('meta_description')}\n"
+        f"EXCERPT: {art.get('excerpt')}\n"
+        f"BODY_HTML:\n{art.get('body_html')}\n\n"
+        'Return ONLY compact JSON: {"score": <1-10 native-fluency score of the whole article>, '
+        '"critical": ["error a native reader would notice, with the exact quote"], '
+        '"minor": ["small polish point"]}'
+    )
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=1500,
+                                      messages=[{'role': 'user', 'content': prompt}])
+        txt = (msg.content[0].text if msg.content else '') or ''
+        m = re.search(r'\{.*\}', txt, re.S)
+        if not m:
+            return None
+        data = json.loads(m.group(0))
+        return {'score': float(data.get('score') or 0),
+                'critical': [str(x) for x in (data.get('critical') or [])][:10],
+                'minor': [str(x) for x in (data.get('minor') or [])][:10]}
+    except Exception as e:
+        print(f"[blog] qa gate failed: {e}")
+        return None
+
+
+def _blog_generate_one(store, topic=None, published=None):
+    """Full pipeline for one store → one article. published: True/False force the
+    state; None = auto mode — publish only when the QA gate passes (and
+    BLOG_AUTO_PUBLISH isn't 0), else save as draft. Returns a result dict."""
     hdrs = shopify_headers(store)
     if not hdrs.get('X-Shopify-Access-Token'):
         return {'store': store, 'error': 'no Shopify token for this store'}
@@ -9518,18 +9568,37 @@ def _blog_generate_one(store, topic=None, published=False):
             break
         print(f"[blog] {store}: repair pass for: {viol}")
         art = _blog_edit(store, art, products, violations=viol)
+    # Auto mode: independent QA gate decides publish vs draft. One extra fix
+    # attempt when the gate flags issues; still failing → draft for human review.
+    qa = None
+    if published is None:
+        qa = _blog_qa_gate(store, art)
+        if qa and (qa['score'] < BLOG_QA_MIN_SCORE or qa['critical']):
+            print(f"[blog] {store}: QA gate {qa['score']}/10, {len(qa['critical'])} critical — fix attempt")
+            art = _blog_edit(store, art, products, violations=(qa['critical'] + qa['minor'])[:8])
+            qa = _blog_qa_gate(store, art)
+        qa_ok = bool(qa) and qa['score'] >= BLOG_QA_MIN_SCORE and not qa['critical']
+        publish = qa_ok and os.getenv('BLOG_AUTO_PUBLISH', '1') != '0'
+        print(f"[blog] {store}: QA {'%.1f' % qa['score'] if qa else 'FAILED'}"
+              f"{'' if not qa else f''' ({len(qa['critical'])} critical)'''} -> "
+              f"{'PUBLISH' if publish else 'DRAFT'}")
+    else:
+        publish = bool(published)
     art['body_html'] = _blog_inline_product_images(art['body_html'], products)
     art['body_html'] += _blog_cta_buttons(store, topic, products, hdrs)
     art['body_html'] += _blog_view_beacon(store)
     if isinstance(art.get('levers'), dict):
         art['levers']['n_inline_images'] = art['body_html'].count('loading="lazy"')
         art['levers']['cta_buttons'] = True
+        if qa:
+            art['levers']['qa_score'] = qa['score']
     blog_id = _blog_ensure(store, hdrs)
     featured = next((p.get('image') for p in products if p.get('image')), None)
-    created = _blog_create_article(store, blog_id, art, hdrs, published=published, featured_img=featured)
-    _blog_log(store, topic, {**created, 'published': published, 'levers': art.get('levers')})
-    return {'store': store, 'topic': topic, 'products_linked': len(products),
-            'article': created, 'preview': {'title': art['title'],
+    created = _blog_create_article(store, blog_id, art, hdrs, published=publish, featured_img=featured)
+    qa_slim = qa and {'score': qa['score'], 'critical': len(qa['critical']), 'minor': len(qa['minor'])}
+    _blog_log(store, topic, {**created, 'published': publish, 'levers': art.get('levers'), 'qa': qa_slim})
+    return {'store': store, 'topic': topic, 'products_linked': len(products), 'qa': qa_slim,
+            'published': publish, 'article': created, 'preview': {'title': art['title'],
             'meta_description': art['meta_description'], 'excerpt': art['excerpt'],
             'tags': art['tags'], 'body_html': art['body_html']}}
 
@@ -9558,7 +9627,7 @@ def api_blog_generate():
     if store not in STORES:
         return jsonify({'error': 'unknown store'}), 400
     res = _blog_generate_one(store, topic=body.get('topic'),
-                             published=bool(body.get('published')))
+                             published=(bool(body['published']) if 'published' in body else None))
     code = 200 if not res.get('error') else 400
     return jsonify(res), code
 
@@ -9571,7 +9640,7 @@ def api_blog_run():
     body = request.get_json(silent=True) or {}
     stores = body.get('stores') or ['dk', 'fr', 'fi']
     per_store = max(1, min(int(body.get('per_store') or 1), 3))
-    published = bool(body.get('published'))
+    published = bool(body['published']) if 'published' in body else None
     results = []
     for st in stores:
         if st not in STORES:
@@ -9614,6 +9683,8 @@ def api_blog_status():
         'scheduler': {
             'enabled': os.getenv('BLOG_SCHEDULER', '1') != '0',
             'bootstrap': os.getenv('BLOG_BOOTSTRAP', '1') != '0',
+            'auto_publish': os.getenv('BLOG_AUTO_PUBLISH', '1') != '0',
+            'qa_min_score': BLOG_QA_MIN_SCORE,
             'days': sorted(BLOG_SCHED_DAYS), 'hour': BLOG_SCHED_HOUR,
             'stores': BLOG_SCHED_STORES,
         },
@@ -9736,8 +9807,8 @@ def _blog_scheduler_loop():
                 if not shopify_headers(st).get('X-Shopify-Access-Token'):
                     boots[st] = {'error': 'no token'}
                     continue
-                print(f'[blog] bootstrap: generating first {st} draft…')
-                res = _blog_generate_one(st, published=False)
+                print(f'[blog] bootstrap: generating first {st} article…')
+                res = _blog_generate_one(st)
                 art = (res.get('article') or {})
                 boots[st] = {'error': res.get('error'), 'url': art.get('storefront_url')}
                 print(f"[blog] bootstrap {st}: {res.get('error') or art.get('storefront_url')}")
@@ -9767,8 +9838,8 @@ def _blog_scheduler_loop():
                     if not shopify_headers(st).get('X-Shopify-Access-Token'):
                         continue
                     try:
-                        print(f'[blog] scheduled draft for {st}…')
-                        res = _blog_generate_one(st, published=False)
+                        print(f'[blog] scheduled article for {st}…')
+                        res = _blog_generate_one(st)
                         art = (res.get('article') or {})
                         _BLOG_LAST['scheduled'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
                                                    'store': st, 'error': res.get('error'),
