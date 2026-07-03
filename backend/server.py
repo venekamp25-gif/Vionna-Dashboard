@@ -9067,7 +9067,8 @@ def _blog_write(store, topic, products):
         "3. Naturally recommend 3-6 of the products above with inline <a href=\"/products/...\"> links "
         "on the product name. Add one styling/care tip context around each — never a bare list dump. "
         "Never mention prices anywhere in the article.\n"
-        "4. End with a short call-to-action paragraph linking to <a href=\"/collections/all\">the shop</a>.\n"
+        "4. End with a short, warm closing paragraph (1-2 sentences, NO link — call-to-action "
+        "buttons are appended automatically below it).\n"
         "5. meta_description: max 155 chars, contains the keyword, enticing.\n"
         "6. excerpt: 1 short sentence summary.\n"
         f"7. tags: 4-6 short {lang} topical tags.\n"
@@ -9209,6 +9210,53 @@ def _blog_inline_product_images(body, products, max_images=3):
     return body
 
 
+def _blog_cta_buttons(store, topic, products, hdrs):
+    """Content-aware CTA buttons appended under the article: primary → the
+    category collection matching the topic (verified to exist, else all products),
+    secondary → the first featured product. Inline-styled so they render
+    identically on every store theme. Returns '' when nothing to link."""
+    cat = (topic or {}).get('category')
+    handle = None
+    if cat == 'shoes':
+        handle = SHOES_HANDLE.get(store)
+    elif cat == 'outerwear':
+        handle = OUTERWEAR_HANDLE
+    elif cat in ('swim', 'swimwear'):
+        handle = SWIM_HANDLE
+    else:
+        handle = CAT_COLLECTION_HANDLES.get(store, {}).get(cat)
+    coll_url, coll_title = '/collections/all', None
+    if handle:
+        try:
+            q = '{ collectionByHandle(handle: %s) { title } }' % json.dumps(handle)
+            r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                              json={'query': q}, timeout=20)
+            node = ((r.json().get('data') or {}).get('collectionByHandle') or {})
+            if node.get('title'):
+                coll_url, coll_title = f'/collections/{handle}', node['title']
+        except Exception as e:
+            print(f"[blog] cta collection probe failed: {e}")
+    if store == 'dk':
+        coll_label = f"Se alle {coll_title.strip().lower()}" if coll_title else 'Se hele kollektionen'
+        prod_label = 'Se {name}'
+    elif store == 'fr':
+        coll_label = 'Voir la collection'
+        prod_label = 'Découvrir {name}'
+    else:
+        coll_label = 'Tutustu mallistoon'
+        prod_label = 'Katso {name}'
+    btn = ('display:inline-block;padding:13px 30px;border-radius:6px;text-decoration:none;'
+           'font-weight:600;letter-spacing:.4px;margin:6px 8px')
+    primary = (f'<a href="{coll_url}" style="{btn};background:#1a1a1a;color:#ffffff;'
+               f'border:1px solid #1a1a1a">{coll_label}</a>')
+    secondary = ''
+    p = next((p for p in (products or []) if p.get('url') and p.get('title')), None)
+    if p:
+        secondary = (f'<a href="{p["url"]}" style="{btn};background:transparent;color:#1a1a1a;'
+                     f'border:1px solid #1a1a1a">{prod_label.format(name=p["title"])}</a>')
+    return f'<div style="text-align:center;margin:2.2em 0 0.6em">{primary}{secondary}</div>'
+
+
 def _blog_edit(store, art, products=None, violations=None):
     """Native copy-editor pass over a written article: fixes grammar, spelling,
     morphology, idiom and calque errors so the text reads native. Preserves HTML
@@ -9346,8 +9394,10 @@ def _blog_generate_one(store, topic=None, published=False):
         print(f"[blog] {store}: repair pass for: {viol}")
         art = _blog_edit(store, art, products, violations=viol)
     art['body_html'] = _blog_inline_product_images(art['body_html'], products)
+    art['body_html'] += _blog_cta_buttons(store, topic, products, hdrs)
     if isinstance(art.get('levers'), dict):
         art['levers']['n_inline_images'] = art['body_html'].count('loading="lazy"')
+        art['levers']['cta_buttons'] = True
     blog_id = _blog_ensure(store, hdrs)
     featured = next((p.get('image') for p in products if p.get('image')), None)
     created = _blog_create_article(store, blog_id, art, hdrs, published=published, featured_img=featured)
