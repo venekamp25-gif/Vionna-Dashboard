@@ -9134,7 +9134,8 @@ def _blog_write(store, topic, products):
         "buttons are appended automatically below it).\n"
         "5. meta_description: max 155 chars, contains the keyword, enticing.\n"
         "6. excerpt: 1 short sentence summary.\n"
-        f"7. tags: 4-6 short {lang} topical tags.\n"
+        f"7. tags: 2-3 short {lang} topical tags, never more (they are data for archive pages, "
+        "not shown on the storefront cards).\n"
         "8. handle: url slug from the title, lowercase, ascii, hyphens, NO year.\n\n"
         "Return ONLY compact JSON with EXACTLY these keys: "
         '{"title": "...", "handle": "...", "meta_description": "...", "excerpt": "...", '
@@ -9183,7 +9184,7 @@ def _blog_write(store, topic, products):
         'handle': handle or None,
         'meta_description': (data.get('meta_description') or '').strip()[:160],
         'excerpt': (data.get('excerpt') or '').strip(),
-        'tags': [str(t).strip() for t in tags][:6],
+        'tags': [str(t).strip() for t in tags][:3],
         'body_html': body,
         'levers': levers,
     }
@@ -9382,7 +9383,7 @@ def _blog_edit(store, art, products=None, violations=None):
         tags = data.get('tags') or art.get('tags') or []
         if isinstance(tags, str):
             tags = [t.strip() for t in tags.split(',') if t.strip()]
-        out['tags'] = [str(t).strip() for t in tags][:6]
+        out['tags'] = [str(t).strip() for t in tags][:3]
         out['body_html'] = body
         if isinstance(out.get('levers'), dict):
             out['levers']['editor_pass'] = True
