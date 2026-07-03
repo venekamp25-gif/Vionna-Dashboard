@@ -160,7 +160,8 @@ def _run_backup():
         day  = time.strftime('%Y-%m-%d')
         dest = os.path.join(BACKUP_DIR, day)
         os.makedirs(dest, exist_ok=True)
-        for fname in ('publish_history.jsonl', 'bug_reports.jsonl'):
+        for fname in ('publish_history.jsonl', 'bug_reports.jsonl', 'blog_history.jsonl',
+                      'blog_performance.jsonl', 'blog_views.json', 'blog_playbook.json'):
             src = os.path.join(_BASE_DIR, fname)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dest, fname))
@@ -8455,6 +8456,8 @@ BLOG_TITLE   = {'dk': 'Vionna Journal', 'fr': 'Le Journal Vionna', 'fi': 'Vionna
 BLOG_HANDLE  = 'journal'
 BLOG_AUTHOR  = 'Vionna'
 BLOG_HISTORY_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blog_history.jsonl')
+BLOG_VIEWS_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blog_views.json')
+_BLOG_VIEWS_LOCK    = threading.Lock()
 BLOG_PERF_PATH      = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blog_performance.jsonl')
 BLOG_PLAYBOOK_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blog_playbook.json')
 # What the feedback loop optimises for (user chose sales/product-clicks). The
@@ -8739,6 +8742,63 @@ def _dfs_url_performance(domain, url_path, store):
             'est_traffic': round(etv, 2), 'top_keywords': kws[:10]}
 
 
+def _blog_views_load():
+    try:
+        with open(BLOG_VIEWS_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _blog_views_bump(store, handle):
+    """Increment the pageview counter for one article (atomic file swap)."""
+    with _BLOG_VIEWS_LOCK:
+        d = _blog_views_load()
+        rec = d.setdefault(store, {}).setdefault(handle, {'views': 0, 'first': None, 'last': None})
+        rec['views'] += 1
+        now = datetime.datetime.utcnow().isoformat() + 'Z'
+        rec['first'] = rec['first'] or now
+        rec['last'] = now
+        tmp = BLOG_VIEWS_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, BLOG_VIEWS_PATH)
+
+
+def _blog_view_beacon(store):
+    """Tiny cookieless pageview beacon embedded at the end of each article body.
+    Fire-and-forget POST (text/plain → no CORS preflight; the response is never
+    read, so no CORS headers are needed either). Bots filtered client-side by UA;
+    the endpoint filters again server-side. Shopify keeps <script> in article
+    body_html, so no theme edit is required."""
+    return ('<script>(function(){try{if(/bot|crawl|spider|lighthouse|headless|preview/i.test(navigator.userAgent))return;'
+            "fetch('https://188-166-11-177.nip.io/api/blog/hit',{method:'POST',headers:{'Content-Type':'text/plain'},"
+            'body:JSON.stringify({s:"%s",p:location.pathname}),keepalive:true})}catch(e){}})()</script>' % store)
+
+
+@app.route('/api/blog/hit', methods=['POST'])
+def api_blog_hit():
+    """Public pageview beacon (see _blog_view_beacon). Counts only valid
+    store+article paths; always 204. Public counters can be inflated by abuse,
+    so views feed insight/correlation, never the ranking-critical score."""
+    ua = (request.headers.get('User-Agent') or '').lower()
+    if re.search(r'bot|crawl|spider|lighthouse|headless|python|curl', ua):
+        return ('', 204)
+    try:
+        data = json.loads(request.get_data(as_text=True) or '{}')
+    except Exception:
+        return ('', 204)
+    store = data.get('s')
+    path = str(data.get('p') or '')[:300].lower()
+    m = re.match(r'^(?:/[a-z]{2}(?:-[a-z]{2})?)?/blogs/[^/]+/([a-z0-9\-]+)/?$', path)
+    if store in STORES and m:
+        try:
+            _blog_views_bump(store, m.group(1))
+        except Exception as e:
+            print(f"[blog] hit failed: {e}")
+    return ('', 204)
+
+
 def _blog_conversions(store, hdrs, since_days=90):
     """Blog-attributed sales per article handle: orders whose SESSION landed on a
     /blogs/ page (Shopify stores landing_site on every order). Captures the funnel
@@ -8852,7 +8912,8 @@ def _blog_measure_all(force=False):
                **(perf or {'keywords_ranked': None, 'best_position': None, 'est_traffic': None}),
                'conversions': conv.get('orders') or 0,
                'conv_revenue': conv.get('revenue') or 0.0,
-               'conversions_tracked': conv_cache[store] is not None}
+               'conversions_tracked': conv_cache[store] is not None,
+               'views': ((_blog_views_load().get(store) or {}).get(row.get('article_handle')) or {}).get('views') or 0}
         rec['score'] = _blog_score(rec)
         try:
             with open(BLOG_PERF_PATH, 'a', encoding='utf-8') as f:
@@ -8882,7 +8943,7 @@ def _blog_learn(min_articles=4):
                 'keywords_ranked': p.get('keywords_ranked'), 'best_position': p.get('best_position'),
                 'est_traffic': p.get('est_traffic'),
                 'conversions': p.get('conversions'), 'conv_revenue': p.get('conv_revenue'),
-                'word_count': lv.get('word_count'),
+                'views': p.get('views'), 'word_count': lv.get('word_count'),
                 'title_len': lv.get('title_len'), 'title_is_question': lv.get('title_is_question'),
                 'title_has_number': lv.get('title_has_number'), 'n_h2': lv.get('n_h2'),
                 'n_product_links': lv.get('n_product_links'), 'topic_source': lv.get('topic_source')}
@@ -9459,6 +9520,7 @@ def _blog_generate_one(store, topic=None, published=False):
         art = _blog_edit(store, art, products, violations=viol)
     art['body_html'] = _blog_inline_product_images(art['body_html'], products)
     art['body_html'] += _blog_cta_buttons(store, topic, products, hdrs)
+    art['body_html'] += _blog_view_beacon(store)
     if isinstance(art.get('levers'), dict):
         art['levers']['n_inline_images'] = art['body_html'].count('loading="lazy"')
         art['levers']['cta_buttons'] = True
@@ -9563,8 +9625,10 @@ def api_blog_status():
             'measure_min_age_days': BLOG_MEASURE_MIN_AGE_DAYS,
             'top': [{'title': p.get('title'), 'store': p.get('store'), 'score': p.get('score'),
                      'keywords_ranked': p.get('keywords_ranked'), 'best_position': p.get('best_position'),
-                     'est_traffic': p.get('est_traffic')} for p in perf_sorted[:5]],
+                     'est_traffic': p.get('est_traffic'), 'views': p.get('views')} for p in perf_sorted[:5]],
         },
+        'views_total': {st: sum((v or {}).get('views') or 0 for v in (_blog_views_load().get(st) or {}).values())
+                        for st in BLOG_SCHED_STORES},
         'playbook': _blog_playbook_summary(),
         'scopes': {st: _blog_scope_check(st) for st in BLOG_SCHED_STORES},
         'last': _BLOG_LAST,
