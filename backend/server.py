@@ -3448,9 +3448,14 @@ _SEASON_MONTHS = ['', 'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 's
 
 
 def _seasonality(monthly):
-    """From DataForSEO monthly_searches (12-mo history) → peak/trough month, a
-    'start pushing ~5-6 weeks before the peak' hint, and recent trend. None if
-    not enough data / not seasonal."""
+    """From DataForSEO monthly_searches (12-mo history) → peak/trough + uptrend/
+    downtrend months, and a 'start pushing ~5 weeks before the UPTREND' hint.
+
+    Anchored on the UPTREND start (not the peak), per the DSA product-research
+    method: "Je mag dit zoekwoord ongeveer 5 weken vóór de uptrend al gebruiken."
+    The push→peak window therefore opens ~5 weeks before demand begins rising and
+    closes at the peak (entering after the peak is too late given listing lead
+    time). None if not enough data / not seasonal."""
     if not monthly or len(monthly) < 6:
         return None
     rows = [(m.get('year') or 0, m.get('month') or 0, m.get('search_volume') or 0) for m in monthly]
@@ -3461,8 +3466,34 @@ def _seasonality(monthly):
         return None
     peak = max(rows, key=lambda x: x[2])
     trough = min(rows, key=lambda x: x[2])
-    peak_m = peak[1]
-    push_m = ((peak_m - 2 - 1) % 12) + 1  # ~1.5 months before the peak
+    peak_m, trough_m = peak[1], trough[1]
+
+    # Per-calendar-month volume (average any duplicate months across years).
+    by_month = {}
+    for _, m, v in rows:
+        if 1 <= m <= 12:
+            by_month.setdefault(m, []).append(v)
+    month_vol = {m: sum(vs) / len(vs) for m, vs in by_month.items()}
+
+    def _walk(start_m, end_m):
+        """Calendar months from start_m up to+incl end_m, wrapping the year."""
+        m = start_m
+        for _ in range(12):
+            yield m
+            if m == end_m:
+                break
+            m = m % 12 + 1
+
+    # Uptrend start = first month (trough → peak) whose volume crosses ABOVE the
+    # yearly average on the way up. Fallback: the month after the trough.
+    uptrend_m = next((m for m in _walk(trough_m, peak_m) if month_vol.get(m, 0) >= avg),
+                     trough_m % 12 + 1)
+    # Downtrend start = first month after the peak whose volume drops BELOW avg.
+    downtrend_m = next((m for m in _walk(peak_m % 12 + 1, peak_m) if month_vol.get(m, 0) < avg),
+                       peak_m % 12 + 1)
+    # "~5 weeks before the uptrend" ≈ the calendar month before the uptrend start.
+    push_m = ((uptrend_m - 1 - 1) % 12) + 1
+
     recent = vols[-3:]
     trend = 'flat'
     if len(recent) >= 2 and recent[0]:
@@ -3471,7 +3502,8 @@ def _seasonality(monthly):
         elif recent[-1] < recent[0] * 0.85:
             trend = 'falling'
     seasonal = peak[2] > avg * 1.4 and trough[2] < avg * 0.7
-    return {'peak_month': _SEASON_MONTHS[peak_m], 'trough_month': _SEASON_MONTHS[trough[1]],
+    return {'peak_month': _SEASON_MONTHS[peak_m], 'trough_month': _SEASON_MONTHS[trough_m],
+            'uptrend_month': _SEASON_MONTHS[uptrend_m], 'downtrend_month': _SEASON_MONTHS[downtrend_m],
             'push_from_month': _SEASON_MONTHS[push_m], 'trend': trend, 'seasonal': bool(seasonal),
             'peak_volume': peak[2], 'avg_volume': round(avg)}
 
@@ -8423,6 +8455,12 @@ BLOG_PLAYBOOK_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), '
 # score prefers GA4 conversions when available, then GSC clicks, then ranking.
 BLOG_OPTIMIZE_FOR = os.getenv('BLOG_OPTIMIZE_FOR', 'sales')   # sales | traffic | ranking
 DFS_RANKED_ENDPOINT = 'https://api.dataforseo.com/v3/dataforseo_labs/google/ranked_keywords/live'
+BLOG_MEASURE_MIN_AGE_DAYS = int(os.getenv('BLOG_MEASURE_MIN_AGE_DAYS', '21'))
+
+# Last-run diagnostics surfaced (read-only) via /api/blog/status so failures of
+# the unattended scheduler/bootstrap are visible without droplet log access.
+_BLOG_LAST = {'bootstrap': None, 'scheduled': None, 'learn': None, 'measure': None}
+_BLOG_DOMAIN_CACHE = {}
 
 # Brand voice per market — feminine, elegant, chic womenswear. Written in-language.
 BLOG_BRAND_VOICE = (
@@ -8521,13 +8559,251 @@ def _blog_log(store, topic, article):
                 'store': store,
                 'keyword': topic.get('keyword'),
                 'category': topic.get('category'),
+                'source': topic.get('source'),
                 'article_id': article.get('id'),
                 'article_handle': article.get('handle'),
                 'title': article.get('title'),
+                'url': article.get('storefront_url'),
                 'published': article.get('published'),
+                'levers': article.get('levers'),
             }, ensure_ascii=False) + '\n')
     except Exception as e:
         print(f"[blog] history write failed: {e}")
+
+
+# ============================================================================
+# Blog performance measurement + feedback loop
+# ----------------------------------------------------------------------------
+# Measurable signal without extra integrations: DataForSEO ranked_keywords for
+# each PUBLISHED article URL on the store's real domain → keywords ranked + best
+# position + estimated organic traffic (etv). We record the writing "levers"
+# (word count, title style, #product links, category…) at write time, then
+# correlate them with measured performance and let Claude distil an evolving
+# PLAYBOOK that is fed back into the writer prompt — closing the loop so each new
+# article is written using lessons from what actually ranked. GA4 sales and Search
+# Console clicks can be layered into the score later (the scorer already prefers
+# them when present). SEO has an indexing lag, so measurement only covers articles
+# published at least BLOG_MEASURE_MIN_AGE_DAYS ago.
+# ----------------------------------------------------------------------------
+def _blog_read_jsonl(path):
+    rows = []
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        pass
+    except FileNotFoundError:
+        pass
+    return rows
+
+
+def _blog_primary_domain(store, hdrs):
+    """The store's live primary domain (what Google indexes), cached. Falls back to
+    the myshopify domain."""
+    if store in _BLOG_DOMAIN_CACHE:
+        return _BLOG_DOMAIN_CACHE[store]
+    dom = tokens.get(store, {}).get('shop') or STORES.get(store)
+    try:
+        r = _shopify_call('get', shopify_url(store, 'shop.json'), hdrs, timeout=20)
+        if r.status_code == 200:
+            dom = (r.json().get('shop') or {}).get('domain') or dom
+    except Exception as e:
+        print(f"[blog] domain lookup failed: {e}")
+    _BLOG_DOMAIN_CACHE[store] = dom
+    return dom
+
+
+def _dfs_url_performance(domain, url_path, store):
+    """DataForSEO ranked_keywords for one article URL. Returns
+    {keywords_ranked, best_position, est_traffic, top_keywords} or None."""
+    if not _dfs_configured() or store not in DFS_LOCATION or not domain or not url_path:
+        return None
+    payload = [{
+        'target': domain,
+        'location_code': DFS_LOCATION[store],
+        'language_code': DFS_LANGUAGE[store],
+        'limit': 100,
+        'filters': [['ranked_serp_element.serp_item.relative_url', 'like', f'%{url_path}%']],
+        'order_by': ['ranked_serp_element.serp_item.rank_absolute,asc'],
+    }]
+    try:
+        r = req.post(DFS_RANKED_ENDPOINT, headers=_dfs_headers(), json=payload, timeout=45)
+        d = r.json()
+    except Exception as e:
+        print(f"[blog] ranked_keywords failed: {e}")
+        return None
+    t = (d.get('tasks') or [{}])[0]
+    items = (((t.get('result') or [{}])[0]) or {}).get('items') or []
+    kws, best, etv = [], None, 0.0
+    for it in items:
+        el = (it.get('ranked_serp_element') or {}).get('serp_item') or {}
+        pos = el.get('rank_absolute')
+        ki = it.get('keyword_data') or {}
+        vol = (ki.get('keyword_info') or {}).get('search_volume')
+        kws.append({'keyword': ki.get('keyword') or it.get('keyword'), 'position': pos, 'volume': vol})
+        if pos is not None:
+            best = pos if best is None else min(best, pos)
+        etv += (el.get('etv') or 0) or 0
+    return {'keywords_ranked': len(kws), 'best_position': best,
+            'est_traffic': round(etv, 2), 'top_keywords': kws[:10]}
+
+
+def _blog_score(perf):
+    """Single performance number (higher = better). Estimated organic traffic
+    dominates; keyword breadth and a top position add to it. GA4/GSC optional."""
+    if not perf:
+        return 0.0
+    s = float(perf.get('est_traffic') or 0)
+    s += 0.5 * (perf.get('keywords_ranked') or 0)
+    bp = perf.get('best_position')
+    if bp:
+        s += max(0, 30 - bp) * 0.3
+    s += 5.0 * float(perf.get('conversions') or 0)     # GA4 sales (future)
+    s += 0.2 * float(perf.get('gsc_clicks') or 0)      # Search Console clicks (future)
+    return round(s, 2)
+
+
+def _blog_perf_latest():
+    """Latest measurement per article_id."""
+    latest = {}
+    for r in _blog_read_jsonl(BLOG_PERF_PATH):
+        aid = r.get('article_id')
+        if aid and (aid not in latest or (r.get('ts') or '') > (latest[aid].get('ts') or '')):
+            latest[aid] = r
+    return list(latest.values())
+
+
+def _blog_measure_all(force=False):
+    """Measure every published article old enough to have indexed; append results
+    to blog_performance.jsonl. Returns a summary. Never raises out."""
+    out = {'measured': 0, 'skipped': 0, 'errors': 0}
+    now = datetime.datetime.utcnow()
+    seen = {p.get('article_id'): p.get('ts') for p in _blog_read_jsonl(BLOG_PERF_PATH)}
+    for row in _blog_read_jsonl(BLOG_HISTORY_PATH):
+        aid = row.get('article_id')
+        if not aid or not row.get('published'):
+            out['skipped'] += 1
+            continue
+        try:
+            age = (now - datetime.datetime.fromisoformat((row.get('ts') or '').replace('Z', ''))).days
+        except Exception:
+            age = 999
+        if age < BLOG_MEASURE_MIN_AGE_DAYS and not force:
+            out['skipped'] += 1
+            continue
+        last = seen.get(aid)
+        if last and not force:
+            try:
+                if (now - datetime.datetime.fromisoformat(last.replace('Z', ''))).days < 6:
+                    out['skipped'] += 1
+                    continue
+            except Exception:
+                pass
+        store = row.get('store')
+        hdrs = shopify_headers(store)
+        perf = _dfs_url_performance(_blog_primary_domain(store, hdrs),
+                                    f"/blogs/{BLOG_HANDLE}/{row.get('article_handle')}", store)
+        if perf is None:
+            out['errors'] += 1
+            continue
+        rec = {'ts': now.isoformat() + 'Z', 'store': store, 'article_id': aid,
+               'article_handle': row.get('article_handle'), 'title': row.get('title'),
+               'keyword': row.get('keyword'), 'category': row.get('category'),
+               'levers': row.get('levers'), 'age_days': age, **perf, 'score': _blog_score(perf)}
+        try:
+            with open(BLOG_PERF_PATH, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+            out['measured'] += 1
+        except Exception as e:
+            print(f"[blog] perf write failed: {e}")
+            out['errors'] += 1
+    _BLOG_LAST['measure'] = {'ts': now.isoformat() + 'Z', **out}
+    return out
+
+
+def _blog_learn(min_articles=4):
+    """Correlate levers with measured performance and distil an evolving playbook
+    via Claude. Writes blog_playbook.json. Returns a status dict."""
+    perf = [p for p in _blog_perf_latest() if p.get('levers')]
+    if len(perf) < min_articles:
+        res = {'ok': False, 'reason': f'need >= {min_articles} measured articles, have {len(perf)}'}
+        _BLOG_LAST['learn'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z', **res}
+        return res
+    perf.sort(key=lambda p: -(p.get('score') or 0))
+
+    def _slim(p):
+        lv = p.get('levers') or {}
+        return {'title': p.get('title'), 'category': p.get('category'), 'score': p.get('score'),
+                'keywords_ranked': p.get('keywords_ranked'), 'best_position': p.get('best_position'),
+                'est_traffic': p.get('est_traffic'), 'word_count': lv.get('word_count'),
+                'title_len': lv.get('title_len'), 'title_is_question': lv.get('title_is_question'),
+                'title_has_number': lv.get('title_has_number'), 'n_h2': lv.get('n_h2'),
+                'n_product_links': lv.get('n_product_links'), 'topic_source': lv.get('topic_source')}
+    table = [_slim(p) for p in perf]
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        return {'ok': False, 'reason': 'no anthropic key'}
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        prompt = (
+            "You optimise an automated fashion blog. Below is per-article performance data "
+            f"(optimising for: {BLOG_OPTIMIZE_FOR}). 'score' blends estimated organic traffic, "
+            "keywords ranked and best position. Study which WRITING LEVERS (word_count, title "
+            "style, number/question in title, n_h2, n_product_links, category, topic_source) "
+            "correlate with HIGH vs LOW score.\n\n"
+            f"DATA (best→worst):\n{json.dumps(table, ensure_ascii=False)}\n\n"
+            "Write a concise PLAYBOOK of 5-8 concrete, imperative rules the writer should follow "
+            "next time to score higher (e.g. 'Aim for 900-1000 words', 'Put a number in the title', "
+            "'Link 4-5 products', 'Prioritise <category> topics'). Base each rule on THIS data, not "
+            "generic SEO advice. Return ONLY a JSON array of short strings."
+        )
+        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=700,
+                                      messages=[{'role': 'user', 'content': prompt}])
+        txt = (msg.content[0].text if msg.content else '') or ''
+        m = re.search(r'\[.*\]', txt, re.S)
+        rules = [str(x).strip() for x in (json.loads(m.group(0)) if m else []) if str(x).strip()][:8]
+    except Exception as e:
+        res = {'ok': False, 'reason': f'llm failed: {str(e)[:100]}'}
+        _BLOG_LAST['learn'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z', **res}
+        return res
+    playbook = {'ts': datetime.datetime.utcnow().isoformat() + 'Z', 'n_articles': len(perf),
+                'optimize_for': BLOG_OPTIMIZE_FOR, 'rules': rules,
+                'best_example': {'title': perf[0].get('title'), 'score': perf[0].get('score')},
+                'worst_example': {'title': perf[-1].get('title'), 'score': perf[-1].get('score')}}
+    try:
+        with open(BLOG_PLAYBOOK_PATH, 'w', encoding='utf-8') as f:
+            json.dump(playbook, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[blog] playbook write failed: {e}")
+    _BLOG_LAST['learn'] = {'ts': playbook['ts'], 'ok': True, 'n_articles': len(perf), 'rules': len(rules)}
+    return {'ok': True, **playbook}
+
+
+def _blog_playbook_text():
+    """The learned playbook as prompt text for the writer. '' if none yet (so the
+    writer simply proceeds without it). Never raises."""
+    try:
+        with open(BLOG_PLAYBOOK_PATH, 'r', encoding='utf-8') as f:
+            pb = json.load(f)
+        rules = pb.get('rules') or []
+        return '\n'.join(f"- {r}" for r in rules) if rules else ''
+    except Exception:
+        return ''
+
+
+def _blog_playbook_summary():
+    """Playbook metadata for the read-only status endpoint. Never raises."""
+    try:
+        with open(BLOG_PLAYBOOK_PATH, 'r', encoding='utf-8') as f:
+            pb = json.load(f)
+        return {'ts': pb.get('ts'), 'n_articles': pb.get('n_articles'),
+                'optimize_for': pb.get('optimize_for'), 'rules': pb.get('rules')}
+    except Exception:
+        return None
 
 
 def _blog_ensure(store, hdrs):
@@ -8709,13 +8985,30 @@ def _blog_write(store, topic, products):
     if isinstance(tags, str):
         tags = [t.strip() for t in tags.split(',') if t.strip()]
     handle = re.sub(r'[^a-z0-9]+', '-', (data.get('handle') or data.get('title') or 'post').lower()).strip('-')[:80]
+    title = (data.get('title') or '').strip()[:120]
+    body = data.get('body_html') or ''
+    # Levers — the writing knobs the feedback loop later correlates with performance.
+    words = len(re.findall(r"[\wÀ-ÿ]+", re.sub(r'<[^>]+>', ' ', body)))
+    levers = {
+        'word_count': words,
+        'title_len': len(title),
+        'title_is_question': title.strip().endswith('?'),
+        'title_has_number': bool(re.search(r'\d', title)),
+        'n_h2': len(re.findall(r'<h2', body, re.I)),
+        'n_product_links': body.count('/products/'),
+        'topic_source': topic.get('source'),
+        'category': topic.get('category'),
+        'keyword_volume': topic.get('volume'),
+        'playbook_applied': bool(pb),
+    }
     return {
-        'title': (data.get('title') or '').strip()[:120],
+        'title': title,
         'handle': handle or None,
         'meta_description': (data.get('meta_description') or '').strip()[:160],
         'excerpt': (data.get('excerpt') or '').strip(),
         'tags': [str(t).strip() for t in tags][:6],
-        'body_html': data.get('body_html') or '',
+        'body_html': body,
+        'levers': levers,
     }
 
 
@@ -8775,7 +9068,7 @@ def _blog_generate_one(store, topic=None, published=False):
     blog_id = _blog_ensure(store, hdrs)
     featured = next((p.get('image') for p in products if p.get('image')), None)
     created = _blog_create_article(store, blog_id, art, hdrs, published=published, featured_img=featured)
-    _blog_log(store, topic, {**created, 'published': published})
+    _blog_log(store, topic, {**created, 'published': published, 'levers': art.get('levers')})
     return {'store': store, 'topic': topic, 'products_linked': len(products),
             'article': created, 'preview': {'title': art['title'],
             'meta_description': art['meta_description'], 'excerpt': art['excerpt'],
@@ -8855,6 +9148,8 @@ def api_blog_status():
         pass
     except Exception as e:
         return jsonify({'error': str(e)[:120]}), 500
+    perf = _blog_perf_latest()
+    perf_sorted = sorted(perf, key=lambda p: -(p.get('score') or 0))
     return jsonify({
         'dataforseo_configured': _dfs_configured(),
         'scheduler': {
@@ -8865,7 +9160,37 @@ def api_blog_status():
         },
         'count': len(recent),
         'recent': recent[-20:],
+        'performance': {
+            'measured_articles': len(perf),
+            'optimize_for': BLOG_OPTIMIZE_FOR,
+            'measure_min_age_days': BLOG_MEASURE_MIN_AGE_DAYS,
+            'top': [{'title': p.get('title'), 'store': p.get('store'), 'score': p.get('score'),
+                     'keywords_ranked': p.get('keywords_ranked'), 'best_position': p.get('best_position'),
+                     'est_traffic': p.get('est_traffic')} for p in perf_sorted[:5]],
+        },
+        'playbook': _blog_playbook_summary(),
+        'last': _BLOG_LAST,
     })
+
+
+@app.route('/api/blog/measure', methods=['POST'])
+@require_droplet_token
+def api_blog_measure():
+    """Measure organic performance of published articles now (DataForSEO
+    ranked_keywords per URL). Body: {force?}. Appends to blog_performance.jsonl."""
+    body = request.get_json(silent=True) or {}
+    if not _dfs_configured():
+        return jsonify({'configured': False, 'message': 'DataForSEO not configured.'})
+    return jsonify({'configured': True, **_blog_measure_all(force=bool(body.get('force')))})
+
+
+@app.route('/api/blog/learn', methods=['POST'])
+@require_droplet_token
+def api_blog_learn():
+    """Rebuild the writer playbook from measured performance (correlate levers →
+    score via Claude). Body: {min_articles?}. Writes blog_playbook.json."""
+    body = request.get_json(silent=True) or {}
+    return jsonify(_blog_learn(min_articles=int(body.get('min_articles') or 4)))
 
 
 # ----------------------------------------------------------------------------
@@ -8903,6 +9228,20 @@ def _blog_store_posted_on(store, date_str):
     return False
 
 
+def _blog_run_learn_cycle():
+    """Weekly: measure published articles, then rebuild the writer playbook."""
+    try:
+        m = _blog_measure_all()
+        print(f"[blog] weekly measure: {m}")
+    except Exception as e:
+        print(f"[blog] measure failed: {e}")
+    try:
+        r = _blog_learn()
+        print(f"[blog] weekly learn: ok={r.get('ok')} {r.get('reason') or r.get('rules')}")
+    except Exception as e:
+        print(f"[blog] learn failed: {e}")
+
+
 def _blog_scheduler_loop():
     # One-shot bootstrap: first real draft (DK) shortly after the first deploy.
     if os.getenv('BLOG_BOOTSTRAP', '1') != '0':
@@ -8913,16 +9252,27 @@ def _blog_scheduler_loop():
                     print('[blog] bootstrap: generating first DK draft…')
                     res = _blog_generate_one('dk', published=False)
                     art = (res.get('article') or {})
+                    _BLOG_LAST['bootstrap'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
+                                               'store': 'dk', 'error': res.get('error'),
+                                               'url': art.get('storefront_url')}
                     print(f"[blog] bootstrap: {res.get('error') or art.get('storefront_url')}")
         except Exception as e:
+            _BLOG_LAST['bootstrap'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
+                                       'store': 'dk', 'error': str(e)[:200]}
             print(f"[blog] bootstrap failed: {e}")
 
     if os.getenv('BLOG_SCHEDULER', '1') == '0':
         return
-    # Recurring: check every 10 min; fire at most once per store per scheduled day.
+    # Recurring: check every 10 min; fire at most once per store per scheduled day,
+    # plus a weekly measure→learn cycle (Monday ~08:00) that self-tunes the writer.
+    last_learn_day = ''
     while True:
         try:
             now = datetime.datetime.now()
+            if now.weekday() == 0 and now.hour == 8 and last_learn_day != now.strftime('%Y-%m-%d'):
+                last_learn_day = now.strftime('%Y-%m-%d')
+                print('[blog] weekly learn cycle…')
+                _blog_run_learn_cycle()
             if now.weekday() in BLOG_SCHED_DAYS and now.hour == BLOG_SCHED_HOUR:
                 today = now.strftime('%Y-%m-%d')
                 for st in BLOG_SCHED_STORES:
@@ -8934,8 +9284,13 @@ def _blog_scheduler_loop():
                         print(f'[blog] scheduled draft for {st}…')
                         res = _blog_generate_one(st, published=False)
                         art = (res.get('article') or {})
+                        _BLOG_LAST['scheduled'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
+                                                   'store': st, 'error': res.get('error'),
+                                                   'url': art.get('storefront_url')}
                         print(f"[blog] {st}: {res.get('error') or art.get('storefront_url')}")
                     except Exception as e:
+                        _BLOG_LAST['scheduled'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
+                                                   'store': st, 'error': str(e)[:200]}
                         print(f'[blog] scheduled {st} failed: {e}')
         except Exception as e:
             print(f'[blog] scheduler error: {e}')
