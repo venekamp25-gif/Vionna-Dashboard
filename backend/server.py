@@ -306,7 +306,13 @@ def require_droplet_token(f):
         if DROPLET_TOKEN_SECRET:
             if not _verify_droplet_token(request.headers.get('X-Droplet-Token', '')):
                 return jsonify({'error': 'Unauthorized — missing, invalid or expired session token'}), 401
-        return f(*args, **kwargs)
+            return f(*args, **kwargs)
+        # Secret niet gezet: fail-CLOSED voor REMOTE calls (voorkomt dat een nieuwe
+        # droplet zonder env-var stil ALLE gated routes openzet), maar laat lokale
+        # dev door zodat start.bat blijft werken.
+        if request.remote_addr in ('127.0.0.1', '::1', 'localhost'):
+            return f(*args, **kwargs)
+        return jsonify({'error': 'Server misconfigured: droplet token secret not set'}), 503
     return _wrapped
 
 
@@ -8494,6 +8500,55 @@ BLOG_BRAND_VOICE = (
     "Never salesy or clickbaity; helpful and tasteful."
 )
 
+# Anti-AI writing rules, all languages. Distilled from a native-style research pass
+# over real Danish/French/Finnish fashion media (Femina, Costume, ELLE, Anna, ...)
+# after owner feedback that drafts read as AI.
+BLOG_ANTI_AI_RULES = '- Dash budget: never use an unspaced em dash (—) anywhere. Maximum ONE dash per 3-4 paragraphs, in the locally correct form (spaced en dash " – " for Danish/Finnish; in French prefer zero dashes). Every other dash you are tempted to write becomes a colon, parentheses, a comma, or a new short sentence.\n- Zero semicolons. The native corpora had 0 (DK), 3 per 4,100 words (FR), and only rare use (FI). Replace every semicolon with a full stop or a colon.\n- Ban the \'not only X, but also Y\' template in all its forms (ikke kun... men også / non seulement... mais aussi / ei vain... vaan myös). Maximum 0 per article — drop the frame and just state Y, or split into two sentences.\n- Paragraph shape: 1-3 sentences per paragraph, never more than 4. Every article must contain at least two one-sentence paragraphs. Paragraph lengths must visibly vary — no run of 3+ paragraphs with the same sentence count.\n- Sentence rhythm: alternate medium sentences (10-20 words) with punchy 2-8 word sentences. Include at least two verbless fragments per article used as full sentences (e.g. \'Snart også sommermoden.\' / \'Pas si facile, le pantalon blanc.\' / \'Vyöt tekevät tosi isoa paluuta.\'). Never write 3 consecutive sentences of similar length.\n- Vary sentence openings: never start 3 consecutive sentences with the same construction or the same subject noun. At least 2 sentences per article must start with a conjunction (Og/Men, Mais/Et, Mutta/Ja), and several must open with a time/place adverbial (\'Denne sæson...\', \'Cette saison...\', \'Tällä hetkellä...\').\n- Keywords: never paste a search keyword verbatim if it is ungrammatical in context — inflect it, reorder it, or split it across the sentence. Exact-match keyword appears at most once in the H1, once in the first 100 words, and at most twice more in the body; everywhere else use natural variants and synonyms.\n- Headings: sentence case only, never Title Case, never \'X: The Ultimate Guide\' formats. Subheadings are 2-5 word noun phrases or short declarative statements, one every 2-4 paragraphs. Body is prose under subheadings, not bullet lists (max one short list per article, only for styling tips).\n- Prices never appear in running prose and never with hard-sell phrasing (\'til kun 299 kr.!\' / \'vain 39,95 €!\' is banned). Prices live only in a caption-style line or product card, in local number format: DK \'2.200 kr.\', FR \'49,99 €\' (comma decimal, € after the number), FI \'49,95 e\' or \'euroa\'. Affordability claims go in the headline, not the sentence.\n- No meta-scaffolding: never write \'In this article we will...\', \'It is important to note that...\', or a labeled \'Conclusion\' section. Open with a scene, season or claim; end on a last styling idea or a light permission-giving line, not a summary or hard CTA.\n- Adjective triplets (\'timeless, elegant and versatile\') maximum once per article — and if used, prefer the native shape (bare adjectives BEFORE a colon in French). Everywhere else: one concrete detail per claim — cut, fabric, length, or a specific styling pairing — instead of stacked adjectives.\n- Brand names other than Vionna: designer houses may appear only as trend evidence in runway context (\'hos Celine\' / \'chez Burberry\' / \'Glamourin mukaan\'), never as purchase links. No competitor webshops or retailers, ever. Ban calqued English fashion-speak (\'embrace the trend\', \'elevate your look/wardrobe\', \'make a statement\' translated literally) — use the native idioms listed in each language block.'
+
+# Language-specific pitfalls observed in real generated drafts (native editor review,
+# 2026-07-03). Fed to BOTH the writer (prevention) and the editor pass (checklist).
+BLOG_LANG_PITFALLS = {
+    'dk': (
+        "- Trousers singular is 'buks/buksen' (DANISH); 'bukse' is Norwegian. Watch for other "
+        "Norwegian/Swedish intruders: 'plagget' -> 'tøjet'.\n"
+        "- Compounds are ONE word: damebukser, plejetip, sommerkjole (never 'Dame bukser'). "
+        "Brand+noun takes a hyphen: Adidas-bukser.\n"
+        "- Gender agreement: et bælte -> 'et smalt bælte'; et snit -> 'et rent snit'. Possessive + "
+        "definite never combine: 'din garderobes vigtigste brik', not 'din garderobens'.\n"
+        "- Spelling: silhuet(ter), håndvask. Commas: before 'men'; between coordinated imperatives "
+        "('Udforsk udvalget, og lad dig inspirere'); 'lige så godt ... som'.\n"
+        "- Reflexives follow the subject: 'du ... klæde dig' (not 'sig'); 'hvile i dig selv'.\n"
+        "- Calques to avoid: 'par den med' -> 'kombinér den med'; 'går aldrig galt' -> 'man går aldrig "
+        "galt i byen med'; 'koordinerer med hinanden' -> 'passer til hinanden'; garments are not "
+        "'stykker'; 'tilføje' requires 'til'."
+    ),
+    'fr': (
+        "- French typography: espace insécable before : ; ? ! and inside « guillemets ». Correct "
+        "apostrophes (l'été).\n"
+        "- Past participle vs infinitive: 'on la voit déclinée' (not 'décliner').\n"
+        "- Anglicisms: 'versatile' -> 'polyvalente'; 'Rien ne dit été' -> 'Rien n'évoque l'été'.\n"
+        "- Keyword phrases like 'jupe longue été' are search queries, not French: write 'la jupe "
+        "longue, cet été,' or 'jupe longue d'été'."
+    ),
+    'fi': (
+        "- Standard spellings: siluetti (not silhuetti), terassi (not terrassi). 'Stailausvinkki', "
+        "never 'Stylingtip'.\n"
+        "- Morphology: 'tuntea olosi keväiseksi' (translative); plural predicative 'pysyvät "
+        "raikkaina'; 'Tässä piilee'; conditional after 'ikään kuin' ('ikään kuin sinulla olisi').\n"
+        "- Word order: 'naisten mekot', not 'mekot naisille' as a subject.\n"
+        "- Word choice: olkilaukku (not olkipussi), monikäyttöisyys (not monitoimisuus).\n"
+        "- Inflect product names carefully and keep the stem intact: Flora -> Floran (never 'Flotan')."
+    ),
+}
+
+# Per-market editorial style guide distilled from real Danish/French/Finnish fashion
+# media (native-style research). Populated from that research; safe to be empty.
+BLOG_STYLE = {
+    'dk': 'DANISH STYLE (Danish women\'s-magazine register: Femina/Costume/ELLE.dk)\n- Punctuation: comma is the workhorse (full Danish grammatical comma). Dash = SPACED en dash " – " only, max 1 per 3-4 paragraphs, almost always a sentence-final afterthought ("– og vi forstår det godt") or a dash-appended question ("– og måske også hos dig?"). Signature move: the colon-reveal ending in a capitalized fragment: "Det er dog nogle år siden: Træningsjakken." Parentheses for playful asides: "En ny (og mere solrig) sæson". No semicolons, no exclamation marks ending sentences.\n- Reader address: always informal "du"; advice as softened imperatives ("Gå gerne efter...", "Prøv evt. ...", "Vælg gerne et med mange lommer – så slipper du for at bære taske"); warm editorial "vi" for opinions ("Vi kan efterhånden næsten ikke leve uden..."); about one rhetorical question per article.\n- Rhythm: 10-20 word sentences broken by 3-8 word fragments ("Snart også sommermoden."). Start sentences with Og/Men/Nej. CRITICAL: use V2 inversion after fronted adverbials — "I 2026 bærer vi...", "Denne sæson er det...", "Hos Celine er det...". Sprinkle modal particles every few sentences: jo, nemlig, da, altså, egentlig, for alvor, efterhånden.\n- Paragraphs: 1-2 sentences. Headlines sentence case, spoken, "Sådan..." / "Her er..." templates. Subheads: 2-5 word noun phrases or idiom puns ("Lag på lag", "Ny romantik").\n- Products/prices: prices only as caption line "Kjole, Vionna, 599 kr." (dot thousands: 2.200 kr.). In prose, name cut/fabric and cite houses as trend evidence with "hos": "spottet hos By Malene Birger". Keep English loanwords in English (look, oversize, preppy, statement); inflect "style" as Danish verb (styler, stylet). Anchor in season/weather and Danish life (overgangsjakke, Copenhagen Fashion Week).\n- Rewrite examples (AI → native):\n  1. "Denne kjole er ikke kun elegant, men også alsidig — perfekt til enhver lejlighed." → "Kjolen fungerer nemlig lige så godt på kontoret som til middagen i byen. Og det er egentlig hele pointen."\n  2. "Omfavn tendensen og elevér dit look med tidløse styles." → "Gå gerne efter en enkel model – så kan du style den på ny hele sæsonen."\n  3. "Blazeren er et must-have i 2026. Den er både klassisk og moderne." → "Der er én jakke, du kommer til at se overalt i år: Blazeren."\n- Tone anchors (verbatim native): "Foråret er jo her for alvor, og med det kommer forårsmoden i billedet." / "Ja, du læste rigtigt: Forklædekjolen." / "Denne sæson har garderoben fra det arbejdende folk vundet indpas på catwalken – og måske også hos dig?"',
+    'fr': 'FRENCH STYLE (ELLE/L\'Officiel service-journalism register)\n- Punctuation: the COLON is the main connector (~1 per 80 words) for enumerations, verdicts and pivots: "Le message est clair : ...", "n\'est plus un geste : c\'est une revendication." Second device: the mini-question answered immediately — "Le secret ? Opter pour...", "L\'avantage ? Elle allonge la silhouette." Parentheses for materials and quick asides: "(lin, viscose, coton)". Em dashes: 0 per article as default, absolute max 1. ZERO exclamation marks in editorial prose (allowed only in shopping captions). French typography is mandatory: narrow no-break space before ? ! : ("cet été ?", "le secret :"), typographic apostrophes (l\'été), guillemets only for named concepts.\n- Reader address: always VOUS, never tu. But most styling moves go through impersonal ON ("on ose le polo rayé", "on privilégie des accessoires minimalistes"); editorial NOUS sparingly; feminine agreement assumed ("celles qui...", "prête"). Vous-imperatives used sparingly, with a crisp payoff ("détrompez-vous").\n- Rhythm: average 15-18 words with big spread — 2-word fragments ("SS26, nous voilà.") to 30+. Verbless sentences are native: "Mais pas question de le ressortir comme au début des années 2000." Rotate openers: "Cette saison,", "Chez [maison],", "Côté matières,", "Si vous...", left dislocation ("Le lin, on y revient chaque été.").\n- Paragraphs: 1-3 sentences under noun-phrase subheads, often noun + apposition: "La robe fluide, basique intemporel". Headlines sentence case, numbered or "Comment porter X cet été ?". Never a labeled "Conclusion :".\n- Products/prices: prices only in captions "Robe en lin, Vionna, 49,99 €" (comma decimal, € after, space before €); affordability in the headline ("à moins de 100 euros"). Brands via "chez X" in runway context; garments described by cut and fabric. Use the native lexicon: le vestiaire, la silhouette, la pièce maîtresse, une valeur sûre, "une touche de / un brin de", du jour au soir. Confident anglicisms fine: le total look, oversized, un hit.\n- Rewrite examples (AI → native):\n  1. "Cette robe n\'est pas seulement élégante, mais aussi polyvalente — un incontournable qui élèvera votre garde-robe." → "Confortable, élégante, facile à vivre : cette robe suit tout, du déjeuner en terrasse à l\'apéro entre amies."\n  2. "Comment porter le lin cet été? Il est essentiel de choisir des coupes adaptées afin de garantir votre confort." → "Le secret ? Des matières qui respirent (lin, viscose, coton) et des coupes qui épousent le corps sans l\'écraser."\n  3. "Faites une déclaration audacieuse avec l\'imprimé floral!" → "Celles qui pensaient l\'imprimé floral dépassé en seront pour leurs frais."\n- Tone anchors (verbatim native): "En 2026, l\'excès n\'est plus un geste : c\'est une revendication stylistique." / "Mais pas question de le ressortir comme au début des années 2000, avec débardeur superposé et tongs." / "Pas si facile, le pantalon blanc."',
+    'fi': 'FINNISH STYLE (Anna/Kotiliesi/Yhteishyvä register)\n- Punctuation: comma and colon are the workhorses — colon introduces the explanation: "Tärkeintä on hyvä istuvuus: liian kireät tai yliväljät housut eivät pue ketään." Exclamation marks are ALLOWED and native, including in headlines (1-4 per article is normal). Em dashes: zero. The only native dash is a spaced en dash " – ", mainly in the headline formula "claim – payoff", plus at most 1-2 in the body for a dramatic aside. Asides otherwise via comma, colon, parentheses or a new sentence.\n- Reader address: informal sinä only. Advice as verb-first imperatives softened with particles: "Kaiva siis esiin...", "Valitse housut, joissa...". Use the zero-person "voi + infinitive" instead of hammering "sinä voit": "Pienten korkojen kanssa voi mennä missä vain asussa." Editorial we for the brand\'s work ("Löysimme..."). A couple of rhetorical questions per article ("Muistatko ylimitoitetun suuret bleiserit?").\n- Rhythm: 8-15 words average; longer explanatory sentence, then a short punch: "Vyöt tekevät tosi isoa paluuta." Verbless fragments as ledes/topic-setters: "Italialaisen jäätelöbaarin sävyjä, ripaus rosoisuutta ja romanttista pitsiä." CRITICAL nativeness marker: sprinkle clitic particles constantly — -han/-hän, -kin, -pa, siis, ihan, tosi, eiköhän, kuulemma ("Peplumhan saa veistoksellisen muodon aikaiseksi"). Exploit free word order: open with adverbials ("Tällä hetkellä himotuin...") or verb-first imperatives, not always subject-first.\n- Paragraphs: 2-4 sentences, frequent 1-sentence paragraphs. Subheads: short declarative statements ("Lahkeet ovat leveät") or numbered noun phrases. Headlines: sentence case, "statement – payoff" with the spaced en dash, numeral and exclamation mark welcome.\n- Products/prices: no prices in trend prose; caption format "Mekko 49,95 e, Vionna" (decimal comma, \'e\' or \'euroa\', never \'€39.95\'). Brands/media cited as authorities with "X:n mukaan". Use native fashion idioms: tehdä paluuta, ottaa haltuun, trendata, pukea ("eivät pue ketään"), kaivaa kaapista esiin, päästä varpaisiin; casual nouns juttu, puntit. Anchor in Finnish seasons (kevät tekee tuloaan, juhannus, "talvi tuntuu luissa ja ytimissä").\n- Rewrite examples (AI → native):\n  1. "Tämä mekko ei ole vain tyylikäs, vaan myös ajaton ja monipuolinen — täydellinen valinta jokaiseen tilaisuuteen." → "Mekko toimii arjessa ja juhlassa. Pienten korkojen kanssa voi mennä missä vain, ja kokonaisuus näyttää heti puetummalta."\n  2. "Sinä voit yhdistää bleiserin farkkuihin. Sinä voit myös käyttää sitä mekon kanssa." → "Bleiserin voi heittää farkkujen päälle tai mekon kaveriksi. Kaiva siis esiin se, joka kaapissa jo odottaa."\n  3. "Nosta tyylisi uudelle tasolle pellavamekolla!" → "Pellavamekko on kesän juttu. Eiköhän se pelasta helteisimmätkin päivät."\n- Tone anchors (verbatim native): "Tärkeintä on hyvä istuvuus: liian kireät tai yliväljät housut eivät pue ketään." / "Vyöt tekevät tosi isoa paluuta." / "Eiköhän tästä ihan mielenkiintoinen muotivuosi saada aikaan."',
+}
+
 # Evergreen fallback topics per store, used when DataForSEO returns nothing (creds
 # not set yet, or no fresh candidates). Keeps the system producing quality drafts
 # regardless. Local-language keyword + the catalogue category to link products from.
@@ -8887,8 +8942,11 @@ def _blog_hot_topics(store, k=3):
     if not cands:
         return []
     # Brand/off-topic guard: seed words like 'top' also surface sports/brand queries
-    # ("rugby top 14") that ranked purely on volume — keep womenswear only.
+    # ("rugby top 14") that ranked purely on volume — keep womenswear only. The kept
+    # set also gates the CLUSTER below: an unfiltered cluster put "adidas bukser" /
+    # "carhartt bukser" into the DK article as a competitor-brands section.
     cands = _dfs_clean_keywords_llm(cands, store, max_tokens=4000)
+    clean_kws = {(c.get('keyword') or '').strip().lower() for c in cands}
     _recommend_keywords(cands, store, top_n=len(cands))   # attaches 'score'
     cands.sort(key=lambda x: -(x.get('score') or 0))
     recent = _blog_recent_sigs(store)
@@ -8902,7 +8960,8 @@ def _blog_hot_topics(store, k=3):
         cat = DFS_TYPE_CATEGORY.get(label)
         cluster = [r.get('keyword') for r in sorted(by_seed.get(seed, []),
                    key=lambda r: -(r.get('volume') or 0))
-                   if r.get('keyword') and r.get('keyword') != x.get('keyword')][:6]
+                   if r.get('keyword') and r.get('keyword') != x.get('keyword')
+                   and (r.get('keyword') or '').strip().lower() in clean_kws][:6]
         topics.append({
             'keyword': x.get('keyword'), 'volume': x.get('volume'), 'intent': x.get('intent'),
             'seasonality': x.get('seasonality'), 'score': x.get('score'),
@@ -8970,8 +9029,9 @@ def _blog_write(store, topic, products):
     cluster = [c for c in (topic.get('cluster') or []) if c]
     prod_lines = []
     for p in products:
-        price = f" — {p['price']} {p.get('currency') or ''}".rstrip() if p.get('price') else ''
-        prod_lines.append(f"- {p.get('title')} (link: {p.get('url')}{price})")
+        # No prices in the writer input: native fashion editorial never puts prices in
+        # running prose, and the linked product page always shows the current price.
+        prod_lines.append(f"- {p.get('title')} (link: {p.get('url')})")
     prod_block = '\n'.join(prod_lines) if prod_lines else '(no products available — write without product links)'
     seas = topic.get('seasonality') or {}
     season_hint = ''
@@ -8983,9 +9043,17 @@ def _blog_write(store, topic, products):
     pb = _blog_playbook_text()
     pb_block = (f"\n\nLEARNED PLAYBOOK (apply these — derived from our best-performing past articles):\n{pb}\n"
                 if pb else "")
+    style = BLOG_STYLE.get(store) or ''
+    style_block = (f"\n\nEDITORIAL STYLE ({lang} fashion media — imitate this, it is how real "
+                   f"{lang} magazine writers sound):\n{style}\n" if style else "")
+    pitfalls = BLOG_LANG_PITFALLS.get(store) or ''
+    pitfall_block = (f"\n\n{lang.upper()} LANGUAGE PITFALLS (this writer has made these exact "
+                     f"mistakes before — do not repeat them):\n{pitfalls}\n" if pitfalls else "")
     prompt = (
         f"You are the content writer for Vionna, writing an SEO blog article. {BLOG_BRAND_VOICE}\n\n"
         f"Write the ENTIRE article in {lang}. Native, fluent, elegant {lang} — not translated-sounding.\n\n"
+        f"WRITING RULES (hard requirements):\n{BLOG_ANTI_AI_RULES}\n"
+        f"{style_block}{pitfall_block}\n"
         f"PRIMARY SEO KEYWORD (must rank for this): \"{kw}\"\n"
         f"Supporting keywords to weave in naturally: {', '.join(cluster) if cluster else '(none)'}"
         f"{season_hint}{pb_block}\n\n"
@@ -8993,11 +9061,12 @@ def _blog_write(store, topic, products):
         f"{prod_block}\n\n"
         "REQUIREMENTS:\n"
         f"1. Title: compelling, contains the primary keyword, max ~60 chars, in {lang}.\n"
-        "2. Body: valid HTML (no <html>/<head>/<body> wrappers). 800-1200 words — never fewer "
-        "than 750. Use <h2>/<h3> subheadings, <p>, and <ul> where useful. Put the primary keyword "
-        "in the first paragraph and in at least one <h2>.\n"
+        "2. Body: valid HTML (no <html>/<head>/<body> wrappers). 600-950 words (native fashion "
+        "editorial length), never fewer than 550. Use <h2>/<h3> subheadings and <p>; prose over "
+        "bullet lists. Put the primary keyword in the first paragraph and in at least one <h2>.\n"
         "3. Naturally recommend 3-6 of the products above with inline <a href=\"/products/...\"> links "
-        "on the product name. Add one styling/care tip context around each — never a bare list dump.\n"
+        "on the product name. Add one styling/care tip context around each — never a bare list dump. "
+        "Never mention prices anywhere in the article.\n"
         "4. End with a short call-to-action paragraph linking to <a href=\"/collections/all\">the shop</a>.\n"
         "5. meta_description: max 155 chars, contains the keyword, enticing.\n"
         "6. excerpt: 1 short sentence summary.\n"
@@ -9041,6 +9110,9 @@ def _blog_write(store, topic, products):
         'category': topic.get('category'),
         'keyword_volume': topic.get('volume'),
         'playbook_applied': bool(pb),
+        'style_guide_applied': bool(style),
+        'editor_pass': False,   # flipped by _blog_edit on success
+        'n_em_dash': body.count('—') + body.count('–'),
     }
     return {
         'title': title,
@@ -9051,6 +9123,107 @@ def _blog_write(store, topic, products):
         'body_html': body,
         'levers': levers,
     }
+
+
+def _blog_quality_violations(art, store):
+    """Deterministic checks for the researched style rules the models tend to
+    ignore when merely prompted: dash budget, semicolons, article length.
+    Returns a list of human-readable violations (empty = clean)."""
+    body = art.get('body_html') or ''
+    text = re.sub(r'&[a-z#0-9]+;', ' ', re.sub(r'<[^>]+>', ' ', body))
+    words = len(re.findall(r"[\wÀ-ÿ]+", text))
+    dashes = body.count('—') + body.count('–')
+    semis = text.count(';')
+    v = []
+    max_dash = 0 if store == 'fr' else 2
+    if dashes > max_dash:
+        v.append(f"the body contains {dashes} dashes (em or en); the maximum allowed is {max_dash}. "
+                 + ("French fashion prose uses a colon, parentheses or the 'Le secret ? ...' question "
+                    "device instead of dashes." if store == 'fr' else
+                    "Keep at most 2 SPACED en dashes ( – ) as sentence-final afterthoughts; rewrite "
+                    "every other dash as a colon, comma, parentheses or a new short sentence."))
+    if '—' in body:
+        v.append("the unspaced em dash (—) appears; it must never be used in any language here.")
+    if semis:
+        v.append(f"{semis} semicolon(s) in the text; replace each with a full stop or a colon.")
+    if words < 550:
+        v.append(f"the article is only ~{words} words; expand naturally to 600-950 words by adding "
+                 "concrete styling scenarios or care advice in the same voice (no filler, no new "
+                 "sections needed, do not touch the links).")
+    return v
+
+
+def _blog_edit(store, art, products=None, violations=None):
+    """Native copy-editor pass over a written article: fixes grammar, spelling,
+    morphology, idiom and calque errors so the text reads native. Preserves HTML
+    structure, links and the SEO keyword placement. Returns the corrected art dict;
+    falls back to the input unchanged on any failure. (Added after native review
+    scored raw drafts 6-7/10: DA had Norwegian word forms, FI case errors.)"""
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        return art
+    lang = DFS_LANG_NAME.get(store, 'Danish')
+    pitfalls = BLOG_LANG_PITFALLS.get(store) or ''
+    names = ', '.join(sorted({p.get('title') for p in (products or []) if p.get('title')})) or '(none)'
+    prompt = (
+        f"You are a professional NATIVE {lang} copy editor at a fashion magazine. Proofread and "
+        f"correct the blog article below so it reads as if written by a skilled native {lang} "
+        f"fashion journalist.\n\n"
+        f"FIX: grammar, spelling, gender/case/agreement, morphology, unidiomatic phrasing, "
+        f"anglicisms and calques, wrong word choices, comma rules.\n"
+        f"KNOWN PITFALLS of this writer in {lang} (check each explicitly):\n{pitfalls}\n\n"
+        f"ALSO ENFORCE:\n{BLOG_ANTI_AI_RULES}\n\n"
+        "HARD RULES:\n"
+        "- Preserve ALL HTML tags and attributes EXACTLY; every <a href> must survive unchanged "
+        "(same URLs, same count). Do not add or remove links, headings or sections.\n"
+        "- Do not rewrite content or restructure; minimal edits a copy editor would make. "
+        "Improving an unnatural sentence is allowed; changing its meaning is not.\n"
+        f"- Keep the primary SEO keyword \"{art.get('primary_keyword') or ''}\" present in the "
+        "title, the first paragraph and at least one <h2> (inflected naturally).\n"
+        f"- Product names are proper names, match them exactly (inflect correctly, never corrupt "
+        f"the stem): {names}\n"
+        "- Also correct the meta_description, excerpt and tags.\n"
+        + ("\nSPECIFIC VIOLATIONS DETECTED — FIXING THESE IS THE MAIN JOB OF THIS PASS:\n"
+           + '\n'.join(f"- {v}" for v in violations) + "\n\n" if violations else "\n")
+        + f"TITLE: {art.get('title')}\n"
+        f"META_DESCRIPTION: {art.get('meta_description')}\n"
+        f"EXCERPT: {art.get('excerpt')}\n"
+        f"TAGS: {json.dumps(art.get('tags'), ensure_ascii=False)}\n"
+        f"BODY_HTML:\n{art.get('body_html')}\n\n"
+        "Return ONLY compact JSON: {\"title\": \"...\", \"meta_description\": \"...\", "
+        "\"excerpt\": \"...\", \"tags\": [\"...\"], \"body_html\": \"...\"}"
+    )
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=8000,
+                                      messages=[{'role': 'user', 'content': prompt}])
+        txt = (msg.content[0].text if msg.content else '') or ''
+        m = re.search(r'\{.*\}', txt, re.S)
+        if not m:
+            print('[blog] editor returned no JSON; keeping writer version')
+            return art
+        data = json.loads(m.group(0))
+        body = data.get('body_html') or ''
+        # Safety: the edit must not lose product links; if it did, keep the original.
+        if body.count('/products/') < (art.get('body_html') or '').count('/products/'):
+            print('[blog] editor dropped product links; keeping writer version')
+            return art
+        out = dict(art)
+        out['title'] = (data.get('title') or art['title']).strip()[:120]
+        out['meta_description'] = (data.get('meta_description') or art.get('meta_description') or '').strip()[:160]
+        out['excerpt'] = (data.get('excerpt') or art.get('excerpt') or '').strip()
+        tags = data.get('tags') or art.get('tags') or []
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(',') if t.strip()]
+        out['tags'] = [str(t).strip() for t in tags][:6]
+        out['body_html'] = body
+        if isinstance(out.get('levers'), dict):
+            out['levers']['editor_pass'] = True
+            out['levers']['n_em_dash'] = body.count('—') + body.count('–')
+        return out
+    except Exception as e:
+        print(f"[blog] editor pass failed: {e}")
+        return art
 
 
 def _blog_create_article(store, blog_id, art, hdrs, published=False, featured_img=None):
@@ -9106,6 +9279,16 @@ def _blog_generate_one(store, topic=None, published=False):
     art = _blog_write(store, topic, products)
     if not art or not art.get('title') or not art.get('body_html'):
         return {'store': store, 'topic': topic, 'error': 'writer failed'}
+    art['primary_keyword'] = topic.get('keyword')
+    art = _blog_edit(store, art, products)
+    # Deterministic style gate: models under-obey the dash/length budget when merely
+    # prompted, so verify and run up to 2 targeted repair passes.
+    for _ in range(2):
+        viol = _blog_quality_violations(art, store)
+        if not viol:
+            break
+        print(f"[blog] {store}: repair pass for: {viol}")
+        art = _blog_edit(store, art, products, violations=viol)
     blog_id = _blog_ensure(store, hdrs)
     featured = next((p.get('image') for p in products if p.get('image')), None)
     created = _blog_create_article(store, blog_id, art, hdrs, published=published, featured_img=featured)
