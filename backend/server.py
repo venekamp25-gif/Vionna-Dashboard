@@ -8886,6 +8886,9 @@ def _blog_hot_topics(store, k=3):
     cands = list(best.values())
     if not cands:
         return []
+    # Brand/off-topic guard: seed words like 'top' also surface sports/brand queries
+    # ("rugby top 14") that ranked purely on volume — keep womenswear only.
+    cands = _dfs_clean_keywords_llm(cands, store, max_tokens=4000)
     _recommend_keywords(cands, store, top_n=len(cands))   # attaches 'score'
     cands.sort(key=lambda x: -(x.get('score') or 0))
     recent = _blog_recent_sigs(store)
