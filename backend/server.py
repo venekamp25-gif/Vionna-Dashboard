@@ -8470,28 +8470,35 @@ _BLOG_DOMAIN_CACHE = {}
 _BLOG_SCOPE_CACHE = {}   # store -> {'ts': epoch, 'write_content': bool|None}
 
 
+# Scopes the blog engine needs, with what each unlocks (shown in /api/blog/status).
+_BLOG_REQ_SCOPES = ('write_content', 'write_themes', 'write_online_store_navigation', 'read_orders')
+
+
 def _blog_scope_check(store, max_age=600):
-    """Does this store's token carry write_content (required for blog articles)?
-    Cached; returns {'token': bool, 'write_content': bool|None}. Scope NAMES only —
+    """Which of the blog engine's required scopes does this store's token carry?
+    Cached; returns {'token': bool, '<scope>': bool|None, ...}. Scope NAMES only —
     never the token itself."""
     tok = shopify_headers(store).get('X-Shopify-Access-Token')
     if not tok:
-        return {'token': False, 'write_content': None}
+        return {'token': False}
     c = _BLOG_SCOPE_CACHE.get(store)
-    if c and time.time() - c['ts'] < max_age:
-        return {'token': True, 'write_content': c['write_content']}
-    wc = None
-    try:
-        shop = tokens.get(store, {}).get('shop') or STORES.get(store)
-        r = _shopify_call('get', f"https://{shop}/admin/oauth/access_scopes.json",
-                          shopify_headers(store), timeout=15)
-        if r.status_code == 200:
-            handles = [s.get('handle') for s in (r.json().get('access_scopes') or [])]
-            wc = 'write_content' in handles
-    except Exception as e:
-        print(f"[blog] scope check {store} failed: {e}")
-    _BLOG_SCOPE_CACHE[store] = {'ts': time.time(), 'write_content': wc}
-    return {'token': True, 'write_content': wc}
+    if not (c and 'handles' in c and time.time() - c['ts'] < max_age):
+        handles = None
+        try:
+            shop = tokens.get(store, {}).get('shop') or STORES.get(store)
+            r = _shopify_call('get', f"https://{shop}/admin/oauth/access_scopes.json",
+                              shopify_headers(store), timeout=15)
+            if r.status_code == 200:
+                handles = [s.get('handle') for s in (r.json().get('access_scopes') or [])]
+        except Exception as e:
+            print(f"[blog] scope check {store} failed: {e}")
+        _BLOG_SCOPE_CACHE[store] = {'ts': time.time(), 'handles': handles}
+        c = _BLOG_SCOPE_CACHE[store]
+    handles = c.get('handles')
+    out = {'token': True}
+    for sc in _BLOG_REQ_SCOPES:
+        out[sc] = (sc in handles) if handles is not None else None
+    return out
 
 # Brand voice per market — feminine, elegant, chic womenswear. Written in-language.
 BLOG_BRAND_VOICE = (
@@ -8732,6 +8739,41 @@ def _dfs_url_performance(domain, url_path, store):
             'est_traffic': round(etv, 2), 'top_keywords': kws[:10]}
 
 
+def _blog_conversions(store, hdrs, since_days=90):
+    """Blog-attributed sales per article handle: orders whose SESSION landed on a
+    /blogs/ page (Shopify stores landing_site on every order). Captures the funnel
+    we optimise (Google → blog article → purchase) without UTM parameters on
+    internal links, which would skew GA4/Shopify session attribution. Mid-session
+    blog visits (home → blog → buy) are invisible here — known limitation.
+    Returns {handle: {'orders': n, 'revenue': x}}, or None when read_orders is
+    missing on this store's token."""
+    since = (datetime.datetime.utcnow() - datetime.timedelta(days=since_days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    url = shopify_url(store, f'orders.json?status=any&limit=250&created_at_min={since}'
+                             '&fields=id,landing_site,total_price')
+    tally = {}
+    while url:
+        r = _shopify_call('get', url, hdrs, timeout=30)
+        if r.status_code == 403:
+            return None
+        if r.status_code != 200:
+            print(f"[blog] orders fetch HTTP {r.status_code}: {r.text[:120]}")
+            break
+        for o in r.json().get('orders', []):
+            m = re.match(r'^/blogs/[^/]+/([^/?#]+)', o.get('landing_site') or '')
+            if not m:
+                continue
+            t = tally.setdefault(m.group(1), {'orders': 0, 'revenue': 0.0})
+            t['orders'] += 1
+            try:
+                t['revenue'] = round(t['revenue'] + float(o.get('total_price') or 0), 2)
+            except Exception:
+                pass
+        link = r.headers.get('Link') or r.headers.get('link') or ''
+        m2 = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        url = m2.group(1) if m2 else None
+    return tally
+
+
 def _blog_score(perf):
     """Single performance number (higher = better). Estimated organic traffic
     dominates; keyword breadth and a top position add to it. GA4/GSC optional."""
@@ -8742,8 +8784,9 @@ def _blog_score(perf):
     bp = perf.get('best_position')
     if bp:
         s += max(0, 30 - bp) * 0.3
-    s += 5.0 * float(perf.get('conversions') or 0)     # GA4 sales (future)
-    s += 0.2 * float(perf.get('gsc_clicks') or 0)      # Search Console clicks (future)
+    s += 5.0 * float(perf.get('conversions') or 0)      # blog-landed orders (Shopify landing_site)
+    s += 0.05 * float(perf.get('conv_revenue') or 0)    # their revenue
+    s += 0.2 * float(perf.get('gsc_clicks') or 0)       # Search Console clicks (future)
     return round(s, 2)
 
 
@@ -8758,11 +8801,14 @@ def _blog_perf_latest():
 
 
 def _blog_measure_all(force=False):
-    """Measure every published article old enough to have indexed; append results
-    to blog_performance.jsonl. Returns a summary. Never raises out."""
+    """Measure every published article; append results to blog_performance.jsonl.
+    Two signals, each on its own clock: blog-landed CONVERSIONS (Shopify orders,
+    meaningful from ~day 2) and Google RANKINGS via DataForSEO (needs indexing,
+    from BLOG_MEASURE_MIN_AGE_DAYS). Returns a summary. Never raises out."""
     out = {'measured': 0, 'skipped': 0, 'errors': 0}
     now = datetime.datetime.utcnow()
     seen = {p.get('article_id'): p.get('ts') for p in _blog_read_jsonl(BLOG_PERF_PATH)}
+    conv_cache = {}   # store -> tally dict, or None when read_orders is missing
     for row in _blog_read_jsonl(BLOG_HISTORY_PATH):
         aid = row.get('article_id')
         if not aid or not row.get('published'):
@@ -8772,7 +8818,7 @@ def _blog_measure_all(force=False):
             age = (now - datetime.datetime.fromisoformat((row.get('ts') or '').replace('Z', ''))).days
         except Exception:
             age = 999
-        if age < BLOG_MEASURE_MIN_AGE_DAYS and not force:
+        if age < 2 and not force:
             out['skipped'] += 1
             continue
         last = seen.get(aid)
@@ -8785,15 +8831,29 @@ def _blog_measure_all(force=False):
                 pass
         store = row.get('store')
         hdrs = shopify_headers(store)
-        perf = _dfs_url_performance(_blog_primary_domain(store, hdrs),
-                                    f"/blogs/{BLOG_HANDLE}/{row.get('article_handle')}", store)
-        if perf is None:
-            out['errors'] += 1
+        if store not in conv_cache:
+            try:
+                conv_cache[store] = _blog_conversions(store, hdrs)
+            except Exception as e:
+                print(f"[blog] conversions {store} failed: {e}")
+                conv_cache[store] = None
+        conv = (conv_cache[store] or {}).get(row.get('article_handle')) or {}
+        perf = None
+        if age >= BLOG_MEASURE_MIN_AGE_DAYS or force:
+            perf = _dfs_url_performance(_blog_primary_domain(store, hdrs),
+                                        f"/blogs/{BLOG_HANDLE}/{row.get('article_handle')}", store)
+        if perf is None and conv_cache[store] is None:
+            out['skipped'] += 1    # nothing measurable for this article yet
             continue
         rec = {'ts': now.isoformat() + 'Z', 'store': store, 'article_id': aid,
                'article_handle': row.get('article_handle'), 'title': row.get('title'),
                'keyword': row.get('keyword'), 'category': row.get('category'),
-               'levers': row.get('levers'), 'age_days': age, **perf, 'score': _blog_score(perf)}
+               'levers': row.get('levers'), 'age_days': age,
+               **(perf or {'keywords_ranked': None, 'best_position': None, 'est_traffic': None}),
+               'conversions': conv.get('orders') or 0,
+               'conv_revenue': conv.get('revenue') or 0.0,
+               'conversions_tracked': conv_cache[store] is not None}
+        rec['score'] = _blog_score(rec)
         try:
             with open(BLOG_PERF_PATH, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + '\n')
@@ -8801,7 +8861,8 @@ def _blog_measure_all(force=False):
         except Exception as e:
             print(f"[blog] perf write failed: {e}")
             out['errors'] += 1
-    _BLOG_LAST['measure'] = {'ts': now.isoformat() + 'Z', **out}
+    _BLOG_LAST['measure'] = {'ts': now.isoformat() + 'Z', **out,
+                             'conversions_tracked': {s: (c is not None) for s, c in conv_cache.items()}}
     return out
 
 
@@ -8819,7 +8880,9 @@ def _blog_learn(min_articles=4):
         lv = p.get('levers') or {}
         return {'title': p.get('title'), 'category': p.get('category'), 'score': p.get('score'),
                 'keywords_ranked': p.get('keywords_ranked'), 'best_position': p.get('best_position'),
-                'est_traffic': p.get('est_traffic'), 'word_count': lv.get('word_count'),
+                'est_traffic': p.get('est_traffic'),
+                'conversions': p.get('conversions'), 'conv_revenue': p.get('conv_revenue'),
+                'word_count': lv.get('word_count'),
                 'title_len': lv.get('title_len'), 'title_is_question': lv.get('title_is_question'),
                 'title_has_number': lv.get('title_has_number'), 'n_h2': lv.get('n_h2'),
                 'n_product_links': lv.get('n_product_links'), 'topic_source': lv.get('topic_source')}
@@ -9516,6 +9579,24 @@ def api_blog_measure():
     if not _dfs_configured():
         return jsonify({'configured': False, 'message': 'DataForSEO not configured.'})
     return jsonify({'configured': True, **_blog_measure_all(force=bool(body.get('force')))})
+
+
+@app.route('/api/blog/conversions', methods=['POST'])
+@require_droplet_token
+def api_blog_conversions():
+    """Blog-attributed orders/revenue per article (orders whose session landed on
+    a blog page). Body: {store?, since_days?}. Gated — revenue never leaves the
+    ungated status endpoint."""
+    body = request.get_json(silent=True) or {}
+    stores = [body['store']] if body.get('store') else ['dk', 'fr', 'fi']
+    since = max(1, min(int(body.get('since_days') or 90), 365))
+    res = {}
+    for st in stores:
+        if st not in STORES:
+            continue
+        t = _blog_conversions(st, shopify_headers(st), since_days=since)
+        res[st] = {'tracked': t is not None, 'articles': t or {}}
+    return jsonify({'since_days': since, 'stores': res})
 
 
 @app.route('/api/blog/learn', methods=['POST'])
