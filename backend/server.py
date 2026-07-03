@@ -9176,6 +9176,39 @@ def _blog_quality_violations(art, store, products=None):
     return v
 
 
+def _blog_inline_product_images(body, products, max_images=3):
+    """Insert a clickable product photo right after the paragraph where each linked
+    product is first mentioned (up to max_images). Fashion editorial is image-led;
+    a text-only body reads bare on the article template. Deterministic HTML insert,
+    no LLM involved. Skips products whose paragraph is already followed by an image."""
+    if not body or not products:
+        return body
+    done = 0
+    for p in products:
+        if done >= max_images:
+            break
+        url, img, title = p.get('url'), p.get('image'), p.get('title')
+        if not url or not img:
+            continue
+        idx = body.find(f'href="{url}"')
+        if idx == -1:
+            continue
+        pend = body.find('</p>', idx)
+        if pend == -1:
+            continue
+        if '<img' in body[pend:pend + 250]:
+            continue
+        sep = '&width=720' if '?' in img else '?width=720'
+        alt = (title or '').replace('"', '')
+        fig = ('<p style="text-align:center;margin:1.2em 0"><a href="%s">'
+               '<img src="%s%s" alt="%s" loading="lazy" '
+               'style="max-width:min(420px,100%%);height:auto;border-radius:10px"/></a></p>'
+               % (url, img, sep, alt))
+        body = body[:pend + 4] + fig + body[pend + 4:]
+        done += 1
+    return body
+
+
 def _blog_edit(store, art, products=None, violations=None):
     """Native copy-editor pass over a written article: fixes grammar, spelling,
     morphology, idiom and calque errors so the text reads native. Preserves HTML
@@ -9312,6 +9345,9 @@ def _blog_generate_one(store, topic=None, published=False):
             break
         print(f"[blog] {store}: repair pass for: {viol}")
         art = _blog_edit(store, art, products, violations=viol)
+    art['body_html'] = _blog_inline_product_images(art['body_html'], products)
+    if isinstance(art.get('levers'), dict):
+        art['levers']['n_inline_images'] = art['body_html'].count('loading="lazy"')
     blog_id = _blog_ensure(store, hdrs)
     featured = next((p.get('image') for p in products if p.get('image')), None)
     created = _blog_create_article(store, blog_id, art, hdrs, published=published, featured_img=featured)
