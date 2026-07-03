@@ -8468,7 +8468,7 @@ BLOG_MEASURE_MIN_AGE_DAYS = int(os.getenv('BLOG_MEASURE_MIN_AGE_DAYS', '21'))
 
 # Last-run diagnostics surfaced (read-only) via /api/blog/status so failures of
 # the unattended scheduler/bootstrap are visible without droplet log access.
-_BLOG_LAST = {'bootstrap': None, 'scheduled': None, 'learn': None, 'measure': None}
+_BLOG_LAST = {'bootstrap': None, 'scheduled': None, 'learn': None, 'measure': None, 'qa_failed': None}
 _BLOG_DOMAIN_CACHE = {}
 _BLOG_SCOPE_CACHE = {}   # store -> {'ts': epoch, 'write_content': bool|None}
 
@@ -9144,9 +9144,10 @@ def _blog_match_products(store, category, hdrs, n=6, keyword=None):
     return uniq[:n]
 
 
-def _blog_write(store, topic, products):
+def _blog_write(store, topic, products, avoid=None):
     """Claude writes the SEO article in the store's language. Returns a dict:
-    {title, handle, meta_description, excerpt, tags[], body_html}. None on failure."""
+    {title, handle, meta_description, excerpt, tags[], body_html}. None on failure.
+    avoid: QA findings from a rejected earlier attempt (rewrite mode)."""
     if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
         return None
     lang = DFS_LANG_NAME.get(store, 'Danish')
@@ -9174,11 +9175,16 @@ def _blog_write(store, topic, products):
     pitfalls = BLOG_LANG_PITFALLS.get(store) or ''
     pitfall_block = (f"\n\n{lang.upper()} LANGUAGE PITFALLS (this writer has made these exact "
                      f"mistakes before — do not repeat them):\n{pitfalls}\n" if pitfalls else "")
+    avoid_block = ''
+    if avoid:
+        avoid_block = ("\n\nA PREVIOUS ATTEMPT AT THIS ARTICLE WAS REJECTED by a native proofreader "
+                       "for the issues below. This is a fresh rewrite: do not repeat any of them.\n"
+                       + '\n'.join(f"- {a}" for a in avoid) + "\n")
     prompt = (
         f"You are the content writer for Vionna, writing an SEO blog article. {BLOG_BRAND_VOICE}\n\n"
         f"Write the ENTIRE article in {lang}. Native, fluent, elegant {lang} — not translated-sounding.\n\n"
         f"WRITING RULES (hard requirements):\n{BLOG_ANTI_AI_RULES}\n"
-        f"{style_block}{pitfall_block}\n"
+        f"{style_block}{pitfall_block}{avoid_block}\n"
         f"PRIMARY SEO KEYWORD (must rank for this): \"{kw}\"\n"
         f"Supporting keywords to weave in naturally: {', '.join(cluster) if cluster else '(none)'}"
         f"{season_hint}{pb_block}\n\n"
@@ -9539,6 +9545,20 @@ def _blog_qa_gate(store, art):
         return None
 
 
+def _blog_qa_fix_loop(store, art, products, max_fixes=2):
+    """QA-gate an article and run up to max_fixes targeted editor rounds on the
+    gate's findings, re-gating after each. Returns (art, qa, passed)."""
+    qa = _blog_qa_gate(store, art)
+    fixes = 0
+    while qa and (qa['score'] < BLOG_QA_MIN_SCORE or qa['critical']) and fixes < max_fixes:
+        fixes += 1
+        print(f"[blog] {store}: QA {qa['score']}/10 ({len(qa['critical'])} critical) — fix round {fixes}")
+        art = _blog_edit(store, art, products, violations=(qa['critical'] + qa['minor'])[:8])
+        qa = _blog_qa_gate(store, art)
+    passed = bool(qa) and qa['score'] >= BLOG_QA_MIN_SCORE and not qa['critical']
+    return art, qa, passed
+
+
 def _blog_generate_one(store, topic=None, published=None):
     """Full pipeline for one store → one article. published: True/False force the
     state; None = auto mode — publish only when the QA gate passes (and
@@ -9568,20 +9588,36 @@ def _blog_generate_one(store, topic=None, published=None):
             break
         print(f"[blog] {store}: repair pass for: {viol}")
         art = _blog_edit(store, art, products, violations=viol)
-    # Auto mode: independent QA gate decides publish vs draft. One extra fix
-    # attempt when the gate flags issues; still failing → draft for human review.
+    # Auto mode: independent QA gate decides publish vs draft. Escalation ladder
+    # (owner: "fix automatically or write a new one"): up to 2 targeted fix rounds
+    # → still failing → ONE full rewrite (fresh article, warned about the earlier
+    # failures) through the whole chain → best attempt wins. Only if even the
+    # rewrite fails does the best version stay behind as a draft (safety valve).
     qa = None
     if published is None:
-        qa = _blog_qa_gate(store, art)
-        if qa and (qa['score'] < BLOG_QA_MIN_SCORE or qa['critical']):
-            print(f"[blog] {store}: QA gate {qa['score']}/10, {len(qa['critical'])} critical — fix attempt")
-            art = _blog_edit(store, art, products, violations=(qa['critical'] + qa['minor'])[:8])
-            qa = _blog_qa_gate(store, art)
-        qa_ok = bool(qa) and qa['score'] >= BLOG_QA_MIN_SCORE and not qa['critical']
+        art, qa, qa_ok = _blog_qa_fix_loop(store, art, products)
+        if not qa_ok:
+            print(f"[blog] {store}: QA keeps failing — full rewrite on the same topic")
+            prev = ((qa['critical'] + qa['minor'])[:6] if qa else ['previous attempt failed QA'])
+            art2 = _blog_write(store, topic, products, avoid=prev)
+            if art2 and art2.get('title') and art2.get('body_html'):
+                art2['primary_keyword'] = topic.get('keyword')
+                art2 = _blog_edit(store, art2, products)
+                for _ in range(2):
+                    viol2 = _blog_quality_violations(art2, store, products)
+                    if not viol2:
+                        break
+                    art2 = _blog_edit(store, art2, products, violations=viol2)
+                art2, qa2, qa_ok2 = _blog_qa_fix_loop(store, art2, products)
+                if qa_ok2 or (qa2 and (not qa or (qa2['score'] or 0) > (qa['score'] or 0))):
+                    art, qa, qa_ok = art2, qa2, qa_ok2
         publish = qa_ok and os.getenv('BLOG_AUTO_PUBLISH', '1') != '0'
-        print(f"[blog] {store}: QA {'%.1f' % qa['score'] if qa else 'FAILED'}"
-              f"{'' if not qa else f''' ({len(qa['critical'])} critical)'''} -> "
+        print(f"[blog] {store}: QA {('%.1f' % qa['score']) if qa else 'FAILED'} -> "
               f"{'PUBLISH' if publish else 'DRAFT'}")
+        if not qa_ok:
+            _BLOG_LAST['qa_failed'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
+                                       'store': store, 'title': art.get('title'),
+                                       'qa': qa and {'score': qa['score'], 'critical': qa['critical'][:3]}}
     else:
         publish = bool(published)
     art['body_html'] = _blog_inline_product_images(art['body_html'], products)
