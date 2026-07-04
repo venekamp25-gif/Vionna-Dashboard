@@ -6136,6 +6136,72 @@ def _append_history(entry):
         print(f"[history] append failed (ignored): {e}")
 
 
+def _norm_name(s):
+    """Accent-stripped, lowercased product name for matching (Zoé→zoe, Amélie→amelie)."""
+    s = unicodedata.normalize('NFKD', str(s or '')).encode('ascii', 'ignore').decode()
+    return s.lower().strip()
+
+
+@app.route('/api/backfill_source_urls', methods=['POST'])
+def api_backfill_source_urls():
+    """One-time backfill: fill EMPTY `source_url` on existing publish_history.jsonl
+    entries from a {product_name: competitor_url} mapping, matched by accent-
+    normalized product name. NEVER overwrites an existing url. Body:
+    {mapping:{name:url}, dry_run:bool}. Backs up to .bak before writing."""
+    body = request.get_json(silent=True) or {}
+    mapping = body.get('mapping') or {}
+    dry = bool(body.get('dry_run'))
+    if not isinstance(mapping, dict) or not mapping:
+        return jsonify({'error': 'no mapping provided'}), 400
+    norm_map = {}
+    for k, v in mapping.items():
+        nk = _norm_name(k)
+        if nk and v:
+            norm_map[nk] = str(v).strip()
+    if not os.path.exists(HISTORY_PATH):
+        return jsonify({'error': 'no history file'}), 404
+    entries = []
+    with open(HISTORY_PATH, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except Exception:
+                continue
+    matched, updated, already = 0, 0, 0
+    per_name = {}
+    hist_norms = set()
+    for e in entries:
+        nn = _norm_name(e.get('product_name'))
+        hist_norms.add(nn)
+        if nn in norm_map:
+            matched += 1
+            if (e.get('source_url') or '').strip():
+                already += 1
+            else:
+                if not dry:
+                    e['source_url'] = norm_map[nn]
+                updated += 1
+                per_name[e.get('product_name')] = per_name.get(e.get('product_name'), 0) + 1
+    if not dry and updated:
+        try:
+            shutil.copy2(HISTORY_PATH, HISTORY_PATH + '.bak')
+        except Exception as e:
+            print(f"[backfill_source_urls] backup failed: {e}")
+        tmp = HISTORY_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            for e in entries:
+                f.write(json.dumps(e, ensure_ascii=False) + '\n')
+        os.replace(tmp, HISTORY_PATH)
+    unmatched = sorted([k for k in norm_map if k not in hist_norms])
+    return jsonify({'dry_run': dry, 'total_entries': len(entries), 'mapping_size': len(norm_map),
+                    'matched_entries': matched, 'updated': updated, 'already_had_url': already,
+                    'distinct_products_updated': len(per_name),
+                    'mapping_names_with_no_history': unmatched})
+
+
 @app.route('/api/history')
 def history():
     """Return the publish log as a list of entries, most recent first.
