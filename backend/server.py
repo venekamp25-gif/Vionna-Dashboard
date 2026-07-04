@@ -6258,6 +6258,96 @@ def api_size_chart_audit():
                     'distinct_charts': distinct, 'gaps': gaps})
 
 
+@app.route('/api/fill_missing_size_charts', methods=['POST'])
+def api_fill_missing_size_charts():
+    """Fallback size charts: for each cat:<x>, take the MOST-COMMON existing chart
+    on that store and write it ONLY to products in that category that currently
+    have NO custom.size_chart (never overwrites a real one). Uses the store's own
+    localized chart. Body: {store, dry_run, categories?[]}."""
+    body = request.get_json(silent=True) or {}
+    store = body.get('store', 'dk')
+    dry = bool(body.get('dry_run'))
+    only = set(body.get('categories') or [])
+    if store not in tokens:
+        return jsonify({'error': f'not authed for {store}'}), 401
+    hdrs = shopify_headers(store)
+    q = ('query($c:String){ products(first:250, after:$c, query:"status:active"){ '
+         'pageInfo{ hasNextPage endCursor } edges{ node{ id title tags '
+         'metafield(namespace:"custom", key:"size_chart"){ value } } } } }')
+    import hashlib as _hl, collections as _col
+    prods = []
+    cursor, pages = None, 0
+    while pages < 25:
+        pages += 1
+        try:
+            r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                              json={'query': q, 'variables': {'c': cursor}}, timeout=45)
+            body2 = r.json() or {}
+        except Exception as e:
+            return jsonify({'error': str(e)[:150]}), 502
+        if body2.get('errors'):
+            return jsonify({'error': 'gql', 'detail': str(body2['errors'])[:200]}), 502
+        conn = ((body2.get('data') or {}).get('products') or {})
+        for e in (conn.get('edges') or []):
+            n = e['node']
+            tags = n.get('tags') or []
+            if isinstance(tags, str):
+                tags = [t.strip() for t in tags.split(',')]
+            cat = next((t.split(':', 1)[1].strip().lower() for t in tags
+                        if str(t).lower().startswith('cat:') and ':' in t), None) or 'uncategorized'
+            mv = (n.get('metafield') or {}).get('value')
+            prods.append({'id': n.get('id'), 'title': n.get('title'), 'cat': cat,
+                          'chart': mv if (mv and mv.strip()) else None})
+        pi = conn.get('pageInfo') or {}
+        if not pi.get('hasNextPage'):
+            break
+        cursor = pi.get('endCursor')
+    # most-common chart per category
+    per_cat = _col.defaultdict(_col.Counter)
+    by_hash = {}
+    for p in prods:
+        if p['chart']:
+            h = _hl.md5(p['chart'].strip().encode('utf-8')).hexdigest()
+            per_cat[p['cat']][h] += 1
+            by_hash[h] = p['chart']
+    std = {cat: by_hash[hc.most_common(1)[0][0]] for cat, hc in per_cat.items() if hc}
+    # collect gaps to fill
+    to_write = []
+    report = _col.defaultdict(lambda: {'filled': 0, 'no_source': 0})
+    for p in prods:
+        if p['chart']:
+            continue
+        if only and p['cat'] not in only:
+            continue
+        chart = std.get(p['cat'])
+        if not chart:
+            report[p['cat']]['no_source'] += 1
+            continue
+        report[p['cat']]['filled'] += 1
+        to_write.append((p['id'], chart))
+    written, errors = 0, []
+    if not dry and to_write:
+        mut = ('mutation($mf:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$mf){ '
+               'userErrors{ field message } } }')
+        for i in range(0, len(to_write), 25):
+            batch = to_write[i:i + 25]
+            mfs = [{'ownerId': pid, 'namespace': 'custom', 'key': 'size_chart',
+                    'type': 'multi_line_text_field', 'value': html} for pid, html in batch]
+            try:
+                rr = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                                   json={'query': mut, 'variables': {'mf': mfs}}, timeout=45)
+                ue = (((rr.json() or {}).get('data') or {}).get('metafieldsSet') or {}).get('userErrors') or []
+                if ue:
+                    errors.append(str(ue)[:150])
+                written += len(batch) - len(ue)
+            except Exception as e:
+                errors.append(str(e)[:120])
+    return jsonify({'store': store, 'dry_run': dry,
+                    'sources': {c: hc.most_common(1)[0][1] for c, hc in per_cat.items() if hc},
+                    'report': report, 'to_fill': len(to_write), 'written': written,
+                    'errors': errors[:5]})
+
+
 @app.route('/api/history')
 def history():
     """Return the publish log as a list of entries, most recent first.
