@@ -6311,6 +6311,19 @@ def api_fill_missing_size_charts():
             per_cat[p['cat']][h] += 1
             by_hash[h] = p['chart']
     std = {cat: by_hash[hc.most_common(1)[0][0]] for cat, hc in per_cat.items() if hc}
+    # optional overrides: a ready-made chart per cat, or borrow another cat's chart
+    provided = body.get('provided') or {}   # {cat: html}
+    aliases = body.get('aliases') or {}      # {cat: source_cat}
+
+    def chart_for(cat):
+        if provided.get(cat):
+            return provided[cat]
+        if cat in std:
+            return std[cat]
+        a = aliases.get(cat)
+        if a and a in std:
+            return std[a]
+        return None
     # collect gaps to fill
     to_write = []
     report = _col.defaultdict(lambda: {'filled': 0, 'no_source': 0})
@@ -6319,7 +6332,7 @@ def api_fill_missing_size_charts():
             continue
         if only and p['cat'] not in only:
             continue
-        chart = std.get(p['cat'])
+        chart = chart_for(p['cat'])
         if not chart:
             report[p['cat']]['no_source'] += 1
             continue
