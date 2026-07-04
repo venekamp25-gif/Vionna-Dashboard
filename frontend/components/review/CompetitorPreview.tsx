@@ -20,9 +20,21 @@ export function CompetitorPreview() {
           {data.competitor.hostname} · {data.competitor.variants} variants · {data.competitor.price}
         </div>
       </div>
-      <span className="px-2.5 py-1 rounded-full bg-bg-elev-2 text-text-dim text-[10px] font-semibold tracking-wider uppercase">
-        Imported
-      </span>
+      {data.competitorUrl ? (
+        <a
+          href={data.competitorUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          title={`Open source: ${data.competitorUrl}`}
+          className="px-2.5 py-1 rounded-full bg-bg-elev-2 text-text-dim hover:text-accent hover:border-accent border border-transparent text-[10px] font-semibold tracking-wider uppercase whitespace-nowrap transition-colors"
+        >
+          Source ↗
+        </a>
+      ) : (
+        <span className="px-2.5 py-1 rounded-full bg-bg-elev-2 text-text-dim text-[10px] font-semibold tracking-wider uppercase">
+          Imported
+        </span>
+      )}
     </div>
   );
 }

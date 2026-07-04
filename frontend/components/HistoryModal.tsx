@@ -196,6 +196,7 @@ interface PublishEvent {
   colors: string[];
   product_urls: string[];
   collection_handle?: string | null;
+  source_url?: string | null;
   variant_count: number;
   total_metafield_errors: number;
 }
@@ -220,12 +221,14 @@ function groupByPublishEvent(entries: HistoryEntry[]): PublishEvent[] {
         colors: [],
         product_urls: [],
         collection_handle: e.collection_handle ?? null,
+        source_url: e.source_url ?? null,
         variant_count: 0,
         total_metafield_errors: 0,
       };
       seenKeys.set(key, g);
       out.push(g);
     }
+    if (!g.source_url && e.source_url) g.source_url = e.source_url;
     if (e.color && !g.colors.includes(e.color)) g.colors.push(e.color);
     if (e.product_url) g.product_urls.push(e.product_url);
     g.variant_count += 1;
@@ -264,6 +267,20 @@ function EventCard({ group: g }: { group: PublishEvent }) {
           )
         )}
       </div>
+      {g.source_url && (
+        <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-text-faint pl-1 min-w-0">
+          <span className="shrink-0">🔗 Imported from</span>
+          <a
+            href={g.source_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={g.source_url}
+            className="text-text-dim hover:text-accent hover:underline truncate"
+          >
+            {sourceLabel(g.source_url)}
+          </a>
+        </div>
+      )}
       {g.total_metafield_errors > 0 && (
         <div className="mt-1.5 text-[11px] text-warning">
           ⚠ {g.total_metafield_errors} metafield {g.total_metafield_errors === 1 ? "error" : "errors"} during this publish
@@ -271,6 +288,18 @@ function EventCard({ group: g }: { group: PublishEvent }) {
       )}
     </div>
   );
+}
+
+/** Short, readable label for a competitor URL: host + trimmed path. */
+function sourceLabel(url: string): string {
+  try {
+    const u = new URL(url);
+    const path = u.pathname.replace(/\/$/, "");
+    const label = u.hostname.replace(/^www\./, "") + path;
+    return label.length > 60 ? label.slice(0, 57) + "…" : label;
+  } catch {
+    return url.length > 60 ? url.slice(0, 57) + "…" : url;
+  }
 }
 
 function formatTimestamp(iso: string): string {

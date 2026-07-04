@@ -205,6 +205,9 @@ export interface HistoryEntry {
   color: string;
   product_id?: number | null;
   product_url?: string | null;
+  /** Competitor URL this product was imported from — internal admin only,
+   *  never in the Shopify feed/metafields (Google Merchant policy). */
+  source_url?: string | null;
   collection_handle?: string | null;
   image_count?: number;
   metafield_errors?: string[];
