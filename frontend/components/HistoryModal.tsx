@@ -290,15 +290,23 @@ function EventCard({ group: g }: { group: PublishEvent }) {
   );
 }
 
-/** Short, readable label for a competitor URL: host + trimmed path. */
+/** Just the store/brand name from a competitor URL — the link itself still points
+ *  at the EXACT product page. e.g. https://www.noirlndn.com/products/x → "Noirlndn". */
 function sourceLabel(url: string): string {
   try {
-    const u = new URL(url);
-    const path = u.pathname.replace(/\/$/, "");
-    const label = u.hostname.replace(/^www\./, "") + path;
-    return label.length > 60 ? label.slice(0, 57) + "…" : label;
+    const host = new URL(url).hostname.replace(/^www\./, "");
+    const parts = host.split(".");
+    // handle two-level TLDs (co.uk, com.au, …) so we pick the brand label
+    const twoLevel = new Set(["co", "com", "org", "net", "gov", "ac"]);
+    const name =
+      parts.length >= 3 && twoLevel.has(parts[parts.length - 2])
+        ? parts[parts.length - 3]
+        : parts.length >= 2
+          ? parts[parts.length - 2]
+          : parts[0];
+    return name ? name.charAt(0).toUpperCase() + name.slice(1) : host;
   } catch {
-    return url.length > 60 ? url.slice(0, 57) + "…" : url;
+    return url;
   }
 }
 
