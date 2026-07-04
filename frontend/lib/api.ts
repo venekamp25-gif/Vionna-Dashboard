@@ -149,6 +149,11 @@ export interface ScrapedProduct {
   /** Competitor's size chart scraped from the product page (headers + rows of cm
    *  values), or null when none was found. Headers are localised at publish. */
   size_chart?: SizeChart | null;
+  /** 'found' = chart read; 'unread' = a chart clearly EXISTS but we couldn't read
+   *  it (unknown app etc.) — worker can flag it; 'none' = genuinely no chart. */
+  size_chart_status?: "found" | "unread" | "none";
+  /** What tipped us off that an unread chart exists (e.g. "SizeFox app"). */
+  size_chart_hint?: string | null;
   error?: string;
 }
 

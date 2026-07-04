@@ -366,8 +366,14 @@ export function GenerateStep() {
         if (scraped.error || !scraped.product) throw new Error(scraped.error || "Scrape failed");
         // Carry the competitor's size chart through to publish (appended, localised,
         // to the description). Patch it BEFORE prepareProduct so it survives the
-        // keyword-review pause. null when the page had no usable table.
-        patch({ sizeChart: scraped.size_chart ?? null });
+        // keyword-review pause. null when the page had no usable table. Also carry
+        // the status/hint so Review can offer "Notify" when a chart exists but was
+        // unreadable (unknown app).
+        patch({
+          sizeChart: scraped.size_chart ?? null,
+          sizeChartStatus: scraped.size_chart_status ?? null,
+          sizeChartHint: scraped.size_chart_hint ?? null,
+        });
         await prepareProduct(scraped.product);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);

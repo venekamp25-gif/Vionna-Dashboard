@@ -1633,10 +1633,77 @@ def _ocr_size_chart(page_html, page_url):
         return None
 
 
+def _smartsize_size_chart(page_html):
+    """Competitors using the SizeFox / SmartSize app render the chart client-side
+    from an authed API. Fetch it via server.smartsize.io/api/script using the shop
+    + product context embedded in the page. Returns {headers, rows} or None."""
+    try:
+        if 'sizefox' not in page_html.lower():
+            return None
+        shop = re.search(r'sizefox\.shop\s*=\s*"([^"]+)"', page_html)
+        i = page_html.find('sizefox.data')
+        if not shop or i < 0:
+            return None
+        seg = page_html[i:i + 6000]
+
+        def v(k):
+            m = re.search(k + r'\s*:\s*"([^"]*)"', seg)
+            return m.group(1) if m else ''
+        data = {'product': v('product'), 'collections': v('collections'),
+                'tags': v('tags'), 'productname': v('productname') or 'x'}
+        if not data['product']:
+            return None
+        r = req.post('https://server.smartsize.io/api/script',
+                     json={'shop': shop.group(1), 'data': data},
+                     headers={'Content-Type': 'application/json'}, timeout=15)
+        ct = ((r.json() or {}).get('size') or {}).get('chart_text') or {}
+        cols = [c.get('size') for c in (ct.get('webg_user_chart_sizes') or []) if c.get('size')]
+        items = ct.get('webg_user_chart_items') or []
+        if not cols or not items:
+            return None
+        rows = []
+        for it in items:
+            nm = it.get('webg_chart_item_name')
+            meas = [m.get('measure') for m in (it.get('webg_user_chart_measurements') or [])]
+            if nm:
+                rows.append([str(nm)] + [str(x) for x in meas])
+        return {'headers': ['Size'] + [str(c) for c in cols], 'rows': rows} if rows else None
+    except Exception as e:
+        print(f"[size-chart] smartsize failed: {e}")
+        return None
+
+
+def _detect_size_chart_hint(page_html):
+    """When automatic extraction FAILS, sniff whether the page still clearly HAS a
+    size chart (a known app / a size-chart image / a size-guide widget) so a human
+    can flag it and we can teach the reader that app. Returns a short hint, or None
+    when there's genuinely no sign of a chart (so we don't nag on chart-less items)."""
+    try:
+        h = (page_html or '').lower()
+        for key, name in (('kiwisizing', 'Kiwi Sizing app'), ('kiwi_sizing', 'Kiwi Sizing app'),
+                          ('sizefox', 'SizeFox / SmartSize app'), ('smartsize', 'SmartSize app'),
+                          ('pify', 'Pify Size Chart app'), ('clothhei', 'Clothhei size app'),
+                          ('sizify', 'Sizify app'), ('size-chart-app', 'size-chart app'),
+                          ('mysize', 'MySize app'), ('fitanalytics', 'Fit Analytics app')):
+            if key in h:
+                return name
+        for m in re.finditer(r'<img\b[^>]*>', page_html or '', re.I):
+            if _SIZE_IMG_RE.search(m.group(0)):
+                return 'size-chart image'
+        if re.search(r'(class|id)\s*=\s*"[^"]*siz[a-z]*[\-_](chart|guide)[^"]*"', h):
+            return 'size-guide widget'
+        if re.search(r'>\s*(size\s?guide|size\s?chart|maattabel|guide des tailles|kokotaulukko|st[oø]rrelsesguide)\s*<', h):
+            return 'size-guide link/button'
+        return None
+    except Exception:
+        return None
+
+
 def _extract_size_chart_full(page_html, page_url=''):
-    """Size chart from a competitor page, trying in order: HTML <table> →
-    Kiwi Sizing app API → image OCR. Returns {headers, rows} or None."""
+    """Size chart from a competitor page, trying in order: HTML <table> → SizeFox/
+    SmartSize app API → Kiwi Sizing app API → image OCR. Returns {headers, rows}."""
     return (_extract_size_chart(page_html)
+            or _smartsize_size_chart(page_html)
             or _kiwi_size_chart(page_html)
             or _ocr_size_chart(page_html, page_url))
 
@@ -1851,6 +1918,13 @@ def scrape():
     except Exception as e:
         print(f"[scrape] size-chart fetch failed: {e}")
 
+    # If we couldn't read a chart, check whether one nonetheless EXISTS (unknown
+    # app etc.) so the worker can flag it — 'unread'. Genuinely chart-less → 'none'.
+    size_chart_hint = None
+    if not size_chart and fallback_html:
+        size_chart_hint = _detect_size_chart_hint(fallback_html)
+    size_chart_status = 'found' if size_chart else ('unread' if size_chart_hint else 'none')
+
     # Detect the "one-product-per-colour" pattern (Billy J etc.) and merge sibling
     # colour-products into the result so the dashboard sees ONE multi-colour product.
     try:
@@ -1931,7 +2005,8 @@ def scrape():
                         'siblings_found': len(sibs) + 1,
                         'colors': (merged.get('options') or [{}])[0].get('values', []),
                     }
-                    return jsonify({'product': merged, 'size_chart': size_chart})
+                    return jsonify({'product': merged, 'size_chart': size_chart,
+                                    'size_chart_status': size_chart_status, 'size_chart_hint': size_chart_hint})
     except Exception as e:
         print(f"[scrape] sibling-merge step failed (continuing with base only): {e}")
 
@@ -1943,7 +2018,8 @@ def scrape():
         'siblings_found': 1,
         'colors': (base.get('options') or [{}])[0].get('values', []),
     }
-    return jsonify({'product': base, 'size_chart': size_chart})
+    return jsonify({'product': base, 'size_chart': size_chart,
+                    'size_chart_status': size_chart_status, 'size_chart_hint': size_chart_hint})
 
 
 @app.route('/api/scrape_manual', methods=['POST'])

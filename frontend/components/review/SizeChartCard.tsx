@@ -4,7 +4,7 @@ import { useState } from "react";
 import { Card } from "@/components/ui/Card";
 import { Field, Label } from "@/components/ui/Field";
 import { useProduct } from "@/lib/product";
-import type { SizeChart } from "@/lib/api";
+import { api, type SizeChart } from "@/lib/api";
 
 /** Parse a pasted table (from Excel / Google Sheets / a website) into a SizeChart.
  *  Rows = newlines; cells = TAB, then ";", then ",", then 2+ spaces. First row = headers. */
@@ -37,10 +37,40 @@ export function SizeChartCard() {
   const { data, patch } = useProduct();
   const chart = data.sizeChart;
   const hasChart = !!chart && chart.rows.length > 0;
+  // A chart clearly EXISTS on the competitor page but we couldn't read it (unknown
+  // app). Offer a one-click "Notify" so support gets added — not shown when there
+  // is genuinely no chart.
+  const unread = !hasChart && data.sizeChartStatus === "unread";
 
   const [paste, setPaste] = useState("");
   const [editing, setEditing] = useState(false);
+  const [notify, setNotify] = useState<"idle" | "sending" | "sent" | "error">("idle");
   const preview = paste.trim() ? parsePastedChart(paste) : null;
+
+  const sendNotify = async () => {
+    setNotify("sending");
+    try {
+      const r = await api.reportBug({
+        title: `Size chart reader needed: ${data.sizeChartHint ?? "unknown app"}`,
+        description:
+          `The import detected a size chart on the competitor page but couldn't read it ` +
+          `automatically (${data.sizeChartHint ?? "unknown app/method"}). Please add support ` +
+          `for this so future imports capture it. Product: ${data.name || "?"}. URL below.`,
+        page_url: data.competitorUrl || undefined,
+        diagnostics: {
+          competitor_url: data.competitorUrl || null,
+          detected_colors: data.canonicalColors ?? [],
+          color_count: (data.canonicalColors ?? []).length,
+          sizes: data.sizes ?? [],
+          selected_stores: data.selectedStores ?? [],
+          product_name: data.name || null,
+        },
+      });
+      setNotify(r.success ? "sent" : "error");
+    } catch {
+      setNotify("error");
+    }
+  };
 
   const applyPaste = () => {
     const parsed = parsePastedChart(paste);
@@ -102,6 +132,31 @@ export function SizeChartCard() {
             </button>
           </div>
         </>
+      ) : unread ? (
+        <div className="rounded-[10px] border border-warning/40 bg-warning/10 px-3 py-2.5 mb-3">
+          <div className="text-[12px] text-text">
+            ⚠ This product <strong>has a size chart</strong> on the competitor page, but we couldn&apos;t read
+            it automatically{data.sizeChartHint ? ` (${data.sizeChartHint})` : ""}.
+          </div>
+          <div className="text-[11px] text-text-dim mt-1 leading-relaxed">
+            Press <strong>Notify</strong> so we add support for reading it — it goes straight to the
+            developer. You can still paste the chart manually below for this product.
+          </div>
+          <div className="mt-2">
+            {notify === "sent" ? (
+              <span className="text-[12px] text-accent">✓ Reported — thanks! We&apos;ll add support for this.</span>
+            ) : (
+              <button
+                type="button"
+                onClick={sendNotify}
+                disabled={notify === "sending"}
+                className="px-3 h-8 rounded-[8px] bg-warning text-white text-[12px] font-medium disabled:opacity-50 hover:opacity-90 transition active:scale-95"
+              >
+                {notify === "sending" ? "Sending…" : notify === "error" ? "↻ Retry notify" : "🔔 Notify"}
+              </button>
+            )}
+          </div>
+        </div>
       ) : (
         <div className="text-[12px] text-text-faint mb-1">
           The import found no size chart. Paste one below and it will show as the size-guide popup on

@@ -179,6 +179,10 @@ export interface ProductData {
   /** Competitor size chart scraped at import (headers + cm rows), or null. Carried
    *  through to publish where it's localised + appended to the description. */
   sizeChart: SizeChart | null;
+  /** 'unread' = a chart exists on the competitor page but we couldn't read it →
+   *  offer the worker a one-click "Notify" so support for that app gets added. */
+  sizeChartStatus: "found" | "unread" | "none" | null;
+  sizeChartHint: string | null;
   bgReferenceUrl: string;
   productType: string;
   nbResults: Record<number, NbResult[]>;
@@ -228,6 +232,8 @@ const DEFAULT_DATA: ProductData = {
   competitorVariantsByColor: {},
   competitorImagesByColor: {},
   sizeChart: null,
+  sizeChartStatus: null,
+  sizeChartHint: null,
   // Initial bg-reference is picked randomly from BG_REFERENCE_OPTIONS at module
   // load (= per page open). resetForNewProduct re-rolls it so each new product
   // started without a reload also gets a fresh model.
