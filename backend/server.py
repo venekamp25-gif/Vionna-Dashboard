@@ -6202,6 +6202,62 @@ def api_backfill_source_urls():
                     'mapping_names_with_no_history': unmatched})
 
 
+@app.route('/api/size_chart_audit')
+def api_size_chart_audit():
+    """Read every ACTIVE product's custom.size_chart + cat:<x> tag + product type
+    for a store, so we can average the real charts per category AND list products
+    missing one. Returns deduped charts per category (+counts) and the gap list."""
+    store = request.args.get('store', 'dk')
+    if store not in tokens:
+        return jsonify({'error': f'not authed for {store}'}), 401
+    hdrs = shopify_headers(store)
+    q = ('query($c:String){ products(first:250, after:$c, query:"status:active"){ '
+         'pageInfo{ hasNextPage endCursor } edges{ node{ title productType tags '
+         'metafield(namespace:"custom", key:"size_chart"){ value } } } } }')
+    import hashlib as _hl, collections as _col
+    cats = _col.defaultdict(_col.Counter)   # cat -> {chart_hash: count}
+    chart_by_hash = {}
+    gaps = []
+    have, miss = _col.Counter(), _col.Counter()
+    cursor, pages = None, 0
+    while pages < 25:
+        pages += 1
+        try:
+            r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                              json={'query': q, 'variables': {'c': cursor}}, timeout=45)
+            body = r.json() or {}
+        except Exception as e:
+            return jsonify({'error': str(e)[:150]}), 502
+        if body.get('errors'):
+            return jsonify({'error': 'gql', 'detail': str(body['errors'])[:200]}), 502
+        conn = ((body.get('data') or {}).get('products') or {})
+        for e in (conn.get('edges') or []):
+            n = e['node']
+            tags = n.get('tags') or []
+            if isinstance(tags, str):
+                tags = [t.strip() for t in tags.split(',')]
+            cat = next((t.split(':', 1)[1].strip().lower() for t in tags
+                        if str(t).lower().startswith('cat:') and ':' in t), None) or 'uncategorized'
+            mv = (n.get('metafield') or {}).get('value')
+            if mv and mv.strip():
+                hh = _hl.md5(mv.strip().encode('utf-8')).hexdigest()
+                cats[cat][hh] += 1
+                chart_by_hash[hh] = mv
+                have[cat] += 1
+            else:
+                gaps.append({'title': n.get('title'), 'cat': cat, 'product_type': n.get('productType')})
+                miss[cat] += 1
+        pi = conn.get('pageInfo') or {}
+        if not pi.get('hasNextPage'):
+            break
+        cursor = pi.get('endCursor')
+    distinct = {cat: [{'count': cnt, 'chart': chart_by_hash[h]} for h, cnt in hc.most_common()]
+                for cat, hc in cats.items()}
+    coverage = {c: {'have': have[c], 'missing': miss[c]} for c in set(list(have) + list(miss))}
+    return jsonify({'store': store, 'pages': pages, 'coverage': coverage,
+                    'distinct_charts': distinct, 'gaps': gaps})
+
+
 @app.route('/api/history')
 def history():
     """Return the publish log as a list of entries, most recent first.
