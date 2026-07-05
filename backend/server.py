@@ -6558,7 +6558,7 @@ def api_known_competitors():
     """Domains we've imported from (publish history source_url), with how many
     distinct products came from each — the stores worth re-checking for winners."""
     from collections import defaultdict
-    doms = defaultdict(lambda: {'products': set(), 'last': ''})
+    doms = defaultdict(lambda: {'products': set(), 'last': '', 'handles': set()})
     if os.path.exists(HISTORY_PATH):
         with open(HISTORY_PATH, 'r', encoding='utf-8') as f:
             for line in f:
@@ -6575,7 +6575,12 @@ def api_known_competitors():
                 d = doms[host]
                 d['products'].add((e.get('product_name') or '').lower())
                 d['last'] = max(d['last'], e.get('timestamp') or '')
-    out = [{'domain': h, 'products': len(v['products']), 'last_import': v['last'][:10]}
+                # competitor product handle (last /products/<handle> path segment)
+                m = re.search(r'/products/([a-z0-9][a-z0-9\-_]*)', su, re.I)
+                if m:
+                    d['handles'].add(m.group(1).lower())
+    out = [{'domain': h, 'products': len(v['products']), 'last_import': v['last'][:10],
+            'imported_handles': sorted(v['handles'])}
            for h, v in doms.items()]
     out.sort(key=lambda x: -x['products'])
     return jsonify({'competitors': out})
