@@ -6459,6 +6459,10 @@ _BS_CATEGORY_KEYWORDS = [
 ]
 
 
+_BS_JUNK_RE = re.compile(r'gift ?card|cadeaubon|e-?gift|parcel protection|shipping protection|'
+                         r'route package|package protection|insurance|verzekering|priority processing', re.I)
+
+
 def _bs_category(title, ptype):
     """Rough product-type bucket from product_type + title text (same buckets as
     the What-to-list categories). 'other' when nothing matches."""
@@ -6522,6 +6526,8 @@ def _bs_scan(host, limit=20):
     import concurrent.futures as _cf
     with _cf.ThreadPoolExecutor(max_workers=6) as pool:
         products = list(pool.map(_one, enumerate(handles, start=1)))
+    # drop non-products (gift cards, parcel protection etc.) — never suggestions
+    products = [p for p in products if not _BS_JUNK_RE.search(p['title'] or '')]
     products.sort(key=lambda x: x['position'])
     from collections import Counter
     by_cat = Counter(p['category'] for p in products)
