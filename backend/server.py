@@ -6629,7 +6629,10 @@ def _bs_snapshots_by_domain():
 def api_bestseller_movers():
     """Risers + new entrants on known competitors' bestseller pages vs ~a week
     ago. Scans (12h-cached), snapshots weekly to bs_snapshots.jsonl, diffs the
-    two most recent snapshots, skips products we already imported."""
+    two most recent snapshots, skips products we already imported. ?store=dk
+    ranks them with the SAME scoring as What-to-list (season + catalogue
+    saturation for that store), so list-now products come first."""
+    store = request.args.get('store', 'dk')
     comps = [c for c in _known_comp_data() if c['products'] >= 2]
     snaps = _bs_snapshots_by_domain()
     today = datetime.datetime.utcnow().strftime('%Y-%m-%d')
@@ -6673,9 +6676,52 @@ def api_bestseller_movers():
             with open(BS_SNAPSHOTS_PATH, 'a', encoding='utf-8') as f:
                 for e in new_snap_lines:
                     f.write(json.dumps(e, ensure_ascii=False) + '\n')
-    movers.sort(key=lambda m: (0 if m['signal'] == 'new' else 1,
-                               m['position'] if m['signal'] == 'new' else -(m['old_position'] - m['position'])))
-    return jsonify({'movers': movers[:20], 'baseline': baseline,
+    # ── Rank with the SAME scoring as What-to-list ──
+    # season bucket per category from the freshest What-to-list cache for this
+    # store (free — no new DataForSEO calls); saturation from the same cache, or
+    # live Shopify counts as fallback. Then: signal + season + gap = score.
+    cat_bucket, recent_counts, live_counts = {}, {}, {}
+    freshest, now_ts = None, time.time()
+    for key, ent in _WTL_CACHE.items():
+        if key.startswith(store + ':') and (now_ts - ent['ts']) < _WTL_TTL:
+            if freshest is None or ent['ts'] > freshest['ts']:
+                freshest = ent
+    season_bonus = {'now': 0.6, 'soon': 0.4, 'evergreen': 0.1, 'off': -0.3}
+    if freshest:
+        p = freshest['payload']
+        recent_counts = p.get('recent_counts') or {}
+        live_counts = p.get('live_counts') or {}
+        for t in (p.get('types') or []):
+            c, b = t.get('category'), t.get('bucket')
+            if c and b and season_bonus.get(b, -1) > season_bonus.get(cat_bucket.get(c, ''), -1):
+                cat_bucket[c] = b
+    elif store in tokens:
+        try:
+            recent_counts, _tot = _recent_cat_counts(store)
+            live_counts = _live_cat_counts(store)
+        except Exception:
+            pass
+    max_recent = max(recent_counts.values()) if recent_counts else 0
+    max_live = max(live_counts.values()) if live_counts else 0
+    for m in movers:
+        cat = m['category']
+        bucket = cat_bucket.get(cat)
+        score = (0.6 + (20 - m['position']) * 0.01) if m['signal'] == 'new' \
+            else (0.35 + min((m['old_position'] or 0) - m['position'], 15) * 0.02)
+        score += season_bonus.get(bucket or '', 0.0)
+        score += (0.35 * (1 - (recent_counts.get(cat, 0) / max_recent))) if max_recent > 0 else 0.15
+        score += (0.25 * (1 - (live_counts.get(cat, 0) / max_live))) if max_live > 0 else 0.1
+        m['score'] = round(score, 3)
+        m['cat_bucket'] = bucket
+        m['cat_recent'] = int(recent_counts.get(cat, 0))
+        m['cat_live'] = int(live_counts.get(cat, 0))
+    movers.sort(key=lambda m: -(m.get('score') or 0))
+    cats_seen = {m['category'] for m in movers}
+    category_context = {c: {'bucket': cat_bucket.get(c), 'recent': int(recent_counts.get(c, 0)),
+                            'live': int(live_counts.get(c, 0))} for c in cats_seen}
+    return jsonify({'movers': movers[:24], 'baseline': baseline, 'store': store,
+                    'season_source': 'what_to_list' if freshest else ('live_counts' if (recent_counts or live_counts) else 'none'),
+                    'category_context': category_context,
                     'checked': len([1 for _, s in scans if s]), 'window_days': 7})
 
 
