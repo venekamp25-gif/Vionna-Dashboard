@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { StoreKey, STORE_CONFIG, STORE_KEYS } from "@/lib/store";
 import { Button } from "@/components/ui/Button";
@@ -95,6 +95,32 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
   const [showMethod, setShowMethod] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const [competitorDomain, setCompetitorDomain] = useState("");
+  const [knownComps, setKnownComps] = useState<{ domain: string; products: number }[]>([]);
+  const [scan, setScan] = useState<Awaited<ReturnType<typeof api.bestsellerScan>> | null>(null);
+  const [scanning, setScanning] = useState(false);
+
+  // Known competitors (domains we've imported from) → one-click chips.
+  useEffect(() => {
+    if (!open) return;
+    api.knownCompetitors()
+      .then((r) => setKnownComps((r.competitors ?? []).slice(0, 8)))
+      .catch(() => setKnownComps([]));
+  }, [open]);
+
+  const runScan = async (domain?: string, force = false) => {
+    const d = (domain ?? competitorDomain).trim();
+    if (!d) return;
+    if (domain) setCompetitorDomain(domain);
+    setScanning(true);
+    setScan(null);
+    try {
+      setScan(await api.bestsellerScan(d, force));
+    } catch (e) {
+      setScan({ ok: false, blocked: e instanceof Error ? e.message : "scan failed" });
+    } finally {
+      setScanning(false);
+    }
+  };
 
   const canRun = selectedStores.length > 0 && !busy;
 
@@ -432,21 +458,47 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
             </p>
           )}
 
-          {/* Bestseller URL helper (DSA step 4) */}
+          {/* Competitor bestseller scanner (DSA step 4, automated) */}
           <div className="mt-6 pt-4 border-t border-border">
-            <div className="text-[12px] font-semibold text-text mb-1">Competitor bestseller finder</div>
+            <div className="text-[12px] font-semibold text-text mb-1">Competitor bestseller scanner</div>
             <p className="text-[11px] text-text-faint mb-2 leading-relaxed">
-              Paste a competitor&apos;s domain and open their store sorted by <strong>best-selling</strong> — the products
-              at the top are their winners. Check which of the types above appear on page 1.
+              Pick a store you&apos;ve imported from before (or type any competitor domain) and press{" "}
+              <strong>Scan</strong> — it reads their <strong>best-selling</strong> page and shows their current
+              winners by product type, so you can check them against the recommendation above.
             </p>
+            {knownComps.length > 0 && (
+              <div className="flex items-center gap-1.5 flex-wrap mb-2">
+                {knownComps.map((c) => (
+                  <button
+                    key={c.domain}
+                    type="button"
+                    onClick={() => void runScan(c.domain)}
+                    title={`${c.products} products imported from here — click to scan`}
+                    className={`px-2.5 h-7 rounded-full text-[11px] border transition ${
+                      competitorDomain === c.domain
+                        ? "border-accent text-accent bg-[var(--accent-soft)]"
+                        : "border-border text-text-dim hover:border-accent hover:text-accent"
+                    }`}
+                  >
+                    {c.domain.replace(/^www\./, "")} <span className="text-text-faint">({c.products})</span>
+                  </button>
+                ))}
+              </div>
+            )}
             <div className="flex items-center gap-2">
               <input
                 type="text"
                 value={competitorDomain}
                 onChange={(e) => setCompetitorDomain(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void runScan();
+                }}
                 placeholder="e.g. noirlndn.com"
                 className="flex-1 px-3 h-9 rounded-[10px] bg-bg-elev-2 border border-border text-[12px] focus:outline-none focus:border-accent"
               />
+              <Button variant="primary" size="sm" onClick={() => void runScan()} disabled={!competitorDomain.trim() || scanning}>
+                {scanning ? "Scanning…" : "Scan"}
+              </Button>
               <Button variant="secondary" size="sm" onClick={() => bestsellerUrl && copyText(bestsellerUrl, "url")} disabled={!bestsellerUrl}>
                 {copied === "url" ? "✓ Copied" : "Copy URL"}
               </Button>
@@ -461,7 +513,90 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
                 Open ↗
               </a>
             </div>
-            {bestsellerUrl && <p className="text-[11px] text-text-faint mt-1.5 break-all">{bestsellerUrl}</p>}
+
+            {scanning && <p className="text-[12px] text-text-faint mt-3">Reading their bestseller page… (~5–10s)</p>}
+
+            {scan && !scanning && !scan.ok && (
+              <div className="mt-3 rounded-[10px] border border-warning/40 bg-warning/10 px-3 py-2.5 text-[12px] text-text">
+                ⚠ Can&apos;t scan this store: {scan.blocked ?? scan.error ?? "unknown error"}.
+                {bestsellerUrl && (
+                  <>
+                    {" "}Try <a className="text-accent hover:underline" href={bestsellerUrl} target="_blank" rel="noopener noreferrer">opening it in your browser ↗</a> instead.
+                  </>
+                )}
+              </div>
+            )}
+
+            {scan && !scanning && scan.ok && (
+              <div className="mt-3">
+                <div className="flex items-baseline gap-2 flex-wrap mb-1.5">
+                  <span className="text-[12px] text-text">
+                    Their top {scan.count}:{" "}
+                    <strong>
+                      {Object.entries(scan.by_category ?? {})
+                        .map(([c, n]) => `${n}× ${c}`)
+                        .join(" · ")}
+                    </strong>
+                  </span>
+                  <span className="text-[11px] text-text-faint">
+                    {scan.from_cache ? `saved ${Math.round((scan.cache_age_seconds ?? 0) / 3600)}h ago ·` : ""}
+                  </span>
+                  <button type="button" onClick={() => void runScan(undefined, true)} className="text-[11px] text-accent hover:underline">
+                    ↻ Rescan
+                  </button>
+                </div>
+                {recommended.length > 0 && (
+                  <p className="text-[11px] text-text-dim mb-2 leading-relaxed">
+                    Vs your recommendation:{" "}
+                    {recommended.slice(0, 3).map((t, i) => {
+                      const n = (scan.by_category ?? {})[t.category ?? ""] ?? 0;
+                      return (
+                        <span key={t.seed}>
+                          {i > 0 && " · "}
+                          <strong>{t.label}</strong>:{" "}
+                          {n > 0 ? (
+                            <span className="text-green-600 dark:text-green-400">{n} in their top {scan.count} ✓</span>
+                          ) : (
+                            <span className="text-text-faint">none in their top {scan.count}</span>
+                          )}
+                        </span>
+                      );
+                    })}
+                  </p>
+                )}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  {(scan.products ?? []).map((p) => (
+                    <a
+                      key={p.handle}
+                      href={p.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title={`${p.title} — click to open (paste this URL in the import screen if it's a winner)`}
+                      className="rounded-[10px] border border-border bg-bg-elev-2 overflow-hidden hover:border-accent transition group"
+                    >
+                      {p.image ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img src={p.image} alt="" className="w-full h-28 object-cover" loading="lazy" />
+                      ) : (
+                        <div className="w-full h-28 bg-bg-elev" />
+                      )}
+                      <div className="px-2 py-1.5">
+                        <div className="text-[11px] text-text truncate group-hover:text-accent">
+                          <span className="text-text-faint">#{p.position}</span> {p.title}
+                        </div>
+                        <div className="text-[10px] text-text-faint">
+                          {p.category}
+                          {p.published_at ? ` · since ${p.published_at}` : ""}
+                        </div>
+                      </div>
+                    </a>
+                  ))}
+                </div>
+                <p className="text-[11px] text-text-faint mt-2">
+                  Found a winner that fits the recommendation? Open it and paste its URL into the import screen.
+                </p>
+              </div>
+            )}
           </div>
         </div>
       </div>

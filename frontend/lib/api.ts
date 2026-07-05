@@ -579,6 +579,38 @@ export const api = {
     siblings_handle: string;
   }) => call<PublishStartStoreResponse>("/api/publish/start_store", { method: "POST", body: params, authed: true }),
 
+  /** Scan a competitor's best-selling page: ordered top products with type/price/
+   *  age + per-category counts. Cached 12h server-side; force=1 rescans. */
+  bestsellerScan: (domain: string, force = false) =>
+    call<{
+      ok: boolean;
+      domain?: string;
+      url?: string;
+      blocked?: string;
+      error?: string;
+      from_cache?: boolean;
+      cache_age_seconds?: number;
+      count?: number;
+      by_category?: Record<string, number>;
+      products?: {
+        position: number;
+        handle: string;
+        title: string;
+        url: string;
+        image: string | null;
+        price: string | null;
+        product_type: string;
+        published_at: string;
+        category: string;
+      }[];
+    }>(`/api/bestseller_scan?domain=${encodeURIComponent(domain)}${force ? "&force=1" : ""}`),
+
+  /** Competitor domains we've imported from before (publish history), most-used first. */
+  knownCompetitors: () =>
+    call<{ competitors: { domain: string; products: number; last_import: string }[] }>(
+      "/api/known_competitors"
+    ),
+
   reportBug: (params: {
     title: string;
     description: string;
