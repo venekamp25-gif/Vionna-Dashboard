@@ -161,7 +161,8 @@ def _run_backup():
         dest = os.path.join(BACKUP_DIR, day)
         os.makedirs(dest, exist_ok=True)
         for fname in ('publish_history.jsonl', 'bug_reports.jsonl', 'blog_history.jsonl',
-                      'blog_performance.jsonl', 'blog_views.json', 'blog_playbook.json'):
+                      'blog_performance.jsonl', 'blog_views.json', 'blog_playbook.json',
+                      'bs_snapshots.jsonl'):
             src = os.path.join(_BASE_DIR, fname)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dest, fname))
@@ -6528,6 +6529,25 @@ def _bs_scan(host, limit=20):
             'by_category': dict(by_cat.most_common()), 'products': products}, None
 
 
+def _bs_scan_cached(host, force=False):
+    """Cached wrapper around _bs_scan. Returns (payload+cache-fields, blocked)."""
+    now_ts = time.time()
+    hit = _BS_CACHE.get(host)
+    if hit and not force and (now_ts - hit['ts']) < _BS_TTL:
+        out = dict(hit['payload'])
+        out['from_cache'] = True
+        out['cache_age_seconds'] = int(now_ts - hit['ts'])
+        return out, None
+    payload, blocked = _bs_scan(host)
+    if blocked:
+        return None, blocked
+    _BS_CACHE[host] = {'ts': now_ts, 'at': datetime.datetime.utcnow().isoformat() + 'Z', 'payload': payload}
+    out = dict(payload)
+    out['from_cache'] = False
+    out['cache_age_seconds'] = 0
+    return out, None
+
+
 @app.route('/api/bestseller_scan')
 def api_bestseller_scan():
     """Scan a competitor store's best-selling page: ordered top products enriched
@@ -6535,28 +6555,16 @@ def api_bestseller_scan():
     host = _bs_host(request.args.get('domain', ''))
     if not host:
         return jsonify({'ok': False, 'error': 'pass ?domain=competitor.com'}), 400
-    now_ts = time.time()
-    hit = _BS_CACHE.get(host)
-    if hit and not request.args.get('force') and (now_ts - hit['ts']) < _BS_TTL:
-        out = dict(hit['payload'])
-        out['from_cache'] = True
-        out['cache_age_seconds'] = int(now_ts - hit['ts'])
-        return jsonify(out)
-    payload, blocked = _bs_scan(host)
+    out, blocked = _bs_scan_cached(host, force=bool(request.args.get('force')))
     if blocked:
         return jsonify({'ok': False, 'domain': host, 'blocked': blocked,
                         'url': f'https://{host}/collections/all?sort_by=best-selling'})
-    _BS_CACHE[host] = {'ts': now_ts, 'at': datetime.datetime.utcnow().isoformat() + 'Z', 'payload': payload}
-    out = dict(payload)
-    out['from_cache'] = False
-    out['cache_age_seconds'] = 0
     return jsonify(out)
 
 
-@app.route('/api/known_competitors')
-def api_known_competitors():
-    """Domains we've imported from (publish history source_url), with how many
-    distinct products came from each — the stores worth re-checking for winners."""
+def _known_comp_data():
+    """Domains we've imported from (publish history source_url) with distinct-
+    product counts + the competitor handles we already took (for dedupe)."""
     from collections import defaultdict
     doms = defaultdict(lambda: {'products': set(), 'last': '', 'handles': set()})
     if os.path.exists(HISTORY_PATH):
@@ -6583,7 +6591,92 @@ def api_known_competitors():
             'imported_handles': sorted(v['handles'])}
            for h, v in doms.items()]
     out.sort(key=lambda x: -x['products'])
-    return jsonify({'competitors': out})
+    return out
+
+
+@app.route('/api/known_competitors')
+def api_known_competitors():
+    return jsonify({'competitors': _known_comp_data()})
+
+
+# ── Weekly movers: droplet-side snapshots of competitor bestseller positions so
+# the What-to-list tab can suggest "risers & new entrants" (same logic as the
+# scraper's Fashion Google tab, but self-contained on the droplet). ──
+BS_SNAPSHOTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bs_snapshots.jsonl')
+_BS_SNAP_LOCK = threading.Lock()
+_BS_RISER_MIN = 5      # positions gained in a week = a signal
+_BS_SNAP_DAYS = 6      # take a fresh snapshot when the last one is ≥6 days old
+
+
+def _bs_snapshots_by_domain():
+    """{domain: [{'date','positions'}...]} sorted by date (oldest→newest)."""
+    from collections import defaultdict
+    out = defaultdict(list)
+    if os.path.exists(BS_SNAPSHOTS_PATH):
+        with open(BS_SNAPSHOTS_PATH, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                    out[e['domain']].append(e)
+                except Exception:
+                    continue
+    for d in out.values():
+        d.sort(key=lambda x: x.get('date') or '')
+    return out
+
+
+@app.route('/api/bestseller_movers')
+def api_bestseller_movers():
+    """Risers + new entrants on known competitors' bestseller pages vs ~a week
+    ago. Scans (12h-cached), snapshots weekly to bs_snapshots.jsonl, diffs the
+    two most recent snapshots, skips products we already imported."""
+    comps = [c for c in _known_comp_data() if c['products'] >= 2]
+    snaps = _bs_snapshots_by_domain()
+    today = datetime.datetime.utcnow().strftime('%Y-%m-%d')
+
+    import concurrent.futures as _cf
+    def _scan(c):
+        return c, _bs_scan_cached(c['domain'])[0]
+    with _cf.ThreadPoolExecutor(max_workers=4) as pool:
+        scans = list(pool.map(_scan, comps))
+
+    movers, baseline, new_snap_lines = [], [], []
+    for c, scan in scans:
+        host = c['domain']
+        if not scan:
+            continue
+        dsnaps = snaps.get(host) or []
+        latest = dsnaps[-1] if dsnaps else None
+        take_new = (not latest) or (latest['date'] < today and
+                                    (datetime.datetime.strptime(today, '%Y-%m-%d')
+                                     - datetime.datetime.strptime(latest['date'], '%Y-%m-%d')).days >= _BS_SNAP_DAYS)
+        if take_new:
+            new_snap_lines.append({'date': today, 'domain': host,
+                                   'positions': {p['handle']: p['position'] for p in scan['products']}})
+            prev = latest                      # diff current scan vs the previous snapshot
+        else:
+            prev = dsnaps[-2] if len(dsnaps) >= 2 else None
+        if prev is None:
+            baseline.append(host.replace('www.', ''))
+            continue
+        imported = set(c.get('imported_handles') or [])
+        for p in scan['products']:
+            if p['handle'] in imported:
+                continue
+            old = (prev.get('positions') or {}).get(p['handle'])
+            if old is None:
+                movers.append({**p, 'domain': host.replace('www.', ''), 'signal': 'new', 'old_position': None})
+            elif (old - p['position']) >= _BS_RISER_MIN:
+                movers.append({**p, 'domain': host.replace('www.', ''), 'signal': 'riser', 'old_position': old})
+    if new_snap_lines:
+        with _BS_SNAP_LOCK:
+            with open(BS_SNAPSHOTS_PATH, 'a', encoding='utf-8') as f:
+                for e in new_snap_lines:
+                    f.write(json.dumps(e, ensure_ascii=False) + '\n')
+    movers.sort(key=lambda m: (0 if m['signal'] == 'new' else 1,
+                               m['position'] if m['signal'] == 'new' else -(m['old_position'] - m['position'])))
+    return jsonify({'movers': movers[:20], 'baseline': baseline,
+                    'checked': len([1 for _, s in scans if s]), 'window_days': 7})
 
 
 @app.route('/api/history')
