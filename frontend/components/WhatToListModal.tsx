@@ -98,13 +98,21 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
   const [knownComps, setKnownComps] = useState<{ domain: string; products: number }[]>([]);
   const [scan, setScan] = useState<Awaited<ReturnType<typeof api.bestsellerScan>> | null>(null);
   const [scanning, setScanning] = useState(false);
+  const [movers, setMovers] = useState<Awaited<ReturnType<typeof api.bestsellerMovers>> | null>(null);
+  const [moversLoading, setMoversLoading] = useState(false);
 
-  // Known competitors (domains we've imported from) → one-click chips.
+  // Known competitors (domains we've imported from) → one-click chips. Also load
+  // this week's movers (risers/new entrants at those competitors) as suggestions.
   useEffect(() => {
     if (!open) return;
     api.knownCompetitors()
       .then((r) => setKnownComps((r.competitors ?? []).slice(0, 8)))
       .catch(() => setKnownComps([]));
+    setMoversLoading(true);
+    api.bestsellerMovers()
+      .then(setMovers)
+      .catch(() => setMovers(null))
+      .finally(() => setMoversLoading(false));
   }, [open]);
 
   const runScan = async (domain?: string, force = false) => {
@@ -457,6 +465,61 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
               Choose a market above and press <strong>Recommend what to list</strong>.
             </p>
           )}
+
+          {/* This week's movers at known competitors (suggestions) */}
+          <div className="mt-6 pt-4 border-t border-border">
+            <div className="text-[12px] font-semibold text-text mb-1">📈 Trending at your competitors</div>
+            <p className="text-[11px] text-text-faint mb-2 leading-relaxed">
+              Products that are <strong>new</strong> on a known competitor&apos;s bestseller page or{" "}
+              <strong>climbed 5+ spots</strong> in the last week — strong signals they&apos;re selling right now.
+              Products you already imported are hidden. Click one to open it, then paste its URL in the import screen.
+            </p>
+            {moversLoading ? (
+              <p className="text-[12px] text-text-faint">Checking competitor bestseller pages… (~10s)</p>
+            ) : !movers ? (
+              <p className="text-[12px] text-text-faint">Couldn&apos;t check right now — try reopening this tab.</p>
+            ) : movers.movers.length === 0 ? (
+              <p className="text-[12px] text-text-faint">
+                No new risers this week ({movers.checked} stores checked).
+                {movers.baseline.length > 0 && (
+                  <> First baseline saved for {movers.baseline.length} store{movers.baseline.length === 1 ? "" : "s"} — risers show up from next week.</>
+                )}
+              </p>
+            ) : (
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                {movers.movers.map((m) => (
+                  <a
+                    key={`${m.domain}:${m.handle}`}
+                    href={m.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title={`${m.title} — ${m.signal === "new" ? `new at #${m.position}` : `#${m.old_position} → #${m.position}`} at ${m.domain}`}
+                    className="rounded-[10px] border border-border bg-bg-elev-2 overflow-hidden hover:border-accent transition group relative"
+                  >
+                    <span
+                      className={`absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                        m.signal === "new" ? "bg-accent text-on-accent" : "bg-amber-500 text-white"
+                      }`}
+                    >
+                      {m.signal === "new" ? `NEW #${m.position}` : `↑ +${(m.old_position ?? 0) - m.position} → #${m.position}`}
+                    </span>
+                    {m.image ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={m.image} alt="" className="w-full h-28 object-cover" loading="lazy" />
+                    ) : (
+                      <div className="w-full h-28 bg-bg-elev" />
+                    )}
+                    <div className="px-2 py-1.5">
+                      <div className="text-[11px] text-text truncate group-hover:text-accent">{m.title}</div>
+                      <div className="text-[10px] text-text-faint truncate">
+                        {m.category} · {m.domain}
+                      </div>
+                    </div>
+                  </a>
+                ))}
+              </div>
+            )}
+          </div>
 
           {/* Competitor bestseller scanner (DSA step 4, automated) */}
           <div className="mt-6 pt-4 border-t border-border">

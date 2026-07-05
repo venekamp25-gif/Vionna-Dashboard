@@ -611,6 +611,28 @@ export const api = {
       "/api/known_competitors"
     ),
 
+  /** Risers + new entrants on known competitors' bestseller pages vs ~a week ago
+   *  (droplet-side weekly snapshots; skips products we already imported). */
+  bestsellerMovers: () =>
+    call<{
+      movers: {
+        domain: string;
+        signal: "new" | "riser";
+        position: number;
+        old_position: number | null;
+        handle: string;
+        title: string;
+        url: string;
+        image: string | null;
+        price: string | null;
+        published_at: string;
+        category: string;
+      }[];
+      baseline: string[];
+      checked: number;
+      window_days: number;
+    }>("/api/bestseller_movers"),
+
   reportBug: (params: {
     title: string;
     description: string;
