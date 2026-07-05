@@ -1678,7 +1678,15 @@ def _detect_size_chart_hint(page_html):
     """When automatic extraction FAILS, sniff whether the page still clearly HAS a
     size chart (a known app / a size-chart image / a size-guide widget) so a human
     can flag it and we can teach the reader that app. Returns a short hint, or None
-    when there's genuinely no sign of a chart (so we don't nag on chart-less items)."""
+    when there's genuinely no sign of a chart (so we don't nag on chart-less items).
+
+    Bug #8: Pify renders its chart client-side (nothing in the raw HTML for
+    _extract_size_chart to find), same as Kiwi Sizing / SmartSize below — but
+    unlike those two, nobody has captured a live Pify page's JS global / API
+    call yet, so there's no real `_pify_size_chart()` parser to add here. Needs
+    a session with normal network access to inspect a Pify-powered product page
+    (e.g. https://www.boheme-infinity.com/products/robe-longue-fleurie-boheme)
+    before a parser can be written."""
     try:
         h = (page_html or '').lower()
         for key, name in (('kiwisizing', 'Kiwi Sizing app'), ('kiwi_sizing', 'Kiwi Sizing app'),
