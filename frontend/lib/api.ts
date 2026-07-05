@@ -612,8 +612,9 @@ export const api = {
     ),
 
   /** Risers + new entrants on known competitors' bestseller pages vs ~a week ago
-   *  (droplet-side weekly snapshots; skips products we already imported). */
-  bestsellerMovers: () =>
+   *  (droplet-side weekly snapshots; skips products we already imported). Ranked
+   *  with the SAME scoring as What-to-list (season + catalogue gap) for `store`. */
+  bestsellerMovers: (store: "dk" | "fr" | "fi" = "dk") =>
     call<{
       movers: {
         domain: string;
@@ -627,11 +628,18 @@ export const api = {
         price: string | null;
         published_at: string;
         category: string;
+        score?: number;
+        cat_bucket?: "now" | "soon" | "evergreen" | "off" | null;
+        cat_recent?: number;
+        cat_live?: number;
       }[];
       baseline: string[];
+      store?: string;
+      season_source?: "what_to_list" | "live_counts" | "none";
+      category_context?: Record<string, { bucket: string | null; recent: number; live: number }>;
       checked: number;
       window_days: number;
-    }>("/api/bestseller_movers"),
+    }>(`/api/bestseller_movers?store=${store}`),
 
   reportBug: (params: {
     title: string;

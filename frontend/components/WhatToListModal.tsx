@@ -101,19 +101,25 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
   const [movers, setMovers] = useState<Awaited<ReturnType<typeof api.bestsellerMovers>> | null>(null);
   const [moversLoading, setMoversLoading] = useState(false);
 
-  // Known competitors (domains we've imported from) → one-click chips. Also load
-  // this week's movers (risers/new entrants at those competitors) as suggestions.
+  // Known competitors (domains we've imported from) → one-click chips.
   useEffect(() => {
     if (!open) return;
     api.knownCompetitors()
       .then((r) => setKnownComps((r.competitors ?? []).slice(0, 8)))
       .catch(() => setKnownComps([]));
+  }, [open]);
+
+  // This week's movers (risers/new entrants at those competitors), ranked with
+  // the What-to-list scoring for the first selected market — refetch on switch.
+  const moversStore = selectedStores[0] ?? "dk";
+  useEffect(() => {
+    if (!open) return;
     setMoversLoading(true);
-    api.bestsellerMovers()
+    api.bestsellerMovers(moversStore)
       .then(setMovers)
       .catch(() => setMovers(null))
       .finally(() => setMoversLoading(false));
-  }, [open]);
+  }, [open, moversStore]);
 
   const runScan = async (domain?: string, force = false) => {
     const d = (domain ?? competitorDomain).trim();
@@ -472,7 +478,9 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
             <p className="text-[11px] text-text-faint mb-2 leading-relaxed">
               Products that are <strong>new</strong> on a known competitor&apos;s bestseller page or{" "}
               <strong>climbed 5+ spots</strong> in the last week — strong signals they&apos;re selling right now.
-              Products you already imported are hidden. Click one to open it, then paste its URL in the import screen.
+              Grouped per product type and <strong>ranked like the recommendation above</strong> (season + what&apos;s
+              missing in your catalogue), so what you should list first is at the top. Products you already imported
+              are hidden. Click one to open it, then paste its URL in the import screen.
             </p>
             {moversLoading ? (
               <p className="text-[12px] text-text-faint">Checking competitor bestseller pages… (~10s)</p>
@@ -486,38 +494,82 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
                 )}
               </p>
             ) : (
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                {movers.movers.map((m) => (
-                  <a
-                    key={`${m.domain}:${m.handle}`}
-                    href={m.url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    title={`${m.title} — ${m.signal === "new" ? `new at #${m.position}` : `#${m.old_position} → #${m.position}`} at ${m.domain}`}
-                    className="rounded-[10px] border border-border bg-bg-elev-2 overflow-hidden hover:border-accent transition group relative"
-                  >
-                    <span
-                      className={`absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded text-[10px] font-semibold ${
-                        m.signal === "new" ? "bg-accent text-on-accent" : "bg-amber-500 text-white"
-                      }`}
-                    >
-                      {m.signal === "new" ? `NEW #${m.position}` : `↑ +${(m.old_position ?? 0) - m.position} → #${m.position}`}
-                    </span>
-                    {m.image ? (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img src={m.image} alt="" className="w-full h-28 object-cover" loading="lazy" />
-                    ) : (
-                      <div className="w-full h-28 bg-bg-elev" />
+              (() => {
+                // Group per category, keeping the server's score order: category
+                // order = its best mover; cards inside stay score-sorted.
+                const order: string[] = [];
+                const byCat: Record<string, typeof movers.movers> = {};
+                movers.movers.forEach((m) => {
+                  if (!byCat[m.category]) {
+                    byCat[m.category] = [];
+                    order.push(m.category);
+                  }
+                  byCat[m.category].push(m);
+                });
+                const seasonLabel: Record<string, { text: string; tone: string }> = {
+                  now: { text: "● in season now", tone: "text-green-600 dark:text-green-400" },
+                  soon: { text: "● season coming up", tone: "text-amber-500" },
+                  evergreen: { text: "in demand all year", tone: "text-text-dim" },
+                  off: { text: "off-season", tone: "text-text-faint" },
+                };
+                return (
+                  <div className="space-y-3">
+                    {order.map((cat) => {
+                      const ctx = movers.category_context?.[cat];
+                      const season = ctx?.bucket ? seasonLabel[ctx.bucket] : null;
+                      return (
+                        <div key={cat}>
+                          <div className="flex items-baseline gap-2 flex-wrap mb-1.5">
+                            <span className="text-[12px] font-semibold text-text capitalize">{cat}</span>
+                            {season && <span className={`text-[11px] ${season.tone}`}>{season.text}</span>}
+                            {ctx && (
+                              <span className="text-[11px] text-text-faint">
+                                {ctx.live} live · {ctx.recent === 0 ? "none added" : `${ctx.recent} added`} in last 45d
+                              </span>
+                            )}
+                          </div>
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                            {byCat[cat].map((m) => (
+                              <a
+                                key={`${m.domain}:${m.handle}`}
+                                href={m.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title={`${m.title} — ${m.signal === "new" ? `new at #${m.position}` : `#${m.old_position} → #${m.position}`} at ${m.domain}`}
+                                className="rounded-[10px] border border-border bg-bg-elev-2 overflow-hidden hover:border-accent transition group relative"
+                              >
+                                <span
+                                  className={`absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                                    m.signal === "new" ? "bg-accent text-on-accent" : "bg-amber-500 text-white"
+                                  }`}
+                                >
+                                  {m.signal === "new" ? `NEW #${m.position}` : `↑ +${(m.old_position ?? 0) - m.position} → #${m.position}`}
+                                </span>
+                                {m.image ? (
+                                  // eslint-disable-next-line @next/next/no-img-element
+                                  <img src={m.image} alt="" className="w-full h-28 object-cover" loading="lazy" />
+                                ) : (
+                                  <div className="w-full h-28 bg-bg-elev" />
+                                )}
+                                <div className="px-2 py-1.5">
+                                  <div className="text-[11px] text-text truncate group-hover:text-accent">{m.title}</div>
+                                  <div className="text-[10px] text-text-faint truncate">{m.domain}</div>
+                                </div>
+                              </a>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })}
+                    {movers.season_source !== "what_to_list" && (
+                      <p className="text-[11px] text-text-faint">
+                        Tip: run <strong>Recommend what to list</strong> above first — then this ranking also uses each
+                        type&apos;s season timing (now it only uses your catalogue gaps).
+                      </p>
                     )}
-                    <div className="px-2 py-1.5">
-                      <div className="text-[11px] text-text truncate group-hover:text-accent">{m.title}</div>
-                      <div className="text-[10px] text-text-faint truncate">
-                        {m.category} · {m.domain}
-                      </div>
-                    </div>
-                  </a>
-                ))}
-              </div>
+                  </div>
+                );
+              })()
             )}
           </div>
 
