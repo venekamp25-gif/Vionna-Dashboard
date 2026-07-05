@@ -6437,6 +6437,150 @@ def api_fill_missing_size_charts():
                     'errors': errors[:5]})
 
 
+# ── Competitor bestseller scan (DSA step 4, automated) ──
+# Shopify's hidden "all products" collection sorted by best-selling = the
+# competitor's real winners. We read the HTML for the product ORDER (the .json
+# endpoints ignore sort_by), then enrich each product via /products/<handle>.json.
+_BS_CACHE = {}          # domain -> {'ts', 'at', 'payload'}
+_BS_TTL = 12 * 3600
+
+_BS_CATEGORY_KEYWORDS = [
+    ('dress',     ['dress', 'kjole', 'robe', 'mekko', 'gown', 'jurk']),
+    ('jumpsuit',  ['jumpsuit', 'playsuit', 'romper', 'combinaison', 'overall']),
+    ('knitwear',  ['knit', 'sweater', 'cardigan', 'jumper', 'pullover', 'strik', 'pull ', 'tricot']),
+    ('outerwear', ['jacket', 'coat', 'blazer', 'trench', 'parka', 'manteau', 'veste', 'jas ']),
+    ('swim',      ['bikini', 'swimsuit', 'swim', 'maillot', 'badpak']),
+    ('skirt',     ['skirt', 'skort', 'nederdel', 'jupe', 'hame']),
+    ('pants',     ['pants', 'trouser', 'jeans', 'shorts', 'legging', 'jogger', 'pantalon', 'broek', 'housut']),
+    ('top',       ['top', 'blouse', 'shirt', 'tee', 'tank', 'camisole', 'bodysuit', 'cami ', 'chemisier']),
+    ('shoes',     ['shoe', 'boot', 'sneaker', 'sandal', 'heel', 'loafer', 'mule', 'sko', 'støvle']),
+    ('accessory', ['bag', 'tote', 'handbag', 'sac ', 'belt', 'scarf', 'necklace', 'earring', 'jewel', 'hat ', 'tas ']),
+]
+
+
+def _bs_category(title, ptype):
+    """Rough product-type bucket from product_type + title text (same buckets as
+    the What-to-list categories). 'other' when nothing matches."""
+    for field in ((ptype or ''), (title or '')):
+        t = ' ' + field.lower() + ' '
+        for cat, kws in _BS_CATEGORY_KEYWORDS:
+            if any(k in t for k in kws):
+                return cat
+    return 'other'
+
+
+def _bs_host(domain):
+    d = (domain or '').strip()
+    d = re.sub(r'^https?://', '', d, flags=re.I).split('/')[0].strip().lower()
+    return d if ('.' in d) else ''
+
+
+def _bs_scan(host, limit=20):
+    """Scan one competitor's best-selling page. Returns (payload, None) or
+    (None, blocked_reason)."""
+    url = f'https://{host}/collections/all?sort_by=best-selling'
+    try:
+        r = _scrape_get(url, timeout=15)
+    except Exception as e:
+        return None, f'could not reach the store ({str(e)[:60]})'
+    if r.status_code == 404:
+        return None, 'this store hides its "all products" page (404) — the bestseller trick doesn\'t work here'
+    if r.status_code != 200:
+        return None, f'store blocked the request (HTTP {r.status_code})'
+    html = r.text
+    if '__cf_chl' in html or 'cf-challenge' in html or 'Just a moment' in html:
+        return None, 'store is protected by Cloudflare — open the URL in your own browser instead'
+    # product handles in page order (dedup, keep first occurrence = rank)
+    seen, handles = set(), []
+    for m in re.finditer(r'href="[^"]*?/products/([a-z0-9][a-z0-9\-_]*)', html, re.I):
+        h = m.group(1).lower()
+        if h not in seen:
+            seen.add(h)
+            handles.append(h)
+        if len(handles) >= limit:
+            break
+    if not handles:
+        return None, 'no products found on the bestseller page (maybe not a Shopify store)'
+
+    def _one(pos_handle):
+        pos, handle = pos_handle
+        try:
+            pr = _scrape_get(f'https://{host}/products/{handle}.json', timeout=12)
+            p = (pr.json() or {}).get('product') or {}
+        except Exception:
+            p = {}
+        title = p.get('title') or handle.replace('-', ' ').title()
+        imgs = p.get('images') or []
+        return {'position': pos, 'handle': handle, 'title': title,
+                'url': f'https://{host}/products/{handle}',
+                'image': (imgs[0].get('src') if imgs else None),
+                'price': ((p.get('variants') or [{}])[0]).get('price'),
+                'product_type': p.get('product_type') or '',
+                'published_at': (p.get('published_at') or '')[:10],
+                'category': _bs_category(title, p.get('product_type'))}
+    import concurrent.futures as _cf
+    with _cf.ThreadPoolExecutor(max_workers=6) as pool:
+        products = list(pool.map(_one, enumerate(handles, start=1)))
+    products.sort(key=lambda x: x['position'])
+    from collections import Counter
+    by_cat = Counter(p['category'] for p in products)
+    return {'ok': True, 'domain': host, 'url': url, 'count': len(products),
+            'by_category': dict(by_cat.most_common()), 'products': products}, None
+
+
+@app.route('/api/bestseller_scan')
+def api_bestseller_scan():
+    """Scan a competitor store's best-selling page: ordered top products enriched
+    with type/price/age + per-category counts. ?domain=X&force=1. Cached 12h."""
+    host = _bs_host(request.args.get('domain', ''))
+    if not host:
+        return jsonify({'ok': False, 'error': 'pass ?domain=competitor.com'}), 400
+    now_ts = time.time()
+    hit = _BS_CACHE.get(host)
+    if hit and not request.args.get('force') and (now_ts - hit['ts']) < _BS_TTL:
+        out = dict(hit['payload'])
+        out['from_cache'] = True
+        out['cache_age_seconds'] = int(now_ts - hit['ts'])
+        return jsonify(out)
+    payload, blocked = _bs_scan(host)
+    if blocked:
+        return jsonify({'ok': False, 'domain': host, 'blocked': blocked,
+                        'url': f'https://{host}/collections/all?sort_by=best-selling'})
+    _BS_CACHE[host] = {'ts': now_ts, 'at': datetime.datetime.utcnow().isoformat() + 'Z', 'payload': payload}
+    out = dict(payload)
+    out['from_cache'] = False
+    out['cache_age_seconds'] = 0
+    return jsonify(out)
+
+
+@app.route('/api/known_competitors')
+def api_known_competitors():
+    """Domains we've imported from (publish history source_url), with how many
+    distinct products came from each — the stores worth re-checking for winners."""
+    from collections import defaultdict
+    doms = defaultdict(lambda: {'products': set(), 'last': ''})
+    if os.path.exists(HISTORY_PATH):
+        with open(HISTORY_PATH, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                su = (e.get('source_url') or '').strip()
+                if not su:
+                    continue
+                host = _bs_host(su)
+                if not host or 'shopify.com' in host:
+                    continue
+                d = doms[host]
+                d['products'].add((e.get('product_name') or '').lower())
+                d['last'] = max(d['last'], e.get('timestamp') or '')
+    out = [{'domain': h, 'products': len(v['products']), 'last_import': v['last'][:10]}
+           for h, v in doms.items()]
+    out.sort(key=lambda x: -x['products'])
+    return jsonify({'competitors': out})
+
+
 @app.route('/api/history')
 def history():
     """Return the publish log as a list of entries, most recent first.
