@@ -1149,6 +1149,13 @@ def _find_siblings_via_catalog(scheme, netloc, base_prefix, base_handle,
     found = []
     seen = set()
     for page in range(1, max_pages + 1):
+        if page > 1:
+            # Small courtesy delay between paginated catalog requests — firing
+            # up to 5 back-to-back requests at the same shop with zero delay
+            # is exactly the burst pattern that trips a shop's own rate
+            # limiter, which then blocks EVERY subsequent scrape of that
+            # store (bug #10).
+            time.sleep(0.5)
         try:
             r = _scrape_get(
                 f'{scheme}://{netloc}/products.json?limit=250&page={page}',
@@ -2128,7 +2135,12 @@ def scrape():
             if sibling_handles:
                 print(f"[scrape] Found {len(sibling_handles)} sibling colour-products for '{base_handle}'")
                 sibs = []
-                for sh in sibling_handles[:25]:   # cap to avoid runaway fetches
+                for i, sh in enumerate(sibling_handles[:25]):   # cap to avoid runaway fetches
+                    if i > 0:
+                        # Courtesy delay — see catalog-fallback comment above;
+                        # same burst-request risk applies to the per-sibling
+                        # .json fetches.
+                        time.sleep(0.5)
                     sib_product = _fetch_product_json(scheme, parsed.netloc, sh)
                     if sib_product:
                         sibs.append(sib_product)
