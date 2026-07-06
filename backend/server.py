@@ -8706,8 +8706,10 @@ def api_update():
         fetch_base = GITHUB_RAW
         pinned = False
 
-    # Pull from backend/ on GitHub, save locally next to the running server.py
-    files_to_update = ['index.html', 'server.py', 'version.txt']
+    # Pull from backend/ on GitHub, save locally next to the running server.py.
+    # NOTE: every .py module the server imports MUST be in this list — otherwise
+    # deploys silently ship a stale module (bit us with shipping_check v1.177).
+    files_to_update = ['index.html', 'server.py', 'shipping_check.py', 'version.txt']
     updated = []
     errors  = []
     for fname in files_to_update:
