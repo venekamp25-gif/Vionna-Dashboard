@@ -7098,11 +7098,16 @@ def api_brand_debug():
     dom = (request.args.get('domain') or '').strip()
     if not dom:
         return jsonify({'error': 'domain?'}), 400
-    from shipping_check import _fetch_html, _html_to_text, brand_signals, looks_like_brand
+    from shipping_check import (_fetch_html, _html_to_text, brand_signals,
+                                looks_like_brand, _brand_llm_verdict)
     html = _fetch_html(f'https://{dom}/') or ''
+    sigs0 = brand_signals(dom)
     out = {'html_len': len(html), 'text_len': len(_html_to_text(html)),
            'anthropic_key': bool(os.environ.get('ANTHROPIC_API_KEY')),
-           'signals': brand_signals(dom)}
+           'signals': sigs0}
+    v, reason = _brand_llm_verdict(dom, sigs0)
+    out['llm_verdict'] = v
+    out['llm_reason'] = reason
     ib, sigs = looks_like_brand(dom)
     out['is_brand'] = ib
     out['reasons'] = sigs

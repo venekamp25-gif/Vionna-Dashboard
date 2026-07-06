@@ -632,6 +632,17 @@ def brand_signals(domain: str) -> list:
             for pat, label in _BRAND_TEXT_SIGNALS:
                 if label not in sigs and re.search(pat, low):
                     sigs.append(label)
+        # page-existence probes: evidence for the LLM (careers/press pages are
+        # typical of real companies — though dropshippers fake them, so these
+        # never auto-trigger on their own)
+        for path, label in (("/pages/careers", "has careers page"),
+                            ("/pages/press", "has press page"),
+                            ("/pages/stores", "has stores page"),
+                            ("/pages/stockists", "has stockists page"),
+                            ("/pages/wholesale", "has wholesale page")):
+            pg = _fetch_html(f"https://{domain}{path}")
+            if pg and len(pg) > 20000 and label not in sigs:
+                sigs.append(label)
     except Exception:
         pass
     _CACHE[key] = sigs
@@ -650,11 +661,17 @@ def _brand_llm_verdict(domain: str, evidence: list) -> tuple:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return None, ""
-    text = _html_to_text(_fetch_html(f"https://{domain}/") or "")[:5000]
+    html = _fetch_html(f"https://{domain}/") or ""
+    full = _html_to_text(html)
+    tm = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+    md = re.search(r'<meta[^>]+name="description"[^>]+content="([^"]{1,300})"', html, re.I)
+    text = f"[TITLE] {tm.group(1).strip()[:150] if tm else ""}\n[META] {md.group(1) if md else ""}\n"
+    # head (hero copy) + tail (footer: about/stores/wholesale links live there)
+    text += full[:3500] + "\n[FOOTER]\n" + full[-2500:]
     for path in _BRAND_ABOUT_PATHS:
         about = _fetch_html(f"https://{domain}{path}")
         if about and len(about) > 2000:
-            text += "\n\n[ABOUT PAGE]\n" + _html_to_text(about)[:3000]
+            text += "\n\n[ABOUT PAGE]\n" + _html_to_text(about)[:3500]
             break
     if len(text) < 300:
         return None, ""
