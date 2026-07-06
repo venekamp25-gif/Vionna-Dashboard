@@ -944,3 +944,30 @@ export const snapshotsApi = {
       `/api/product_snapshots/${encodeURIComponent(id)}?owner=${encodeURIComponent(owner)}`
     ),
 };
+
+/** A pending change-plan awaiting the CEO's approval (bug → plan → akkoord → auto-fix). */
+export interface PlanEntry {
+  id: number;
+  bug_id: number | null;
+  title: string;
+  summary: string;
+  plan: string;
+  status: "pending" | "approved" | "rejected";
+  created_at: string;
+  decided_at: string | null;
+}
+
+export const plansApi = {
+  list: (all = false) =>
+    call<{ entries: PlanEntry[]; pending_count: number }>(
+      `/api/plans${all ? "?status=all" : ""}`
+    ),
+  approve: (id: number) =>
+    call<{ success?: boolean; status?: string; error?: string }>(
+      `/api/plans/${id}/approve`, { method: "POST", authed: true }
+    ),
+  reject: (id: number) =>
+    call<{ success?: boolean; status?: string; error?: string }>(
+      `/api/plans/${id}/reject`, { method: "POST", authed: true }
+    ),
+};
