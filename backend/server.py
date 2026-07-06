@@ -501,6 +501,20 @@ def classify_shipping():
         print(f"[classify_shipping] error for {url}: {e}")
         # Treat failures as 'Onbekend' so the import step can still warn (per user choice)
         return jsonify({'label': 'Onbekend', 'detail': '', 'source': 'none', 'confidence': 'none', 'error': str(e)[:200]})
+    # Billy J-class false negative: slow international shipping reads as
+    # "dropshipper", but real brands (MESHKI etc.) ship slowly too. When the
+    # classifier clears a store, double-check for brand markers and warn.
+    if d.get('label') == 'Dropshipper':
+        try:
+            from shipping_check import looks_like_brand
+            is_brand, sigs = looks_like_brand(host)
+            if is_brand:
+                return jsonify({'label': 'Mogelijk eigen merk',
+                                'detail': f"shipping looks like dropship ({d['detail']}), BUT this store shows "
+                                          f"real-brand signals: {', '.join(sigs)}. Verify before importing!",
+                                'source': 'brand-signals', 'confidence': 'medium'})
+        except Exception as e:
+            print(f"[classify_shipping] brand check failed: {e}")
     return jsonify({'label': d['label'], 'detail': d['detail'],
                     'source': d['source'], 'confidence': d['confidence']})
 

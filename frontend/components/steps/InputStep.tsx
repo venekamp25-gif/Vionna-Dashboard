@@ -19,6 +19,8 @@ const SHIPPING_SOURCE_LABEL: Record<string, string> = {
   llm: "AI reading the policy text",
   "llm-sonnet": "AI reading the policy text",
   vision: "AI reading a policy screenshot",
+  "manual-blocklist": "our own blocklist (this store was flagged manually)",
+  "brand-signals": "brand markers found on the store's site",
 };
 
 function formatRelative(iso: string): string {
@@ -426,14 +428,29 @@ export function InputStep() {
                 <h3 className="text-[15px] font-semibold text-text">
                   {shippingWarn.label === "Eigen voorraad"
                     ? "Source doesn't look like a dropshipper"
-                    : "Couldn't determine delivery time"}
+                    : shippingWarn.label === "Mogelijk eigen merk"
+                      ? "This may be a real brand — do not import"
+                      : "Couldn't determine delivery time"}
                 </h3>
                 <p className="text-[13px] text-text-dim mt-1.5 leading-relaxed">
                   {shippingWarn.label === "Eigen voorraad" ? (
                     <>
-                      This store has <strong>fast delivery
-                      {shippingWarn.detail ? ` (${shippingWarn.detail})` : ""}</strong> — under 5
-                      business days, so it&apos;s likely <strong>own stock</strong>, not a dropshipper.
+                      {shippingWarn.source === "manual-blocklist" && shippingWarn.detail ? (
+                        <strong>{shippingWarn.detail}</strong>
+                      ) : (
+                        <>
+                          This store has <strong>fast delivery
+                          {shippingWarn.detail ? ` (${shippingWarn.detail})` : ""}</strong> — under 5
+                          business days, so it&apos;s likely <strong>own stock</strong>, not a dropshipper.
+                        </>
+                      )}
+                    </>
+                  ) : shippingWarn.label === "Mogelijk eigen merk" ? (
+                    <>
+                      Shipping times look dropship-like, but this store shows <strong>real-brand
+                      signals</strong>{shippingWarn.detail ? <> ({shippingWarn.detail})</> : null}. Brands like
+                      this (e.g. Billy J, MESHKI) ship slowly from abroad but are NOT dropshippers — importing
+                      their products has cost us a lot of cleanup before.
                     </>
                   ) : (
                     <>

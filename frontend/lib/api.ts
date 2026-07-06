@@ -302,9 +302,11 @@ export const api = {
    *  by parsing its shipping policy. Used to warn at the import step. */
   classifyShipping: (url: string) =>
     call<{
-      label: "Dropshipper" | "Eigen voorraad" | "Onbekend";
+      label: "Dropshipper" | "Eigen voorraad" | "Mogelijk eigen merk" | "Onbekend";
       detail: string;                                   // "7-14d"
-      source: "structured" | "policy" | "policy-js" | "llm" | "llm-sonnet" | "vision" | "none";
+      source:
+        | "structured" | "policy" | "policy-js" | "llm" | "llm-sonnet" | "vision"
+        | "manual-blocklist" | "brand-signals" | "none";
       confidence: "high" | "medium" | "low" | "none";
       error?: string;
     }>(`/api/classify_shipping?url=${encodeURIComponent(url)}`),

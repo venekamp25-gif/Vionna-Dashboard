@@ -593,6 +593,60 @@ def _maybe_llm_verify(p: dict, text: str, domain: str, source: str) -> dict:
     return _res(p["label"], p["lo"], p["hi"], source, "low")
 
 
+# ── Brand signals: is this a real BRAND/boutique rather than a dropshipper? ──
+# Slow international shipping makes real brands (Billy J, MESHKI) look like
+# dropshippers to the day-count classifier. These signals catch that: hrefs to
+# store-locator / stockists / wholesale pages are near-certain brand markers;
+# text markers are noisier and need two hits.
+_BRAND_LINK_SIGNALS = (
+    ("store-locator", "store locator"), ("storelocator", "store locator"),
+    ("find-a-store", "store locator"), ("our-stores", "own stores"),
+    ("stockist", "stockists page"), ("winkels", "own stores"),
+    ("butikker", "own stores"), ("wholesale", "wholesale program"),
+    ("/b2b", "wholesale/B2B"), ("become-a-retailer", "wholesale program"),
+)
+_BRAND_TEXT_SIGNALS = (
+    (r"design(?:ed)?\s+in[\-\s]?house|our design team|eigen ontwerp|our atelier", "in-house designs"),
+    (r"visit (?:one of )?our stores?|in onze winkel", "own stores"),
+    (r"become a (?:stockist|retailer)|wholesale (?:portal|inquir|application)", "wholesale program"),
+    (r"as seen in|featured in", "press features"),
+    (r"founded in (?:19|20)\d\d|est\.?\s?(?:19|20)\d\d|opgericht in (?:19|20)\d\d", "established year"),
+)
+
+
+def brand_signals(domain: str) -> list:
+    """Signals that `domain` is a real brand/boutique. Returns labels (possibly
+    empty). Cached per domain; homepage-only, best-effort, never raises."""
+    key = f"B|{domain}"
+    if key in _CACHE:
+        return _CACHE[key]
+    sigs = []
+    try:
+        html = _fetch_html(f"https://{domain}/") or ""
+        low = html.lower()
+        if low:
+            hrefs = " ".join(re.findall(r'href="([^"]{1,200})"', low))
+            for hint, label in _BRAND_LINK_SIGNALS:
+                if hint in hrefs and label not in sigs:
+                    sigs.append(label)
+            for pat, label in _BRAND_TEXT_SIGNALS:
+                if label not in sigs and re.search(pat, low):
+                    sigs.append(label)
+    except Exception:
+        pass
+    _CACHE[key] = sigs
+    return sigs
+
+
+def looks_like_brand(domain: str) -> tuple:
+    """(True, reasons) when brand evidence is strong: a link-based signal (store
+    locator / stockists / wholesale) or >= 2 text markers."""
+    sigs = brand_signals(domain)
+    link_labels = {"store locator", "own stores", "stockists page", "wholesale program", "wholesale/B2B"}
+    strong = [s for s in sigs if s in link_labels]
+    return (bool(strong) or len(sigs) >= 2), sigs
+
+
 def classify_detailed(product_url: str, skip_browser: bool = True) -> dict:
     """Full structured classification. -> {label, lo, hi, detail, source, confidence}."""
     domain = _get_domain(product_url)
