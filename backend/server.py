@@ -162,7 +162,7 @@ def _run_backup():
         os.makedirs(dest, exist_ok=True)
         for fname in ('publish_history.jsonl', 'bug_reports.jsonl', 'blog_history.jsonl',
                       'blog_performance.jsonl', 'blog_views.json', 'blog_playbook.json',
-                      'bs_snapshots.jsonl'):
+                      'bs_snapshots.jsonl', 'known_sources.json'):
             src = os.path.join(_BASE_DIR, fname)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dest, fname))
@@ -6583,11 +6583,40 @@ def api_bestseller_scan():
     return jsonify(out)
 
 
+KNOWN_SOURCES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'known_sources.json')
+
+
+def _load_known_sources():
+    """Manually-registered competitor source URLs for products whose import
+    predates source-url logging (e.g. mapped from the Size Charts sheet). Keeps
+    the already-imported dedupe complete. [{'url','product_name'}...]."""
+    try:
+        if os.path.exists(KNOWN_SOURCES_PATH):
+            return json.load(open(KNOWN_SOURCES_PATH, encoding='utf-8')) or []
+    except Exception as e:
+        print(f"[known_sources] load failed: {e}")
+    return []
+
+
 def _known_comp_data():
-    """Domains we've imported from (publish history source_url) with distinct-
-    product counts + the competitor handles we already took (for dedupe)."""
+    """Domains we've imported from (publish history source_url + the manual
+    known_sources registry) with distinct-product counts + the competitor
+    handles we already took (for dedupe)."""
     from collections import defaultdict
     doms = defaultdict(lambda: {'products': set(), 'last': '', 'handles': set()})
+
+    def _add(source_url, product_name, ts):
+        host = _bs_host(source_url)
+        if not host or 'shopify.com' in host:
+            return
+        d = doms[host]
+        d['products'].add((product_name or '').lower())
+        d['last'] = max(d['last'], ts or '')
+        # competitor product handle (last /products/<handle> path segment)
+        m = re.search(r'/products/([a-z0-9][a-z0-9\-_]*)', source_url, re.I)
+        if m:
+            d['handles'].add(m.group(1).lower())
+
     if os.path.exists(HISTORY_PATH):
         with open(HISTORY_PATH, 'r', encoding='utf-8') as f:
             for line in f:
@@ -6596,23 +6625,55 @@ def _known_comp_data():
                 except Exception:
                     continue
                 su = (e.get('source_url') or '').strip()
-                if not su:
-                    continue
-                host = _bs_host(su)
-                if not host or 'shopify.com' in host:
-                    continue
-                d = doms[host]
-                d['products'].add((e.get('product_name') or '').lower())
-                d['last'] = max(d['last'], e.get('timestamp') or '')
-                # competitor product handle (last /products/<handle> path segment)
-                m = re.search(r'/products/([a-z0-9][a-z0-9\-_]*)', su, re.I)
-                if m:
-                    d['handles'].add(m.group(1).lower())
+                if su:
+                    _add(su, e.get('product_name'), e.get('timestamp'))
+    for s in _load_known_sources():
+        _add((s.get('url') or '').strip(), s.get('product_name'), s.get('added_at'))
     out = [{'domain': h, 'products': len(v['products']), 'last_import': v['last'][:10],
             'imported_handles': sorted(v['handles'])}
            for h, v in doms.items()]
     out.sort(key=lambda x: -x['products'])
     return out
+
+
+@app.route('/api/known_sources', methods=['GET', 'POST'])
+def api_known_sources():
+    """Registry of manually-added competitor source URLs (imports from before
+    source-url logging). GET lists; POST {add:[{url, product_name?}]} appends
+    (deduped by host+handle, /products/ URLs only, capped)."""
+    if request.method == 'GET':
+        return jsonify({'sources': _load_known_sources()})
+    body = request.get_json(silent=True) or {}
+    add = body.get('add') or []
+    cur = _load_known_sources()
+    seen = set()
+    for s in cur:
+        m = re.search(r'/products/([a-z0-9][a-z0-9\-_]*)', s.get('url') or '', re.I)
+        if m:
+            seen.add((_bs_host(s.get('url')), m.group(1).lower()))
+    added, skipped = 0, 0
+    now = datetime.datetime.utcnow().isoformat() + 'Z'
+    for item in add[:500]:
+        url = (item.get('url') or '').strip() if isinstance(item, dict) else str(item).strip()
+        name = (item.get('product_name') or '') if isinstance(item, dict) else ''
+        m = re.search(r'/products/([a-z0-9][a-z0-9\-_]*)', url, re.I)
+        host = _bs_host(url)
+        if not url.startswith('http') or not m or not host:
+            skipped += 1
+            continue
+        key = (host, m.group(1).lower())
+        if key in seen:
+            skipped += 1
+            continue
+        seen.add(key)
+        cur.append({'url': url, 'product_name': name, 'added_at': now})
+        added += 1
+    if added and len(cur) <= 2000:
+        tmp = KNOWN_SOURCES_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(cur, f, ensure_ascii=False, indent=0)
+        os.replace(tmp, KNOWN_SOURCES_PATH)
+    return jsonify({'added': added, 'skipped': skipped, 'total': len(cur)})
 
 
 @app.route('/api/known_competitors')
@@ -10229,6 +10290,36 @@ def _blog_qa_fix_loop(store, art, products, max_fixes=2):
     return art, qa, passed
 
 
+def _blog_slack(text, blocks=None):
+    """Best-effort Slack ping for the blog engine (reuses the bug-report webhook).
+    No-op when unconfigured; never raises."""
+    try:
+        url = _slack_webhook_url()
+        if not url:
+            return
+        payload = {'text': text}
+        if blocks:
+            payload['blocks'] = blocks
+        req.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"[blog] slack notify failed: {e}")
+
+
+def _blog_slack_article(store, created, publish, qa_slim, topic):
+    """Owner notification for every generated article: published or draft, QA
+    score, topic and link. Never raises."""
+    try:
+        score = qa_slim and qa_slim.get('score')
+        status = '✅ GEPUBLICEERD' if publish else '⚠️ CONCEPT (QA niet gehaald — review nodig)'
+        qa_txt = f"QA {score}/10" if score is not None else 'QA n.v.t. (handmatig)'
+        _blog_slack(
+            f"📝 Blog [{store.upper()}] {status} | {qa_txt}\n"
+            f"*{created.get('title')}*  (onderwerp: {(topic or {}).get('keyword')})\n"
+            f"{created.get('storefront_url')}")
+    except Exception as e:
+        print(f"[blog] slack article notify failed: {e}")
+
+
 def _blog_generate_one(store, topic=None, published=None):
     """Full pipeline for one store → one article. published: True/False force the
     state; None = auto mode — publish only when the QA gate passes (and
@@ -10303,6 +10394,7 @@ def _blog_generate_one(store, topic=None, published=None):
     created = _blog_create_article(store, blog_id, art, hdrs, published=publish, featured_img=featured)
     qa_slim = qa and {'score': qa['score'], 'critical': len(qa['critical']), 'minor': len(qa['minor'])}
     _blog_log(store, topic, {**created, 'published': publish, 'levers': art.get('levers'), 'qa': qa_slim})
+    _blog_slack_article(store, created, publish, qa_slim, topic)
     return {'store': store, 'topic': topic, 'products_linked': len(products), 'qa': qa_slim,
             'published': publish, 'article': created, 'preview': {'title': art['title'],
             'meta_description': art['meta_description'], 'excerpt': art['excerpt'],
@@ -10490,13 +10582,18 @@ def _blog_run_learn_cycle():
     try:
         m = _blog_measure_all()
         print(f"[blog] weekly measure: {m}")
+        if m.get('errors'):
+            _blog_slack(f"🚨 Blog-meting: {m['errors']} fout(en) tijdens de wekelijkse meetronde "
+                        f"(gemeten: {m.get('measured')}, overgeslagen: {m.get('skipped')}).")
     except Exception as e:
         print(f"[blog] measure failed: {e}")
+        _blog_slack(f"🚨 Blog-meting volledig mislukt: {str(e)[:180]}")
     try:
         r = _blog_learn()
         print(f"[blog] weekly learn: ok={r.get('ok')} {r.get('reason') or r.get('rules')}")
     except Exception as e:
         print(f"[blog] learn failed: {e}")
+        _blog_slack(f"🚨 Blog-leerronde (playbook) mislukt: {str(e)[:180]}")
 
 
 def _blog_scheduler_loop():
