@@ -162,7 +162,7 @@ def _run_backup():
         os.makedirs(dest, exist_ok=True)
         for fname in ('publish_history.jsonl', 'bug_reports.jsonl', 'blog_history.jsonl',
                       'blog_performance.jsonl', 'blog_views.json', 'blog_playbook.json',
-                      'bs_snapshots.jsonl', 'known_sources.json'):
+                      'bs_snapshots.jsonl', 'known_sources.json', 'blocked_sources.json'):
             src = os.path.join(_BASE_DIR, fname)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dest, fname))
@@ -486,6 +486,14 @@ def classify_shipping():
     url = (request.args.get('url') or '').strip()
     if not url:
         return jsonify({'label': 'Onbekend', 'detail': '', 'source': 'none', 'confidence': 'none'})
+    # Manual blocklist beats the classifier: stores we KNOW aren't dropshippers
+    # always warn at import, regardless of what their shipping policy says.
+    host = re.sub(r'^https?://', '', url, flags=re.I).split('/')[0].lower().replace('www.', '')
+    if host in _load_blocked_sources():
+        return jsonify({'label': 'Eigen voorraad',
+                        'detail': f'{host} is manually flagged: {_blocked_reason(host)}. '
+                                  'Products from this store should NOT be imported.',
+                        'source': 'manual-blocklist', 'confidence': 'high'})
     try:
         from shipping_check import classify_detailed
         d = classify_detailed(url, skip_browser=True)
@@ -6905,6 +6913,9 @@ def api_bestseller_scan():
     host = _bs_host(request.args.get('domain', ''))
     if not host:
         return jsonify({'ok': False, 'error': 'pass ?domain=competitor.com'}), 400
+    if host.replace('www.', '') in _load_blocked_sources():
+        return jsonify({'ok': False, 'domain': host,
+                        'blocked': f'this store is flagged: {_blocked_reason(host)} - do not source from it'})
     out, blocked = _bs_scan_cached(host, force=bool(request.args.get('force')))
     if blocked:
         return jsonify({'ok': False, 'domain': host, 'blocked': blocked,
@@ -6925,6 +6936,67 @@ def _load_known_sources():
     except Exception as e:
         print(f"[known_sources] load failed: {e}")
     return []
+
+
+BLOCKED_SOURCES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blocked_sources.json')
+
+
+def _load_blocked_sources():
+    """Competitor domains flagged as NOT-a-dropshipper (real boutiques etc.):
+    warned on import, excluded from bestseller chips/watch/movers."""
+    try:
+        if os.path.exists(BLOCKED_SOURCES_PATH):
+            items = json.load(open(BLOCKED_SOURCES_PATH, encoding='utf-8')) or []
+            return {str(i.get('domain') or '').lower().replace('www.', '') for i in items if i.get('domain')}
+    except Exception as e:
+        print(f"[blocked_sources] load failed: {e}")
+    return set()
+
+
+def _blocked_reason(host):
+    h = (host or '').lower().replace('www.', '')
+    try:
+        for i in (json.load(open(BLOCKED_SOURCES_PATH, encoding='utf-8')) or []):
+            if str(i.get('domain') or '').lower().replace('www.', '') == h:
+                return i.get('reason') or 'flagged as not a dropshipper'
+    except Exception:
+        pass
+    return 'flagged as not a dropshipper'
+
+
+@app.route('/api/blocked_sources', methods=['GET', 'POST'])
+def api_blocked_sources():
+    """Manage the not-a-dropshipper blocklist. GET lists; POST {add:[{domain,
+    reason}], remove:[domain]} updates the file."""
+    cur = []
+    try:
+        if os.path.exists(BLOCKED_SOURCES_PATH):
+            cur = json.load(open(BLOCKED_SOURCES_PATH, encoding='utf-8')) or []
+    except Exception:
+        cur = []
+    if request.method == 'GET':
+        return jsonify({'blocked': cur})
+    body = request.get_json(silent=True) or {}
+    now = datetime.datetime.utcnow().isoformat() + 'Z'
+    have = {str(i.get('domain') or '').lower().replace('www.', '') for i in cur}
+    added = 0
+    for item in (body.get('add') or [])[:50]:
+        dom = str((item.get('domain') if isinstance(item, dict) else item) or '').lower()
+        dom = re.sub(r'^https?://', '', dom).split('/')[0].replace('www.', '').strip()
+        if not dom or '.' not in dom or dom in have:
+            continue
+        cur.append({'domain': dom, 'reason': (item.get('reason') if isinstance(item, dict) else '') or '',
+                    'added_at': now})
+        have.add(dom)
+        added += 1
+    removes = {str(d or '').lower().replace('www.', '') for d in (body.get('remove') or [])}
+    if removes:
+        cur = [i for i in cur if str(i.get('domain') or '').lower().replace('www.', '') not in removes]
+    tmp = BLOCKED_SOURCES_PATH + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(cur, f, ensure_ascii=False, indent=0)
+    os.replace(tmp, BLOCKED_SOURCES_PATH)
+    return jsonify({'added': added, 'removed': len(removes), 'blocked': cur})
 
 
 def _known_comp_data():
@@ -6958,9 +7030,10 @@ def _known_comp_data():
                     _add(su, e.get('product_name'), e.get('timestamp'))
     for s in _load_known_sources():
         _add((s.get('url') or '').strip(), s.get('product_name'), s.get('added_at'))
+    blocked = _load_blocked_sources()
     out = [{'domain': h, 'products': len(v['products']), 'last_import': v['last'][:10],
             'imported_handles': sorted(v['handles'])}
-           for h, v in doms.items()]
+           for h, v in doms.items() if h.replace('www.', '') not in blocked]
     out.sort(key=lambda x: -x['products'])
     return out
 
@@ -7008,6 +7081,67 @@ def api_known_sources():
 @app.route('/api/known_competitors')
 def api_known_competitors():
     return jsonify({'competitors': _known_comp_data()})
+
+
+@app.route('/api/set_products_status', methods=['POST'])
+def api_set_products_status():
+    """Bulk-set product status (ACTIVE/DRAFT) by product NAME across stores --
+    e.g. unpublish everything sourced from a store that turned out not to be a
+    dropshipper. Matches title first-token (accent-normalized) like the size-
+    chart matcher, so all colour siblings are hit. Reversible. Body:
+    {names:[], stores:[], status: draft|active, dry_run}."""
+    body = request.get_json(silent=True) or {}
+    names = [n for n in (body.get('names') or []) if str(n).strip()]
+    stores = body.get('stores') or ['dk', 'fr', 'fi']
+    status = (body.get('status') or 'draft').upper()
+    dry = bool(body.get('dry_run', True))
+    if not names or status not in ('DRAFT', 'ACTIVE'):
+        return jsonify({'error': 'need names[] + status draft|active'}), 400
+
+    def gql(store, q, v=None):
+        return req.post(shopify_url(store, 'graphql.json'), headers=shopify_headers(store),
+                        json={'query': q, 'variables': v or {}}, timeout=25).json()
+
+    def _norm(s):
+        return ''.join(c for c in unicodedata.normalize('NFKD', (s or '').strip().lower())
+                       if not unicodedata.combining(c))
+
+    report = []
+    total = 0
+    for store in stores:
+        if store not in tokens:
+            report.append({'store': store, 'error': 'not authed'})
+            continue
+        ent = {'store': store, 'matched': [], 'changed': 0, 'errors': []}
+        for name in names:
+            nb = _norm(name)
+            try:
+                d = gql(store, 'query($q:String){products(first:100,query:$q){edges{node{id title status}}}}',
+                        {'q': 'title:%s' % name})
+                nodes = [e['node'] for e in (((d.get('data') or {}).get('products') or {}).get('edges') or [])]
+                nodes = [n for n in nodes
+                         if _norm(re.split(r'[|\s]', (n.get('title') or '').strip(), 1)[0]) == nb]
+            except Exception as e:
+                ent['errors'].append(f'{name}: {str(e)[:60]}')
+                continue
+            for n in nodes:
+                ent['matched'].append(n['title'] + ' (' + (n.get('status') or '?') + ')')
+                if dry or n.get('status') == status:
+                    continue
+                try:
+                    r = gql(store, 'mutation($i:ProductInput!){productUpdate(input:$i){userErrors{message}}}',
+                            {'i': {'id': n['id'], 'status': status}})
+                    ue = (((r.get('data') or {}).get('productUpdate') or {}).get('userErrors') or [])
+                    if ue:
+                        ent['errors'].append((n['title'] + ': ' + str(ue))[:100])
+                    else:
+                        ent['changed'] += 1
+                        total += 1
+                except Exception as e:
+                    ent['errors'].append((n['title'] + ': ' + str(e))[:80])
+        ent['errors'] = ent['errors'][:5]
+        report.append(ent)
+    return jsonify({'dry_run': dry, 'status': status, 'total_changed': total, 'report': report})
 
 
 # ── Weekly movers: droplet-side snapshots of competitor bestseller positions so
