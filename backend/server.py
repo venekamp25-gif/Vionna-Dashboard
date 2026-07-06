@@ -6495,6 +6495,32 @@ def _bs_host(domain):
     return d if ('.' in d) else ''
 
 
+def _searchanise_handles(html, limit=20):
+    """Fallback for stores whose product grid is rendered client-side by the
+    Searchanise app: pull the sales-sorted product list from its public API
+    (api key sits in the page's init.js include). Returns ordered handles."""
+    m = re.search(r'init\.js\?a=([A-Za-z0-9]+)', html or '')
+    if not m:
+        return []
+    try:
+        r = req.get('https://searchserverapi.com/getresults',
+                    params={'api_key': m.group(1), 'q': '', 'items': 'true', 'output': 'json',
+                            'sortBy': 'sales_amount', 'sortOrder': 'desc', 'maxResults': limit},
+                    timeout=15)
+        items = (r.json() or {}).get('items') or []
+    except Exception as e:
+        print(f"[bestsellers] searchanise fallback failed: {e}")
+        return []
+    out = []
+    for it in items:
+        h = (it.get('handle') or '').strip().lower()
+        if not h and '/products/' in (it.get('link') or ''):
+            h = it['link'].split('/products/')[-1].split('?')[0].strip('/').lower()
+        if h and h not in out:
+            out.append(h)
+    return out[:limit]
+
+
 def _bs_scan(host, limit=20):
     """Scan one competitor's best-selling page. Returns (payload, None) or
     (None, blocked_reason)."""
@@ -6519,6 +6545,10 @@ def _bs_scan(host, limit=20):
             handles.append(h)
         if len(handles) >= limit:
             break
+    if not handles:
+        # JS-rendered grids (e.g. Searchanise/snize) leave no links in the HTML —
+        # query the search app's public API for the sales-sorted list instead.
+        handles = _searchanise_handles(html, limit)
     if not handles:
         return None, 'no products found on the bestseller page (maybe not a Shopify store)'
 
