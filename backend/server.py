@@ -7092,6 +7092,23 @@ def api_known_sources():
     return jsonify({'added': added, 'skipped': skipped, 'total': len(cur)})
 
 
+@app.route('/api/_brand_debug')
+def api_brand_debug():
+    """TEMP: what does the droplet see for a domain's brand check? Remove after."""
+    dom = (request.args.get('domain') or '').strip()
+    if not dom:
+        return jsonify({'error': 'domain?'}), 400
+    from shipping_check import _fetch_html, _html_to_text, brand_signals, looks_like_brand
+    html = _fetch_html(f'https://{dom}/') or ''
+    out = {'html_len': len(html), 'text_len': len(_html_to_text(html)),
+           'anthropic_key': bool(os.environ.get('ANTHROPIC_API_KEY')),
+           'signals': brand_signals(dom)}
+    ib, sigs = looks_like_brand(dom)
+    out['is_brand'] = ib
+    out['reasons'] = sigs
+    return jsonify(out)
+
+
 @app.route('/api/known_competitors')
 def api_known_competitors():
     return jsonify({'competitors': _known_comp_data()})
