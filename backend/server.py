@@ -1604,6 +1604,23 @@ def _ocr_size_chart(page_html, page_url):
         return None
 
 
+def _sniff_image_mime(content, fallback='image/png'):
+    """Detect the real image type from its magic bytes. Some CDNs (e.g. bug #9's
+    Vitals chart host, cdn-sc.vitals.app) send a Content-Type header that doesn't
+    match the actual file — a WebP image served as 'image/jpeg' — which makes
+    Claude vision reject/misread the base64 payload. Sniffing the bytes themselves
+    is the only reliable way to get the right media_type."""
+    if content.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'image/png'
+    if content.startswith(b'\xff\xd8\xff'):
+        return 'image/jpeg'
+    if content.startswith((b'GIF87a', b'GIF89a')):
+        return 'image/gif'
+    if content[:4] == b'RIFF' and content[8:12] == b'WEBP':
+        return 'image/webp'
+    return fallback
+
+
 def _ocr_chart_image(img_url):
     """OCR a known size-chart image URL with Claude vision → {headers, rows} or
     None. Shared by the page-image scan above and app readers (Vitals) whose
@@ -1615,9 +1632,8 @@ def _ocr_chart_image(img_url):
         if ir.status_code != 200 or not ir.content:
             return None
         import base64
-        mime = (ir.headers.get('content-type') or 'image/png').split(';')[0].strip()
-        if not mime.startswith('image/'):
-            mime = 'image/png'
+        header_mime = (ir.headers.get('content-type') or '').split(';')[0].strip()
+        mime = _sniff_image_mime(ir.content, header_mime if header_mime.startswith('image/') else 'image/png')
         b64 = base64.b64encode(ir.content).decode()
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
