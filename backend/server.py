@@ -1677,24 +1677,31 @@ def _smartsize_size_chart(page_html):
 def _detect_size_chart_hint(page_html):
     """When automatic extraction FAILS, sniff whether the page still clearly HAS a
     size chart (a known app / a size-chart image / a size-guide widget) so a human
-    can flag it and we can teach the reader that app. Returns a short hint, or None
-    when there's genuinely no sign of a chart (so we don't nag on chart-less items).
+    can flag it and we know which reader to add. Returns a short hint, or None when
+    there's genuinely no sign of a chart (so we don't nag on chart-less items).
 
-    Bug #8: Pify renders its chart client-side (nothing in the raw HTML for
-    _extract_size_chart to find), same as Kiwi Sizing / SmartSize below — but
-    unlike those two, nobody has captured a live Pify page's JS global / API
-    call yet, so there's no real `_pify_size_chart()` parser to add here. Needs
-    a session with normal network access to inspect a Pify-powered product page
-    (e.g. https://www.boheme-infinity.com/products/robe-longue-fleurie-boheme)
-    before a parser can be written."""
+    Markers are matched with letter-boundaries. A plain substring check used to
+    flag EVERY Shopify page as "Pify Size Chart app" because 'shopify' contains
+    'pify' (bug #8 — the reported page was actually the Vitals app, mislabeled by
+    that false positive). Vitals embeds its chart INDEX inline
+    (window.vtlsLiquidData.sizeChart) but fetches the table content client-side,
+    so extraction still returns None here → status 'unread'."""
     try:
         h = (page_html or '').lower()
-        for key, name in (('kiwisizing', 'Kiwi Sizing app'), ('kiwi_sizing', 'Kiwi Sizing app'),
-                          ('sizefox', 'SizeFox / SmartSize app'), ('smartsize', 'SmartSize app'),
-                          ('pify', 'Pify Size Chart app'), ('clothhei', 'Clothhei size app'),
-                          ('sizify', 'Sizify app'), ('size-chart-app', 'size-chart app'),
-                          ('mysize', 'MySize app'), ('fitanalytics', 'Fit Analytics app')):
-            if key in h:
+        # (regex marker, friendly app name). Order = specificity; first hit wins.
+        for pat, name in (
+            (r'kiwisizing|kiwi_sizing',                        'Kiwi Sizing app'),
+            (r'sizefox',                                       'SizeFox / SmartSize app'),
+            (r'\bsmartsize\b',                                 'SmartSize app'),
+            (r'vitals\.app|vtlsliquiddata|vitals-size_chart',  'Vitals app'),
+            (r'(?<![a-z])pify(?![a-z])',                       'Pify Size Chart app'),
+            (r'clothhei',                                      'Clothhei size app'),
+            (r'\bsizify\b',                                    'Sizify app'),
+            (r'size-chart-app',                                'size-chart app'),
+            (r'\bmysize\b',                                    'MySize app'),
+            (r'fitanalytics',                                  'Fit Analytics app'),
+        ):
+            if re.search(pat, h):
                 return name
         for m in re.finditer(r'<img\b[^>]*>', page_html or '', re.I):
             if _SIZE_IMG_RE.search(m.group(0)):
