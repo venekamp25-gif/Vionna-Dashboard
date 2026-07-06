@@ -1580,8 +1580,6 @@ def _ocr_size_chart(page_html, page_url):
     """Last resort: find a size-chart IMAGE on the page and OCR it with Claude
     vision → {headers, rows}. Only fires on an image that looks size-related (so
     we don't OCR random product photos). Best-effort, never raises."""
-    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
-        return None
     try:
         from urllib.parse import urljoin
         cand = None
@@ -1600,6 +1598,19 @@ def _ocr_size_chart(page_html, page_url):
             img_url = cand
         else:
             img_url = urljoin(page_url, cand)
+        return _ocr_chart_image(img_url)
+    except Exception as e:
+        print(f"[size-chart] ocr failed: {e}")
+        return None
+
+
+def _ocr_chart_image(img_url):
+    """OCR a known size-chart image URL with Claude vision → {headers, rows} or
+    None. Shared by the page-image scan above and app readers (Vitals) whose
+    charts are uploaded images rather than HTML tables. Never raises."""
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        return None
+    try:
         ir = _scrape_get(img_url, timeout=15)
         if ir.status_code != 200 or not ir.content:
             return None
@@ -1674,6 +1685,91 @@ def _smartsize_size_chart(page_html):
         return None
 
 
+def _vitals_size_chart(page_html):
+    """Competitors using the Vitals app (bug #8's reported page). Vitals embeds a
+    product→chart INDEX inline (window.vtlsLiquidData.sizeChart) and fetches the
+    chart itself from an open, unauthenticated JSON endpoint:
+
+        https://appsolve.io/bundle/api/v2/sf/sc/<shopId>/<lang>/<chartId>/<ts>.json
+
+    (endpoint observed from the live widget's own request on the bug-#8 page).
+    Charts are either an HTML table in `content` (parsed directly) or an uploaded
+    image in `imageUrl` (read via the Claude-vision OCR helper). Returns
+    {headers, rows} or None. Best-effort, never raises."""
+    try:
+        if 'vtlsLiquidData' not in (page_html or ''):
+            return None
+        shop = re.search(r'vtlsLiquidData\.shopInfo\s*=\s*\{\s*"?id"?\s*:\s*(\d+)', page_html)
+        key = 'vtlsLiquidData.sizeChart='
+        i = page_html.find(key)
+        if not shop or i < 0:
+            return None
+        # Brace-balanced slice of the index object (it contains nested arrays).
+        seg = page_html[i + len(key):]
+        depth, end = 0, None
+        for j, ch in enumerate(seg[:200000]):
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    end = j + 1
+                    break
+        if end is None:
+            return None
+        idx = json.loads(seg[:end])
+        charts = idx.get('size_charts') or []
+        if not charts:
+            return None
+
+        pid_m = re.search(r'vtlsLiquidData\.product\s*=\s*\{\s*"id"\s*:\s*(\d+)', page_html)
+        pid = pid_m.group(1) if pid_m else None
+        # Product-specific charts first (newest first — the widget shows the most
+        # recently updated one), then general charts as fallback.
+        mine = [c for c in charts if pid and str(pid) in [str(x) for x in (c.get('pIds') or [])]]
+        gen  = [c for c in charts if 'g' in (c.get('types') or [])]
+        cands = sorted(mine, key=lambda c: str(c.get('timestamp') or ''), reverse=True) + gen
+        if not cands:
+            return None
+
+        lang_m = re.search(r'<html[^>]*\blang="([a-z]{2})', page_html, re.I)
+        langs = []
+        for l in ((lang_m.group(1).lower(),) if lang_m else ()) + ('en', 'fr'):
+            if l not in langs:
+                langs.append(l)
+
+        for c in cands[:3]:
+            cid, ts = c.get('id'), c.get('timestamp')
+            if not cid or not ts:
+                continue
+            data = None
+            for lang in langs:
+                try:
+                    r = _scrape_get(f'https://appsolve.io/bundle/api/v2/sf/sc/{shop.group(1)}/{lang}/{cid}/{ts}.json',
+                                    timeout=12)
+                    if r.status_code == 200:
+                        data = r.json()
+                        break
+                except Exception:
+                    continue
+            if not isinstance(data, dict):
+                continue
+            content = data.get('content') or ''
+            if '<table' in str(content):
+                chart = _extract_size_chart(str(content))
+                if chart:
+                    return chart
+            img = data.get('imageUrl')
+            if img:
+                chart = _ocr_chart_image(img)
+                if chart:
+                    return chart
+        return None
+    except Exception as e:
+        print(f"[size-chart] vitals failed: {e}")
+        return None
+
+
 def _detect_size_chart_hint(page_html):
     """When automatic extraction FAILS, sniff whether the page still clearly HAS a
     size chart (a known app / a size-chart image / a size-guide widget) so a human
@@ -1683,9 +1779,8 @@ def _detect_size_chart_hint(page_html):
     Markers are matched with letter-boundaries. A plain substring check used to
     flag EVERY Shopify page as "Pify Size Chart app" because 'shopify' contains
     'pify' (bug #8 — the reported page was actually the Vitals app, mislabeled by
-    that false positive). Vitals embeds its chart INDEX inline
-    (window.vtlsLiquidData.sizeChart) but fetches the table content client-side,
-    so extraction still returns None here → status 'unread'."""
+    that false positive). Vitals charts are now read by _vitals_size_chart above;
+    this hint only fires for Vitals pages whose chart couldn't be fetched/OCR'd."""
     try:
         h = (page_html or '').lower()
         # (regex marker, friendly app name). Order = specificity; first hit wins.
@@ -1717,10 +1812,12 @@ def _detect_size_chart_hint(page_html):
 
 def _extract_size_chart_full(page_html, page_url=''):
     """Size chart from a competitor page, trying in order: HTML <table> → SizeFox/
-    SmartSize app API → Kiwi Sizing app API → image OCR. Returns {headers, rows}."""
+    SmartSize app API → Kiwi Sizing app API → Vitals app → image OCR. Returns
+    {headers, rows}."""
     return (_extract_size_chart(page_html)
             or _smartsize_size_chart(page_html)
             or _kiwi_size_chart(page_html)
+            or _vitals_size_chart(page_html)
             or _ocr_size_chart(page_html, page_url))
 
 
@@ -1739,9 +1836,15 @@ def api_debug_extract_chart():
     c = _extract_size_chart(html)
     if c:
         return jsonify({**out, 'method': 'html', 'chart': c})
+    c = _smartsize_size_chart(html)
+    if c:
+        return jsonify({**out, 'method': 'smartsize', 'chart': c})
     c = _kiwi_size_chart(html)
     if c:
         return jsonify({**out, 'method': 'kiwi', 'chart': c})
+    c = _vitals_size_chart(html)
+    if c:
+        return jsonify({**out, 'method': 'vitals', 'chart': c})
     c = _ocr_size_chart(html, url)
     return jsonify({**out, 'method': ('ocr' if c else None), 'chart': c})
 
