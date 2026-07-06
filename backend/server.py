@@ -10615,9 +10615,12 @@ def _blog_scheduler_loop():
                 art = (res.get('article') or {})
                 boots[st] = {'error': res.get('error'), 'url': art.get('storefront_url')}
                 print(f"[blog] bootstrap {st}: {res.get('error') or art.get('storefront_url')}")
+                if res.get('error'):
+                    _blog_slack(f"🚨 Blog bootstrap [{st.upper()}] faalde: {res['error']}")
             except Exception as e:
                 boots[st] = {'error': str(e)[:200]}
                 print(f"[blog] bootstrap {st} failed: {e}")
+                _blog_slack(f"🚨 Blog bootstrap [{st.upper()}] crashte: {str(e)[:180]}")
         if boots:
             _BLOG_LAST['bootstrap'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z', **boots}
 
@@ -10648,10 +10651,13 @@ def _blog_scheduler_loop():
                                                    'store': st, 'error': res.get('error'),
                                                    'url': art.get('storefront_url')}
                         print(f"[blog] {st}: {res.get('error') or art.get('storefront_url')}")
+                        if res.get('error'):
+                            _blog_slack(f"🚨 Blog-run [{st.upper()}] faalde: {res['error']}")
                     except Exception as e:
                         _BLOG_LAST['scheduled'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
                                                    'store': st, 'error': str(e)[:200]}
                         print(f'[blog] scheduled {st} failed: {e}')
+                        _blog_slack(f"🚨 Blog-run [{st.upper()}] crashte: {str(e)[:180]}")
         except Exception as e:
             print(f'[blog] scheduler error: {e}')
         time.sleep(600)
