@@ -638,13 +638,82 @@ def brand_signals(domain: str) -> list:
     return sigs
 
 
+_BRAND_ABOUT_PATHS = ("/pages/about-us", "/pages/about", "/pages/our-story", "/pages/over-ons")
+
+
+def _brand_llm_verdict(domain: str, evidence: list) -> tuple:
+    """Claude reads the store's own homepage/about copy and judges: real brand/
+    boutique vs dropshipping store. Returns (True/False/None, reason). The text
+    heuristics alone miss exactly the Billy J/MESHKI class, so this is the
+    decisive layer. Only called when the shipping classifier said 'Dropshipper'
+    (i.e. at most once per new source domain; cached by the caller)."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None, ""
+    text = _html_to_text(_fetch_html(f"https://{domain}/") or "")[:5000]
+    for path in _BRAND_ABOUT_PATHS:
+        about = _fetch_html(f"https://{domain}{path}")
+        if about and len(about) > 2000:
+            text += "\n\n[ABOUT PAGE]\n" + _html_to_text(about)[:3000]
+            break
+    if len(text) < 300:
+        return None, ""
+    try:
+        import anthropic, json as _json
+        client = anthropic.Anthropic(api_key=api_key)
+        prompt = (
+            "You are auditing a fashion webshop for a dropshipping business that must ONLY source from "
+            "other dropshippers, never from real brands/boutiques (importing a real brand's products has "
+            "caused expensive cleanups: Billy J, MESHKI).\n\n"
+            "Classify this store as:\n"
+            "A) REAL BRAND / BOUTIQUE - designs or manufactures its own products, or is an established "
+            "label/boutique: own design studio or atelier, physical stores or stockists, wholesale "
+            "program, genuine brand story/history, press features, consistent eponymous branding.\n"
+            "B) DROPSHIPPING STORE - generic products shipped by third-party suppliers: vague or absent "
+            "brand story, template text, discount pop-ups, wide unrelated assortment, long overseas "
+            "shipping, recently renamed/generic boutique-sounding name with no substance behind it.\n\n"
+            f"Store domain: {domain}\n"
+            f"Automated signals found: {', '.join(evidence) or 'none'}\n\n"
+            "STORE'S OWN TEXT (homepage + about):\n" + text +
+            "\n\nRespond ONLY with JSON: {\"is_brand\": true|false, \"confidence\": \"high\"|\"low\", "
+            "\"reason\": \"<max 15 words>\"}. If genuinely unsure, use confidence low."
+        )
+        msg = client.messages.create(model="claude-haiku-4-5-20251001", max_tokens=150,
+                                     messages=[{"role": "user", "content": prompt}])
+        raw = (msg.content[0].text if msg.content else "") or ""
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            return None, ""
+        d = _json.loads(m.group(0))
+        is_brand = bool(d.get("is_brand"))
+        if d.get("confidence") == "low" and not is_brand:
+            return None, ""
+        return is_brand, str(d.get("reason") or "")[:120]
+    except Exception as e:
+        print(f"[brand] llm verdict failed for {domain}: {e}")
+        return None, ""
+
+
 def looks_like_brand(domain: str) -> tuple:
-    """(True, reasons) when brand evidence is strong: a link-based signal (store
-    locator / stockists / wholesale) or >= 2 text markers."""
+    """(True, reasons) when the store looks like a real BRAND/boutique rather
+    than a dropshipper. Layered: cheap link signals (store locator / stockists /
+    wholesale hrefs) decide instantly; otherwise Claude judges the store's own
+    homepage/about copy. Result cached per domain."""
+    key = f"BB|{domain}"
+    if key in _CACHE:
+        return _CACHE[key]
     sigs = brand_signals(domain)
     link_labels = {"store locator", "own stores", "stockists page", "wholesale program", "wholesale/B2B"}
-    strong = [s for s in sigs if s in link_labels]
-    return (bool(strong) or len(sigs) >= 2), sigs
+    if any(s in link_labels for s in sigs):
+        res = (True, sigs)
+    else:
+        verdict, reason = _brand_llm_verdict(domain, sigs)
+        if verdict is True:
+            res = (True, sigs + ([f"AI: {reason}"] if reason else ["AI judged this a real brand"]))
+        else:
+            res = (False, sigs)
+    _CACHE[key] = res
+    return res
 
 
 def classify_detailed(product_url: str, skip_browser: bool = True) -> dict:
