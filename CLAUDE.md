@@ -49,3 +49,21 @@ Notes:
   need any Slack access — only the GitHub repo + (when reachable) the public API.
 - Data-mutation tasks that need live Shopify tokens (`tokens.json`) only work from
   the laptop, not cloud sessions.
+
+---
+
+## 📋 Plans: the approval loop for feature requests
+
+The hands-off pipeline distinguishes two kinds of reports:
+- **Clear code bug** → the fix routine repairs it directly (PR + auto-merge on
+  green CI). No human in the loop.
+- **Feature request / judgement call** → the routine must NOT build. It POSTs a
+  plan to `POST /api/plans` (`{bug_id, title, summary, plan}`); the droplet
+  Slack-pings the CEO with the summary. The CEO approves/rejects in the
+  dashboard (**Tools → Plans**). Approving (token-gated) fires the routine again
+  with the plan text in "APPROVED PLAN" mode — it then builds exactly that plan,
+  opens a PR with auto-merge, and resolves the bug.
+- Plan storage: `backend/plans.jsonl` (gitignored, droplet-only).
+- The routine's cloud environment needs network access to the droplet
+  (`188-166-11-177.nip.io`) for the plan POST + resolve calls; if unreachable it
+  falls back to a draft PR describing the plan.

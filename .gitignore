@@ -34,3 +34,5 @@ IMPLEMENTATION_GUIDE.md
 # OS
 .DS_Store
 Thumbs.db
+plans.jsonl
+backend/plans.jsonl

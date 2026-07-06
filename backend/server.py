@@ -5778,11 +5778,6 @@ def _fire_routine(entry):
     everything it needs (bug details + import context) in the `text` payload
     rather than expecting it to call back for the queue.
     """
-    fire_url = os.getenv('ROUTINE_FIRE_URL', '').strip()
-    token    = os.getenv('ROUTINE_FIRE_TOKEN', '').strip()
-    if not fire_url or not token:
-        return  # auto-fix not configured on this droplet
-
     bug_id = entry.get('id', '?')
     shop_base = os.getenv('PUBLIC_BASE_URL', 'https://188-166-11-177.nip.io').rstrip('/')
     lines = [
@@ -5809,6 +5804,17 @@ def _fire_routine(entry):
     if entry.get('screenshot_filename'):
         lines.append(f"\nScreenshot: {shop_base}/api/bug_reports/{bug_id}/screenshot")
 
+    _fire_routine_text('\n'.join(lines), f'bug #{bug_id}')
+
+
+def _fire_routine_text(text, label):
+    """Transport for kicking the Claude Code routine with an arbitrary payload.
+    Shared by the new-bug fire above and the approved-plan fire below. Returns
+    True when the fire was accepted; best-effort, never raises."""
+    fire_url = os.getenv('ROUTINE_FIRE_URL', '').strip()
+    token    = os.getenv('ROUTINE_FIRE_TOKEN', '').strip()
+    if not fire_url or not token:
+        return False  # auto-fix not configured on this droplet
     headers = {
         'Authorization':    f'Bearer {token}',
         'anthropic-version': '2023-06-01',
@@ -5818,13 +5824,165 @@ def _fire_routine(entry):
     if beta:
         headers['anthropic-beta'] = beta
     try:
-        r = req.post(fire_url, headers=headers, json={'text': '\n'.join(lines)}, timeout=15)
+        r = req.post(fire_url, headers=headers, json={'text': text}, timeout=15)
         if r.status_code >= 300:
-            print(f"[bugs] routine fire returned {r.status_code}: {r.text[:300]}")
-        else:
-            print(f"[bugs] routine fired for #{bug_id}")
+            print(f"[routine] fire for {label} returned {r.status_code}: {r.text[:300]}")
+            return False
+        print(f"[routine] fired for {label}")
+        return True
     except Exception as ex:
-        print(f"[bugs] routine fire failed: {ex}")
+        print(f"[routine] fire for {label} failed: {ex}")
+        return False
+
+
+# ── Plans: the approval loop for feature requests ─────────────────────────────
+# A reported "bug" that is really a feature request (or any change needing a
+# human call) should not be auto-merged. Instead the routine POSTs a PLAN here;
+# the CEO gets a Slack ping with the summary and approves/rejects it from the
+# dashboard. Approving fires the routine again in execute mode. Plans live in a
+# gitignored jsonl next to the bug queue.
+
+PLANS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'plans.jsonl')
+
+
+def _load_plans():
+    out = []
+    if not os.path.exists(PLANS_PATH):
+        return out
+    with open(PLANS_PATH, encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    pass
+    return out
+
+
+def _rewrite_plans(entries):
+    tmp = PLANS_PATH + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        for e in entries:
+            f.write(json.dumps(e, ensure_ascii=False) + '\n')
+    os.replace(tmp, PLANS_PATH)
+
+
+@app.route('/api/plans', methods=['POST'])
+def plans_create():
+    """Submit a plan (called by the fix routine when a report needs a human
+    decision). Body: {bug_id, title, summary, plan}. Same open trust level as
+    bug-report submission — worst case is a spam plan the CEO rejects."""
+    data = request.json or {}
+    title = (data.get('title') or '').strip()[:200]
+    if not title:
+        return jsonify({'error': 'title is required'}), 400
+    plans = _load_plans()
+    plan_id = max([p.get('id', 0) for p in plans] or [0]) + 1
+    entry = {
+        'id':         plan_id,
+        'bug_id':     data.get('bug_id'),
+        'title':      title,
+        'summary':    (data.get('summary') or '').strip()[:2000],
+        'plan':       (data.get('plan') or '').strip()[:20000],
+        'status':     'pending',
+        'created_at': datetime.datetime.utcnow().isoformat() + 'Z',
+        'decided_at': None,
+    }
+    try:
+        with open(PLANS_PATH, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+    except Exception as ex:
+        return jsonify({'error': f'Could not save plan: {ex}'}), 500
+    print(f"[plans] #{plan_id} submitted for bug #{entry['bug_id']}: {title!r}")
+    try:
+        _post_plan_to_slack(entry)
+    except Exception as ex:
+        print(f"[plans] slack notify failed: {ex}")
+    return jsonify({'success': True, 'id': plan_id})
+
+
+def _post_plan_to_slack(entry):
+    """Ping the CEO that a plan is awaiting approval. No-op without webhook."""
+    url = _slack_webhook_url()
+    if not url:
+        return
+    blocks = [
+        {'type': 'header', 'text': {'type': 'plain_text',
+                                    'text': f"📋 Plan #{entry['id']} wacht op akkoord", 'emoji': True}},
+        {'type': 'section', 'text': {'type': 'mrkdwn',
+                                     'text': f"*{entry['title']}*  (bug #{entry.get('bug_id') or '—'})"}},
+    ]
+    if entry.get('summary'):
+        blocks.append({'type': 'section', 'text': {'type': 'mrkdwn', 'text': entry['summary'][:1500]}})
+    blocks.append({'type': 'context', 'elements': [
+        {'type': 'mrkdwn', 'text': 'Open het dashboard → 📋 Plans → *Akkoord* om het automatisch te laten bouwen.'}]})
+    req.post(url, json={'text': f"📋 Plan #{entry['id']} wacht op akkoord: {entry['title']}",
+                        'blocks': blocks}, timeout=10)
+
+
+@app.route('/api/plans', methods=['GET'])
+def plans_list():
+    """List plans. Default: pending only. ?status=all for full history."""
+    status = request.args.get('status', 'pending')
+    plans = _load_plans()
+    if status != 'all':
+        plans = [p for p in plans if p.get('status') == 'pending']
+    plans.sort(key=lambda p: p.get('id', 0), reverse=True)
+    return jsonify({'entries': plans,
+                    'pending_count': sum(1 for p in _load_plans() if p.get('status') == 'pending')})
+
+
+@app.route('/api/plans/<int:plan_id>/approve', methods=['POST'])
+@require_droplet_token
+def plans_approve(plan_id):
+    """CEO approval: mark approved and fire the routine in execute mode. Token-
+    protected — this is the action that spends compute."""
+    plans = _load_plans()
+    entry = next((p for p in plans if p.get('id') == plan_id), None)
+    if not entry:
+        return jsonify({'error': f'plan #{plan_id} not found'}), 404
+    if entry.get('status') != 'pending':
+        return jsonify({'error': f"plan #{plan_id} is already {entry.get('status')}"}), 409
+    shop_base = os.getenv('PUBLIC_BASE_URL', 'https://188-166-11-177.nip.io').rstrip('/')
+    text = '\n'.join([
+        'APPROVED PLAN — execute now, hands-off, following your routine instructions (mode A).',
+        '',
+        f"Plan #{entry['id']} for bug #{entry.get('bug_id') or '?'}: {entry['title']}",
+        f"After the PR is open with auto-merge enabled, mark the bug resolved via:",
+        f"  curl -sS -X POST {shop_base}/api/bug_reports/{entry.get('bug_id') or 0}/resolve",
+        '',
+        '--- PLAN (approved verbatim by the CEO) ---',
+        entry.get('plan') or entry.get('summary') or '(no plan text)',
+    ])
+    if not _fire_routine_text(text, f"plan #{plan_id}"):
+        return jsonify({'error': 'Routine fire failed or not configured — plan left pending.'}), 502
+    entry['status'] = 'approved'
+    entry['decided_at'] = datetime.datetime.utcnow().isoformat() + 'Z'
+    try:
+        _rewrite_plans(plans)
+    except Exception as ex:
+        return jsonify({'error': f'Fired but could not persist status: {ex}'}), 500
+    return jsonify({'success': True, 'id': plan_id, 'status': 'approved'})
+
+
+@app.route('/api/plans/<int:plan_id>/reject', methods=['POST'])
+@require_droplet_token
+def plans_reject(plan_id):
+    """CEO rejection: close the plan without executing."""
+    plans = _load_plans()
+    entry = next((p for p in plans if p.get('id') == plan_id), None)
+    if not entry:
+        return jsonify({'error': f'plan #{plan_id} not found'}), 404
+    if entry.get('status') != 'pending':
+        return jsonify({'error': f"plan #{plan_id} is already {entry.get('status')}"}), 409
+    entry['status'] = 'rejected'
+    entry['decided_at'] = datetime.datetime.utcnow().isoformat() + 'Z'
+    try:
+        _rewrite_plans(plans)
+    except Exception as ex:
+        return jsonify({'error': f'Could not persist: {ex}'}), 500
+    return jsonify({'success': True, 'id': plan_id, 'status': 'rejected'})
 
 
 @app.route('/api/config/slack_webhook', methods=['POST'])

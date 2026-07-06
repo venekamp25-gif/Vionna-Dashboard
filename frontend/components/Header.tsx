@@ -13,7 +13,9 @@ import { KeywordBackfillModal } from "./KeywordBackfillModal";
 import { KeywordResearchModal } from "./KeywordResearchModal";
 import { WhatToListModal } from "./WhatToListModal";
 import { CatalogMaintenanceModal } from "./CatalogMaintenanceModal";
+import { PlansModal } from "./PlansModal";
 import { useCatalogJobs } from "@/lib/catalogJobs";
+import { plansApi } from "@/lib/api";
 
 export function Header() {
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -23,9 +25,25 @@ export function Header() {
   const [researchOpen, setResearchOpen] = useState(false);
   const [whatToListOpen, setWhatToListOpen] = useState(false);
   const [maintenanceOpen, setMaintenanceOpen] = useState(false);
+  const [plansOpen, setPlansOpen] = useState(false);
+  const [pendingPlans, setPendingPlans] = useState(0);
   const [toolsOpen, setToolsOpen] = useState(false);
   const maintenanceRunning = useCatalogJobs().some((j) => j.status === "running");
   const menuRef = useRef<HTMLDivElement>(null);
+
+  // Poll the plan-approval inbox so the CEO sees a badge without opening it.
+  // Light touch: on mount + every 5 minutes.
+  useEffect(() => {
+    let stop = false;
+    const tick = () =>
+      plansApi
+        .list()
+        .then((r) => { if (!stop) setPendingPlans(r.pending_count); })
+        .catch(() => {});
+    void tick();
+    const iv = setInterval(tick, 5 * 60_000);
+    return () => { stop = true; clearInterval(iv); };
+  }, []);
 
   // Close the Tools menu on outside click or Escape.
   useEffect(() => {
@@ -59,6 +77,7 @@ export function Header() {
     { label: "Catalogue maintenance", desc: "Bulk fixes (bold, channels, cutlines, duplicates)", action: () => setMaintenanceOpen(true), running: maintenanceRunning },
     { label: "Publish history", desc: "Products you recently published", action: () => setHistoryOpen(true) },
     { label: "Report a bug", desc: "Something not working? Let us know", action: () => setBugOpen(true), divider: true },
+    { label: pendingPlans > 0 ? `Plans (${pendingPlans})` : "Plans", desc: "Feature requests awaiting your approval", action: () => setPlansOpen(true) },
     { label: "Settings", desc: "API keys & preferences", action: () => setSettingsOpen(true) },
   ];
 
@@ -86,7 +105,7 @@ export function Header() {
             >
               Tools
               <span className={`text-[9px] transition-transform ${toolsOpen ? "rotate-180" : ""}`}>▼</span>
-              {maintenanceRunning && (
+              {(maintenanceRunning || pendingPlans > 0) && (
                 <span className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-accent border border-bg-elev animate-pulse" />
               )}
             </button>
@@ -133,6 +152,7 @@ export function Header() {
       <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
       <HistoryModal open={historyOpen} onClose={() => setHistoryOpen(false)} />
       <ReportBugModal open={bugOpen} onClose={() => setBugOpen(false)} />
+      <PlansModal open={plansOpen} onClose={() => setPlansOpen(false)} onPendingCount={setPendingPlans} />
       <KeywordBackfillModal open={backfillOpen} onClose={() => setBackfillOpen(false)} />
       <KeywordResearchModal open={researchOpen} onClose={() => setResearchOpen(false)} />
       <WhatToListModal open={whatToListOpen} onClose={() => setWhatToListOpen(false)} />
