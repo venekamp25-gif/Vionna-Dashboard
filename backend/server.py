@@ -6756,6 +6756,13 @@ def _bs_host(domain):
     return d if ('.' in d) else ''
 
 
+# Vionna is womenswear: never surface men's/kids items from competitor
+# bestseller pages (some sources, e.g. vesperlorain, now sell menswear too).
+_BS_NOT_WOMENS_RE = re.compile(
+    r"pour hommes?|hommes?|(?<!wo)men'?s?|for men|menswear|herren|heren|"
+    r"herenmode|männer|til mænd|miesten|boys?|kids|kinder", re.I)
+
+
 def _searchanise_handles(html, limit=20):
     """Fallback for stores whose product grid is rendered client-side by the
     Searchanise app: pull the sales-sorted product list from its public API
@@ -6835,6 +6842,9 @@ def _bs_scan(host, limit=20):
     # drop non-products (gift cards, parcel protection etc.) — never suggestions
     products = [p for p in products if not _BS_JUNK_RE.search(p['title'] or '')]
     products.sort(key=lambda x: x['position'])
+    products = [p for p in products
+                if not _BS_NOT_WOMENS_RE.search((p.get('title') or '') + ' ' + (p.get('product_type') or '')
+                                                + ' ' + (p.get('handle') or ''))]
     from collections import Counter
     by_cat = Counter(p['category'] for p in products)
     return {'ok': True, 'domain': host, 'url': url, 'count': len(products),
