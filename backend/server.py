@@ -11160,7 +11160,39 @@ def _blog_run_learn_cycle():
         _blog_slack(f"🚨 Blog-leerronde (playbook) mislukt: {str(e)[:180]}")
 
 
+# Bookkeeping seeds: two articles were (re)generated from the laptop on 2026-07-07
+# (assortment/anchor fixes), so the droplet's history missed them — and dedupe +
+# category-cooldown read that history. Idempotent by article_id; prune after 2026-09.
+_BLOG_HISTORY_SEEDS = [
+    {'ts': '2026-07-07T10:11:38Z', 'store': 'fi', 'keyword': 'hameen tyylivinkit', 'category': 'skirt',
+     'source': 'fallback', 'article_id': 614378504519,
+     'article_handle': 'hameen-tyylivinkit-nain-puet-helman-hienosti',
+     'title': 'Hameen tyylivinkit – näin puet helman hienosti',
+     'url': 'https://p2wmp9-1u.myshopify.com/blogs/journal/hameen-tyylivinkit-nain-puet-helman-hienosti',
+     'published': True},
+    {'ts': '2026-07-07T10:18:19Z', 'store': 'dk', 'keyword': 'sommerkjole', 'category': 'dress',
+     'source': 'fallback', 'article_id': 1007821062493,
+     'article_handle': 'sommerkjoler-der-passer-til-alt',
+     'title': 'Sommerkjoler, der passer til alt – find din favorit',
+     'url': 'https://86d3b0-76.myshopify.com/blogs/journal/sommerkjoler-der-passer-til-alt',
+     'published': True},
+]
+
+
+def _blog_seed_history():
+    try:
+        have = {r.get('article_id') for r in _blog_read_jsonl(BLOG_HISTORY_PATH)}
+        for s in _BLOG_HISTORY_SEEDS:
+            if s['article_id'] not in have:
+                with open(BLOG_HISTORY_PATH, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(s, ensure_ascii=False) + '\n')
+                print(f"[blog] history seed added: {s['store']} {s['article_handle']}")
+    except Exception as e:
+        print(f"[blog] history seed failed: {e}")
+
+
 def _blog_scheduler_loop():
+    _blog_seed_history()
     # One-shot bootstrap: a first real draft for every store that has never posted,
     # shortly after each (re)start. Idempotent — stores with history are skipped, so
     # a restart after fixing a store's token immediately produces its first draft.
