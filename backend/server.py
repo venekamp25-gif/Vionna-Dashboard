@@ -9758,13 +9758,15 @@ BLOG_FALLBACK_TOPICS = {
 }
 
 
-def _blog_fallback_topic(store):
+def _blog_fallback_topic(store, hdrs=None):
     """Pick a fallback topic that (1) wasn't blogged recently, (2) fits the current
-    month ('months' absent = evergreen), (3) respects the category cooldown.
-    Constraints are relaxed in that order rather than returning nothing."""
+    month ('months' absent = evergreen), (3) respects the category cooldown and
+    (4) has actual assortment in this store. Constraints 1-3 are relaxed in that
+    order rather than returning nothing; the assortment gate never relaxes."""
     pool = BLOG_FALLBACK_TOPICS.get(store, [])
     if not pool:
         return None
+    hdrs = hdrs or shopify_headers(store)
     month = datetime.datetime.utcnow().month
     recent = _blog_recent_sigs(store)
     recent_cats = _blog_recent_categories(store)
@@ -9777,10 +9779,17 @@ def _blog_fallback_topic(store):
                 continue
             if cooldown and t.get('category') in recent_cats:
                 continue
+            stock = _blog_category_stock(store, t.get('category'), hdrs)
+            if 0 <= stock < BLOG_MIN_CATEGORY_STOCK:
+                continue
             return t
         return None
 
-    t = _pick(True, True) or _pick(False, True) or _pick(False, False) or pool[0]
+    t = _pick(True, True) or _pick(False, True) or _pick(False, False)
+    if not t:
+        stocked = [x for x in pool
+                   if not (0 <= _blog_category_stock(store, x.get('category'), hdrs) < BLOG_MIN_CATEGORY_STOCK)]
+        t = (stocked or pool)[0]
     return {**{k: v for k, v in t.items() if k != 'months'}, 'source': 'fallback',
             'seasonality': None, 'intent': 'commercial', 'label': None, 'seed': None, 'volume': None}
 
@@ -10228,13 +10237,41 @@ def _blog_ensure(store, hdrs):
     return cr.json()['blog']['id']
 
 
-def _blog_hot_topics(store, k=3):
+def _blog_category_stock(store, cat, hdrs, _cache={}):
+    """How many active products this store carries in `cat:<cat>` (0-10, capped).
+    Guards topic choice against subjects the store doesn't actually sell — the FI
+    store published a wool-coat article while carrying zero coats. Cached per
+    store+cat for the process lifetime; -1 on lookup failure (treated as unknown)."""
+    if not cat:
+        return -1
+    key = (store, cat)
+    if key in _cache:
+        return _cache[key]
+    try:
+        q = ('{ products(first:10, query:%s) { edges { node { id } } } }'
+             % json.dumps(f"tag:'cat:{cat}' AND status:active"))
+        r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                          json={'query': q}, timeout=20)
+        n = len((((r.json().get('data') or {}).get('products') or {}).get('edges') or []))
+    except Exception as e:
+        print(f"[blog] stock probe {store}/{cat} failed: {e}")
+        n = -1
+    _cache[key] = n
+    return n
+
+
+BLOG_MIN_CATEGORY_STOCK = 3   # need at least this many products to blog about a category
+
+
+def _blog_hot_topics(store, k=3, hdrs=None):
     """Rank the hottest blog subjects for a market. Reuses _dfs_keyword_suggestions
     (which attaches seasonality) + _recommend_keywords (volume + in-season + intent
-    scoring), dedupes word-order/plural variants, and drops subjects already blogged
-    recently. Returns up to k topic dicts with a supporting keyword cluster."""
+    scoring), dedupes word-order/plural variants, drops subjects already blogged
+    recently AND subjects the store has no assortment for. Returns up to k topic
+    dicts with a supporting keyword cluster."""
     if not _dfs_configured() or store not in DFS_LOCATION:
         return []
+    hdrs = hdrs or shopify_headers(store)
     seeds = DFS_NICHE_SEEDS.get(store, [])
     floor = max(150, DFS_MIN_VOLUME.get(store, 1000) // 6)
     import concurrent.futures as _cf
@@ -10287,6 +10324,9 @@ def _blog_hot_topics(store, k=3):
             cat = DFS_TYPE_CATEGORY.get(label)
             if respect_cooldown and cat and cat in recent_cats:
                 continue                      # no two dress/pants/... articles back-to-back
+            stock = _blog_category_stock(store, cat, hdrs)
+            if 0 <= stock < BLOG_MIN_CATEGORY_STOCK:
+                continue                      # store barely/doesn't sell this: never blog it
             cluster = [r.get('keyword') for r in sorted(by_seed.get(seed, []),
                        key=lambda r: -(r.get('volume') or 0))
                        if r.get('keyword') and r.get('keyword') != x.get('keyword')
@@ -10341,7 +10381,9 @@ def _blog_match_products(store, category, hdrs, n=6, keyword=None):
     prods = []
     if category:
         prods = _run(f"tag:'cat:{category}' AND status:active")
-    if not prods:
+        # NO generic fallback for categorized topics: unrelated product photos under
+        # e.g. a coat article are worse than fewer images (owner feedback 2026-07-07).
+    else:
         prods = _run("status:active")
     # Colour-siblings are separate products with the same title (flora-sommer-1/2/3);
     # linking near-duplicates reads poorly — keep one per title.
@@ -10728,7 +10770,9 @@ def _blog_qa_gate(store, art):
         f"invent problems to look useful.\n\n"
         f"CHECK: grammar, spelling, morphology/agreement, non-{lang} words, unidiomatic calques, "
         f"broken or truncated sentences, verbatim keyword stuffing, competitor brand/retailer names "
-        f"(Vionna is the only brand allowed), title/meta sanity, dangling HTML.\n\n"
+        f"(Vionna is the only brand allowed), title/meta sanity, dangling HTML.\n"
+        f"IGNORE: URL slugs/handles inside href attributes and product NAMES — those are store "
+        f"data, not article prose (a product may carry a foreign name; that is never an error).\n\n"
         f"TITLE: {art.get('title')}\n"
         f"META: {art.get('meta_description')}\n"
         f"EXCERPT: {art.get('excerpt')}\n"
@@ -10807,14 +10851,18 @@ def _blog_generate_one(store, topic=None, published=None):
     if not hdrs.get('X-Shopify-Access-Token'):
         return {'store': store, 'error': 'no Shopify token for this store'}
     if topic is None:
-        topics = _blog_hot_topics(store, k=3)
+        topics = _blog_hot_topics(store, k=3, hdrs=hdrs)
         if topics:
             topic = {**topics[0], 'source': 'dataforseo'}
         else:
-            topic = _blog_fallback_topic(store)
+            topic = _blog_fallback_topic(store, hdrs=hdrs)
             if not topic:
                 return {'store': store, 'error': 'no topics available (no DataForSEO + no fallback)'}
     products = _blog_match_products(store, topic.get('category'), hdrs, n=6, keyword=topic.get('keyword'))
+    if topic.get('category') and len(products) < BLOG_MIN_CATEGORY_STOCK:
+        return {'store': store, 'topic': topic,
+                'error': f"assortment too thin for category '{topic.get('category')}' "
+                         f"({len(products)} products) — topic rejected"}
     art = _blog_write(store, topic, products)
     if not art or not art.get('title') or not art.get('body_html'):
         return {'store': store, 'topic': topic, 'error': 'writer failed'}
@@ -10890,7 +10938,7 @@ def api_blog_topics():
         return jsonify({'error': 'unknown store'}), 400
     if not _dfs_configured():
         return jsonify({'configured': False, 'message': 'DataForSEO not configured.'})
-    topics = _blog_hot_topics(store, k=int(body.get('k') or 5))
+    topics = _blog_hot_topics(store, k=int(body.get('k') or 5), hdrs=shopify_headers(store))
     return jsonify({'configured': True, 'store': store, 'count': len(topics), 'topics': topics})
 
 
