@@ -10354,7 +10354,7 @@ def _blog_match_products(store, category, hdrs, n=6, keyword=None):
         # NB: BEST_SELLING is a Storefront-API sort key only — the Admin API rejects
         # it (and returns 200 + errors, silently yielding 0 products). Newest first.
         query = ('{ products(first:%d, query:%s, sortKey:CREATED_AT, reverse:true) { edges { node { '
-                 'id title handle featuredImage{url} '
+                 'id title handle productType description(truncateAt: 220) featuredImage{url} '
                  'priceRangeV2{minVariantPrice{amount currencyCode}} } } } }'
                  % (min(n * 3, 50), json.dumps(q)))   # over-fetch: title-dedupe below shrinks the pool
         try:
@@ -10376,6 +10376,8 @@ def _blog_match_products(store, category, hdrs, n=6, keyword=None):
                 'url': '/products/' + (nd.get('handle') or ''),
                 'image': (nd.get('featuredImage') or {}).get('url'),
                 'price': price.get('amount'), 'currency': price.get('currencyCode'),
+                'type': (nd.get('productType') or '').strip(),
+                'desc': ' '.join((nd.get('description') or '').split())[:200],
             })
         return out
     prods = []
@@ -10409,7 +10411,11 @@ def _blog_write(store, topic, products, avoid=None):
     for p in products:
         # No prices in the writer input: native fashion editorial never puts prices in
         # running prose, and the linked product page always shows the current price.
-        prod_lines.append(f"- {p.get('title')} (link: {p.get('url')})")
+        # DO include what the product actually IS (type + description snippet): titles
+        # are just names ("Cecilie"), and guessing led to a boot described as a slipper.
+        kind = ' | '.join(x for x in (p.get('type'), p.get('desc')) if x)
+        prod_lines.append(f"- {p.get('title')} (link: {p.get('url')})"
+                          + (f" — WHAT IT IS: {kind}" if kind else ""))
     prod_block = '\n'.join(prod_lines) if prod_lines else '(no products available — write without product links)'
     seas = topic.get('seasonality') or {}
     season_hint = ''
@@ -10447,9 +10453,12 @@ def _blog_write(store, topic, products, avoid=None):
         "2. Body: valid HTML (no <html>/<head>/<body> wrappers). 600-950 words (native fashion "
         "editorial length), never fewer than 550. Use <h2>/<h3> subheadings and <p>; prose over "
         "bullet lists. Put the primary keyword in the first paragraph and in at least one <h2>.\n"
-        "3. Naturally recommend 3-6 of the products above with inline <a href=\"/products/...\"> links "
-        "on the product name. Add one styling/care tip context around each — never a bare list dump. "
-        "Never mention prices anywhere in the article.\n"
+        "3. Naturally recommend 3-6 of the products above with inline <a href=\"/products/...\"> links. "
+        "The anchor text of a product link is the PRODUCT NAME ONLY (1-3 words) — never wrap a "
+        "sentence or phrase in the link. Describe each product ONLY with attributes from its "
+        "'WHAT IT IS' data (a boot must never be described as a slipper); when the data is thin, "
+        "stay generic rather than inventing details. Add one styling/care tip around each — never "
+        "a bare list dump. Never mention prices anywhere in the article.\n"
         "4. End with a short, warm closing paragraph (1-2 sentences, NO link — call-to-action "
         "buttons are appended automatically below it).\n"
         "5. meta_description: max 155 chars, contains the keyword, enticing.\n"
@@ -10561,6 +10570,31 @@ def _blog_quality_violations(art, store, products=None):
     return v
 
 
+def _blog_fix_anchors(body, products):
+    """Deterministic guard: a product link whose anchor text runs longer than ~45
+    chars (models sometimes wrap half a paragraph) is shrunk to the product name;
+    the rest of the phrase stays as plain text after the link."""
+    by_handle = {(p.get('handle') or ''): (p.get('title') or '') for p in (products or [])}
+
+    def _fix(m):
+        href, anchor = m.group(1), m.group(2)
+        plain = re.sub(r'<[^>]+>', '', anchor).strip()
+        if len(plain) <= 45:
+            return m.group(0)
+        handle = href.rsplit('/', 1)[-1].split('?')[0]
+        name = by_handle.get(handle)
+        if not name:
+            for h, t in by_handle.items():
+                if h and h in href:
+                    name = t
+                    break
+        name = name or ' '.join(plain.split()[:3])
+        rest = plain[len(name):].strip() if plain.lower().startswith(name.lower()) else plain
+        return f'<a href="{href}">{name}</a> {rest}'.rstrip()
+
+    return re.sub(r'<a href="(/products/[^"]+)">(.*?)</a>', _fix, body, flags=re.S)
+
+
 def _blog_inline_product_images(body, products, max_images=3):
     """Insert a clickable product photo right after the paragraph where each linked
     product is first mentioned (up to max_images). Fashion editorial is image-led;
@@ -10662,7 +10696,9 @@ def _blog_edit(store, art, products=None, violations=None):
         f"ALSO ENFORCE:\n{BLOG_ANTI_AI_RULES}\n\n"
         "HARD RULES:\n"
         "- Preserve ALL HTML tags and attributes EXACTLY; every <a href> must survive unchanged "
-        "(same URLs, same count). Do not add or remove links, headings or sections.\n"
+        "(same URLs, same count). Do not add or remove links, headings or sections. Product-link "
+        "anchor text must be the product NAME only (1-3 words): when a link wraps a longer phrase, "
+        "shorten the anchor to the name and leave the rest as plain text.\n"
         "- Do not rewrite content or restructure; minimal edits a copy editor would make. "
         "Improving an unnatural sentence is allowed; changing its meaning is not.\n"
         f"- Keep the primary SEO keyword \"{art.get('primary_keyword') or ''}\" present in the "
@@ -10908,6 +10944,7 @@ def _blog_generate_one(store, topic=None, published=None):
                                        'qa': qa and {'score': qa['score'], 'critical': qa['critical'][:3]}}
     else:
         publish = bool(published)
+    art['body_html'] = _blog_fix_anchors(art['body_html'], products)
     art['body_html'] = _blog_inline_product_images(art['body_html'], products)
     art['body_html'] += _blog_cta_buttons(store, topic, products, hdrs)
     art['body_html'] += _blog_view_beacon(store)
