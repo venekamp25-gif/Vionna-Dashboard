@@ -97,6 +97,15 @@ _PROC_CONTEXT_WORDS = (
     "behandling", "handläggn", "handlaggn", "pakker", "afsendes",
 )
 
+# Sale-countdown banners ("se termine dans 1 jour 12 heures"), promo timers and
+# opening hours all contain day/hour words that are NOT delivery times.
+_NOISE_NEG = (
+    "se termine", "termine dans", "ends in", "eindigt over", "sale ends", "offer ends",
+    "countdown", "compte à rebours", "udløber om", "slutar om",
+    "heures d'ouverture", "heures d’ouverture", "openingstijden", "opening hours",
+    "öffnungszeiten", "åbningstider", "öppettider",
+)
+
 # ── Duration parsing (idea 1+4: unit-aware — biz days / calendar days / weeks / hours) ──
 _WEEK = r"weken|weke|weeks|week|wochen|woche|semaines|semaine|veckor|vecka|uger|uge|uke"
 _HOUR = r"uren|uur|hours|hour|stunden|stunde|heures|heure|timmar|timer|timen"
@@ -123,6 +132,11 @@ def _to_days(lo: int, hi: int, unit: str) -> tuple[int, int]:
 def _dur_days(m: re.Match) -> tuple[int, int]:
     lo = int(m.group(1))
     hi = int(m.group(2)) if m.group(2) else lo
+    # a literal 0-duration is never a shipping time — it's countdown-timer noise
+    # ("se termine dans 0 jour 0 heure…"); without this, the hours→days rounding
+    # (max(1, …)) turns "0 heure" into a bogus 1-day delivery estimate.
+    if lo == 0 and hi == 0:
+        return (0, 0)
     lo, hi = _to_days(lo, hi, m.group("unit"))
     return tuple(sorted((lo, hi)))
 
@@ -318,6 +332,8 @@ def _find_range_near_trigger(text: str, trigger_re: re.Pattern, window: int = 17
     best_lo, best_hi = 0, 0
     for trig in trigger_re.finditer(text):
         seg = text[trig.start(): trig.end() + window]
+        if any(n in seg for n in _NOISE_NEG):
+            continue
         m = _DUR_RE.search(seg)
         if not m:
             continue
@@ -342,6 +358,8 @@ def _find_delivery_range(text: str, window: int = 350) -> tuple:
             local_ctx = seg[ls:le]
             if any(n in local_ctx for n in _RETURN_NEG):
                 continue
+            if any(n in local_ctx for n in _NOISE_NEG):
+                continue
             if any(p in local_ctx for p in _PROC_CONTEXT_WORDS):
                 continue
             lo, hi = _dur_days(m)
@@ -361,6 +379,8 @@ def _scan_all_durations(text: str) -> tuple:
         if not any(w in ctx for w in SHIPPING_CONTEXT_NEAR):
             continue
         if any(n in ctx for n in _RETURN_NEG):
+            continue
+        if any(n in ctx for n in _NOISE_NEG):
             continue
         lo, hi = _dur_days(m)
         if not (1 <= lo <= 90 and 1 <= hi <= 90):
