@@ -248,17 +248,36 @@ export function NanoBananaSteps() {
     const slots: (NbResult | null)[] = new Array(stepFavourites.length).fill(null);
     const slotErrors: (string | undefined)[] = new Array(stepFavourites.length).fill(undefined);
 
-    const calls = stepFavourites.map(async ({ step, ref }, i) => {
-      try {
-        const res = await higgsfieldQueue.run(() => api.higgsfield({
-          prompt_type: 10 + step,   // 11, 12, 13, 14
+    const genOnce = (step: number, ref: string) =>
+      higgsfieldQueue.run(() =>
+        api.higgsfield({
+          prompt_type: 10 + step, // 11, 12, 13, 14
           product_type: data.productType || "dress",
           color,
           image_urls: [ref, ...colorRefs],
           count: 1,
-        }));
-        const url = res.urls?.[0];
-        if (!url) throw new Error(res.error ?? "No image returned");
+        })
+      );
+
+    const calls = stepFavourites.map(async ({ step, ref }, i) => {
+      try {
+        // Image generation is idempotent — retry twice on a transient failure
+        // (a droplet restart mid-deploy or a network blip) instead of failing
+        // the whole colour. Only the final error surfaces on the tile.
+        let res: Awaited<ReturnType<typeof api.higgsfield>> | null = null;
+        let lastErr: unknown;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          if (attempt > 0) await new Promise((r) => setTimeout(r, 1500 * attempt));
+          try {
+            res = await genOnce(step, ref);
+            if (res?.urls?.[0]) break;
+            lastErr = new Error(res?.error ?? "No image returned");
+          } catch (err) {
+            lastErr = err;
+          }
+        }
+        const url = res?.urls?.[0];
+        if (!url) throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
         slots[i] = { url, selected: false };
         slotErrors[i] = undefined;
       } catch (e) {

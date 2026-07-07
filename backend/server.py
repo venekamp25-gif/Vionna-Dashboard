@@ -6212,6 +6212,53 @@ def get_names():
 
 
 # --- Generate content via Claude ---
+# Colour keywords must NOT seed the SHARED copy: a product has one description
+# shared by every colour variant, so "hvid bluse" (white) is wrong on a red one.
+# Strip any keyword containing a colour word before it feeds description/meta/
+# title; colour lives only in the per-variant cutline. Multi-language, accent-
+# normalized whole-token match (short/ambiguous tokens like "or"/"vin" excluded).
+_COLOR_WORDS = {
+    "hvid", "hvide", "white", "blanc", "blanche", "blancs", "valkoinen", "wit", "witte", "weiss", "offwhite",
+    "sort", "sorte", "black", "noir", "noire", "noirs", "musta", "zwart", "zwarte", "schwarz",
+    "rod", "rode", "red", "rouge", "rouges", "punainen", "rood", "rot",
+    "bla", "blue", "blauw", "blauwe", "bleu", "bleue", "bleus", "sininen", "navy", "marine", "marinebla",
+    "morkebla", "tummansininen", "lysebla", "azuur", "azur", "kobalt", "cobalt",
+    "gron", "gronne", "green", "vert", "verte", "verts", "vihrea", "groen", "groene", "grun", "olijf", "olive", "kaki", "khaki",
+    "gul", "gule", "yellow", "jaune", "jaunes", "keltainen", "geel", "gele", "gelb", "oker", "ocre", "mosterd", "mustard", "moutarde",
+    "lyserod", "pink", "rosa", "rose", "roze", "vaaleanpunainen", "fuchsia", "fuksia",
+    "lilla", "purple", "violet", "violette", "pourpre", "viininpunainen", "lila", "paars", "paarse",
+    "aubergine", "bordeaux", "burgundy", "bordo", "wine", "viini",
+    "gra", "grey", "gray", "gris", "grise", "harmaa", "grijs", "grijze", "grau", "antraciet", "anthracite",
+    "brun", "brune", "bruns", "brown", "marron", "ruskea", "bruin", "bruine", "braun", "taupe", "camel", "chocolat", "chocolate", "cognac",
+    "beige", "bez", "ecru", "sand", "sable", "hiekka", "nude", "naturel", "creme", "cream", "kerma", "ivory", "ivoire",
+    "orange", "oranje", "oranssi", "koraal", "coral", "corail", "terracotta", "terrakotta", "abricot", "aprikoosi", "peche", "peach", "perzik",
+    "turquoise", "turkoois", "turkoosi", "teal", "aqua", "mint", "menthe", "mintgroen",
+    "guld", "gold", "dore", "doree", "silver", "solv", "argent", "argente", "kulta", "kultainen", "hopea", "metallic",
+    "multicolor", "multicolour", "multi", "kleurrijk", "colorful", "colore", "monivarinen",
+}
+
+
+_NORDIC_MAP = str.maketrans({"ø": "o", "æ": "ae", "å": "a", "ß": "ss", "ð": "d", "þ": "th"})
+
+
+def _deaccent(s):
+    # oe/ae (and a few others) don't decompose under NFKD, so map them first --
+    # else Danish colours like "rod"/"morkebla" would slip through the filter.
+    s = str(s or "").lower().translate(_NORDIC_MAP)
+    return "".join(c for c in unicodedata.normalize("NFKD", s)
+                   if not unicodedata.combining(c))
+
+
+def _is_color_kw(kw):
+    toks = re.split(r"[\s\-_/]+", _deaccent(kw))
+    return any(t in _COLOR_WORDS for t in toks if t)
+
+
+def _strip_color_kws(keywords):
+    """Drop keywords that name a colour (kept out of the shared copy)."""
+    return [k for k in (keywords or []) if not _is_color_kw(k)]
+
+
 @app.route('/api/generate', methods=['POST'])
 def generate():
     if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
@@ -6223,6 +6270,8 @@ def generate():
     product_name  = data.get('product_name', '')
     product_title = data.get('product_title', '')
     keywords      = data.get('keywords', [])
+    # colour keywords never seed the SHARED description/meta/title
+    keywords      = _strip_color_kws(keywords)
     # When set, regenerate ONLY this single field — one of:
     #   'description' / 'meta_description' / 'm_title_specs'
     # The frontend uses this for per-field "↻" buttons in the Review screen.
@@ -6292,6 +6341,7 @@ Regels:
 - Dan 5 bulletpoints: **eigenschap**: korte uitleg
 - Slotszin over hoe het voelt om te dragen
 - Rustige toon, geen hype, geen superlatieven
+- Noem GEEN specifieke kleur in de tekst — dit product komt in meerdere kleuren en de beschrijving is gedeeld over alle kleurvarianten (kleur wordt apart getoond)
 
 Bestaande meta description (handhaaf consistentie): {current_meta_description!r}
 
@@ -6356,6 +6406,7 @@ Regels:
 - Dan 5 bulletpoints: **eigenschap**: korte uitleg
 - Slotszin over hoe het voelt om te dragen
 - Rustige toon, geen hype, geen superlatieven
+- Noem GEEN specifieke kleur in de tekst — dit product komt in meerdere kleuren en de beschrijving is gedeeld over alle kleurvarianten (kleur wordt apart getoond)
 
 Geef ook (dit zijn de velden die het zwaarst meetellen voor Google — verwerk hierin de belangrijkste keywords uit de lijst hierboven, natuurlijk en leesbaar):
 - meta_description: max 155 tekens, SEO-geoptimaliseerd voor {language}. Verwerk 1-2 van de belangrijkste keywords op een natuurlijke manier.
