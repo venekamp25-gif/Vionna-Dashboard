@@ -63,6 +63,8 @@ export interface PublishResult {
   metafieldErrors: string[];
   productIds?: number[];          // Shopify product ids of the created variants
   verification?: ProductVerify[]; // post-publish re-check (images/cutline/channels)
+  activateRequested?: boolean;    // "Prepare Meta Ads" ticked → product asked to go LIVE
+  liveCount?: number;             // how many of the created variants are actually active
 }
 
 export interface CompetitorImage {

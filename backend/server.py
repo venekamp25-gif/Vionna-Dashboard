@@ -7441,21 +7441,22 @@ def _publish_make_handle(p_name, color):
 
 
 def _find_product_by_handle(store, handle, hdrs):
-    """Return {'id': int} for an existing product at `handle`, else None.
+    """Return {'id': int, 'status': str} for an existing product at `handle`, else None.
     Used as an idempotency guard so re-running a publish (retry / double-click)
-    doesn't create Shopify-suffixed duplicate products. Uses the REST handle
-    filter which returns an exact (not prefix) match."""
+    doesn't create Shopify-suffixed duplicate products. `status` lets the reuse path
+    report whether the product is already live. Uses the REST handle filter which
+    returns an exact (not prefix) match."""
     if not handle:
         return None
     try:
         r = req.get(
-            shopify_url(store, f'products.json?handle={urllib.parse.quote(handle)}&fields=id,handle&status=any'),
+            shopify_url(store, f'products.json?handle={urllib.parse.quote(handle)}&fields=id,handle,status&status=any'),
             headers=hdrs, timeout=15,
         )
         if r.status_code == 200:
             for p in (r.json().get('products') or []):
                 if (p.get('handle') or '') == handle:
-                    return {'id': p.get('id')}
+                    return {'id': p.get('id'), 'status': p.get('status')}
     except Exception as e:
         print(f"[publish] handle-existence check failed for {handle}: {e}")
     return None
@@ -7753,6 +7754,8 @@ def _publish_one_variant(
     collection_id,     # may be None (skip the collects.json POST)
     actual_handle,     # value to write into theme.siblings metafield
     size_chart_html='',  # localised HTML size chart → custom.size_chart metafield
+    activate=False,    # publish LIVE (status=active) instead of draft — set when the
+                       # operator opts into launching (e.g. ticked "Prepare Meta Ads")
     hdrs, base,
 ):
     """Create one colour-variant product. Returns dict:
@@ -7788,12 +7791,24 @@ def _publish_one_variant(
     if existing:
         eid = existing.get('id')
         shop_domain = tokens.get(store, {}).get('shop', '')
-        print(f"[publish] Color '{color}' handle='{product_handle}' already exists (id={eid}) — reusing, skipping create")
+        # This branch is a retry/dedup safety net: the product may have been left in a
+        # PARTIAL state by an earlier failed attempt (missing images/metafields/channels).
+        # We deliberately do NOT auto-flip it live here — activating an unknown-state
+        # product could expose a broken listing, or make it "active but unpublished"
+        # (invisible). But we report its REAL current status: if a prior full run already
+        # made it active, activated=True (honest — no false "not live" warning on the
+        # checklist); if it's still draft, activated=False so the operator is prompted to
+        # check + set it live manually.
+        already_active = (existing.get('status') or '').lower() == 'active'
+        print(f"[publish] Color '{color}' handle='{product_handle}' already exists (id={eid}, "
+              f"status={existing.get('status')}) — reusing, skipping create"
+              + ("" if not activate else (" (already live)" if already_active else " (still draft — not auto-activated)")))
         return {
             'product_id':      eid,
             'product_url':     f'https://{shop_domain}/admin/products/{eid}' if shop_domain else '',
             'metafield_errors': [],
             'reused':          True,
+            'activated':       bool(activate and already_active),
         }
 
     # Download + base64-encode images (reliable — no dependency on Shopify
@@ -7894,9 +7909,29 @@ def _publish_one_variant(
     except Exception as e:
         mf_errors.append(f'sales channels: {e}')
 
+    # --- Go live if requested ---
+    # Flip draft→active only NOW — after images, metafields, collection and channels are
+    # all wired — so the product never appears live-but-empty on the storefront. Opted in
+    # via the "Prepare Meta Ads" tick (you're launching ads, so the product goes live).
+    # `activated` reflects the REAL outcome: if the PUT fails the product stays on draft,
+    # and we surface that (activated=False + an error) so the UI never reports a green
+    # "live" while the product is actually invisible.
+    activated = False
+    if activate:
+        try:
+            act_res = req.put(shopify_url(store, f'products/{prod_id}.json'), headers=hdrs,
+                              json={'product': {'id': prod_id, 'status': 'active'}}, timeout=20)
+            if act_res.status_code in (200, 201):
+                activated = True
+            else:
+                mf_errors.append(f'activate: {act_res.status_code} {act_res.text[:120]}')
+        except Exception as e:
+            mf_errors.append(f'activate: {e}')
+
     shop_domain = tokens.get(store, {}).get('shop', '')
     product_url = f'https://{shop_domain}/admin/products/{prod_id}' if shop_domain else ''
-    return {'product_id': prod_id, 'product_url': product_url, 'metafield_errors': mf_errors}
+    return {'product_id': prod_id, 'product_url': product_url,
+            'metafield_errors': mf_errors, 'activated': activated}
 
 
 # --- Granular publish endpoints (for live per-variant progress in the dashboard) ---
@@ -7969,6 +8004,7 @@ def publish_create_variant():
     collection_id    = data.get('collection_id')
     actual_handle    = data.get('actual_handle', '') or data.get('siblings_handle', '')
     source_url       = (data.get('competitorUrl') or data.get('source_url') or '').strip()
+    activate         = bool(data.get('activate'))   # publish LIVE (active) instead of draft
 
     # Description-driven category → cat:<x> tag (honours a frontend-supplied
     # `category`, else classifies the description).
@@ -7994,6 +8030,7 @@ def publish_create_variant():
         collection_id=collection_id,
         actual_handle=actual_handle,
         size_chart_html=size_chart_html,
+        activate=activate,
         hdrs=hdrs,
         base=base,
     )
@@ -8018,6 +8055,8 @@ def publish_create_variant():
         'product_type':       product_type or None,
         'size_chart_applied': bool(data.get('size_chart')),
         'dfs_recommended':    data.get('dfs_recommended'),
+        # Log the ACTUAL outcome (did it really go active?), not just the request.
+        'published_live':     bool(result.get('activated')),
     })
     return jsonify({'success': True, **result})
 

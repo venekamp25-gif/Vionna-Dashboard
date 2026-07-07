@@ -224,6 +224,11 @@ export interface PublishCreateVariantResponse {
   product_url?: string;
   metafield_errors?: string[];
   error?: string;
+  /** True only if the product was actually flipped to LIVE (status=active). False when
+   *  activate wasn't requested, the flip failed, or the product was reused (retry). */
+  activated?: boolean;
+  /** True when an existing product at this handle was reused (retry/dedup), not created. */
+  reused?: boolean;
 }
 
 // ── Keyword / SEO backfill (regenerate copy for already-listed products) ──
@@ -717,6 +722,8 @@ export const api = {
     competitorUrl?: string;
     /** Scraped competitor size chart — appended (localised) to the description. */
     size_chart?: SizeChart | null;
+    /** Publish LIVE (status=active) instead of draft. Set when "Prepare Meta Ads" is ticked. */
+    activate?: boolean;
   }) => call<PublishCreateVariantResponse>("/api/publish/create_variant", { method: "POST", body: params, authed: true }),
 
   /** Keyword backfill: list a store's products grouped per dress, with current

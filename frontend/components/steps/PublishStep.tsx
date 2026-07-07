@@ -4,7 +4,7 @@ import { useState, useEffect, useRef } from "react";
 import { AnimatedCheckmark } from "@/components/ui/AnimatedCheckmark";
 import { Button } from "@/components/ui/Button";
 import { api, MetaDraftResult } from "@/lib/api";
-import { useProduct, colorLabelFor, pickRandomBgReferenceUrl, ProductVerify, saveLastProduct } from "@/lib/product";
+import { useProduct, colorLabelFor, pickRandomBgReferenceUrl, ProductVerify, PublishResult, saveLastProduct } from "@/lib/product";
 import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
 import { useStep } from "@/lib/step";
 
@@ -45,6 +45,7 @@ export function PublishStep() {
   const { setStore } = useStore();
   const { setStep } = useStep();
   const [kept, setKept] = useState(false);
+  const [metaResults, setMetaResults] = useState<MetaDraftResult[] | null>(null);
 
   const resultsByStore = data.publishResultsByStore ?? {};
   const publishedStores = (Object.keys(resultsByStore) as StoreKey[]).filter(
@@ -155,6 +156,8 @@ export function PublishStep() {
             metafieldErrors={result.metafieldErrors}
             verification={result.verification}
             productIds={result.productIds}
+            activateRequested={result.activateRequested}
+            liveCount={result.liveCount}
             onVerificationUpdate={(v) =>
               setData((prev) => ({
                 ...prev,
@@ -179,6 +182,15 @@ export function PublishStep() {
         productType={data.productType}
         defaultEnabled={!!data.prepareMeta}
         onAutoStarted={() => setData((p) => ({ ...p, prepareMeta: false }))}
+        onComplete={setMetaResults}
+      />
+
+      <PostPublishChecklist
+        stores={fallbackList.filter((s) => !!(resultsByStore[s] ?? (s === data.activeViewStore ? data.publishResult : null)))}
+        resultsByStore={resultsByStore}
+        legacyResult={data.publishResult ?? null}
+        activeViewStore={data.activeViewStore}
+        metaResults={metaResults}
       />
 
       <div className="bg-bg-elev border border-border rounded-2xl px-6 py-4 space-y-2.5">
@@ -218,6 +230,7 @@ function MetaDraftSection({
   productType,
   defaultEnabled = false,
   onAutoStarted,
+  onComplete,
 }: {
   stores: StoreKey[];
   colorKeys: string[];
@@ -227,6 +240,7 @@ function MetaDraftSection({
   productType: string;
   defaultEnabled?: boolean;
   onAutoStarted?: () => void;
+  onComplete?: (results: MetaDraftResult[]) => void;
 }) {
   const [enabled, setEnabled] = useState(defaultEnabled);
   const [selected, setSelected] = useState<Record<string, boolean>>(
@@ -261,9 +275,11 @@ function MetaDraftSection({
       const prog = job.total ? ` (${job.processed}/${job.total})` : "";
       setPhase(`${job.phase || "Working"}${prog}…`);
       if (job.status === "done") {
-        setResults(job.result ?? []);
+        const res = job.result ?? [];
+        setResults(res);
         if (job.summary) setNote(job.summary);
         setLastJobId(null);
+        onComplete?.(res);
         return;
       }
       if (job.status === "error") {
@@ -458,6 +474,8 @@ interface CardProps {
   metafieldErrors: string[];
   verification?: ProductVerify[];
   productIds?: number[];
+  activateRequested?: boolean;
+  liveCount?: number;
   onVerificationUpdate?: (verification: ProductVerify[]) => void;
   getColorLabel: (canonical: string) => string;
   onJump: () => void;
@@ -475,6 +493,8 @@ function StoreResultCard({
   metafieldErrors,
   verification,
   productIds,
+  activateRequested,
+  liveCount,
   onVerificationUpdate,
   getColorLabel,
   onJump,
@@ -564,7 +584,29 @@ function StoreResultCard({
             ) : (
               <strong className="text-text">{siblingsHandle}</strong>
             )}{" "}
-            created · swatches linked. Product is set to <strong>draft</strong> until final review.
+            created · swatches linked.{" "}
+            {(() => {
+              const total = productsCreated ?? canonicalColors.length;
+              const live = liveCount ?? 0;
+              if (!activateRequested) {
+                return (
+                  <>Product is set to <strong>draft</strong> until final review.</>
+                );
+              }
+              if (live >= total && total > 0) {
+                return (
+                  <span className="text-accent font-semibold">
+                    🟢 Product staat LIVE (actief) — zichtbaar &amp; bestelbaar.
+                  </span>
+                );
+              }
+              return (
+                <span className="text-warning font-semibold">
+                  ⚠ Live zetten deels mislukt — {live}/{total} live, de rest staat nog op
+                  concept. Controleer handmatig.
+                </span>
+              );
+            })()}
           </p>
         </div>
       </div>
@@ -683,6 +725,180 @@ function StoreResultCard({
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+/** Post-publish "is alles goed geland?" checklist. Two parts: (1) an AUTO-STATUS block that
+ *  reads the real publish + Meta results and flags only what needs attention (so an all-green
+ *  run needs no manual scrutiny), and (2) a short manual tick-list for the human-eye checks
+ *  the tooling can't make (photos render, copy reads well, campaign set live). Interactive
+ *  ticks are ephemeral (local state) — this is a working checklist, not persisted data. */
+function PostPublishChecklist({
+  stores,
+  resultsByStore,
+  legacyResult,
+  activeViewStore,
+  metaResults,
+}: {
+  stores: StoreKey[];
+  resultsByStore: Partial<Record<StoreKey, PublishResult>>;
+  legacyResult: PublishResult | null;
+  activeViewStore: StoreKey;
+  metaResults: MetaDraftResult[] | null;
+}) {
+  const [checked, setChecked] = useState<Record<string, boolean>>({});
+  if (stores.length === 0) return null;
+
+  const resultFor = (s: StoreKey) =>
+    resultsByStore[s] ?? (s === activeViewStore ? legacyResult : null);
+  const metaFor = (s: StoreKey) => (metaResults ?? []).find((m) => m.store === s) ?? null;
+  const metaRan = !!metaResults && metaResults.length > 0;
+  // Was live-publish (and thus a campaign) opted into for any store? If so and the Meta
+  // job hasn't reported back yet, the run isn't finished — don't declare "all good".
+  const anyActivateRequested = stores.some((s) => resultFor(s)?.activateRequested);
+  const metaPending = anyActivateRequested && !metaRan;
+
+  type Level = "ok" | "warn" | "fail";
+  type Row = { level: Level; label: string };
+  const statusByStore = stores.map((s) => {
+    const r = resultFor(s);
+    const rows: Row[] = [];
+    const total = r?.productsCreated ?? r?.productUrls?.length ?? 0;
+
+    // Live vs draft — the whole point of the new one-click flow.
+    if (r?.activateRequested) {
+      const live = r?.liveCount ?? 0;
+      rows.push(
+        live >= total && total > 0
+          ? { level: "ok", label: `Product staat live (actief) — ${total}/${total} kleuren` }
+          : { level: "fail", label: `Live zetten (deels) mislukt — ${live}/${total} live; rest staat nog op concept` }
+      );
+    } else {
+      // Not opting into live-publish is a deliberate, correct outcome — never a warning.
+      rows.push({ level: "ok", label: "Product staat bewust op concept (niet live gezet)" });
+    }
+
+    // Images + metafields (colour swatch / size chart / siblings).
+    const mfErr = r?.metafieldErrors ?? [];
+    rows.push(
+      mfErr.length === 0
+        ? { level: "ok", label: "Foto's + metafields (kleur, maattabel, siblings) gelukt" }
+        : { level: "warn", label: `${mfErr.length} metafield-waarschuwing(en) — zie de kaart hierboven` }
+    );
+
+    // Post-publish verification (already run at publish time).
+    const ver = r?.verification ?? [];
+    if (ver.length > 0) {
+      const issues = ver.filter((p) => (p.issues ?? []).length > 0);
+      const fails = ver.some((p) => (p.issues ?? []).some((i) => i.level === "fail"));
+      rows.push(
+        issues.length === 0
+          ? { level: "ok", label: "Na-controle: foto's, swatch, kanalen & varianten aanwezig" }
+          : { level: fails ? "fail" : "warn", label: `Na-controle: ${issues.length} product(en) om na te kijken` }
+      );
+    }
+
+    // Meta ad drafts — only for stores that were ACTUALLY part of the ad run (present in
+    // metaResults). A store the user excluded from ads gets no row (not a false warning).
+    const m = metaFor(s);
+    if (m) {
+      rows.push(
+        m.error
+          ? { level: "fail", label: `Meta-ads: mislukt — ${m.error}` }
+          : { level: "ok", label: `Meta-ads: ${m.ad_ids?.length ?? 0} gepauzeerde ad(s) klaar` }
+      );
+    }
+
+    return { store: s, rows };
+  });
+
+  // "All good" = every status row ok AND no campaign still pending.
+  const allOk = !metaPending && statusByStore.every((s) => s.rows.every((r) => r.level === "ok"));
+  const ICON: Record<Level, string> = { ok: "✓", warn: "⚠", fail: "✕" };
+  const COLOR: Record<Level, string> = { ok: "text-accent", warn: "text-warning", fail: "text-danger" };
+
+  const manualItems: { id: string; label: string }[] = [
+    { id: "page", label: "Productpagina bekeken: foto's, kleur-swatches en maattabel-popup kloppen" },
+    { id: "price", label: "Prijs + kortingsprijs kloppen in elke winkel" },
+    ...(metaRan
+      ? [
+          { id: "adcopy", label: "Ad-preview (beeld + tekst) leest goed per taal" },
+          { id: "budget", label: "Budget €30/dag + targeting-land klopt in Ads Manager" },
+          { id: "setlive", label: "Campagne op LIVE gezet in Ads Manager (ads staan nu op pauze)" },
+        ]
+      : []),
+  ];
+  const doneCount = manualItems.filter((i) => checked[i.id]).length;
+
+  return (
+    <div className="bg-bg-elev border border-border rounded-2xl px-6 py-4 space-y-4">
+      <div>
+        <div className="text-[14px] font-semibold text-text">✅ Controle-checklist</div>
+        <p className="text-[11px] text-text-faint mt-0.5 leading-relaxed">
+          Snelle eindcheck. Groen = niks aan de hand; een ⚠ of ✕ hieronder is het enige wat je nog
+          hoeft na te lopen.
+        </p>
+      </div>
+
+      <div className="space-y-2.5">
+        {metaPending ? (
+          <div className="px-3 py-2 rounded-md bg-bg-elev-2 border border-border text-[12px] text-text-dim font-medium">
+            ⏳ Meta-ads zijn nog niet afgerond — zie het kader hierboven. De checklist vult zich
+            aan zodra ze klaar zijn.
+          </div>
+        ) : allOk ? (
+          <div className="px-3 py-2 rounded-md bg-accent/10 border border-accent/30 text-[12px] text-accent font-medium">
+            🎉 Alles ziet er goed uit — geen actie nodig. Loop hieronder alleen nog even de
+            handmatige punten na.
+          </div>
+        ) : (
+          <div className="px-3 py-2 rounded-md bg-warning/10 border border-warning/30 text-[12px] text-warning font-medium">
+            Een paar punten vragen aandacht (⚠ / ✕). De rest ging automatisch goed.
+          </div>
+        )}
+        {statusByStore.map(({ store, rows }) => (
+          <div key={store} className="text-[12px]">
+            <div className="flex items-center gap-1.5 mb-1">
+              <span className="inline-flex items-center">{FLAGS[store]}</span>
+              <span className="font-semibold uppercase tracking-wider">{store}</span>
+            </div>
+            <ul className="space-y-0.5 ml-1">
+              {rows.map((r, i) => (
+                <li key={i} className={`flex items-start gap-1.5 ${COLOR[r.level]}`}>
+                  <span className="mt-px">{ICON[r.level]}</span>
+                  <span className={r.level === "ok" ? "text-text-dim" : ""}>{r.label}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </div>
+
+      <div className="border-t border-border pt-3">
+        <div className="flex items-center justify-between mb-1.5">
+          <span className="text-[12px] font-semibold text-text">Zelf even nalopen</span>
+          <span className="text-[11px] text-text-faint">
+            {doneCount}/{manualItems.length} afgevinkt
+          </span>
+        </div>
+        <div className="space-y-1.5">
+          {manualItems.map((item) => (
+            <label
+              key={item.id}
+              className="flex items-start gap-2 cursor-pointer select-none text-[12px] text-text-dim hover:text-text"
+            >
+              <input
+                type="checkbox"
+                checked={!!checked[item.id]}
+                onChange={(e) => setChecked((p) => ({ ...p, [item.id]: e.target.checked }))}
+                className="mt-0.5 h-4 w-4 accent-[var(--accent)] cursor-pointer"
+              />
+              <span className={checked[item.id] ? "line-through text-text-faint" : ""}>{item.label}</span>
+            </label>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }

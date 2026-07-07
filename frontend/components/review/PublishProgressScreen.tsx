@@ -168,7 +168,8 @@ export function PublishProgressScreen({
           )}
           {!error && prepareMeta && (
             <p className="text-[11px] text-text-faint mt-2">
-              📣 Daarna worden automatisch je Meta Ads-campagnes voorbereid (per kleur).
+              🟢 De producten worden direct <strong>live</strong> gezet (actief) in de gekozen
+              stores. 📣 Daarna worden automatisch je Meta Ads-campagnes voorbereid (per kleur).
             </p>
           )}
         </div>

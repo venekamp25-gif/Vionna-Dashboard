@@ -173,6 +173,7 @@ export function ReviewStep() {
         const productUrls: string[] = [];
         const productIds: number[] = [];
         const allMetafieldErrors: string[] = [];
+        let liveCount = 0; // how many variants actually reached status=active
         const primaryCanonical = data.canonicalColors[0] ?? null;
 
         for (let i = 0; i < data.canonicalColors.length; i++) {
@@ -209,6 +210,9 @@ export function ReviewStep() {
             actual_handle: actualHandle,
             competitorUrl: data.competitorUrl,
             size_chart: data.sizeChart,
+            // "Prepare Meta Ads" ticked ⇒ publish the product LIVE (active) instead of
+            // draft, so it's ready for the ads with no manual draft→active flip.
+            activate: !!data.prepareMeta,
           });
 
           if (!variantRes.success || variantRes.error) {
@@ -219,6 +223,7 @@ export function ReviewStep() {
 
           if (variantRes.product_url) productUrls.push(variantRes.product_url);
           if (variantRes.product_id) productIds.push(variantRes.product_id);
+          if (variantRes.activated) liveCount++;
           if (variantRes.metafield_errors?.length)
             allMetafieldErrors.push(...variantRes.metafield_errors);
 
@@ -245,6 +250,8 @@ export function ReviewStep() {
           collectionUrl: startRes.collection_url ?? null,
           metafieldErrors: allMetafieldErrors,
           productIds,
+          activateRequested: !!data.prepareMeta,
+          liveCount,
         };
         resultsByStore[store] = storeResult;
         lastResult = storeResult;
@@ -404,7 +411,7 @@ export function ReviewStep() {
         <div className="flex items-center gap-3">
           <label
             className="flex items-center gap-2 cursor-pointer select-none text-[12px] text-text-dim hover:text-text"
-            title="Bereid na publiceren PAUSED Meta Ads-campagnes voor (per kleur). Niks gaat live."
+            title="Publiceert het product direct LIVE (actief i.p.v. concept) én bereidt na publiceren PAUSED Meta Ads-campagnes voor (per kleur). De ads zelf blijven gepauzeerd — die zet je zelf live in Ads Manager."
           >
             <input
               type="checkbox"
@@ -413,7 +420,10 @@ export function ReviewStep() {
               disabled={publishing}
               className="h-4 w-4 accent-[var(--accent)] cursor-pointer"
             />
-            <span className="whitespace-nowrap">📣 Prepare Meta&nbsp;Ads</span>
+            <span className="whitespace-nowrap">
+              📣 Prepare Meta&nbsp;Ads
+              <span className="text-accent"> + publiceer live</span>
+            </span>
           </label>
           <Button
             variant="secondary"
