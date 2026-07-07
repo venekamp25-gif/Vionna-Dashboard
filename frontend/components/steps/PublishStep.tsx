@@ -236,17 +236,54 @@ function MetaDraftSection({
   const [results, setResults] = useState<MetaDraftResult[] | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [lastJobId, setLastJobId] = useState<string | null>(null);
+  const [canResume, setCanResume] = useState(false);
   const autoRan = useRef(false);
   const sectionRef = useRef<HTMLDivElement>(null);
 
   const running = phase !== null;
   const chosen = stores.filter((s) => selected[s]);
 
+  // Poll a running backend job to completion. The job lives server-side under jobId, so if the
+  // browser poll window lapses (slow box, closed tab, flaky wifi) the job keeps going — re-polling
+  // the same id later picks up wherever it got to. On timeout we don't error out: we flag the job
+  // as resumable so the operator can reconnect instead of restarting (which would double-create).
+  const pollJob = async (jobId: string) => {
+    setCanResume(false);
+    for (let polls = 0; polls < 600; polls++) {
+      await new Promise((r) => setTimeout(r, 2500));
+      let job;
+      try {
+        job = await api.metaJobStatus(jobId);
+      } catch {
+        continue; // transient network blip — keep polling
+      }
+      const prog = job.total ? ` (${job.processed}/${job.total})` : "";
+      setPhase(`${job.phase || "Working"}${prog}…`);
+      if (job.status === "done") {
+        setResults(job.result ?? []);
+        if (job.summary) setNote(job.summary);
+        setLastJobId(null);
+        return;
+      }
+      if (job.status === "error") {
+        setErr(job.error || job.summary || (job.errors && job.errors[0]) || "The job failed.");
+        return;
+      }
+    }
+    // Browser stopped watching, but the backend job may still be finishing. Keep the id so
+    // "Hervat" can re-attach rather than kicking off a duplicate run.
+    setErr("Timed out — the job may still be running. Click Hervat to keep watching, or check Ads Manager.");
+    setCanResume(true);
+  };
+
   const run = async () => {
     if (chosen.length === 0) return;
     setResults(null);
     setErr(null);
     setNote(null);
+    setCanResume(false);
+    setLastJobId(null);
     try {
       // Hand the whole job to the backend: it generates lifestyle shots, writes copy, uploads
       // images and creates the Flexible ads — all paced server-side. We just poll for progress,
@@ -268,28 +305,23 @@ function MetaDraftSection({
         return;
       }
 
-      const jobId = start.job_id;
-      for (let polls = 0; polls < 600; polls++) {
-        await new Promise((r) => setTimeout(r, 2500));
-        let job;
-        try {
-          job = await api.metaJobStatus(jobId);
-        } catch {
-          continue; // transient network blip — keep polling
-        }
-        const prog = job.total ? ` (${job.processed}/${job.total})` : "";
-        setPhase(`${job.phase || "Working"}${prog}…`);
-        if (job.status === "done") {
-          setResults(job.result ?? []);
-          if (job.summary) setNote(job.summary);
-          return;
-        }
-        if (job.status === "error") {
-          setErr(job.error || job.summary || (job.errors && job.errors[0]) || "The job failed.");
-          return;
-        }
-      }
-      setErr("Timed out waiting for the job — check Ads Manager.");
+      setLastJobId(start.job_id);
+      await pollJob(start.job_id);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPhase(null);
+    }
+  };
+
+  // Re-attach to the last job after a poll timeout — the backend job kept running past the window,
+  // so we resume watching the same jobId instead of starting over (no duplicate campaigns).
+  const resume = async () => {
+    if (!lastJobId) return;
+    setErr(null);
+    try {
+      setPhase("Reconnecting…");
+      await pollJob(lastJobId);
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -361,14 +393,21 @@ function MetaDraftSection({
                 );
               })}
             </div>
-            <Button
-              variant="primary"
-              size="sm"
-              onClick={() => void run()}
-              disabled={running || chosen.length === 0}
-            >
-              {running ? "Working…" : "Create paused drafts"}
-            </Button>
+            <div className="flex items-center gap-2">
+              {canResume && lastJobId && !running && (
+                <Button variant="primary" size="sm" onClick={() => void resume()}>
+                  ↻ Hervat
+                </Button>
+              )}
+              <Button
+                variant={canResume || err ? "secondary" : "primary"}
+                size="sm"
+                onClick={() => void run()}
+                disabled={running || chosen.length === 0}
+              >
+                {running ? "Working…" : canResume || err ? "Opnieuw starten" : "Create paused drafts"}
+              </Button>
+            </div>
           </div>
 
           {phase && <p className="text-[12px] text-text-dim">⏳ {phase}</p>}
