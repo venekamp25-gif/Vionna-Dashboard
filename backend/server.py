@@ -11643,6 +11643,185 @@ except Exception as _e:
     print(f'[blog] could not start scheduler thread: {_e}')
 
 
+# ============================================================================
+# Deletion watchdog — detect products being deleted OUTSIDE the dashboard
+# ----------------------------------------------------------------------------
+# Context (2026-07-08): ~69 FI products turned out to be hard-deleted from the
+# Shopify ADMIN over a month (author: a staff account), silently breaking
+# listings + Meta ad links. The dashboard itself NEVER deletes products, so any
+# Product-destroy event is outside it. This watchdog polls each store's Shopify
+# Events log (verb=destroy) every 6h; new deletions are appended to
+# deletion_log.jsonl and filed as a bug report (Slack ping) naming WHO deleted
+# WHAT and WHEN — so a deletion can never go unnoticed for a month again.
+# First run per store only records a baseline (no alert on historic events).
+# Kill-switch: DELETION_WATCH=0.
+# ============================================================================
+DELETION_LOG_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'deletion_log.jsonl')
+DELETION_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'deletion_watch_state.json')
+
+
+def _deletion_state():
+    try:
+        with open(DELETION_STATE_PATH, encoding='utf-8') as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _deletion_state_save(state):
+    try:
+        with open(DELETION_STATE_PATH, 'w', encoding='utf-8') as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f'[delwatch] state save failed: {e}')
+
+
+def _history_id_name_map():
+    """product_id -> 'Name — Colour' from the publish log, to label deleted ids."""
+    out = {}
+    try:
+        with open(HISTORY_PATH, encoding='utf-8') as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                m = re.search(r'/products/(\d+)', e.get('product_url') or '')
+                if m:
+                    out[m.group(1)] = f"{e.get('product_name') or '?'} — {e.get('color') or '?'}"
+    except Exception:
+        pass
+    return out
+
+
+def _deletion_watch_check():
+    state = _deletion_state()
+    id_names = None
+    for store in list(tokens):
+        try:
+            hdrs = shopify_headers(store)
+            if not hdrs.get('X-Shopify-Access-Token'):
+                continue
+            last = int(state.get(store) or 0)
+            new_events, since = [], (last or None)
+            for _ in range(8):
+                qs = ('events.json?filter=Product&verb=destroy&limit=250'
+                      + (f'&since_id={since}' if since else ''))
+                r = _shopify_call('get', shopify_url(store, qs), hdrs, timeout=25)
+                if r is None or r.status_code != 200:
+                    break
+                evs = (r.json() or {}).get('events') or []
+                if not evs:
+                    break
+                new_events.extend(evs)
+                since = evs[-1]['id']
+                if len(evs) < 250:
+                    break
+            if not new_events:
+                continue
+            state[store] = max(int(e['id']) for e in new_events)
+            _deletion_state_save(state)
+            if not last:
+                print(f'[delwatch] {store}: baseline set ({len(new_events)} historic destroy events, no alert)')
+                continue
+
+            if id_names is None:
+                id_names = _history_id_name_map()
+            lines = []
+            for e in new_events:
+                pid = str(e.get('subject_id') or '')
+                rec = {'store': store, 'product_id': pid,
+                       'name': id_names.get(pid),
+                       'author': e.get('author'),
+                       'deleted_at': e.get('created_at'),
+                       'event_id': e.get('id')}
+                lines.append(rec)
+                try:
+                    with open(DELETION_LOG_PATH, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+                except Exception:
+                    pass
+
+            desc_rows = '\n'.join(
+                f"- {r['deleted_at']} | {r['name'] or ('id ' + r['product_id'])} | door: {r['author'] or '?'}"
+                for r in lines[:40])
+            if len(lines) > 40:
+                desc_rows += f'\n… en nog {len(lines) - 40} meer (zie deletion_log.jsonl)'
+            entry = {
+                'id':             _next_bug_id(),
+                'created_at':     datetime.datetime.utcnow().isoformat() + 'Z',
+                'reporter_email': 'deletion-watchdog',
+                'store':          store,
+                'page_url':       None,
+                'title':          f'🗑️ {len(lines)} product(en) verwijderd op {store.upper()} (buiten de dashboard om)',
+                'description':    ('De waakhond zag nieuwe product-verwijderingen in de Shopify-admin '
+                                   f'van {store.upper()} sinds de vorige controle:\n\n{desc_rows}\n\n'
+                                   'De dashboard verwijdert zelf nooit producten — dit gebeurde dus '
+                                   'handmatig of door een externe app. Controleer of dit de bedoeling '
+                                   'was; onterecht verwijderde producten kunnen via een backfill hersteld worden.'),
+                'diagnostics':    None,
+                'screenshot_filename': None,
+                'status':         'open',
+                'resolved_at':    None,
+            }
+            try:
+                with open(BUG_REPORTS_PATH, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+            except Exception as ex:
+                print(f'[delwatch] bug write failed: {ex}')
+            try:
+                # Slack ping only — deliberately NO _fire_routine: a deletion is a
+                # human/catalog action, not a code bug for the auto-fix pipeline.
+                _post_bug_to_slack(entry)
+            except Exception as ex:
+                print(f'[delwatch] slack notify failed: {ex}')
+            print(f"[delwatch] {store}: {len(lines)} nieuwe verwijdering(en) gemeld (bug #{entry['id']})")
+        except Exception as e:
+            print(f'[delwatch] {store} check failed: {e}')
+
+
+@app.route('/api/deletion_log')
+def deletion_log():
+    """Read-only: recent product-deletion events seen by the watchdog (same
+    sensitivity class as /api/history — product names + admin author names)."""
+    try:
+        limit = min(500, int(request.args.get('limit', 100) or 100))
+    except Exception:
+        limit = 100
+    rows = []
+    try:
+        with open(DELETION_LOG_PATH, encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        continue
+    except FileNotFoundError:
+        pass
+    rows = rows[-limit:][::-1]
+    return jsonify({'entries': rows, 'count': len(rows)})
+
+
+def _deletion_watch_loop():
+    if os.getenv('DELETION_WATCH', '1') == '0':
+        return
+    time.sleep(120)   # let the box settle after (re)start
+    while True:
+        try:
+            _deletion_watch_check()
+        except Exception as e:
+            print(f'[delwatch] loop error: {e}')
+        time.sleep(6 * 3600)
+
+
+try:
+    threading.Thread(target=_deletion_watch_loop, daemon=True, name='deletion-watchdog').start()
+except Exception as _e:
+    print(f'[delwatch] could not start watchdog thread: {_e}')
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print(f"\nVionna Dashboard running on http://localhost:{port}\n")
