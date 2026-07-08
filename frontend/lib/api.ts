@@ -825,7 +825,47 @@ export const api = {
   /** Poll a Meta-draft background job (reuses the catalog-job status route). */
   metaJobStatus: (id: string) =>
     call<MetaDraftJob>(`/api/catalog_job/status?id=${encodeURIComponent(id)}`),
+
+  /** Read-only: recent Meta campaigns (id/name/status) — for the link-repair picker. */
+  metaCampaigns: () =>
+    call<{ campaigns: { id: string; name: string; status: string }[]; count: number }>(
+      "/api/meta/campaigns"
+    ),
+
+  /** Repair an existing campaign's ad destination links to the REAL per-store product handle.
+   *  dry_run (default true) previews without changing anything. Gated. */
+  metaFixLinks: (params: {
+    campaign_id: string;
+    store?: string;
+    product_name?: string;
+    dry_run?: boolean;
+  }) => call<MetaFixLinksResponse>("/api/meta/fix_links", { method: "POST", body: params, authed: true }),
 };
+
+export interface MetaFixLinkRow {
+  ad_id: string;
+  ad_name: string;
+  old_link: string;
+  new_link: string;
+  colour: string | null;
+  match: string;
+  verified_200: boolean;
+  status: string;
+  new_ad_id?: string;
+  old_paused?: boolean;
+}
+export interface MetaFixLinksResponse {
+  campaign_id?: string;
+  campaign_name?: string;
+  store?: string;
+  product_name?: string;
+  dry_run?: boolean;
+  fixed?: number;
+  manual?: number;
+  real_handles?: string[];
+  ads?: MetaFixLinkRow[];
+  error?: string;
+}
 
 export interface MetaDraftResult {
   store: string;

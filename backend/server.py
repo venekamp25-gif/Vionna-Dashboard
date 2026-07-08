@@ -9711,6 +9711,266 @@ def meta_create_draft_job():
     return jsonify({'job_id': jid, 'status': 'running'})
 
 
+# ── Meta Ads: repair wrong destination links on an EXISTING campaign ──────────
+# Campaigns built before v1.189 linked every store to the CANONICAL colour slug (often French),
+# so non-FR stores 404'd (maeve-blanc on .fi instead of maeve-valkoinen). This repair maps each
+# ad back to the store's REAL handle by the colour the (wrong) link still encodes, verifies the
+# new URL returns 200, then creates a corrected ad + pauses the broken one. Editing a delivered
+# ad's creative isn't reliable, so we replace the ad instead.
+
+# token → canonical colour concept (multi-language). Ordered so compound/dark variants win over
+# the plain colour they contain (navy before blue; pink/burgundy before red). Short tokens match
+# only as whole words; long tokens (≥6) also match inside a compacted compound.
+_COLOR_CONCEPT_GROUPS = [
+    ('navy',      ['navy', 'marine', 'marinebla', 'morkebla', 'tummansininen', 'donkerblauw', 'bleu fonce', 'bleufonce', 'darkblue']),
+    ('lightblue', ['lyseblaa', 'lysebla', 'lightblue', 'vaaleansininen', 'bleu clair', 'bleuclair', 'babyblue']),
+    ('blue',      ['blue', 'bleu', 'blauw', 'blau', 'sininen', 'bla', 'blaa', 'azuur', 'azur', 'kobalt', 'cobalt']),
+    ('pink',      ['pink', 'rose', 'roze', 'lyserod', 'roosa', 'vaaleanpunainen', 'rosa', 'fuchsia', 'fuksia']),
+    ('burgundy',  ['burgundy', 'bordeaux', 'bordo', 'wine', 'viininpunainen', 'aubergine']),
+    ('red',       ['red', 'rouge', 'rod', 'roed', 'rood', 'punainen', 'rot']),
+    ('white',     ['white', 'blanc', 'blanche', 'hvid', 'hvide', 'valkoinen', 'wit', 'weiss', 'offwhite', 'ivory', 'ivoire', 'creme', 'cream', 'kerma', 'ecru']),
+    ('black',     ['black', 'noir', 'noire', 'sort', 'sorte', 'musta', 'zwart', 'schwarz']),
+    ('green',     ['green', 'vert', 'verte', 'gron', 'groen', 'groenn', 'vihrea', 'olive', 'olijf', 'kaki', 'khaki', 'mint', 'menthe']),
+    ('yellow',    ['yellow', 'jaune', 'gul', 'keltainen', 'geel', 'gelb', 'mustard', 'moutarde', 'oker', 'ocre']),
+    ('orange',    ['orange', 'oranje', 'oranssi', 'koraal', 'coral', 'corail', 'terracotta', 'abricot', 'peche', 'peach', 'perzik']),
+    ('purple',    ['purple', 'violet', 'violette', 'lilla', 'lila', 'paars', 'pourpre', 'orkidea']),
+    ('grey',      ['grey', 'gray', 'gris', 'grise', 'graa', 'gra', 'harmaa', 'grijs', 'grau', 'antraciet', 'anthracite']),
+    ('brown',     ['brown', 'marron', 'brun', 'brune', 'ruskea', 'bruin', 'braun', 'taupe', 'camel', 'cognac', 'chocolat', 'chocolate']),
+    ('beige',     ['beige', 'bez', 'sand', 'sable', 'hiekka', 'nude', 'naturel', 'kameli']),
+    ('gold',      ['gold', 'guld', 'dore', 'kulta', 'kultainen', 'metallic']),
+    ('silver',    ['silver', 'solv', 'argent', 'hopea']),
+]
+
+
+def _color_concept(s):
+    """Canonical colour concept for a colour word/handle-segment, or None if unrecognised."""
+    padded = ' ' + _deaccent(s).replace('-', ' ').replace('_', ' ') + ' '
+    compact = _deaccent(s).replace('-', '').replace('_', '').replace(' ', '')
+    for concept, words in _COLOR_CONCEPT_GROUPS:
+        for w in words:
+            wd = _deaccent(w)
+            if ' ' + wd + ' ' in padded:                          # whole word
+                return concept
+            if ' ' not in wd and len(wd) >= 6 and wd in compact:   # long compound token
+                return concept
+    return None
+
+
+def _url_ok(url):
+    """True if the URL is reachable (2xx/3xx) using a browser-like UA — so a storefront WAF
+    doesn't 403 a bare python-requests UA and make us skip a valid, live product page."""
+    if not str(url or '').startswith('http'):
+        return False
+    try:
+        r = _scrape_get(url, timeout=15)
+        return 200 <= r.status_code < 400
+    except Exception:
+        return False
+
+
+def _store_variant_handles(store, product_name):
+    """Active product handles for EXACTLY this product title on a store, in creation order. Shopify
+    `title:` is a phrase/token match, so we additionally require the title to slug-equal the name
+    AND the handle to be `<name>` or `<name>-<colour>` — else "Maeve Midi"/"Robe Maeve" would
+    pollute the list and the repair could relink an ad to the wrong product."""
+    if store not in tokens or not product_name:
+        return []
+    hdrs = shopify_headers(store)
+    name_slug = _meta_slug(product_name)
+    name_esc = str(product_name).replace('\\', '\\\\').replace('"', '\\"')
+    out, seen, cursor = [], set(), None
+    for _ in range(6):
+        after = f', after: "{cursor}"' if cursor else ''
+        q = ('{ products(first: 100%s, sortKey: CREATED_AT, query: "title:\\"%s\\" status:active") '
+             '{ edges { cursor node { handle title } } pageInfo { hasNextPage } } }' % (after, name_esc))
+        try:
+            r = req.post(shopify_url(store, 'graphql.json'), headers=hdrs, json={'query': q}, timeout=30)
+            conn = (r.json().get('data') or {}).get('products') or {}
+        except Exception:
+            break
+        edges = conn.get('edges') or []
+        for e in edges:
+            n = e.get('node') or {}
+            h = n.get('handle') or ''
+            if (h and h not in seen and _meta_slug(n.get('title')) == name_slug
+                    and (h == name_slug or h.startswith(name_slug + '-'))):
+                out.append(h)
+                seen.add(h)
+            cursor = e.get('cursor')
+        if not (conn.get('pageInfo') or {}).get('hasNextPage'):
+            break
+    return out
+
+
+@app.route('/api/meta/fix_links', methods=['POST'])
+@require_droplet_token
+def meta_fix_links():
+    """Repair the destination links of an existing campaign's ads (see note above). Pass
+    {campaign_id, store?, product_name?, dry_run?}. dry_run (default) previews without changing
+    anything. Session-token gated. Never spends; only relinks ads to verified-200 product pages."""
+    if not (META_ACCESS_TOKEN and _meta_acct() and META_PAGE_ID):
+        return jsonify({'error': 'Meta not configured in backend/.env'}), 400
+    data = request.json or {}
+    cid = str(data.get('campaign_id') or '').strip()
+    dry = bool(data.get('dry_run', True))
+    if not cid:
+        return jsonify({'error': 'campaign_id required'}), 400
+    camp = _meta_get(cid, {'fields': 'name'})
+    if camp.get('error'):
+        return jsonify({'error': _meta_err(camp, 'campaign')}), 400
+    cname = camp.get('name') or ''
+    store = (data.get('store') or '').lower().strip()
+    if not store:
+        m = re.search(r'\|\s*([A-Za-z]{2})\s*$', cname)
+        store = m.group(1).lower() if m else ''
+    if store not in tokens:
+        return jsonify({'error': f'Kon geen bekende store bepalen uit "{cname}". Geef store mee.'}), 400
+    domain = META_STORE_DOMAIN.get(store)
+    parts = [p.strip() for p in cname.split('|') if p.strip()]
+    product_name = (data.get('product_name') or (parts[1] if len(parts) >= 3 else (parts[0] if parts else ''))).strip()
+    if not (domain and product_name):
+        return jsonify({'error': 'Kon domein of productnaam niet bepalen.'}), 400
+    name_slug = _meta_slug(product_name)
+
+    real_handles = _store_variant_handles(store, product_name)
+    if not real_handles:
+        return jsonify({'error': f'Geen actieve producten met titel "{product_name}" gevonden in '
+                                 f'{store.upper()} — controleer de campagnenaam of geef product_name mee.'}), 400
+
+    def _seg(h):
+        return h[len(name_slug) + 1:] if h.startswith(name_slug + '-') else h
+    by_concept = {}
+    for h in real_handles:
+        by_concept.setdefault(_color_concept(_seg(h)), []).append(h)
+    handle_set = set(real_handles)
+
+    # Fetch ALL ads (follow paging), not just the first page.
+    ads, after = [], None
+    for _ in range(20):
+        params = {'fields': 'name,status,adset_id,creative{id,object_story_spec}', 'limit': 50}
+        if after:
+            params['after'] = after
+        adj = _meta_get(f'{cid}/ads', params)
+        if adj.get('error'):
+            return jsonify({'error': _meta_err(adj, 'ads')}), 400
+        ads.extend(adj.get('data') or [])
+        after = (((adj.get('paging') or {}).get('cursors') or {}).get('after'))
+        if not ((adj.get('paging') or {}).get('next') and after):
+            break
+
+    acct = _meta_acct()
+    su = store.upper()
+    report = []
+    for ad in ads:
+        aid = ad.get('id')
+        aname = ad.get('name') or ''
+        spec = ((ad.get('creative') or {}).get('object_story_spec')) or {}
+        ld = spec.get('link_data') or {}
+        cta_link = ((ld.get('call_to_action') or {}).get('value') or {}).get('link')
+        old_link = ld.get('link') or cta_link or ''
+        old_handle = old_link.rstrip('/').split('/products/')[-1].split('?')[0] if '/products/' in old_link else ''
+        old_seg = _seg(old_handle)
+        concept = _color_concept(old_seg)
+
+        # Choose the target handle — ONLY confident colour matches are eligible to auto-apply:
+        #   • the ad already points at a real handle of this product → already correct;
+        #   • an exact same-colour (same-language) handle exists → use it;
+        #   • the colour concept maps to EXACTLY ONE of this product's handles → use it.
+        # Anything ambiguous / unknown-colour / order-based is left for MANUAL review — never
+        # auto-relinked to a wrong-but-200 page.
+        target, how = None, ''
+        if old_handle and old_handle in handle_set:
+            target, how = old_handle, 'al een echte handle'
+        else:
+            exact = [h for h in real_handles if _meta_slug(_seg(h)) == _meta_slug(old_seg)]
+            cand = by_concept.get(concept) or []
+            if exact:
+                target, how = exact[0], 'exacte kleur'
+            elif concept and len(cand) == 1:
+                target, how = cand[0], f'kleur «{concept}»'
+            else:
+                how = 'kleur onbekend' if not concept else f'kleur «{concept}» ambigu ({len(cand)} kandidaten)'
+        new_link = f'https://{domain}/products/{target}' if target else ''
+        ok200 = _url_ok(new_link) if new_link else False
+
+        row = {'ad_id': aid, 'ad_name': aname, 'old_link': old_link, 'new_link': new_link,
+               'colour': concept, 'match': how, 'verified_200': ok200}
+        if not old_link:
+            row['status'] = 'geen link — overgeslagen'
+            report.append(row)
+            continue
+        if target and old_link == new_link:
+            row['status'] = 'al correct'
+            report.append(row)
+            continue
+        if not target:
+            row['status'] = 'geen betrouwbare kleur-match — handmatig nakijken'
+            report.append(row)
+            continue
+        if not ok200:
+            row['status'] = 'nieuwe URL geeft geen 200 — overgeslagen'
+            report.append(row)
+            continue
+        if dry:
+            row['status'] = 'zou corrigeren (dry-run)'
+            report.append(row)
+            continue
+
+        # --- APPLY ---
+        # Rebuild the creative with the corrected link, reusing the ad's OWN images + copy.
+        hashes = ([ld['image_hash']] if ld.get('image_hash')
+                  else [c.get('image_hash') for c in (ld.get('child_attachments') or []) if c.get('image_hash')])
+        child0 = (ld.get('child_attachments') or [{}])[0]
+        pics = [p for p in [ld.get('picture'), child0.get('picture')] if p]
+        if not hashes and not pics:
+            row['status'] = 'geen afbeelding in bron-ad — overgeslagen (handmatig)'
+            report.append(row)
+            continue
+        primary_text = ld.get('message') or product_name
+        headline = ld.get('name') or child0.get('name') or product_name
+        description = ld.get('description') or child0.get('description') or ''
+        mi = re.search(r'(\d+)\s*$', aname)
+        idx0 = (int(mi.group(1)) - 1) if mi else 0
+        cr = _meta_creative(acct, su, idx0, new_link, primary_text, headline, description, hashes, pics)
+        if not cr.get('id'):
+            row['status'] = 'creative faalde: ' + _meta_err(cr, 'creative')
+            report.append(row)
+            continue
+        # Pause the OLD (broken) ad FIRST — so there is never a moment with two delivering ads.
+        # If the pause fails we do NOT create the new one (avoids double-delivery) and flag it.
+        pause = _meta_post(aid, {'status': 'PAUSED'})
+        if pause.get('error'):
+            row['status'] = 'FOUT: oude ad niet gepauzeerd — niks aangemaakt, pauzeer handmatig: ' + _meta_err(pause, 'ad')
+            report.append(row)
+            continue
+        ad_payload = {'name': f'{aname or su + " ad"} (fixed link)', 'adset_id': ad.get('adset_id'),
+                      'creative': {'creative_id': cr['id']}, 'status': 'ACTIVE'}
+        dom = _reg_domain(new_link)
+        if dom:
+            ad_payload['conversion_domain'] = dom
+        if META_DSA_NAME:
+            ad_payload['dsa_beneficiary'] = META_DSA_NAME
+            ad_payload['dsa_payor'] = META_DSA_NAME
+        newad = _meta_post(f'{acct}/ads', ad_payload)
+        if (newad.get('error') or not newad.get('id')) and META_DSA_NAME:
+            ad_payload.pop('dsa_beneficiary', None)
+            ad_payload.pop('dsa_payor', None)
+            newad = _meta_post(f'{acct}/ads', ad_payload)
+        if not newad.get('id'):
+            row['status'] = 'oude ad gepauzeerd, maar nieuwe ad faalde (maak handmatig aan): ' + _meta_err(newad, 'ad')
+        else:
+            row['status'] = 'gecorrigeerd ✓ (oude ad gepauzeerd)'
+            row['new_ad_id'] = newad['id']
+        time.sleep(0.4)
+        report.append(row)
+
+    fixed = sum(1 for r in report if str(r.get('status', '')).startswith('gecorrigeerd'))
+    manual = sum(1 for r in report if 'handmatig' in str(r.get('status', '')) or 'FOUT' in str(r.get('status', '')))
+    return jsonify({'campaign_id': cid, 'campaign_name': cname, 'store': store,
+                    'product_name': product_name, 'dry_run': dry, 'fixed': fixed, 'manual': manual,
+                    'real_handles': real_handles, 'ads': report})
+
+
 # ============================================================================
 # Blog engine — 2×/week SEO blog posts per store
 # ----------------------------------------------------------------------------

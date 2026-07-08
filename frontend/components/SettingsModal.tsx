@@ -134,6 +134,40 @@ export function SettingsModal({ open, onClose }: Props) {
   // ── Meta Ads connection test: one paused draft, no import needed ──
   const [metaTestBusy, setMetaTestBusy] = useState(false);
   const [metaTestResult, setMetaTestResult] = useState<string | null>(null);
+
+  // ── Meta Ads link repair: fix wrong destination URLs on an existing campaign ──
+  const [fixCampaigns, setFixCampaigns] = useState<{ id: string; name: string; status: string }[] | null>(null);
+  const [fixSel, setFixSel] = useState("");
+  const [fixBusy, setFixBusy] = useState<"" | "load" | "dry" | "apply">("");
+  const [fixReport, setFixReport] = useState<import("@/lib/api").MetaFixLinksResponse | null>(null);
+  const [fixErr, setFixErr] = useState<string | null>(null);
+  const loadFixCampaigns = async () => {
+    setFixBusy("load");
+    setFixErr(null);
+    try {
+      const r = await api.metaCampaigns();
+      setFixCampaigns(r.campaigns ?? []);
+    } catch (e) {
+      setFixErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFixBusy("");
+    }
+  };
+  const runFix = async (dryRun: boolean) => {
+    if (!fixSel) return;
+    setFixBusy(dryRun ? "dry" : "apply");
+    setFixErr(null);
+    setFixReport(null);
+    try {
+      const r = await api.metaFixLinks({ campaign_id: fixSel, dry_run: dryRun });
+      if (r.error) setFixErr(r.error);
+      else setFixReport(r);
+    } catch (e) {
+      setFixErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFixBusy("");
+    }
+  };
   const runMetaTest = async () => {
     setMetaTestBusy(true);
     setMetaTestResult(null);
@@ -638,6 +672,96 @@ export function SettingsModal({ open, onClose }: Props) {
               <p className={`text-[12px] mt-2 ${metaTestResult.startsWith("✓") ? "text-accent" : "text-danger"}`}>
                 {metaTestResult}
               </p>
+            )}
+          </div>
+
+          {/* ── Meta Ads: fix wrong destination links on an existing campaign ── */}
+          <div className="mt-6 pt-6 border-t border-border">
+            <div className="text-[14px] font-semibold text-text mb-1">Meta Ads — repareer ad-links</div>
+            <p className="text-[12px] text-text-faint mb-3 leading-relaxed">
+              Voor campagnes van vóór de handle-fix: koppelt elke ad naar de <strong>juiste</strong>{" "}
+              productpagina van die winkel (op kleur, gecontroleerd op 200). <strong>Dry-run</strong>{" "}
+              toont eerst wat er verandert; <strong>Corrigeer</strong> maakt per foute ad een nieuwe
+              (juiste) ad en pauzeert de oude. Verandert niets aan budget of spend.
+            </p>
+            <div className="flex items-center gap-2 flex-wrap">
+              <Button variant="secondary" size="sm" onClick={() => void loadFixCampaigns()} disabled={fixBusy !== ""}>
+                {fixBusy === "load" ? "Laden…" : "Laad campagnes"}
+              </Button>
+              {fixCampaigns && (
+                <select
+                  value={fixSel}
+                  onChange={(e) => setFixSel(e.target.value)}
+                  className="px-3 h-8 rounded-[10px] bg-bg-elev-2 border border-border text-[12px] max-w-[280px] focus:outline-none focus:border-accent"
+                >
+                  <option value="">Kies een campagne…</option>
+                  {fixCampaigns.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.status === "ACTIVE" ? "🟢 " : "⏸ "}
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+              {fixSel && (
+                <>
+                  <Button variant="secondary" size="sm" onClick={() => void runFix(true)} disabled={fixBusy !== ""}>
+                    {fixBusy === "dry" ? "Checken…" : "Dry-run"}
+                  </Button>
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={() => {
+                      if (
+                        confirm(
+                          "Dit maakt per foute ad een nieuwe ad met de juiste link en pauzeert de oude — in je LIVE Meta-account. Doe eerst een dry-run. Doorgaan?"
+                        )
+                      )
+                        void runFix(false);
+                    }}
+                    disabled={fixBusy !== ""}
+                  >
+                    {fixBusy === "apply" ? "Corrigeren…" : "Corrigeer"}
+                  </Button>
+                </>
+              )}
+            </div>
+            {fixErr && <p className="text-[12px] mt-2 text-danger">⚠ {fixErr}</p>}
+            {fixReport && (
+              <div className="mt-3 text-[12px]">
+                <p className="text-text-dim mb-1.5">
+                  <strong>{fixReport.campaign_name}</strong> · {fixReport.product_name} ·{" "}
+                  {fixReport.dry_run ? "dry-run" : `${fixReport.fixed ?? 0} gecorrigeerd`} ·{" "}
+                  {(fixReport.ads ?? []).length} ads
+                  {(fixReport.manual ?? 0) > 0 && (
+                    <span className="text-warning"> · {fixReport.manual} handmatig nakijken</span>
+                  )}
+                </p>
+                <div className="space-y-1.5 max-h-[280px] overflow-auto pr-1">
+                  {(fixReport.ads ?? []).map((a) => {
+                    const good = a.status === "al correct" || a.status.startsWith("gecorrigeerd") || a.status.startsWith("zou corrigeren");
+                    return (
+                      <div key={a.ad_id} className="border border-border rounded-md px-2.5 py-1.5">
+                        <div className={`font-semibold ${good ? "text-accent" : "text-warning"}`}>
+                          {a.ad_name} — {a.status}
+                          {a.colour ? ` · ${a.colour}` : ""} {a.verified_200 ? "· ✓200" : ""}
+                        </div>
+                        {a.old_link !== a.new_link && (
+                          <div className="text-text-faint break-all mt-0.5">
+                            <span className="line-through">{a.old_link.replace(/^https?:\/\//, "")}</span>
+                            {a.new_link && (
+                              <>
+                                {" → "}
+                                <span className="text-text">{a.new_link.replace(/^https?:\/\//, "")}</span>
+                              </>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
             )}
           </div>
 
