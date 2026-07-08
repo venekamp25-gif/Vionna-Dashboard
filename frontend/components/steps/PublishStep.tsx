@@ -440,7 +440,7 @@ function MetaDraftSection({
                   ) : (
                     <>
                       <span className="text-accent">
-                        ✓ {r.ad_ids?.length ?? 0} paused ad{(r.ad_ids?.length ?? 0) === 1 ? "" : "s"} created
+                        ✓ {r.ad_ids?.length ?? 0} ad{(r.ad_ids?.length ?? 0) === 1 ? "" : "s"} klaar (campagne op pauze)
                       </span>
                       <a
                         href="https://adsmanager.facebook.com/adsmanager/manage/campaigns?act=6399532626780380"
@@ -806,7 +806,7 @@ function PostPublishChecklist({
       rows.push(
         m.error
           ? { level: "fail", label: `Meta-ads: mislukt — ${m.error}` }
-          : { level: "ok", label: `Meta-ads: ${m.ad_ids?.length ?? 0} gepauzeerde ad(s) klaar` }
+          : { level: "ok", label: `Meta-ads: ${m.ad_ids?.length ?? 0} ad(s) klaar — campagne staat op pauze (ad sets & ads staan aan)` }
       );
     }
 
@@ -825,7 +825,7 @@ function PostPublishChecklist({
       ? [
           { id: "adcopy", label: "Ad-preview (beeld + tekst) leest goed per taal" },
           { id: "budget", label: "Budget €30/dag + targeting-land klopt in Ads Manager" },
-          { id: "setlive", label: "Campagne op LIVE gezet in Ads Manager (ads staan nu op pauze)" },
+          { id: "setlive", label: "Campagne op LIVE gezet in Ads Manager — één toggle (ad sets & ads staan al aan)" },
         ]
       : []),
   ];

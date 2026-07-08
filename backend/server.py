@@ -8817,7 +8817,8 @@ def api_update():
 
 # ── Meta Ads ──────────────────────────────────────────────────────────────────
 # Config + a read-only connectivity check. The "Prepare Meta Ads campaign" draft
-# feature builds on this. DRAFTS ONLY — this code never launches or spends.
+# feature builds on this. DRAFTS ONLY — the campaign is always PAUSED, so this code never
+# launches or spends (ad set + ads are active but gated by the paused campaign).
 META_APP_ID        = os.getenv('META_APP_ID')
 META_APP_SECRET    = os.getenv('META_APP_SECRET')
 META_ACCESS_TOKEN  = os.getenv('META_ACCESS_TOKEN')
@@ -9063,8 +9064,9 @@ def meta_channels_debug():
 # ── Meta Ads: create a PAUSED draft campaign ──────────────────────────────────
 # Per store/country: a Sales CBO campaign (€30/day, campaign-level budget) → 1 ad set
 # (geo-targeted to that country, conversion-optimised if a pixel exists) → 1 ad with the
-# product's image, under the Vionna Clothing page. EVERYTHING IS PAUSED — the operator
-# finalises and launches in Ads Manager. This code never sets status ACTIVE and never spends.
+# product's image, under the Vionna Clothing page. The CAMPAIGN is PAUSED (the ad set + ads
+# are created ACTIVE but the paused campaign gates all delivery → €0 spend). This code NEVER
+# sets the campaign active and never spends — the operator launches with one campaign toggle.
 STORE_COUNTRY = {'dk': 'DK', 'fr': 'FR', 'fi': 'FI'}
 
 
@@ -9339,6 +9341,11 @@ def _meta_create_draft(store, product_name, copy, colors, hash_by_url, pixel_id)
     su = str(store).upper()
 
     # 1) Campaign — Sales objective, CBO (budget on the campaign), €30/day, PAUSED.
+    #    ONLY the campaign is paused: the ad set + ads below are created ACTIVE. In Meta the
+    #    campaign status gates everything under it, so a PAUSED campaign delivers nothing and
+    #    spends €0 (still fully money-safe) — but the operator can then launch the whole thing
+    #    with a SINGLE campaign-level toggle instead of un-pausing campaign + ad set + each ad.
+    #    Bonus: the ads enter Meta's review immediately, so they're approved before go-live.
     #    Name mirrors the operator's manual convention: "ADV+ | <product> | <STORE>".
     c = _meta_post(f'{acct}/campaigns', {
         'name': f'ADV+ | {pname} | {su}',
@@ -9346,7 +9353,7 @@ def _meta_create_draft(store, product_name, copy, colors, hash_by_url, pixel_id)
         'special_ad_categories': [],
         'daily_budget': 3000,                       # €30.00 in cents (account is EUR)
         'bid_strategy': 'LOWEST_COST_WITHOUT_CAP',
-        'status': 'PAUSED',
+        'status': 'PAUSED',                         # master toggle — the ONLY paused level
     })
     if c.get('error') or not c.get('id'):
         res['error'] = _meta_err(c, 'campaign')
@@ -9359,7 +9366,7 @@ def _meta_create_draft(store, product_name, copy, colors, hash_by_url, pixel_id)
         'name': f'{su} ad set',
         'campaign_id': c['id'],
         'billing_event': 'IMPRESSIONS',
-        'status': 'PAUSED',
+        'status': 'ACTIVE',   # active, but gated by the PAUSED campaign → no delivery/spend yet
     }
     if pixel_id:
         base['optimization_goal'] = 'OFFSITE_CONVERSIONS'
@@ -9398,7 +9405,7 @@ def _meta_create_draft(store, product_name, copy, colors, hash_by_url, pixel_id)
             'name': f'{su} ad {idx + 1}',
             'adset_id': a['id'],
             'creative': {'creative_id': cr['id']},
-            'status': 'PAUSED',
+            'status': 'ACTIVE',   # active + enters review now; still gated by the PAUSED campaign
         }
         if pixel_id:
             dom = _reg_domain(purl)

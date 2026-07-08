@@ -411,7 +411,7 @@ export function ReviewStep() {
         <div className="flex items-center gap-3">
           <label
             className="flex items-center gap-2 cursor-pointer select-none text-[12px] text-text-dim hover:text-text"
-            title="Publiceert het product direct LIVE (actief i.p.v. concept) én bereidt na publiceren PAUSED Meta Ads-campagnes voor (per kleur). De ads zelf blijven gepauzeerd — die zet je zelf live in Ads Manager."
+            title="Publiceert het product direct LIVE (actief i.p.v. concept) én bereidt na publiceren Meta Ads-campagnes voor (per kleur). Alleen de campagne staat op pauze — de ad sets en ads staan al aan, dus met één toggle in Ads Manager zet je alles tegelijk live."
           >
             <input
               type="checkbox"
