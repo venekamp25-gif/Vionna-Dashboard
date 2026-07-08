@@ -80,6 +80,13 @@ export function PublishStep() {
     if (result?.productUrls?.length) urlByStoreColor[store] = result.productUrls;
   }
   const metaStores = fallbackList.filter((s) => (urlByStoreColor[s]?.length ?? 0) > 0);
+  // Per-store localised colour labels aligned with colorKeys — the ad link is built from the
+  // real Shopify handle (which uses the localised label, e.g. Finnish "musta"), so the Meta
+  // job needs these to reconstruct the correct URL when the admin-id lookup can't be used.
+  const colorLabelsByStore: Partial<Record<StoreKey, string[]>> = {};
+  for (const store of metaStores) {
+    colorLabelsByStore[store] = colorKeys.map((ck) => colorLabelFor(data, ck, store));
+  }
 
   const resetForNewProduct = () => {
     // Stash the finished product so the user can jump back into it later (e.g. to re-test
@@ -180,6 +187,7 @@ export function PublishStep() {
         urlByStoreColor={urlByStoreColor}
         productName={data.name}
         productType={data.productType}
+        colorLabelsByStore={colorLabelsByStore}
         defaultEnabled={!!data.prepareMeta}
         onAutoStarted={() => setData((p) => ({ ...p, prepareMeta: false }))}
         onComplete={setMetaResults}
@@ -228,6 +236,7 @@ function MetaDraftSection({
   urlByStoreColor,
   productName,
   productType,
+  colorLabelsByStore,
   defaultEnabled = false,
   onAutoStarted,
   onComplete,
@@ -238,6 +247,7 @@ function MetaDraftSection({
   urlByStoreColor: Partial<Record<StoreKey, string[]>>;
   productName: string;
   productType: string;
+  colorLabelsByStore: Partial<Record<StoreKey, string[]>>;
   defaultEnabled?: boolean;
   onAutoStarted?: () => void;
   onComplete?: (results: MetaDraftResult[]) => void;
@@ -306,7 +316,11 @@ function MetaDraftSection({
       // so the browser is never blocked and a many-colour product can't overload the box.
       setPhase("Starting…");
       const url_by_store_color: Record<string, string[]> = {};
-      for (const s of chosen) url_by_store_color[s] = urlByStoreColor[s] ?? [];
+      const color_labels_by_store: Record<string, string[]> = {};
+      for (const s of chosen) {
+        url_by_store_color[s] = urlByStoreColor[s] ?? [];
+        color_labels_by_store[s] = colorLabelsByStore[s] ?? [];
+      }
 
       const start = await api.metaCreateDraftJob({
         product_name: productName || "Product",
@@ -315,6 +329,7 @@ function MetaDraftSection({
         color_keys: colorKeys,
         images_by_color: imagesByColor,
         url_by_store_color,
+        color_labels_by_store,
       });
       if (start.error || !start.job_id) {
         setErr(start.error || "Could not start the job.");

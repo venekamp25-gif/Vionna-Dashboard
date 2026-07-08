@@ -9568,12 +9568,33 @@ def _meta_draft_job(jid, payload):
     template = payload.get('template')
     per_color = int(payload.get('lifestyle_per_color') or 2)
 
-    # 0) Build public storefront URLs (custom domain) per store-colour from the DETERMINISTIC
-    #    handle — used for the ad link AND inside the ad copy. Aligned with color_keys order, so
-    #    it doesn't depend on the (often stale) admin product ids the publish step returns.
+    # 0) Build public storefront URLs (custom domain) per store-colour — used for the ad link
+    #    AND inside the ad copy. The link MUST match the handle Shopify actually assigned, which
+    #    is built from the store's LOCALISED colour label (e.g. Finnish "musta", not canonical
+    #    "black") — using the canonical key here 404'd every non-English store. So per colour we:
+    #      1. resolve the REAL handle from the freshly-created product id (admin URL) — ground
+    #         truth, also catches Shopify auto-suffixes;
+    #      2. else fall back to the deterministic handle from the per-store localised label;
+    #      3. else the canonical key.
+    #    Aligned with color_keys order (publish pushes product URLs in the same order).
+    color_labels_by_store = payload.get('color_labels_by_store') or {}
     sf_by_store = {}
     for store in stores:
-        sf_by_store[store] = [_storefront_handle_url(store, product_name, ck) for ck in color_keys]
+        admin_urls = url_by_store_color.get(store) or []
+        labels = color_labels_by_store.get(store) or []
+        urls = []
+        for i, ck in enumerate(color_keys):
+            sf = None
+            admin = admin_urls[i] if i < len(admin_urls) else None
+            if admin:
+                resolved = _storefront_url(store, admin)   # id → real storefront handle
+                if resolved and str(resolved).startswith('http') and '/admin/' not in resolved:
+                    sf = resolved
+            if not sf:
+                label = labels[i] if i < len(labels) else None
+                sf = _storefront_handle_url(store, product_name, label or ck)
+            urls.append(sf)
+        sf_by_store[store] = urls
 
     # 1) Lifestyle generation per colour — paced sequentially so it never overloads the box.
     #    The prompt is season- + product-type-aware (re-stages the model in a seasonal scene).

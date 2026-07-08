@@ -810,6 +810,9 @@ export const api = {
     color_keys: string[];
     images_by_color: Record<string, string[]>;
     url_by_store_color: Record<string, string[]>;
+    /** Per store: localised colour labels aligned with color_keys — so the ad link matches
+     *  the real Shopify handle (built from the localised label, e.g. Finnish "musta"). */
+    color_labels_by_store?: Record<string, string[]>;
     lifestyle_per_color?: number;
     template?: string;
   }) =>
