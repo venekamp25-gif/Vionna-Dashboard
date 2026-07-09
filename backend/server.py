@@ -10687,6 +10687,7 @@ def _blog_hot_topics(store, k=3, hdrs=None):
     cands.sort(key=lambda x: -(x.get('score') or 0))
     recent = _blog_recent_sigs(store)
     recent_cats = _blog_recent_categories(store)
+    gap_sigs = _blog_gap_keywords(store)   # secondary signal: bonus only, never a gate
 
     def _collect(respect_cooldown):
         out = []
@@ -10711,9 +10712,12 @@ def _blog_hot_topics(store, k=3, hdrs=None):
                        and (r.get('keyword') or '').strip().lower() in clean_kws][:6]
             # blogs profit most from 'soon' (peak in 1-2 months = indexed right on time)
             score = (x.get('score') or 0) + (0.35 if bucket == 'soon' else 0)
+            gap_hit = sig in gap_sigs
+            if gap_hit:
+                score += BLOG_GAP_BONUS       # competitor blogs already rank for this
             out.append({
                 'keyword': x.get('keyword'), 'volume': x.get('volume'), 'intent': x.get('intent'),
-                'seasonality': x.get('seasonality'), 'season_bucket': bucket,
+                'seasonality': x.get('seasonality'), 'season_bucket': bucket, 'gap_hit': gap_hit,
                 'score': round(score, 3), 'seed': seed, 'label': label, 'category': cat,
                 'cluster': cluster,
             })
@@ -10776,10 +10780,15 @@ def _blog_match_products(store, category, hdrs, n=6, keyword=None):
     return uniq[:n]
 
 
-def _blog_write(store, topic, products, avoid=None):
+BLOG_FAQ_HEADING = {'dk': 'Ofte stillede spørgsmål', 'fr': 'Questions fréquentes',
+                    'fi': 'Usein kysytyt kysymykset'}
+
+
+def _blog_write(store, topic, products, avoid=None, faq_questions=None):
     """Claude writes the SEO article in the store's language. Returns a dict:
-    {title, handle, meta_description, excerpt, tags[], body_html}. None on failure.
-    avoid: QA findings from a rejected earlier attempt (rewrite mode)."""
+    {title, handle, meta_description, excerpt, tags[], body_html, faq[]}. None on
+    failure. avoid: QA findings from a rejected earlier attempt (rewrite mode).
+    faq_questions: real question-style searches to build the FAQ section from."""
     if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
         return None
     lang = DFS_LANG_NAME.get(store, 'Danish')
@@ -10816,6 +10825,11 @@ def _blog_write(store, topic, products, avoid=None):
         avoid_block = ("\n\nA PREVIOUS ATTEMPT AT THIS ARTICLE WAS REJECTED by a native proofreader "
                        "for the issues below. This is a fresh rewrite: do not repeat any of them.\n"
                        + '\n'.join(f"- {a}" for a in avoid) + "\n")
+    faq_block = ''
+    if faq_questions:
+        faq_block = ("\n\nREAL SEARCH QUESTIONS about this subject (people literally type these into "
+                     "Google — build the FAQ from the most relevant ones, rephrased naturally):\n"
+                     + '\n'.join(f"- {q}" for q in faq_questions[:6]) + "\n")
     prompt = (
         f"You are the content writer for Vionna, writing an SEO blog article. {BLOG_BRAND_VOICE}\n\n"
         f"Write the ENTIRE article in {lang}. Native, fluent, elegant {lang} — not translated-sounding.\n\n"
@@ -10825,7 +10839,7 @@ def _blog_write(store, topic, products, avoid=None):
         f"Supporting keywords to weave in naturally: {', '.join(cluster) if cluster else '(none)'}"
         f"{season_hint}{pb_block}\n\n"
         f"Products from our shop to feature (link them inline with <a href> using the given relative links):\n"
-        f"{prod_block}\n\n"
+        f"{prod_block}{faq_block}\n\n"
         "REQUIREMENTS:\n"
         f"1. Title: compelling, contains the primary keyword, max ~60 chars, in {lang}.\n"
         "2. Body: valid HTML (no <html>/<head>/<body> wrappers). 600-950 words (native fashion "
@@ -10837,16 +10851,22 @@ def _blog_write(store, topic, products, avoid=None):
         "'WHAT IT IS' data (a boot must never be described as a slipper); when the data is thin, "
         "stay generic rather than inventing details. Add one styling/care tip around each — never "
         "a bare list dump. Never mention prices anywhere in the article.\n"
-        "4. End with a short, warm closing paragraph (1-2 sentences, NO link — call-to-action "
+        f"4. After the main sections add an FAQ section: <h2>{BLOG_FAQ_HEADING.get(store, 'FAQ')}</h2> "
+        "with 3-4 pairs of <h3>question</h3> + <p>answer</p>. Prefer the REAL SEARCH QUESTIONS "
+        "above (rephrased naturally, keyword-bearing); answers are 40-70 words, direct and complete "
+        "on their own — they compete for Google's featured snippets. Only questions about the "
+        "SUBJECT of this article; no shipping/returns/company questions.\n"
+        "5. End with a short, warm closing paragraph (1-2 sentences, NO link — call-to-action "
         "buttons are appended automatically below it).\n"
-        "5. meta_description: max 155 chars, contains the keyword, enticing.\n"
-        "6. excerpt: 1 short sentence summary.\n"
-        f"7. tags: 2-3 short {lang} topical tags, never more (they are data for archive pages, "
+        "6. meta_description: max 155 chars, contains the keyword, enticing.\n"
+        "7. excerpt: 1 short sentence summary.\n"
+        f"8. tags: 2-3 short {lang} topical tags, never more (they are data for archive pages, "
         "not shown on the storefront cards).\n"
-        "8. handle: url slug from the title, lowercase, ascii, hyphens, NO year.\n\n"
+        "9. handle: url slug from the title, lowercase, ascii, hyphens, NO year.\n\n"
         "Return ONLY compact JSON with EXACTLY these keys: "
         '{"title": "...", "handle": "...", "meta_description": "...", "excerpt": "...", '
-        '"tags": ["..."], "body_html": "..."}'
+        '"tags": ["..."], "body_html": "...", '
+        '"faq": [{"q": "plain-text question", "a": "plain-text answer"}]}'
     )
     try:
         import anthropic
@@ -10866,6 +10886,11 @@ def _blog_write(store, topic, products, avoid=None):
     tags = data.get('tags') or []
     if isinstance(tags, str):
         tags = [t.strip() for t in tags.split(',') if t.strip()]
+    faq = []
+    for f in (data.get('faq') or [])[:5]:
+        if isinstance(f, dict) and (f.get('q') or '').strip() and (f.get('a') or '').strip():
+            faq.append({'q': re.sub(r'<[^>]+>', '', f['q']).strip()[:200],
+                        'a': re.sub(r'<[^>]+>', '', f['a']).strip()[:600]})
     handle = re.sub(r'[^a-z0-9]+', '-', (data.get('handle') or data.get('title') or 'post').lower()).strip('-')[:80]
     title = (data.get('title') or '').strip()[:120]
     body = data.get('body_html') or ''
@@ -10885,6 +10910,8 @@ def _blog_write(store, topic, products, avoid=None):
         'style_guide_applied': bool(style),
         'editor_pass': False,   # flipped by _blog_edit on success
         'n_em_dash': body.count('—') + body.count('–'),
+        'n_faq': len(faq),
+        'gap_hit': bool(topic.get('gap_hit')),
     }
     return {
         'title': title,
@@ -10893,6 +10920,7 @@ def _blog_write(store, topic, products, avoid=None):
         'excerpt': (data.get('excerpt') or '').strip(),
         'tags': [str(t).strip() for t in tags][:3],
         'body_html': body,
+        'faq': faq,
         'levers': levers,
     }
 
@@ -11213,6 +11241,152 @@ def _blog_qa_gate(store, art):
         return None
 
 
+# --- FAQ on real search questions -------------------------------------------
+BLOG_QUESTION_WORDS = {
+    'dk': ('hvordan', 'hvad', 'hvilke', 'hvilken', 'hvorfor', 'hvornår', 'kan man', 'skal man', 'må man'),
+    'fr': ('comment', 'quelle', 'quel', 'quelles', 'quels', 'pourquoi', 'combien', 'peut-on', 'faut-il'),
+    'fi': ('miten', 'mikä', 'mitkä', 'miksi', 'kuinka', 'mitä', 'voiko', 'sopiiko', 'milloin'),
+}
+
+
+def _blog_faq_questions(store, keyword, limit=6):
+    """Real question-style searches around the topic keyword (DataForSEO keyword
+    suggestions filtered on interrogatives). [] when DFS is unavailable — the
+    writer then formulates natural questions itself."""
+    if not _dfs_configured() or not keyword:
+        return []
+    words = BLOG_QUESTION_WORDS.get(store) or ()
+    out = []
+    try:
+        for k in _dfs_keyword_suggestions(keyword, store, min_volume=0, limit=60):
+            if not isinstance(k, dict) or 'error' in k:
+                continue
+            kw2 = (k.get('keyword') or '').strip().lower()
+            if not kw2:
+                continue
+            if any(kw2.startswith(w + ' ') or f' {w} ' in f' {kw2} ' for w in words) or kw2.endswith('?'):
+                out.append({'q': k.get('keyword'), 'volume': k.get('volume') or 0})
+    except Exception as e:
+        print(f"[blog] faq questions failed: {e}")
+    out.sort(key=lambda x: -x['volume'])
+    return [x['q'] for x in out[:limit]]
+
+
+def _blog_faq_from_body(store, body):
+    """Extract the FAQ pairs from the FINAL body (post-editor), so the JSON-LD
+    matches the published text. Falls back to [] when the section is missing."""
+    heading = BLOG_FAQ_HEADING.get(store, 'FAQ')
+    m = re.search(r'<h2[^>]*>\s*' + re.escape(heading) + r'\s*</h2>(.*?)(?=<h2|\Z)', body or '', re.S | re.I)
+    if not m:
+        return []
+    faq = []
+    for qm in re.finditer(r'<h3[^>]*>(.*?)</h3>\s*<p[^>]*>(.*?)</p>', m.group(1), re.S):
+        q = re.sub(r'<[^>]+>', '', qm.group(1)).strip()
+        a = re.sub(r'<[^>]+>', '', qm.group(2)).strip()
+        if q and a:
+            faq.append({'q': q[:200], 'a': a[:600]})
+    return faq[:5]
+
+
+def _blog_faq_jsonld(faq):
+    """FAQPage structured data (Google rich results / featured snippets)."""
+    ents = [{'@type': 'Question', 'name': f['q'],
+             'acceptedAnswer': {'@type': 'Answer', 'text': f['a']}}
+            for f in (faq or []) if f.get('q') and f.get('a')]
+    if not ents:
+        return ''
+    data = {'@context': 'https://schema.org', '@type': 'FAQPage', 'mainEntity': ents}
+    return '<script type="application/ld+json">' + json.dumps(data, ensure_ascii=False) + '</script>'
+
+
+# --- Internal links between blog articles ------------------------------------
+BLOG_READALSO = {'dk': 'Læs også', 'fr': 'À lire aussi', 'fi': 'Lue myös'}
+
+
+def _blog_related_links(store, category, hdrs, exclude_handle=None, max_links=3):
+    """'Read also' block linking this store's other PUBLISHED articles (same
+    category first, then newest), each verified live (HTTP 200) so a parked
+    draft never gets linked. '' until at least 2 verified candidates exist."""
+    latest = {}
+    for r in _blog_read_jsonl(BLOG_HISTORY_PATH):
+        h = r.get('article_handle')
+        if r.get('store') == store and h and h != exclude_handle:
+            latest[h] = r     # file order = chronological; last row per handle wins
+    rows = [r for r in latest.values() if r.get('published')]
+    rows.sort(key=lambda r: r.get('ts') or '', reverse=True)
+    rows.sort(key=lambda r: 0 if (category and r.get('category') == category) else 1)
+    dom = _blog_primary_domain(store, hdrs)
+    picks = []
+    for r in rows:
+        if len(picks) >= max_links:
+            break
+        try:
+            resp = req.get(f"https://{dom}/blogs/{BLOG_HANDLE}/{r['article_handle']}",
+                           headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+            if resp.status_code == 200:
+                picks.append(r)
+        except Exception:
+            continue
+    if len(picks) < 2:
+        return ''
+    items = ''.join(f'<li><a href="/blogs/{BLOG_HANDLE}/{r["article_handle"]}">'
+                    f'{(r.get("title") or r["article_handle"])}</a></li>' for r in picks)
+    return f'<h2>{BLOG_READALSO.get(store, "Read also")}</h2><ul>{items}</ul>'
+
+
+# --- Content-gap signal (SECONDARY: small bonus, never a gate) ----------------
+BLOG_GAP_BONUS = 0.25
+
+
+def _blog_gap_keywords(store, _cache={}):
+    """Keyword signatures competitor shops' BLOGS already rank for in this market:
+    DataForSEO ranked_keywords on competitor domains, filtered to blog paths.
+    A SECONDARY signal only (owner rule): matching candidates get BLOG_GAP_BONUS
+    on top of the volume+season score — search volume stays the primary driver.
+    Domains from BLOG_GAP_DOMAINS env (comma-sep) or derived from the most-used
+    publish_history source_url domains. Cached per store per day; {} on failure."""
+    day = datetime.datetime.utcnow().strftime('%Y-%m-%d')
+    ck = (store, day)
+    if ck in _cache:
+        return _cache[ck]
+    sigs = set()
+    if _dfs_configured() and store in DFS_LOCATION:
+        domains = [d.strip() for d in os.getenv('BLOG_GAP_DOMAINS', '').split(',') if d.strip()]
+        if not domains:
+            from collections import Counter as _Counter
+            cnt = _Counter()
+            try:
+                with open(HISTORY_PATH, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        try:
+                            src = (json.loads(line).get('source_url') or '').strip()
+                        except Exception:
+                            continue
+                        m = re.match(r'https?://([^/]+)/', src + '/')
+                        if m:
+                            cnt[m.group(1).lower().lstrip('w.')] += 1
+            except Exception:
+                pass
+            domains = [d for d, _ in cnt.most_common(3)]
+        for dom in domains[:3]:
+            payload = [{'target': dom, 'location_code': DFS_LOCATION[store],
+                        'language_code': DFS_LANGUAGE[store], 'limit': 300,
+                        'filters': [['ranked_serp_element.serp_item.relative_url', 'like', '%/blogs%']]}]
+            try:
+                r = req.post(DFS_RANKED_ENDPOINT, headers=_dfs_headers(), json=payload, timeout=40)
+                t = (r.json().get('tasks') or [{}])[0]
+                items = (((t.get('result') or [{}])[0]) or {}).get('items') or []
+                for it in items:
+                    kw = ((it.get('keyword_data') or {}).get('keyword')) or it.get('keyword')
+                    sig = _kw_signature(kw or '')
+                    if sig:
+                        sigs.add(sig)
+            except Exception as e:
+                print(f"[blog] gap probe {dom}/{store} failed: {e}")
+    _cache[ck] = sigs
+    return sigs
+
+
 def _blog_qa_fix_loop(store, art, products, max_fixes=2):
     """QA-gate an article and run up to max_fixes targeted editor rounds on the
     gate's findings, re-gating after each. Returns (art, qa, passed)."""
@@ -11277,7 +11451,8 @@ def _blog_generate_one(store, topic=None, published=None):
         return {'store': store, 'topic': topic,
                 'error': f"assortment too thin for category '{topic.get('category')}' "
                          f"({len(products)} products) — topic rejected"}
-    art = _blog_write(store, topic, products)
+    faqs = _blog_faq_questions(store, topic.get('keyword'))
+    art = _blog_write(store, topic, products, faq_questions=faqs)
     if not art or not art.get('title') or not art.get('body_html'):
         return {'store': store, 'topic': topic, 'error': 'writer failed'}
     art['primary_keyword'] = topic.get('keyword')
@@ -11301,7 +11476,7 @@ def _blog_generate_one(store, topic=None, published=None):
         if not qa_ok:
             print(f"[blog] {store}: QA keeps failing — full rewrite on the same topic")
             prev = ((qa['critical'] + qa['minor'])[:6] if qa else ['previous attempt failed QA'])
-            art2 = _blog_write(store, topic, products, avoid=prev)
+            art2 = _blog_write(store, topic, products, avoid=prev, faq_questions=faqs)
             if art2 and art2.get('title') and art2.get('body_html'):
                 art2['primary_keyword'] = topic.get('keyword')
                 art2 = _blog_edit(store, art2, products)
@@ -11324,11 +11499,19 @@ def _blog_generate_one(store, topic=None, published=None):
         publish = bool(published)
     art['body_html'] = _blog_fix_anchors(art['body_html'], products)
     art['body_html'] = _blog_inline_product_images(art['body_html'], products)
+    related = _blog_related_links(store, topic.get('category'), hdrs, exclude_handle=art.get('handle'))
+    art['body_html'] += related
     art['body_html'] += _blog_cta_buttons(store, topic, products, hdrs)
+    # JSON-LD from the FINAL body text (post-editor), so the structured data
+    # matches what readers see; falls back to the writer's faq array.
+    faq_final = _blog_faq_from_body(store, art['body_html']) or art.get('faq') or []
+    art['body_html'] += _blog_faq_jsonld(faq_final)
     art['body_html'] += _blog_view_beacon(store)
     if isinstance(art.get('levers'), dict):
         art['levers']['n_inline_images'] = art['body_html'].count('loading="lazy"')
         art['levers']['cta_buttons'] = True
+        art['levers']['n_faq'] = len(faq_final)
+        art['levers']['n_internal_links'] = related.count('<li>')
         if qa:
             art['levers']['qa_score'] = qa['score']
     blog_id = _blog_ensure(store, hdrs)
