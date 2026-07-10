@@ -10240,6 +10240,7 @@ def _blog_log(store, topic, article):
                 'published': article.get('published'),
                 'levers': article.get('levers'),
                 'qa': article.get('qa'),
+                'products': article.get('products'),
             }, ensure_ascii=False) + '\n')
     except Exception as e:
         print(f"[blog] history write failed: {e}")
@@ -10626,11 +10627,14 @@ def _blog_category_stock(store, cat, hdrs, _cache={}):
     if key in _cache:
         return _cache[key]
     try:
-        q = ('{ products(first:10, query:%s) { edges { node { id } } } }'
+        q = ('{ products(first:30, query:%s) { edges { node { id title } } } }'
              % json.dumps(f"tag:'cat:{cat}' AND status:active"))
         r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
                           json={'query': q}, timeout=20)
-        n = len((((r.json().get('data') or {}).get('products') or {}).get('edges') or []))
+        edges = (((r.json().get('data') or {}).get('products') or {}).get('edges') or [])
+        # count unique DESIGNS, not raw products: the matcher collapses colour-
+        # siblings by title, so 8 knitwear products can be just 2 linkable items
+        n = len({((e.get('node') or {}).get('title') or '').strip().lower() for e in edges} - {''})
     except Exception as e:
         print(f"[blog] stock probe {store}/{cat} failed: {e}")
         n = -1
@@ -10729,9 +10733,10 @@ def _blog_hot_topics(store, k=3, hdrs=None):
     return topics[:k]
 
 
-def _blog_match_products(store, category, hdrs, n=6, keyword=None):
+def _blog_match_products(store, category, hdrs, n=6, keyword=None, exclude=None):
     """Return up to n on-catalogue products to link, matched by the topic's
-    `cat:<x>` tag (best-sellers first). Falls back to newest active products."""
+    `cat:<x>` tag (newest first). exclude: handles featured in recent articles
+    (skipped while enough alternatives remain)."""
     def _run(q):
         # NB: BEST_SELLING is a Storefront-API sort key only — the Admin API rejects
         # it (and returns 200 + errors, silently yielding 0 products). Newest first.
@@ -10777,6 +10782,12 @@ def _blog_match_products(store, category, hdrs, n=6, keyword=None):
         if key and key not in seen:
             seen.add(key)
             uniq.append(p)
+    # Variety across articles: prefer products NOT featured in the store's recent
+    # posts (matcher sorts newest-first, which otherwise reuses the same items).
+    if exclude:
+        fresh = [p for p in uniq if (p.get('handle') or '') not in exclude]
+        if len(fresh) >= min(n, BLOG_MIN_CATEGORY_STOCK):
+            uniq = fresh
     return uniq[:n]
 
 
@@ -10849,8 +10860,10 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None):
         "The anchor text of a product link is the PRODUCT NAME ONLY (1-3 words) — never wrap a "
         "sentence or phrase in the link. Describe each product ONLY with attributes from its "
         "'WHAT IT IS' data (a boot must never be described as a slipper); when the data is thin, "
-        "stay generic rather than inventing details. Add one styling/care tip around each — never "
-        "a bare list dump. Never mention prices anywhere in the article.\n"
+        "stay generic rather than inventing details. If a product does NOT genuinely fit the "
+        "article's topic, LEAVE IT OUT entirely — a few correct links beat forced ones, and never "
+        "stretch a product to fit (a denim dress is not wedding wear). Add one styling/care tip "
+        "around each — never a bare list dump. Never mention prices anywhere in the article.\n"
         f"4. After the main sections add an FAQ section: <h2>{BLOG_FAQ_HEADING.get(store, 'FAQ')}</h2> "
         "with 3-4 pairs of <h3>question</h3> + <p>answer</p>. Prefer the REAL SEARCH QUESTIONS "
         "above (rephrased naturally, keyword-bearing); answers are 40-70 words, direct and complete "
@@ -11125,11 +11138,13 @@ def _blog_edit(store, art, products=None, violations=None):
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=8000,
+        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=16000,
                                       messages=[{'role': 'user', 'content': prompt}])
         txt = (msg.content[0].text if msg.content else '') or ''
         m = re.search(r'\{.*\}', txt, re.S)
         if not m:
+            # usually output-cap truncation (the editor must echo the FULL body);
+            # keeping the writer version is safe but skips the fixes
             print('[blog] editor returned no JSON; keeping writer version')
             return art
         data = json.loads(m.group(0))
@@ -11387,6 +11402,53 @@ def _blog_gap_keywords(store, _cache={}):
     return sigs
 
 
+def _blog_recent_product_handles(store, n_articles=2):
+    """Product handles linked in this store's most recent articles — excluded from
+    the next match so consecutive posts don't showcase the same products."""
+    rows = [r for r in _blog_read_jsonl(BLOG_HISTORY_PATH)
+            if r.get('store') == store and r.get('products')]
+    out = set()
+    for r in rows[-n_articles:]:
+        out.update(h for h in r['products'] if h)
+    return out
+
+
+def _blog_products_fit_topic(store, topic, products):
+    """LLM sanity check: which candidate products genuinely FIT the article topic?
+    The category gate is coarse (a 'wedding dress' topic passes on 368 generic
+    dresses — and a denim dress got presented as wedding wear). Strict for
+    subtype topics, lenient for broad ones. Fail-open on any error: the writer's
+    leave-it-out rule is the second net."""
+    kw = (topic or {}).get('keyword') or ''
+    if not products or not kw or not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        return products
+    lines = [f"{i}. {p.get('title')} — {((p.get('type') or '') + ' ' + (p.get('desc') or ''))[:170].strip()}"
+             for i, p in enumerate(products)]
+    prompt = (
+        f"A fashion-webshop blog article will be written about the search topic: \"{kw}\".\n"
+        "Below are candidate products from the shop. Return ONLY a JSON array with the NUMBERS of "
+        "the products a reasonable shopper would accept as genuinely fitting that topic.\n"
+        "Be STRICT for specific topics: a denim dress is NOT a wedding dress, sneakers are not "
+        "evening shoes, a bikini is not officewear. An item of a DIFFERENT garment type than the "
+        "topic never fits: a jumpsuit/combinaison/haalari is not a dress, a skirt is not trousers. "
+        "For broad topics (plain 'dresses', 'shoes') most items of that exact kind fit.\n\n"
+        + '\n'.join(lines))
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=100,
+                                      messages=[{'role': 'user', 'content': prompt}])
+        txt = (msg.content[0].text if msg.content else '') or ''
+        m = re.search(r'\[.*?\]', txt, re.S)
+        if not m:
+            return products
+        keep = {int(i) for i in json.loads(m.group(0)) if isinstance(i, (int, float))}
+        return [p for i, p in enumerate(products) if i in keep]
+    except Exception as e:
+        print(f"[blog] product-fit filter failed (fail-open): {e}")
+        return products
+
+
 def _blog_qa_fix_loop(store, art, products, max_fixes=2):
     """QA-gate an article and run up to max_fixes targeted editor rounds on the
     gate's findings, re-gating after each. Returns (art, qa, passed)."""
@@ -11438,19 +11500,34 @@ def _blog_generate_one(store, topic=None, published=None):
     hdrs = shopify_headers(store)
     if not hdrs.get('X-Shopify-Access-Token'):
         return {'store': store, 'error': 'no Shopify token for this store'}
+    # Candidate topics: caller-supplied, else top DFS topics + fallback. Each
+    # candidate must survive the product-FIT check (subtype topics like 'robe de
+    # mariée' pass the coarse category gate on 368 generic dresses, but a denim
+    # dress is not wedding wear — reject and try the next subject instead).
+    if topic is not None:
+        candidates = [topic]
+    else:
+        candidates = [{**t, 'source': 'dataforseo'} for t in _blog_hot_topics(store, k=3, hdrs=hdrs)]
+        fb = _blog_fallback_topic(store, hdrs=hdrs)
+        if fb:
+            candidates.append(fb)
+        if not candidates:
+            return {'store': store, 'error': 'no topics available (no DataForSEO + no fallback)'}
+    exclude = _blog_recent_product_handles(store)
+    topic, products = None, []
+    for cand in candidates:
+        prods = _blog_match_products(store, cand.get('category'), hdrs, n=6,
+                                     keyword=cand.get('keyword'), exclude=exclude)
+        prods = _blog_products_fit_topic(store, cand, prods)
+        if cand.get('category') and len(prods) < BLOG_MIN_CATEGORY_STOCK:
+            print(f"[blog] {store}: topic '{cand.get('keyword')}' rejected — "
+                  f"only {len(prods)} genuinely fitting products")
+            continue
+        topic, products = cand, prods
+        break
     if topic is None:
-        topics = _blog_hot_topics(store, k=3, hdrs=hdrs)
-        if topics:
-            topic = {**topics[0], 'source': 'dataforseo'}
-        else:
-            topic = _blog_fallback_topic(store, hdrs=hdrs)
-            if not topic:
-                return {'store': store, 'error': 'no topics available (no DataForSEO + no fallback)'}
-    products = _blog_match_products(store, topic.get('category'), hdrs, n=6, keyword=topic.get('keyword'))
-    if topic.get('category') and len(products) < BLOG_MIN_CATEGORY_STOCK:
-        return {'store': store, 'topic': topic,
-                'error': f"assortment too thin for category '{topic.get('category')}' "
-                         f"({len(products)} products) — topic rejected"}
+        return {'store': store, 'topic': candidates[0],
+                'error': 'no candidate topic has enough genuinely fitting products'}
     faqs = _blog_faq_questions(store, topic.get('keyword'))
     art = _blog_write(store, topic, products, faq_questions=faqs)
     if not art or not art.get('title') or not art.get('body_html'):
@@ -11518,7 +11595,8 @@ def _blog_generate_one(store, topic=None, published=None):
     featured = next((p.get('image') for p in products if p.get('image')), None)
     created = _blog_create_article(store, blog_id, art, hdrs, published=publish, featured_img=featured)
     qa_slim = qa and {'score': qa['score'], 'critical': len(qa['critical']), 'minor': len(qa['minor'])}
-    _blog_log(store, topic, {**created, 'published': publish, 'levers': art.get('levers'), 'qa': qa_slim})
+    _blog_log(store, topic, {**created, 'published': publish, 'levers': art.get('levers'), 'qa': qa_slim,
+                             'products': [p.get('handle') for p in products if p.get('handle')]})
     _blog_slack_article(store, created, publish, qa_slim, topic)
     return {'store': store, 'topic': topic, 'products_linked': len(products), 'qa': qa_slim,
             'published': publish, 'article': created, 'preview': {'title': art['title'],
@@ -11737,6 +11815,26 @@ _BLOG_HISTORY_SEEDS = [
      'title': 'Sommerkjoler, der passer til alt – find din favorit',
      'url': 'https://86d3b0-76.myshopify.com/blogs/journal/sommerkjoler-der-passer-til-alt',
      'published': True},
+    # 2026-07-10: three laptop-generated replacements after the wedding-dress /
+    # topic-rejection incidents (fit-filter + candidate-loop fixes).
+    {'ts': '2026-07-10T09:32:36Z', 'store': 'fr', 'keyword': "robe d'été", 'category': 'dress',
+     'source': 'fallback', 'article_id': 631324770651,
+     'article_handle': 'quelle-robe-ete-choisir-cette-saison',
+     'title': "Quelle robe d'été choisir cette saison ?",
+     'url': 'https://g3et2j-k1.myshopify.com/blogs/journal/quelle-robe-ete-choisir-cette-saison',
+     'published': True, 'products': ['maren-bleu', 'laerke-multicolore', 'flora-sommer-3']},
+    {'ts': '2026-07-10T09:44:03Z', 'store': 'dk', 'keyword': 'nederdel styling', 'category': 'skirt',
+     'source': 'fallback', 'article_id': 1008114368861,
+     'article_handle': 'nederdel-styling-saadan-finder-du-din-stil',
+     'title': 'Nederdel styling: sådan finder du din stil',
+     'url': 'https://86d3b0-76.myshopify.com/blogs/journal/nederdel-styling-saadan-finder-du-din-stil',
+     'published': True, 'products': ['jorunn-gron', 'lucia-armygron', 'romane-bordeaux']},
+    {'ts': '2026-07-10T10:29:49Z', 'store': 'fi', 'keyword': 'housut töihin', 'category': 'pants',
+     'source': 'fallback', 'article_id': 614410486087,
+     'article_handle': 'housut-toihin-paras-pari',
+     'title': 'Housut töihin – näin löydät parhaan parin!',
+     'url': 'https://p2wmp9-1u.myshopify.com/blogs/journal/housut-toihin-paras-pari',
+     'published': True, 'products': ['cosette-sininen', 'zara-ruskea', 'yolande-ruskea', 'hana-mork-merensininen']},
 ]
 
 
