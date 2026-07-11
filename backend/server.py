@@ -8953,6 +8953,40 @@ def meta_campaigns():
     return jsonify({'campaigns': rows, 'count': len(rows)})
 
 
+@app.route('/api/meta/campaign_insights')
+def meta_campaign_insights():
+    """Read-only: lifetime spend + purchase-ROAS per campagne. Gebruikt door de
+    winninghunter-research-sheet (ROAS-terugkoppeling via de Campagnes-tab):
+    de fashion-token blijft zo op de droplet. ?ids=<id,id,...> of leeg = alle
+    (max 50) campagnes van het account. Muteert nooit iets."""
+    if not META_ACCESS_TOKEN or not _meta_acct():
+        return jsonify({'error': 'Meta not configured'}), 400
+    ids = [i.strip() for i in (request.args.get('ids') or '').split(',') if i.strip()]
+    if not ids:
+        j = _meta_get(f'{_meta_acct()}/campaigns', {'fields': 'id', 'limit': 50})
+        ids = [c.get('id') for c in ((j or {}).get('data') or []) if c.get('id')]
+    out = []
+    for cid in ids[:50]:
+        j = _meta_get(f'{cid}/insights', {
+            'fields': 'campaign_name,spend,purchase_roas,website_purchase_roas',
+            'date_preset': 'maximum',
+        })
+        row = (((j or {}).get('data')) or [{}])[0]
+        roas = None
+        for k in ('purchase_roas', 'website_purchase_roas'):
+            v = row.get(k)
+            if isinstance(v, list) and v:
+                try:
+                    roas = max(float(x.get('value', 0)) for x in v)
+                    break
+                except (TypeError, ValueError):
+                    pass
+        out.append({'id': cid, 'name': row.get('campaign_name'),
+                    'spend': row.get('spend'), 'roas': roas,
+                    'error': (str(j['error'].get('message'))[:120] if j.get('error') else None)})
+    return jsonify({'insights': out, 'count': len(out)})
+
+
 @app.route('/api/meta/storefront_test')
 def meta_storefront_test():
     """Read-only debug: show how _storefront_url resolves an admin product URL → storefront URL,
@@ -11826,6 +11860,8 @@ def api_blog_status():
     perf_sorted = sorted(perf, key=lambda p: -(p.get('score') or 0))
     return jsonify({
         'dataforseo_configured': _dfs_configured(),
+        'reddit_enrichment': ('reddit-api' if os.getenv('REDDIT_CLIENT_ID', '').strip() else
+                              'apify' if os.getenv('APIFY_TOKEN', '').strip() else 'off'),
         'scheduler': {
             'enabled': os.getenv('BLOG_SCHEDULER', '1') != '0',
             'bootstrap': os.getenv('BLOG_BOOTSTRAP', '1') != '0',
