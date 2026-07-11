@@ -9996,7 +9996,8 @@ BLOG_MEASURE_MIN_AGE_DAYS = int(os.getenv('BLOG_MEASURE_MIN_AGE_DAYS', '21'))
 
 # Last-run diagnostics surfaced (read-only) via /api/blog/status so failures of
 # the unattended scheduler/bootstrap are visible without droplet log access.
-_BLOG_LAST = {'bootstrap': None, 'scheduled': None, 'learn': None, 'measure': None, 'qa_failed': None}
+_BLOG_LAST = {'bootstrap': None, 'scheduled': None, 'learn': None, 'measure': None,
+              'qa_failed': None, 'reddit': None}
 _BLOG_DOMAIN_CACHE = {}
 _BLOG_SCOPE_CACHE = {}   # store -> {'ts': epoch, 'write_content': bool|None}
 
@@ -10795,11 +10796,12 @@ BLOG_FAQ_HEADING = {'dk': 'Ofte stillede spørgsmål', 'fr': 'Questions fréquen
                     'fi': 'Usein kysytyt kysymykset'}
 
 
-def _blog_write(store, topic, products, avoid=None, faq_questions=None):
+def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns=None):
     """Claude writes the SEO article in the store's language. Returns a dict:
     {title, handle, meta_description, excerpt, tags[], body_html, faq[]}. None on
     failure. avoid: QA findings from a rejected earlier attempt (rewrite mode).
-    faq_questions: real question-style searches to build the FAQ section from."""
+    faq_questions: real question-style searches to build the FAQ section from.
+    concerns: real consumer doubts from fashion forums (English) to address."""
     if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
         return None
     lang = DFS_LANG_NAME.get(store, 'Danish')
@@ -10841,6 +10843,13 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None):
         faq_block = ("\n\nREAL SEARCH QUESTIONS about this subject (people literally type these into "
                      "Google — build the FAQ from the most relevant ones, rephrased naturally):\n"
                      + '\n'.join(f"- {q}" for q in faq_questions[:6]) + "\n")
+    concern_block = ''
+    if concerns:
+        concern_block = ("\n\nREAL CONSUMER CONCERNS (from fashion forums, in English). Address at "
+                         f"least 2 of these naturally in the body, IN {lang} and in your own words — "
+                         "they are what shoppers actually hesitate about. Never mention forums or "
+                         "Reddit; never copy phrasing literally:\n"
+                         + '\n'.join(f"- {c}" for c in concerns[:5]) + "\n")
     prompt = (
         f"You are the content writer for Vionna, writing an SEO blog article. {BLOG_BRAND_VOICE}\n\n"
         f"Write the ENTIRE article in {lang}. Native, fluent, elegant {lang} — not translated-sounding.\n\n"
@@ -10850,7 +10859,7 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None):
         f"Supporting keywords to weave in naturally: {', '.join(cluster) if cluster else '(none)'}"
         f"{season_hint}{pb_block}\n\n"
         f"Products from our shop to feature (link them inline with <a href> using the given relative links):\n"
-        f"{prod_block}{faq_block}\n\n"
+        f"{prod_block}{faq_block}{concern_block}\n\n"
         "REQUIREMENTS:\n"
         f"1. Title: compelling, contains the primary keyword, max ~60 chars, in {lang}.\n"
         "2. Body: valid HTML (no <html>/<head>/<body> wrappers). 600-950 words (native fashion "
@@ -10925,6 +10934,7 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None):
         'n_em_dash': body.count('—') + body.count('–'),
         'n_faq': len(faq),
         'gap_hit': bool(topic.get('gap_hit')),
+        'n_concerns': len(concerns or []),
     }
     return {
         'title': title,
@@ -11349,6 +11359,140 @@ def _blog_related_links(store, category, hdrs, exclude_handle=None, max_links=3)
     return f'<h2>{BLOG_READALSO.get(store, "Read also")}</h2><ul>{items}</ul>'
 
 
+# --- Reddit consumer concerns (content ENRICHMENT only; topics stay Google) ---
+# Owner-approved 2026-07-10: real doubts/considerations from fashion forums make
+# the body more helpful, but subjects/keywords remain 100% search-volume-driven.
+# Free public JSON route (no Apify cost); loud diagnostics via _BLOG_LAST when
+# the droplet's IP turns out to be blocked, so an Apify fallback can be added.
+BLOG_REDDIT_SUBS = 'femalefashionadvice+fashionadvice+PetiteFashionAdvice+capsulewardrobe+AskWomenOver30'
+BLOG_REDDIT_UA = 'vionna-blog-research/1.0 (fashion content research; contact support@vionna-clothing.com)'
+_BLOG_REDDIT_TOKEN = {'value': None, 'exp': 0.0}
+
+
+def _blog_reddit_oauth_token():
+    """App-only OAuth token for Reddit's official (free) API. None when
+    REDDIT_CLIENT_ID/SECRET aren't configured. Cached ~50 min."""
+    cid = os.getenv('REDDIT_CLIENT_ID', '').strip()
+    sec = os.getenv('REDDIT_CLIENT_SECRET', '').strip()
+    if not cid or not sec:
+        return None
+    if _BLOG_REDDIT_TOKEN['value'] and time.time() < _BLOG_REDDIT_TOKEN['exp']:
+        return _BLOG_REDDIT_TOKEN['value']
+    try:
+        r = req.post('https://www.reddit.com/api/v1/access_token', auth=(cid, sec),
+                     data={'grant_type': 'client_credentials'},
+                     headers={'User-Agent': BLOG_REDDIT_UA}, timeout=12)
+        tok = (r.json() or {}).get('access_token')
+        if tok:
+            _BLOG_REDDIT_TOKEN.update(value=tok, exp=time.time() + 3000)
+        return tok
+    except Exception as e:
+        print(f"[blog] reddit oauth failed: {e}")
+        return None
+
+
+def _blog_reddit_fetch(query):
+    """Thread titles+snippets for a query. Priority: official Reddit API (free,
+    needs REDDIT_CLIENT_ID/SECRET) → Apify RAG Web Browser (needs APIFY_TOKEN)
+    → plain reddit.com (usually 403 nowadays). Returns list of snippet lines,
+    or None on failure (diagnostics in _BLOG_LAST['reddit'])."""
+    now = datetime.datetime.utcnow().isoformat() + 'Z'
+    tok = _blog_reddit_oauth_token()
+    base = 'https://oauth.reddit.com' if tok else 'https://www.reddit.com'
+    hdrs = {'User-Agent': BLOG_REDDIT_UA}
+    if tok:
+        hdrs['Authorization'] = f'bearer {tok}'
+    try:
+        r = req.get(f'{base}/r/{BLOG_REDDIT_SUBS}/search' + ('' if tok else '.json'),
+                    params={'q': query, 'restrict_sr': 'on', 'sort': 'relevance', 't': 'all', 'limit': 10},
+                    headers=hdrs, timeout=12)
+        if r.status_code == 200:
+            posts = []
+            for ch in ((r.json().get('data') or {}).get('children') or [])[:10]:
+                d = ch.get('data') or {}
+                t = (d.get('title') or '').strip()
+                s = ' '.join((d.get('selftext') or '').split())[:280]
+                if t:
+                    posts.append(f"- {t}" + (f" | {s}" if s else ""))
+            _BLOG_LAST['reddit'] = {'ts': now, 'ok': True,
+                                    'note': f'{len(posts)} threads via {"oauth" if tok else "public"} ({query!r})'}
+            return posts
+        note = f'HTTP {r.status_code} via {"oauth" if tok else "public"}'
+    except Exception as e:
+        note = str(e)[:100]
+    # Apify fallback: RAG Web Browser (simple, stable input: query + maxResults)
+    ap = os.getenv('APIFY_TOKEN', '').strip()
+    if ap:
+        try:
+            r = req.post('https://api.apify.com/v2/acts/apify~rag-web-browser/run-sync-get-dataset-items',
+                         params={'token': ap},
+                         json={'query': f'site:reddit.com {query} women', 'maxResults': 5},
+                         timeout=90)
+            if r.status_code in (200, 201):
+                posts = []
+                for it in (r.json() or [])[:5]:
+                    txt = ' '.join(((it.get('markdown') or it.get('text') or ''))[:500].split())
+                    title = ((it.get('metadata') or {}).get('title') or '').strip()
+                    if title or txt:
+                        posts.append(f"- {title} | {txt[:280]}")
+                _BLOG_LAST['reddit'] = {'ts': now, 'ok': True, 'note': f'{len(posts)} via apify ({query!r})'}
+                return posts
+            note += f'; apify HTTP {r.status_code}'
+        except Exception as e:
+            note += f'; apify {str(e)[:80]}'
+    else:
+        note += '; set REDDIT_CLIENT_ID/SECRET (free) or APIFY_TOKEN to enable'
+    _BLOG_LAST['reddit'] = {'ts': now, 'ok': False, 'note': note[:180]}
+    print(f"[blog] reddit fetch unavailable: {note}")
+    return None
+
+
+def _blog_reddit_concerns(store, topic, limit=5):
+    """Real consumer concerns around the topic, distilled from fashion-subreddit
+    threads. Returns up to `limit` one-line English concerns; [] on ANY failure
+    (fail-open — enrichment must never block an article)."""
+    kw = (topic or {}).get('keyword') or ''
+    if not kw or not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        return []
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=40,
+                                      messages=[{'role': 'user', 'content':
+                                      f'Translate the MEANING of this fashion search topic into the short English '
+                                      f'phrase a shopper would type on a fashion forum (2-4 words, no quotes). '
+                                      f'Use the correct garment word, beware false friends (French "robe" = dress, '
+                                      f'Danish "kjole" = dress): "{kw}"'}])
+        query = ((msg.content[0].text if msg.content else '') or '').strip().strip('"')[:60] or kw
+    except Exception:
+        query = kw
+    posts = _blog_reddit_fetch(query)
+    if posts is None:
+        return []
+    if not posts:
+        _BLOG_LAST['reddit'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
+                                'ok': True, 'note': f'0 threads for {query!r}'}
+        return []
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=350,
+                                      messages=[{'role': 'user', 'content':
+            f'These are fashion-forum threads about "{query}". Distill the {limit} most common REAL '
+            'consumer concerns, doubts or considerations (fit, fabric, practicality, styling worries). '
+            'One short English line each, generic (no brand names, no usernames, no forum references). '
+            'Return ONLY a JSON array of strings.\n\n' + '\n'.join(posts)}])
+        txt = (msg.content[0].text if msg.content else '') or ''
+        m = re.search(r'\[.*\]', txt, re.S)
+        concerns = [str(x).strip() for x in (json.loads(m.group(0)) if m else []) if str(x).strip()][:limit]
+        _BLOG_LAST['reddit'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
+                                'ok': True, 'note': f'{len(concerns)} concerns ({query!r})'}
+        return concerns
+    except Exception as e:
+        print(f"[blog] reddit distill failed: {e}")
+        return []
+
+
 # --- Content-gap signal (SECONDARY: small bonus, never a gate) ----------------
 BLOG_GAP_BONUS = 0.25
 
@@ -11529,7 +11673,8 @@ def _blog_generate_one(store, topic=None, published=None):
         return {'store': store, 'topic': candidates[0],
                 'error': 'no candidate topic has enough genuinely fitting products'}
     faqs = _blog_faq_questions(store, topic.get('keyword'))
-    art = _blog_write(store, topic, products, faq_questions=faqs)
+    concerns = _blog_reddit_concerns(store, topic)
+    art = _blog_write(store, topic, products, faq_questions=faqs, concerns=concerns)
     if not art or not art.get('title') or not art.get('body_html'):
         return {'store': store, 'topic': topic, 'error': 'writer failed'}
     art['primary_keyword'] = topic.get('keyword')
@@ -11553,7 +11698,7 @@ def _blog_generate_one(store, topic=None, published=None):
         if not qa_ok:
             print(f"[blog] {store}: QA keeps failing — full rewrite on the same topic")
             prev = ((qa['critical'] + qa['minor'])[:6] if qa else ['previous attempt failed QA'])
-            art2 = _blog_write(store, topic, products, avoid=prev, faq_questions=faqs)
+            art2 = _blog_write(store, topic, products, avoid=prev, faq_questions=faqs, concerns=concerns)
             if art2 and art2.get('title') and art2.get('body_html'):
                 art2['primary_keyword'] = topic.get('keyword')
                 art2 = _blog_edit(store, art2, products)
