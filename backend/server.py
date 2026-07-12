@@ -1601,6 +1601,89 @@ def _kiwi_size_chart(page_html):
         return None
 
 
+def _json_array_at(s, start):
+    """Parse a balanced JSON array starting at s[start] == '[' (string-aware).
+    Needed because regexing 'up to ];' breaks on brackets inside cell strings."""
+    depth, i, instr, esc = 0, start, False, False
+    while i < len(s):
+        c = s[i]
+        if instr:
+            if esc:
+                esc = False
+            elif c == '\\':
+                esc = True
+            elif c == '"':
+                instr = False
+        else:
+            if c == '"':
+                instr = True
+            elif c == '[':
+                depth += 1
+            elif c == ']':
+                depth -= 1
+                if depth == 0:
+                    return s[start:i + 1]
+        i += 1
+    return None
+
+
+def _relentless_size_chart(page_html):
+    """Competitors using the 'Relentless Size Charts' Shopify app (maisonelorie.fr)
+    embed EVERY chart of the shop as JSON in the page
+    (sizeChartsRelentless.metafield.charts = [...]) with a 'conditions' list saying
+    which products each chart applies to. Pick the chart for the current product
+    (sizeChartsRelentless.product) and convert its 2D 'values' grid to
+    {headers, rows}. Pure page parse — no network. Best-effort, never raises."""
+    try:
+        if 'sizeChartsRelentless' not in (page_html or ''):
+            return None
+        pm = re.search(r'sizeChartsRelentless\.product\s*=\s*\{"id":\s*(\d+)', page_html)
+        pid = pm.group(1) if pm else None
+        cm = re.search(r'sizeChartsRelentless\.metafield\.charts\s*=\s*\[', page_html)
+        if not cm:
+            return None
+        raw = _json_array_at(page_html, cm.end() - 1)
+        if not raw:
+            return None
+        charts = json.loads(raw)
+
+        def match_strength(ch):
+            conds = ch.get('conditions') or []
+            if not conds:
+                return 1                      # unconditional chart — weak match
+            for c in conds:
+                if str(c.get('id') or '') == (pid or '') and (c.get('type') or 'product') == 'product':
+                    return 2                  # explicit product match — strong
+            return 0
+
+        best = None
+        for ch in charts:
+            if not (ch.get('values') or []):
+                continue
+            s = match_strength(ch)
+            if s and (best is None or s > best[0]):
+                best = (s, ch)
+        if not best:
+            return None
+        grid = []
+        for row in best[1]['values']:
+            cells = [re.sub(r'\s+', ' ', re.sub(r'&nbsp;| ', ' ',
+                     re.sub(r'<[^>]+>', ' ', str(c or '')))).strip() for c in row]
+            nonempty = [c for c in cells if c]
+            if not nonempty:
+                continue
+            if len(nonempty) == 1 and len(cells) > 2:
+                continue                       # section label row ('Haut') — skip
+            grid.append(cells)
+        if len(grid) < 2:
+            return None
+        w = len(grid[0])
+        return {'headers': grid[0], 'rows': [(r + [''] * w)[:w] for r in grid[1:]]}
+    except Exception as e:
+        print(f"[size-chart] relentless failed: {e}")
+        return None
+
+
 _SIZE_IMG_RE = re.compile(r'size[\-_ ]?chart|size[\-_ ]?guide|sizing|measurement|maattabel|st(?:ø|oe)rrelse|'
                           r'guide.?des.?tailles|kokotaulukko|size_?chart|maatschema', re.I)
 
@@ -1830,6 +1913,7 @@ def _detect_size_chart_hint(page_html):
         h = (page_html or '').lower()
         # (regex marker, friendly app name). Order = specificity; first hit wins.
         for pat, name in (
+            (r'sizechartsrelentless',                          'Relentless Size Charts app'),
             (r'kiwisizing|kiwi_sizing',                        'Kiwi Sizing app'),
             (r'sizefox',                                       'SizeFox / SmartSize app'),
             (r'\bsmartsize\b',                                 'SmartSize app'),
@@ -1856,10 +1940,11 @@ def _detect_size_chart_hint(page_html):
 
 
 def _extract_size_chart_full(page_html, page_url=''):
-    """Size chart from a competitor page, trying in order: HTML <table> → SizeFox/
-    SmartSize app API → Kiwi Sizing app API → Vitals app → image OCR. Returns
-    {headers, rows}."""
+    """Size chart from a competitor page, trying in order: HTML <table> → Relentless
+    app (inline JSON, no network) → SizeFox/SmartSize app API → Kiwi Sizing app API
+    → Vitals app → image OCR. Returns {headers, rows}."""
     return (_extract_size_chart(page_html)
+            or _relentless_size_chart(page_html)
             or _smartsize_size_chart(page_html)
             or _kiwi_size_chart(page_html)
             or _vitals_size_chart(page_html)
@@ -1881,6 +1966,9 @@ def api_debug_extract_chart():
     c = _extract_size_chart(html)
     if c:
         return jsonify({**out, 'method': 'html', 'chart': c})
+    c = _relentless_size_chart(html)
+    if c:
+        return jsonify({**out, 'method': 'relentless', 'chart': c})
     c = _smartsize_size_chart(html)
     if c:
         return jsonify({**out, 'method': 'smartsize', 'chart': c})
