@@ -9,6 +9,9 @@ export type ReviewKw = {
   volume: number | null;
   intent: string | null;
   recommended: boolean;
+  /** Colour keyword ('kjole hvid') — never recommended: the copy is shared across
+   *  colour variants and /api/generate strips colours from it anyway. */
+  is_color?: boolean;
   source: "manual" | "research" | "custom";
   seasonality?: {
     peak_month?: string;
@@ -213,6 +216,14 @@ export function KeywordReviewModal({
                         )}
                         {k.source === "custom" && (
                           <span className="ml-1.5 text-[10px] text-accent">(added)</span>
+                        )}
+                        {k.is_color && (
+                          <span
+                            className="ml-1.5 text-[10px] text-text-faint"
+                            title="Colour keywords are never used in the product text — the description is shared by all colour variants, so colours are stripped when generating."
+                          >
+                            🎨 colour — not used in copy
+                          </span>
                         )}
                         {hot && <span className="ml-1.5 text-[10px] text-green-600 dark:text-green-400">● in season</span>}
                       </td>

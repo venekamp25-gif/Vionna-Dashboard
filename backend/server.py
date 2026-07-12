@@ -3865,12 +3865,18 @@ def _recommend_keywords(keywords, store, top_n=8):
     search volume + a bonus for being in season right now (or trending up) + a
     bonus for buying intent. Mutates each keyword in place, adding 'score' and
     'recommended' (bool). Returns the same list, order unchanged. The top
-    `top_n` by score are flagged recommended (but only ones with real volume)."""
+    `top_n` by score are flagged recommended (but only ones with real volume).
+
+    COLOUR keywords ('kjole hvid') are never recommended: the generated copy is
+    shared across all colour variants, so /api/generate strips them anyway
+    (v1.186) — starring them would waste recommendation slots and mislead the
+    operator. They stay in the list (tickable), tagged is_color for the UI."""
     real = [k for k in keywords if isinstance(k, dict) and k.get('keyword') and 'error' not in k]
     if not real:
         return keywords
     max_vol = max((k.get('volume') or 0) for k in real) or 1
     for k in real:
+        k['is_color'] = _is_color_kw(k.get('keyword') or '')
         vol = k.get('volume') or 0
         score = vol / max_vol  # 0..1 volume component
         seas = k.get('seasonality') or {}
@@ -3884,7 +3890,7 @@ def _recommend_keywords(keywords, store, top_n=8):
             score += 0.3                       # buyer intent
         k['score'] = round(score, 3)
         k['recommended'] = False
-    ranked = sorted(real, key=lambda x: -(x.get('score') or 0))
+    ranked = sorted((k for k in real if not k['is_color']), key=lambda x: -(x.get('score') or 0))
     for k in ranked[:max(0, top_n)]:
         k['recommended'] = True
     return keywords
