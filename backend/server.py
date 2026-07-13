@@ -487,6 +487,22 @@ TRAFFIC_AOV_CAP = 150.0        # nep-AOV's door valuta-verwarring niet laten win
 TRAFFIC_CACHE_TTL = 7 * 86400  # traffic verandert langzaam; 1 actor-run/store/week
 _TRAFFIC_RATE_TO_EUR = {'dk': 0.134, 'se': 0.091, 'no': 0.087, 'uk': 1.17,
                         'us': 0.93, 'au': 0.61, 'ca': 0.68, 'ch': 1.07, 'pl': 0.235}
+# Lat naar RATIO van de markt (user 2026-07-13): EUR 300k is geijkt op NL;
+# kleinere markten naar rato van inwonertal (TLD van de bron-store), grote
+# markten en internationale/onbekende TLD's houden de volle lat.
+_TRAFFIC_POP_M = {'nl': 17.6, 'be': 11.8, 'de': 84.0, 'at': 9.1, 'fr': 68.0,
+                  'dk': 5.9, 'se': 10.5, 'no': 5.5, 'fi': 5.6, 'ch': 8.8,
+                  'uk': 68.0, 'us': 335.0, 'ca': 39.0, 'au': 26.0, 'it': 59.0,
+                  'es': 48.0, 'pt': 10.4, 'pl': 37.0}
+_TRAFFIC_ANCHOR_POP_M = 17.6   # NL
+
+
+def _traffic_bar_eur(host):
+    tld = str(host or '').lower().strip().rsplit('.', 1)[-1]
+    pop = _TRAFFIC_POP_M.get(tld)
+    if pop is None:
+        return TRAFFIC_THRESHOLD_EUR
+    return int(min(TRAFFIC_THRESHOLD_EUR, TRAFFIC_THRESHOLD_EUR * pop / _TRAFFIC_ANCHOR_POP_M))
 
 
 def _traffic_cache_read():
@@ -7807,6 +7823,72 @@ def api_wtl_stores_add():
         except Exception as e:
             return jsonify({'error': f'opslaan mislukt: {e}'}), 500
     return jsonify({'ok': True, 'domain': dom, 'extra_total': len(cur)})
+
+
+@app.route('/api/wtl_export')
+def api_wtl_export():
+    """CSV export of the funnel so employees can work through a LIST instead of
+    re-running the flow per product.
+      ?what=stores   → the ranked store list (score/traffic/trend).
+      ?what=products → the WORK LIST: every qualifying store × its bestsellers,
+                       with an empty Status column, the already-imported flag and
+                       the product URL to paste into the import screen.
+      &store=dk|fr|fi &category=<type category> &only_ok=0|1 (default 1: only
+      stores that clear the local-traffic bar).
+    Semicolon-delimited + UTF-8 BOM so NL/EU Excel opens it correctly."""
+    what = (request.args.get('what') or 'products').lower()
+    store = (request.args.get('store') or 'dk').lower()
+    category = (request.args.get('category') or '').strip().lower()
+    only_ok = (request.args.get('only_ok') or '1') != '0'
+    self_base = f'http://127.0.0.1:{os.environ.get("PORT", "5000")}'
+    try:
+        sj = req.get(f'{self_base}/api/wtl_stores', params={'store': store}, timeout=45).json()
+    except Exception as e:
+        return jsonify({'error': f'stores ophalen faalde: {e}'}), 502
+    stores = sj.get('stores') or []
+    cc = sj.get('country') or store.upper()
+
+    import csv
+    import io as _io
+    buf = _io.StringIO()
+    w = csv.writer(buf, delimiter=';')
+    today = datetime.datetime.utcnow().strftime('%Y-%m-%d')
+
+    if what == 'stores':
+        w.writerow(['Score', 'Store', f'Bezoekers {cc}/mnd', 'Bezoekers totaal/mnd', '% lokaal',
+                    'Trend m/m', 'Eerder geimporteerd', 'Laatste import', 'Bestseller-pagina'])
+        for s in stores:
+            if only_ok and not s.get('market_ok'):
+                continue
+            w.writerow([s['score'], s['domain'], s['local_visits'], s['total_visits'],
+                        round((s.get('local_share') or 0) * 100),
+                        (f"{s['trend_pct']:+d}%" if s.get('trend_pct') is not None else ''),
+                        s.get('products') or 0, s.get('last_import') or '',
+                        f"https://{s['domain']}/collections/all?sort_by=best-selling"])
+        fname = f'wtl_stores_{store}_{today}.csv'
+    else:
+        w.writerow(['Status', 'Store', 'Store-score', f'Bezoekers {cc}/mnd', 'Positie', 'Titel',
+                    'Type', 'Prijs', 'Sinds', 'Al geimporteerd', 'Product-URL'])
+        picked = [s for s in stores if s.get('market_ok') or not only_ok][:12]
+        for s in picked:
+            payload, blocked = _bs_scan_cached(s['domain'])
+            if not payload:
+                w.writerow(['', s['domain'], s['score'], s['local_visits'], '', f'(scan mislukt: {blocked})',
+                            '', '', '', '', ''])
+                continue
+            imported = set(s.get('imported_handles') or [])
+            for p in payload.get('products') or []:
+                if category and (p.get('category') or '').lower() != category:
+                    continue
+                w.writerow(['', s['domain'], s['score'], s['local_visits'], p.get('position'),
+                            p.get('title'), p.get('category'), p.get('price'),
+                            p.get('published_at') or '',
+                            'JA' if p.get('handle') in imported else '', p.get('url')])
+        fname = f'wtl_werklijst_{store}{("_" + category) if category else ""}_{today}.csv'
+
+    resp = app.response_class('﻿' + buf.getvalue(), mimetype='text/csv; charset=utf-8')
+    resp.headers['Content-Disposition'] = f'attachment; filename="{fname}"'
+    return resp
 
 
 def _wtl_traffic_loop():

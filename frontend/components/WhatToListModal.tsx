@@ -708,6 +708,23 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
                   {trafficRefreshing ? "Updating traffic… (~2 min)" : "↻ Update traffic"}
                 </button>
               )}
+              <a
+                href={api.wtlExportUrl("stores", funnelMarket, { onlyOk: false })}
+                className="text-[11px] text-accent hover:underline"
+                title="Download the full ranked store list (score, exact local/total visits, trend) as a CSV for Excel / Google Sheets"
+              >
+                ⬇ Stores CSV
+              </a>
+              <a
+                href={api.wtlExportUrl("products", funnelMarket, {
+                  category: funnelType?.category ?? undefined,
+                  onlyOk: onlyEnough,
+                })}
+                className="text-[11px] text-accent hover:underline"
+                title={`Download the WORK LIST: every qualifying store × its bestsellers${funnelType ? ` (only ${funnelType.label})` : ""} — with an empty Status column, the already-imported flag and each product URL. Work through it and paste URLs into the import screen; no need to re-run this flow per product. First download can take ~1 min while stores are scanned.`}
+              >
+                ⬇ Work list CSV
+              </a>
             </div>
             {storesLoading ? (
               <p className="text-[12px] text-text-faint">Loading stores…</p>

@@ -652,6 +652,16 @@ export const api = {
       body: { domain },
     }),
 
+  /** Direct-download URL for the funnel CSV exports (stores list / product work list). */
+  wtlExportUrl: (
+    what: "stores" | "products",
+    store: "dk" | "fr" | "fi",
+    opts?: { category?: string; onlyOk?: boolean }
+  ) =>
+    `${BACKEND_URL}/api/wtl_export?what=${what}&store=${store}` +
+    (opts?.category ? `&category=${encodeURIComponent(opts.category)}` : "") +
+    (opts?.onlyOk === false ? "&only_ok=0" : ""),
+
   /** Risers + new entrants on known competitors' bestseller pages vs ~a week ago
    *  (droplet-side weekly snapshots; skips products we already imported). Ranked
    *  with the SAME scoring as What-to-list (season + catalogue gap) for `store`. */
