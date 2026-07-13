@@ -898,6 +898,32 @@ def _ensure_color_option(product):
 _SCRAPE_UA_PRIMARY  = 'FashionListingDashboard/1.0 (+https://fashion-listing-dashboard.netlify.app)'
 _SCRAPE_UA_FALLBACK = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
+# Once a host 429s us, every retry (ours AND the next user's import from that
+# same store) just adds to the pressure keeping the block up — that's what
+# turned "one slow import" into "won't let me list ANY more products from
+# that store" (bug #16: boheme-infinity.com kept 429ing every subsequent
+# attempt). Remember the host for a cooldown window and fail fast without
+# hitting the network again, so we stop hammering it and it can clear sooner.
+_SCRAPE_429_LOCK       = threading.Lock()
+_scrape_429_until      = {}    # host -> monotonic() time the cooldown ends
+_SCRAPE_429_COOLDOWN_MIN = 30   # seconds — floor, even if Retry-After is tiny/absent
+_SCRAPE_429_COOLDOWN_MAX = 300  # seconds — cap, so one huge Retry-After doesn't wedge a host
+
+
+def _scrape_429_cooldown_response(url, host, remaining):
+    """Synthetic 429 Response returned instead of hitting `host` again while
+    it's in cooldown. Shaped like a real requests.Response so callers (incl.
+    r.raise_for_status()) work unchanged."""
+    resp = req.Response()
+    resp.status_code = 429
+    resp.reason = 'Too Many Requests'
+    resp.url = url
+    resp.headers['Retry-After'] = str(int(remaining))
+    resp._content = (
+        f'{{"error": "cooling down for {host} after repeated 429s — retry in {int(remaining)}s"}}'
+    ).encode()
+    return resp
+
 
 def _scrape_get(url, timeout=10, _retries_remaining=2):
     """GET a competitor URL with UA-fallback AND retry-on-transient.
@@ -910,7 +936,19 @@ def _scrape_get(url, timeout=10, _retries_remaining=2):
     The UA fallback runs INSIDE the final-attempt path: try primary UA, if 403
     try Mozilla. We don't retry 403 — that's an auth/scope decision by the
     upstream, not a transient flake.
+
+    A host that 429s us is remembered for a cooldown window (see
+    _scrape_429_cooldown_response) — further calls to ANY path fail fast
+    instead of retrying against a host that's already rate-limiting us.
     """
+    host = urllib.parse.urlparse(url).netloc.lower()
+    with _SCRAPE_429_LOCK:
+        until = _scrape_429_until.get(host, 0)
+    remaining = until - time.monotonic()
+    if remaining > 0:
+        print(f"[scrape] {host} in 429 cooldown for {int(remaining)}s more — skipping request")
+        return _scrape_429_cooldown_response(url, host, remaining)
+
     delays_left = [1, 3]  # seconds before each retry; popped front-first
     headers_primary  = {'User-Agent': _SCRAPE_UA_PRIMARY,
                         'Accept': 'application/json, text/html;q=0.9, */*;q=0.5'}
@@ -931,6 +969,9 @@ def _scrape_get(url, timeout=10, _retries_remaining=2):
                     wait_s = int(r.headers.get('Retry-After', '5'))
                 except Exception:
                     pass
+                cooldown = min(max(wait_s, _SCRAPE_429_COOLDOWN_MIN), _SCRAPE_429_COOLDOWN_MAX)
+                with _SCRAPE_429_LOCK:
+                    _scrape_429_until[host] = time.monotonic() + cooldown
                 if delays_left:
                     print(f"[scrape] 429 rate-limit on {url}, sleeping {wait_s}s then retrying")
                     time.sleep(min(wait_s, 30))
