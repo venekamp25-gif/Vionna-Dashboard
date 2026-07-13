@@ -505,6 +505,14 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
                               <span className="text-[13px] font-semibold text-text">{t.label}</span>
                               <span className="text-[11px] text-text-faint">({t.seed})</span>
                               <span className="text-[11px] text-text-dim tabular-nums">· up to {fmt(t.volume)}/mo</span>
+                              {t.meets_doc_volume && (
+                                <span
+                                  className="text-[10px] font-semibold text-green-600 dark:text-green-400"
+                                  title="Meets the research doc's step-1 bar: ≥ 20,000 monthly searches"
+                                >
+                                  ✓ 20k+
+                                </span>
+                              )}
                             </div>
                             <div className="text-[11px] mt-0.5 flex items-center gap-1.5 flex-wrap">
                               <span className={w.tone}>● {w.season}</span>

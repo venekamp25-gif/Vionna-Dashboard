@@ -497,7 +497,8 @@ _TRAFFIC_POP_M = {'nl': 17.6, 'be': 11.8, 'de': 84.0, 'at': 9.1, 'fr': 68.0,
 _TRAFFIC_ANCHOR_POP_M = 17.6   # NL
 TRAFFIC_BASKET = 1.3           # AOV = ORDER-gemiddelde, niet productprijs
                                # (bundels/upsells; user-correctie 2026-07-13)
-TRAFFIC_MIN_VISITS = 50_000    # bezoekersvloer (NL-anker), schaalt mee
+TRAFFIC_MIN_VISITS = 50_000    # DOC-MINIMUM (Product Research DSA stap 3):
+                               # bron-store >= 50k bezoekers/mnd — VLAK
 
 
 def _traffic_ratio(host):
@@ -511,7 +512,7 @@ def _traffic_bar_eur(host):
 
 
 def _traffic_visits_floor(host):
-    return int(TRAFFIC_MIN_VISITS * _traffic_ratio(host))
+    return TRAFFIC_MIN_VISITS   # vlak doc-minimum, geen marktschaling
 
 
 def _traffic_cache_read():
@@ -4472,7 +4473,11 @@ def api_what_to_list():
     types.sort(key=lambda x: -(x.get('score') or 0))
     for i, t in enumerate(types):
         t['recommended'] = i < top_n
+        # DOC-MINIMUM ("2. Product Research DSA.pdf" stap 1): >= 20k zoekopdrachten/mnd.
+        # Informatief vlagje — kleine markten halen dat zelden, dus geen hard filter hier.
+        t['meets_doc_volume'] = (t.get('volume') or 0) >= _DOC_MIN_KW_VOLUME
     payload = {'configured': True, 'store': store, 'per_type': per_type, 'floor': floor,
+               'doc_min_volume': _DOC_MIN_KW_VOLUME,
                'count': len(types), 'recent_total': recent_total, 'recent_window_days': 45,
                'recent_counts': recent_counts, 'live_counts': live_counts, 'types': types,
                'errors': errors[:3]}
@@ -7780,11 +7785,9 @@ def api_wtl_stores():
     except Exception:
         min_local = 0
     if not min_local:
-        # User-set norm (2026-07-13, same as the import-gate): visitor floor 50k/mnd
-        # NL-anchored, scaled by the MARKET's population — dk ≈ 17k, fi ≈ 16k, fr 50k.
-        pop = _TRAFFIC_POP_M.get(store)
-        ratio = 1.0 if pop is None else min(1.0, pop / _TRAFFIC_ANCHOR_POP_M)
-        min_local = int(TRAFFIC_MIN_VISITS * ratio)
+        # DOC-MINIMUM ("2. Product Research DSA.pdf" stap 3, user 2026-07-13):
+        # concurrenten >= 50.000 bezoekers/mnd — VLAK, geen marktschaling.
+        min_local = TRAFFIC_MIN_VISITS
     cache = _wtl_traffic_load()
     now = datetime.datetime.utcnow()
     comps = {c['domain']: c for c in _known_comp_data()}
@@ -8002,13 +8005,21 @@ _GD_MAX_NEW = 6        # cap on new stores added per market per run
 WTL_DISCOVER_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wtl_discover_state.json')
 
 
+_DOC_MIN_KW_VOLUME = 20_000   # DOC-MINIMUM ("2. Product Research DSA.pdf" stap 1):
+                              # keywords met >= 20k maandelijkse zoekopdrachten
+
+
 def _gd_wtl_terms(market):
     """Top season-gated What-to-list seeds from the (free) _WTL_CACHE — so the
-    Google hunt searches what shoppers in that market are looking for NOW."""
+    Google hunt searches what shoppers in that market are looking for NOW.
+    Doc step 1 applied: only seeds with >= 20k monthly searches qualify (small
+    markets may yield none — then the base queries carry the run)."""
     for key, ent in _WTL_CACHE.items():
         if key.startswith(market + ':'):
             types = (ent.get('payload') or {}).get('types') or []
-            return [t.get('seed') for t in types if t.get('recommended') and t.get('seed')][:3]
+            return [t.get('seed') for t in types
+                    if t.get('recommended') and t.get('seed')
+                    and (t.get('volume') or 0) >= _DOC_MIN_KW_VOLUME][:3]
     return []
 
 

@@ -528,6 +528,8 @@ export const api = {
         volume: number | null;
         intent: string | null;
         recommended?: boolean;
+        /** Meets the DSA-doc step-1 bar: >= 20k monthly searches. */
+        meets_doc_volume?: boolean;
         score?: number;
         category?: string | null;
         recent_listed?: number;
