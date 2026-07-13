@@ -301,6 +301,20 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
                     </p>
                   ) : (
                     <>
+                      {(() => {
+                        const docCount = (active.keywords ?? []).filter((k) => (k.volume ?? 0) >= 20000).length;
+                        return (
+                          <p className="text-[11px] mb-2">
+                            <span className={docCount >= 30 ? "text-green-600 dark:text-green-400" : "text-text-dim"}>
+                              {docCount} keyword{docCount === 1 ? "" : "s"} meet the research-doc bar (≥ 20,000/mo)
+                            </span>{" "}
+                            <span className="text-text-faint">
+                              — the method advises collecting 30+ before moving on. Small markets rarely get there;
+                              combine several product types or check the volume markets (DE/UK) too.
+                            </span>
+                          </p>
+                        );
+                      })()}
                       <table className="w-full text-[12px] border-collapse">
                         <colgroup>
                           <col className="w-[30px]" />
