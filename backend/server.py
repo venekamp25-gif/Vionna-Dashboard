@@ -495,14 +495,23 @@ _TRAFFIC_POP_M = {'nl': 17.6, 'be': 11.8, 'de': 84.0, 'at': 9.1, 'fr': 68.0,
                   'uk': 68.0, 'us': 335.0, 'ca': 39.0, 'au': 26.0, 'it': 59.0,
                   'es': 48.0, 'pt': 10.4, 'pl': 37.0}
 _TRAFFIC_ANCHOR_POP_M = 17.6   # NL
+TRAFFIC_BASKET = 1.3           # AOV = ORDER-gemiddelde, niet productprijs
+                               # (bundels/upsells; user-correctie 2026-07-13)
+TRAFFIC_MIN_VISITS = 50_000    # bezoekersvloer (NL-anker), schaalt mee
+
+
+def _traffic_ratio(host):
+    tld = str(host or '').lower().strip().rsplit('.', 1)[-1]
+    pop = _TRAFFIC_POP_M.get(tld)
+    return 1.0 if pop is None else min(1.0, pop / _TRAFFIC_ANCHOR_POP_M)
 
 
 def _traffic_bar_eur(host):
-    tld = str(host or '').lower().strip().rsplit('.', 1)[-1]
-    pop = _TRAFFIC_POP_M.get(tld)
-    if pop is None:
-        return TRAFFIC_THRESHOLD_EUR
-    return int(min(TRAFFIC_THRESHOLD_EUR, TRAFFIC_THRESHOLD_EUR * pop / _TRAFFIC_ANCHOR_POP_M))
+    return int(TRAFFIC_THRESHOLD_EUR * _traffic_ratio(host))
+
+
+def _traffic_visits_floor(host):
+    return int(TRAFFIC_MIN_VISITS * _traffic_ratio(host))
 
 
 def _traffic_cache_read():
@@ -594,12 +603,13 @@ def _traffic_check(url, host):
     if visits is None:
         return None
     aov = _import_price_eur(url) or TRAFFIC_AOV_FALLBACK
-    aov = min(aov, TRAFFIC_AOV_CAP)
+    aov = min(aov, TRAFFIC_AOV_CAP) * TRAFFIC_BASKET
     est = visits * TRAFFIC_CONV * aov
     bar = _traffic_bar_eur(host)
+    floor = _traffic_visits_floor(host)
     return {'visits': visits, 'est_monthly_eur': round(est),
-            'market_ok': est >= bar,
-            'threshold_eur': bar}
+            'market_ok': est >= bar and visits >= floor,
+            'threshold_eur': bar, 'min_visits': floor}
 
 
 @app.route('/api/classify_shipping')
@@ -7708,9 +7718,15 @@ def api_wtl_stores():
     store = (request.args.get('store') or 'dk').lower()
     cc = _WTL_MARKET_CC.get(store, 'DK')
     try:
-        min_local = int(request.args.get('min_local') or 2000)
+        min_local = int(request.args.get('min_local') or 0)
     except Exception:
-        min_local = 2000
+        min_local = 0
+    if not min_local:
+        # User-set norm (2026-07-13, same as the import-gate): visitor floor 50k/mnd
+        # NL-anchored, scaled by the MARKET's population — dk ≈ 17k, fi ≈ 16k, fr 50k.
+        pop = _TRAFFIC_POP_M.get(store)
+        ratio = 1.0 if pop is None else min(1.0, pop / _TRAFFIC_ANCHOR_POP_M)
+        min_local = int(TRAFFIC_MIN_VISITS * ratio)
     cache = _wtl_traffic_load()
     now = datetime.datetime.utcnow()
     comps = {c['domain']: c for c in _known_comp_data()}
