@@ -321,6 +321,10 @@ export const api = {
         market_ok: boolean;
         threshold_eur: number;
       } | null;
+      /** €25-minimum check (scraper rule): price in EUR (null = unknown) + pass flag. */
+      price_eur?: number | null;
+      price_ok?: boolean;
+      min_price_eur?: number;
       error?: string;
     }>(`/api/classify_shipping?url=${encodeURIComponent(url)}`),
 
@@ -617,6 +621,11 @@ export const api = {
         product_type: string;
         published_at: string;
         category: string;
+        /** Rough EUR price (TLD currency); null = unknown. price_ok=false → under the €25 minimum. */
+        price_eur?: number | null;
+        price_ok?: boolean;
+        /** Same product is a bestseller at these OTHER scanned stores (multi-store heat signal). */
+        also_at?: string[];
       }[];
     }>(`/api/bestseller_scan?domain=${encodeURIComponent(domain)}${force ? "&force=1" : ""}`),
 
@@ -650,6 +659,13 @@ export const api = {
     call<{ ok?: boolean; domain?: string; error?: string }>("/api/wtl_stores/add", {
       method: "POST",
       body: { domain },
+    }),
+
+  /** Kick a background Google-discovery run (hunt unknown local fashion stores). */
+  wtlDiscover: (markets: ("dk" | "fr" | "fi")[]) =>
+    call<{ job_id?: string; status?: string; error?: string }>("/api/wtl_discover", {
+      method: "POST",
+      body: { markets },
     }),
 
   /** Direct-download URL for the funnel CSV exports (stores list / product work list). */

@@ -641,6 +641,16 @@ def classify_shipping():
     def _with_traffic(payload):
         _tt.join(timeout=100)
         payload['traffic'] = _tr.get('r')
+        # €25-minimum (scraper rule 2026-07-12): under €25-equivalent = too little
+        # margin. Unknown price = pass (a fetch failure is not "too cheap"). WARN
+        # only — the employee decides, like every other gate signal.
+        try:
+            pe = _import_price_eur(url)
+        except Exception:
+            pe = None
+        payload['price_eur'] = round(pe, 2) if pe else None
+        payload['price_ok'] = pe is None or pe >= _MIN_PRICE_EUR
+        payload['min_price_eur'] = _MIN_PRICE_EUR
         return jsonify(payload)
 
     try:
@@ -7389,6 +7399,54 @@ def _bs_scan_cached(host, force=False):
     return out, None
 
 
+# ── Product-level quality signals (ported from the research scraper, 2026-07-13) ──
+_MIN_PRICE_EUR = 25.0   # user rule 2026-07-12: under €25-equivalent = too little margin
+
+
+def _price_eur_for_host(price, host):
+    """Rough EUR price using the host TLD's currency (quality gate, not bookkeeping)."""
+    try:
+        p = float(str(price).replace(',', '.'))
+    except (TypeError, ValueError):
+        return None
+    if p <= 0:
+        return None
+    tld = str(host or '').lower().rsplit('.', 1)[-1]
+    return round(p * _TRAFFIC_RATE_TO_EUR.get(tld, 1.0), 2)
+
+
+def _bs_sig(title, handle):
+    """Cross-store product signature (the scraper's copycat method): sorted title
+    tokens — but ONLY when the title matches its own slug (≥2 shared tokens), the
+    placeholder guard from the multi-store heat rule."""
+    tt = frozenset(w for w in re.split(r'[^a-z0-9]+', re.sub(r'[™®]', ' ', str(title or '').lower()))
+                   if len(w) >= 3)
+    st = frozenset(t for t in re.split(r'[^a-z0-9]+', str(handle or '').lower())
+                   if len(t) >= 3 and t != 'products')
+    return ' '.join(sorted(tt)) if len(tt & st) >= 2 else None
+
+
+def _bs_enrich(payload, host):
+    """Add price_eur/price_ok (€25 minimum, unknown = pass) and also_at (same product
+    a bestseller at OTHER scanned stores — user-confirmed multi-store heat signal)."""
+    sig_map = {}
+    bare = host.replace('www.', '')
+    for h, hit in _BS_CACHE.items():
+        if h.replace('www.', '') == bare:
+            continue
+        for p in (hit.get('payload') or {}).get('products') or []:
+            sig = _bs_sig(p.get('title'), p.get('handle'))
+            if sig:
+                sig_map.setdefault(sig, set()).add(h.replace('www.', ''))
+    for p in payload.get('products') or []:
+        pe = _price_eur_for_host(p.get('price'), host)
+        p['price_eur'] = pe
+        p['price_ok'] = pe is None or pe >= _MIN_PRICE_EUR
+        sig = _bs_sig(p.get('title'), p.get('handle'))
+        p['also_at'] = sorted(sig_map.get(sig) or []) if sig else []
+    return payload
+
+
 @app.route('/api/bestseller_scan')
 def api_bestseller_scan():
     """Scan a competitor store's best-selling page: ordered top products enriched
@@ -7403,7 +7461,7 @@ def api_bestseller_scan():
     if blocked:
         return jsonify({'ok': False, 'domain': host, 'blocked': blocked,
                         'url': f'https://{host}/collections/all?sort_by=best-selling'})
-    return jsonify(out)
+    return jsonify(_bs_enrich(out, host))
 
 
 KNOWN_SOURCES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'known_sources.json')
@@ -7885,20 +7943,26 @@ def api_wtl_export():
         fname = f'wtl_stores_{store}_{today}.csv'
     else:
         w.writerow(['Status', 'Store', 'Store-score', f'Bezoekers {cc}/mnd', 'Positie', 'Titel',
-                    'Type', 'Prijs', 'Sinds', 'Al geimporteerd', 'Product-URL'])
+                    'Type', 'Prijs', 'Prijs EUR', 'Ook bestseller bij', 'Sinds', 'Al geimporteerd',
+                    'Product-URL'])
         picked = [s for s in stores if s.get('market_ok') or not only_ok][:12]
         for s in picked:
             payload, blocked = _bs_scan_cached(s['domain'])
             if not payload:
                 w.writerow(['', s['domain'], s['score'], s['local_visits'], '', f'(scan mislukt: {blocked})',
-                            '', '', '', '', ''])
+                            '', '', '', '', '', '', ''])
                 continue
+            payload = _bs_enrich(payload, s['domain'])
             imported = set(s.get('imported_handles') or [])
             for p in payload.get('products') or []:
                 if category and (p.get('category') or '').lower() != category:
                     continue
+                if p.get('price_ok') is False:
+                    continue   # scraper rule: under €25-equivalent = not listed
                 w.writerow(['', s['domain'], s['score'], s['local_visits'], p.get('position'),
                             p.get('title'), p.get('category'), p.get('price'),
+                            p.get('price_eur') if p.get('price_eur') is not None else '',
+                            ', '.join(p.get('also_at') or []),
                             p.get('published_at') or '',
                             'JA' if p.get('handle') in imported else '', p.get('url')])
         fname = f'wtl_werklijst_{store}{("_" + category) if category else ""}_{today}.csv'
@@ -7908,10 +7972,241 @@ def api_wtl_export():
     return resp
 
 
+# ── WTL store DISCOVERY: hunt UNKNOWN local fashion dropshippers via Google ────
+# Port of the research scraper's google_discovery method (user 2026-07-13):
+# localized Google searches (Apify google-search-scraper, organic + paid — paid =
+# active advertiser, extra dropshipper signal) → unknown candidate domains →
+# Shopify check → LOCALITY requirement (market TLD, or generic TLD + local
+# homepage language) → womens-bestseller check (_bs_scan) → market-size gate
+# (revenue bar + visitor floor, market-scaled) → passers land in the extra-stores
+# list + traffic cache, so they appear in the stores tab immediately.
+_GD_QUERIES = {
+    'dk': ['kjole "gratis fragt" shop', 'dame kjoler online shop tilbud'],
+    'fr': ['robe "livraison gratuite" boutique', 'robe femme boutique en ligne promo'],
+    'fi': ['mekko "ilmainen toimitus" verkkokauppa', 'naisten mekot verkkokauppa tarjous'],
+}
+_GD_MARKET_TLDS = {'dk': ('.dk',), 'fr': ('.fr', '.be'), 'fi': ('.fi',)}
+_GD_MARKET_LANGS = {'dk': ('da', 'dk'), 'fr': ('fr',), 'fi': ('fi',)}
+_GD_GENERIC_TLDS = ('.com', '.net', '.co', '.shop', '.store', '.online', '.eu', '.site')
+_GD_SKIP = ('instagram.', 'facebook.', 'youtube.', 'tiktok.', 'pinterest.', 'reddit.',
+            'wikipedia.', 'google.', 'blogspot.', 'trustpilot.', 'linkedin.', 'twitter.',
+            'x.com', 'snapchat.', 'etsy.', 'ebay.', 'marktplaats.', 'dba.dk', 'leboncoin.',
+            'vionna', 'thelightsupplier', 'aliexpress.', 'alibaba.', 'myshopify.com')
+_GD_RETAILERS = ('karwei', 'gamma', 'praxis', 'bonprix', 'azazie', 'whatnot', 'nextory',
+                 'zalando', 'aboutyou', 'about-you', 'shein', 'temu', 'amazon', 'bol.com',
+                 'wehkamp', 'hm.com', 'ikea', 'leenbakker', 'kwantum', 'action.', 'lidl',
+                 'aldi', 'otto.', 'veepee', 'vinted', 'boozt', 'asos', 'ellos', 'nelly',
+                 'zara', 'mango', 'only', 'veromoda', 'cellbes', 'bubbleroom')
+_GD_MIN_WOMENS = 5     # fewer bestsellers = not a womens-fashion store
+_GD_MAX_NEW = 6        # cap on new stores added per market per run
+WTL_DISCOVER_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wtl_discover_state.json')
+
+
+def _gd_wtl_terms(market):
+    """Top season-gated What-to-list seeds from the (free) _WTL_CACHE — so the
+    Google hunt searches what shoppers in that market are looking for NOW."""
+    for key, ent in _WTL_CACHE.items():
+        if key.startswith(market + ':'):
+            types = (ent.get('payload') or {}).get('types') or []
+            return [t.get('seed') for t in types if t.get('recommended') and t.get('seed')][:3]
+    return []
+
+
+def _gd_domain(url):
+    m = re.match(r'https?://(?:www\.)?([^/]+)', str(url or '').strip().lower())
+    return m.group(1) if m else ''
+
+
+def _gd_is_shopify(domain):
+    try:
+        r = _scrape_get(f'https://{domain}/products.json?limit=1', timeout=12)
+        return r.status_code == 200 and 'products' in (r.json() or {})
+    except Exception:
+        return False
+
+
+def _gd_is_local(domain, market):
+    """Locality requirement: market TLD = yes; generic TLD only when the homepage
+    language is the market language; someone else's country TLD = no."""
+    d = domain.lower()
+    if any(d.endswith(t) for t in _GD_MARKET_TLDS.get(market, ())):
+        return True
+    if not any(d.endswith(t) for t in _GD_GENERIC_TLDS):
+        return False
+    try:
+        r = _scrape_get(f'https://{d}', timeout=10)
+        m = re.search(r'<html[^>]*\slang=["\']?([a-zA-Z-]{2,7})', (r.text or '')[:4000])
+        if m:
+            return m.group(1).lower().split('-')[0] in _GD_MARKET_LANGS.get(market, ())
+    except Exception:
+        pass
+    return False
+
+
+def _gd_google(queries_by_market):
+    """[(market, term, url)] from one Apify google-search run per market (organic + paid)."""
+    token = os.getenv('APIFY_TOKEN', '').strip()
+    out = []
+    for m, queries in queries_by_market.items():
+        if not queries:
+            continue
+        try:
+            r = req.post('https://api.apify.com/v2/acts/apify~google-search-scraper/runs',
+                         params={'token': token},
+                         json={'queries': '\n'.join(queries), 'resultsPerPage': 30,
+                               'maxPagesPerQuery': 1, 'countryCode': m}, timeout=30)
+            if r.status_code not in (200, 201):
+                print(f'[wtl-disc] google run {m} start failed: {r.status_code}')
+                continue
+            run = (r.json() or {}).get('data') or {}
+            rid, ds = run.get('id'), run.get('defaultDatasetId')
+            status, waited = run.get('status'), 0
+            while status in ('READY', 'RUNNING') and waited < 300:
+                time.sleep(10)
+                waited += 10
+                rr = req.get(f'https://api.apify.com/v2/actor-runs/{rid}',
+                             params={'token': token}, timeout=30)
+                status = ((rr.json() or {}).get('data') or {}).get('status')
+            if status != 'SUCCEEDED':
+                print(f'[wtl-disc] google run {m} ended {status}')
+                continue
+            items = req.get(f'https://api.apify.com/v2/datasets/{ds}/items',
+                            params={'token': token, 'format': 'json', 'clean': 'true'},
+                            timeout=60).json()
+        except Exception as e:
+            print(f'[wtl-disc] google run {m} failed: {e}')
+            continue
+        for it in (items if isinstance(items, list) else []):
+            term = ((it.get('searchQuery') or {}).get('term')) or ''
+            for o in (it.get('organicResults') or []) + (it.get('paidResults') or []):
+                if o.get('url'):
+                    out.append((m, term, o['url']))
+    return out
+
+
+def _wtl_discover(markets, jid=None):
+    """Run the discovery pipeline for the given markets; passers are added to the
+    extra-stores list (+ traffic cache) and show up in the stores tab immediately."""
+    import statistics
+    markets = [m for m in (markets or []) if m in _GD_QUERIES]
+    if not markets:
+        return {'error': 'geen geldige markten'}
+    known = _wtl_all_domains() | _load_blocked_sources()
+    queries = {}
+    for m in markets:
+        qs = list(_GD_QUERIES[m])
+        qs += [t for t in _gd_wtl_terms(m) if t not in qs]
+        queries[m] = qs[:6]
+    if jid:
+        _job_set(jid, phase='Google doorzoeken', total=None)
+    results = _gd_google(queries)
+
+    cand = {}
+    for m, term, url in results:
+        d = _gd_domain(url)
+        if (not d or d in known or d in cand
+                or any(s in d for s in _GD_SKIP) or any(s in d for s in _GD_RETAILERS)):
+            continue
+        cand[d] = (m, term)
+    print(f'[wtl-disc] {len(results)} results -> {len(cand)} unknown candidates')
+
+    scanned, skipped = {}, []
+    if jid:
+        _job_set(jid, phase='Kandidaten checken (Shopify/lokaal/mode)', total=len(cand), processed=0)
+    for d, (m, term) in cand.items():
+        if jid:
+            _job_inc(jid, processed=1)
+        per_market = sum(1 for v in scanned.values() if v[0] == m)
+        if per_market >= _GD_MAX_NEW * 3:
+            continue
+        if not _gd_is_shopify(d):
+            skipped.append({'domain': d, 'market': m, 'reason': 'geen Shopify'})
+            continue
+        if not _gd_is_local(d, m):
+            skipped.append({'domain': d, 'market': m, 'reason': f'niet lokaal voor {m.upper()}'})
+            continue
+        payload, blocked = _bs_scan(d)
+        n = len((payload or {}).get('products') or [])
+        if blocked or n < _GD_MIN_WOMENS:
+            skipped.append({'domain': d, 'market': m,
+                            'reason': blocked or f'maar {n} vrouwenmode-bestsellers'})
+            continue
+        scanned[d] = (m, term, payload)
+    print(f'[wtl-disc] {len(scanned)} local Shopify womens stores found')
+
+    added, gated = [], []
+    if scanned:
+        if jid:
+            _job_set(jid, phase='SimilarWeb marktgrootte-gate')
+        fresh = _similarweb_bulk(list(scanned))
+        cache = _wtl_traffic_load()
+        cache.update(fresh)
+        _wtl_traffic_save(cache)
+        extra = _wtl_extra_stores()
+        per_market_added = {}
+        for d, (m, term, payload) in scanned.items():
+            visits = (fresh.get(d) or {}).get('total_visits') or 0
+            prices = [_price_eur_for_host(p.get('price'), d) for p in payload['products']]
+            prices = [p for p in prices if p]
+            aov = min(statistics.median(prices) if prices else TRAFFIC_AOV_FALLBACK,
+                      TRAFFIC_AOV_CAP) * TRAFFIC_BASKET
+            est = visits * TRAFFIC_CONV * aov
+            ratio = min(1.0, (_TRAFFIC_POP_M.get(m) or _TRAFFIC_ANCHOR_POP_M) / _TRAFFIC_ANCHOR_POP_M)
+            bar, floor = TRAFFIC_THRESHOLD_EUR * ratio, TRAFFIC_MIN_VISITS * ratio
+            ok = est >= bar and visits >= floor
+            row = {'domain': d, 'market': m, 'term': term, 'visits': visits,
+                   'est_eur': round(est), 'bar_eur': round(bar), 'floor': round(floor),
+                   'bestsellers': len(payload['products'])}
+            if ok and per_market_added.get(m, 0) < _GD_MAX_NEW:
+                if d not in extra:
+                    extra.append(d)
+                per_market_added[m] = per_market_added.get(m, 0) + 1
+                added.append(row)
+            else:
+                gated.append({**row, 'reason': 'onder de marktgrootte-lat' if not ok else 'cap bereikt'})
+        try:
+            tmp = WTL_EXTRA_STORES_PATH + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(extra, f)
+            os.replace(tmp, WTL_EXTRA_STORES_PATH)
+        except Exception as e:
+            print(f'[wtl-disc] extra-stores save failed: {e}')
+
+    return {'markets': markets, 'candidates': len(cand), 'scanned': len(scanned),
+            'added': added, 'gated': gated, 'skipped': skipped[:40]}
+
+
+@app.route('/api/wtl_discover', methods=['POST'])
+def api_wtl_discover():
+    """Kick a background discovery run (Google hunt for unknown local stores).
+    Body: {markets: ['fi', ...]} — defaults to all three. Poll via catalog_job/status."""
+    if not os.getenv('APIFY_TOKEN', '').strip():
+        return jsonify({'error': 'APIFY_TOKEN not configured on the server'}), 400
+    body = request.get_json(silent=True) or {}
+    markets = [str(m).lower() for m in (body.get('markets') or ['dk', 'fr', 'fi'])]
+    jid = _job_new('wtl_discover', 'wtl')
+
+    def _runner():
+        try:
+            res = _wtl_discover(markets, jid=jid)
+            _job_set(jid, status='done', result=res,
+                     finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+            _job_summary(jid, f"{len(res.get('added') or [])} nieuwe store(s) toegevoegd, "
+                              f"{len(res.get('gated') or [])} onder de lat")
+        except Exception as e:
+            _job_error(jid, str(e))
+            _job_set(jid, status='error', finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+
+    threading.Thread(target=_runner, daemon=True).start()
+    return jsonify({'job_id': jid, 'status': 'running'})
+
+
 def _wtl_traffic_loop():
     """Weekly self-refresh so the stores tab is always warm ('actief research'):
     every 12h check the cache; when entries are stale/missing, run one bulk
-    refresh. Kill-switch WTL_TRAFFIC_LOOP=0."""
+    refresh. Also: when a market has fewer than 3 stores clearing its local
+    floor, run the Google discovery for it (max once a week per market) — the
+    funnel feeds itself. Kill-switches WTL_TRAFFIC_LOOP=0 / WTL_DISCOVER_LOOP=0."""
     if os.getenv('WTL_TRAFFIC_LOOP', '1') == '0':
         return
     time.sleep(300)
@@ -7922,6 +8217,43 @@ def _wtl_traffic_loop():
                 print(f"[wtl] weekly traffic refresh: {res}")
         except Exception as e:
             print(f'[wtl] traffic loop error: {e}')
+        try:
+            if os.getenv('WTL_DISCOVER_LOOP', '1') != '0' and os.getenv('APIFY_TOKEN', '').strip():
+                try:
+                    with open(WTL_DISCOVER_STATE_PATH, encoding='utf-8') as f:
+                        st = json.load(f) or {}
+                except Exception:
+                    st = {}
+                now = datetime.datetime.utcnow()
+                cache = _wtl_traffic_load()
+                todo = []
+                for m in ('dk', 'fr', 'fi'):
+                    try:
+                        last = datetime.datetime.fromisoformat((st.get(m) or '1970-01-01').rstrip('Z'))
+                    except Exception:
+                        last = datetime.datetime(1970, 1, 1)
+                    if (now - last).total_seconds() < 7 * 86400:
+                        continue
+                    cc = _WTL_MARKET_CC[m]
+                    ratio = min(1.0, (_TRAFFIC_POP_M.get(m) or _TRAFFIC_ANCHOR_POP_M) / _TRAFFIC_ANCHOR_POP_M)
+                    floor = TRAFFIC_MIN_VISITS * ratio
+                    ok = 0
+                    for d in _wtl_all_domains():
+                        t = cache.get(d) or {}
+                        local = (t.get('total_visits') or 0) * ((t.get('shares') or {}).get(cc) or 0)
+                        if local >= floor:
+                            ok += 1
+                    if ok < 3:
+                        todo.append(m)
+                if todo:
+                    print(f'[wtl] weekly discovery for thin markets: {todo}')
+                    _wtl_discover(todo)
+                    for m in todo:
+                        st[m] = now.isoformat() + 'Z'
+                    with open(WTL_DISCOVER_STATE_PATH, 'w', encoding='utf-8') as f:
+                        json.dump(st, f)
+        except Exception as e:
+            print(f'[wtl] discovery loop error: {e}')
         time.sleep(12 * 3600)
 
 

@@ -168,6 +168,33 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
     }
   };
 
+  const [discovering, setDiscovering] = useState(false);
+  const [discoverMsg, setDiscoverMsg] = useState<string | null>(null);
+  /** Google hunt for UNKNOWN local stores (the research scraper's method, run server-side). */
+  const discoverStores = async () => {
+    setDiscovering(true);
+    setDiscoverMsg(null);
+    try {
+      const start = await api.wtlDiscover([funnelMarket]);
+      if (!start.job_id) throw new Error(start.error || "could not start");
+      let summary = "";
+      for (let i = 0; i < 200; i++) {
+        await new Promise((r) => setTimeout(r, 3000));
+        const j = await api.metaJobStatus(start.job_id).catch(() => null);
+        if (j && j.status !== "running") {
+          summary = j.summary || "";
+          break;
+        }
+      }
+      setDiscoverMsg(summary ? `✓ ${summary}` : "✓ done");
+      setWtlStores(await api.wtlStores(funnelMarket));
+    } catch (e) {
+      setDiscoverMsg(e instanceof Error ? e.message : "failed");
+    } finally {
+      setDiscovering(false);
+    }
+  };
+
   const addStore = async () => {
     const d = addDomain.trim();
     if (!d) return;
@@ -708,6 +735,17 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
                   {trafficRefreshing ? "Updating traffic… (~2 min)" : "↻ Update traffic"}
                 </button>
               )}
+              {wtlStores?.apify_configured && (
+                <button
+                  type="button"
+                  onClick={() => void discoverStores()}
+                  disabled={discovering}
+                  className="text-[11px] text-accent hover:underline disabled:opacity-50"
+                  title="Google-hunt for local fashion stores we DON'T know yet (the research scraper's method): localized searches → Shopify + locality + womens-fashion checks → market-size gate. Passers appear in this list. ~3-5 min."
+                >
+                  {discovering ? "Discovering… (~4 min)" : "🔍 Discover new stores"}
+                </button>
+              )}
               <a
                 href={api.wtlExportUrl("stores", funnelMarket, { onlyOk: false })}
                 className="text-[11px] text-accent hover:underline"
@@ -726,6 +764,7 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
                 ⬇ Work list CSV
               </a>
             </div>
+            {discoverMsg && <p className="text-[11px] text-text-dim mb-2">{discoverMsg}</p>}
             {storesLoading ? (
               <p className="text-[12px] text-text-faint">Loading stores…</p>
             ) : !wtlStores || wtlStores.stores.length === 0 ? (
@@ -987,6 +1026,26 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
                                     {p.category}
                                     {p.published_at ? ` · since ${p.published_at}` : ""}
                                   </div>
+                                  {(p.price_ok === false || (p.also_at?.length ?? 0) > 0) && (
+                                    <div className="flex items-center gap-1 mt-1 flex-wrap">
+                                      {p.price_ok === false && (
+                                        <span
+                                          className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-500/15 text-amber-500 border border-amber-500/40"
+                                          title={`≈ €${p.price_eur ?? "?"} — under the €25 minimum (too little margin)`}
+                                        >
+                                          &lt; €25
+                                        </span>
+                                      )}
+                                      {(p.also_at?.length ?? 0) > 0 && (
+                                        <span
+                                          className="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-green-600/15 text-green-600 dark:text-green-400 border border-green-600/40"
+                                          title={`Also a bestseller at: ${(p.also_at ?? []).join(", ")} — multiple stores pushing the same product is a strong winner signal`}
+                                        >
+                                          🔥 also at {p.also_at?.length}
+                                        </span>
+                                      )}
+                                    </div>
+                                  )}
                                   <div className="flex items-center gap-1 mt-1.5">
                                     <button
                                       type="button"

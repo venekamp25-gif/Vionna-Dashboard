@@ -94,6 +94,9 @@ export function InputStep() {
     {
       label: string; detail: string; source: string; confidence: string;
       traffic?: { visits: number; est_monthly_eur: number; market_ok: boolean; threshold_eur: number } | null;
+      priceEur?: number | null;
+      priceOk?: boolean;
+      minPriceEur?: number;
     } | null
   >(null);
 
@@ -172,12 +175,14 @@ export function InputStep() {
     try {
       const res = await api.classifyShipping(data.competitorUrl.trim());
       const trafficOk = !res.traffic || res.traffic.market_ok; // null check = infra-falen, niet straffen
-      if (res.label === "Dropshipper" && trafficOk) {
+      const priceOk = res.price_ok !== false; // unknown price = pass (scraper rule)
+      if (res.label === "Dropshipper" && trafficOk && priceOk) {
         proceed();
       } else {
         setShippingWarn({
           label: res.label, detail: res.detail || "", source: res.source,
           confidence: res.confidence, traffic: res.traffic ?? null,
+          priceEur: res.price_eur ?? null, priceOk, minPriceEur: res.min_price_eur ?? 25,
         });
       }
     } catch {
@@ -440,7 +445,9 @@ export function InputStep() {
                     : shippingWarn.label === "Mogelijk eigen merk"
                       ? "This may be a real brand — do not import"
                       : shippingWarn.label === "Dropshipper"
-                        ? "Source store's traffic is too low"
+                        ? (shippingWarn.traffic && !shippingWarn.traffic.market_ok
+                            ? "Source store's traffic is too low"
+                            : "Product price is under the €25 minimum")
                         : "Couldn't determine delivery time"}
                 </h3>
                 <p className="text-[13px] text-text-dim mt-1.5 leading-relaxed">
@@ -464,15 +471,24 @@ export function InputStep() {
                       their products has cost us a lot of cleanup before.
                     </>
                   ) : shippingWarn.label === "Dropshipper" ? (
-                    <>
-                      Shipping checks out as dropshipper, but this store only gets{" "}
-                      <strong>{(shippingWarn.traffic?.visits ?? 0).toLocaleString()} visitors/month</strong>{" "}
-                      (SimilarWeb) — estimated revenue ≈ €
-                      {(shippingWarn.traffic?.est_monthly_eur ?? 0).toLocaleString()}/month, under the{" "}
-                      <strong>€{(shippingWarn.traffic?.threshold_eur ?? 300000).toLocaleString()}/month
-                      proven-market bar</strong>. A bestseller of a store this small is weak proof the
-                      product actually sells.
-                    </>
+                    shippingWarn.traffic && !shippingWarn.traffic.market_ok ? (
+                      <>
+                        Shipping checks out as dropshipper, but this store only gets{" "}
+                        <strong>{(shippingWarn.traffic?.visits ?? 0).toLocaleString()} visitors/month</strong>{" "}
+                        (SimilarWeb) — estimated revenue ≈ €
+                        {(shippingWarn.traffic?.est_monthly_eur ?? 0).toLocaleString()}/month, under the{" "}
+                        <strong>€{(shippingWarn.traffic?.threshold_eur ?? 300000).toLocaleString()}/month
+                        proven-market bar</strong>. A bestseller of a store this small is weak proof the
+                        product actually sells.
+                      </>
+                    ) : (
+                      <>
+                        Shipping checks out as dropshipper, but this product costs about{" "}
+                        <strong>€{(shippingWarn.priceEur ?? 0).toLocaleString()}</strong> — under the{" "}
+                        <strong>€{(shippingWarn.minPriceEur ?? 25).toLocaleString()} minimum</strong>. Below
+                        that there&apos;s too little margin to be worth listing.
+                      </>
+                    )
                   ) : (
                     <>
                       Couldn&apos;t find this store&apos;s delivery time (no readable shipping
@@ -485,6 +501,12 @@ export function InputStep() {
                     Also: only <strong>{shippingWarn.traffic.visits.toLocaleString()} visitors/month</strong> on
                     SimilarWeb (est. €{shippingWarn.traffic.est_monthly_eur.toLocaleString()}/mo — under the
                     €{shippingWarn.traffic.threshold_eur.toLocaleString()} market bar).
+                  </p>
+                )}
+                {shippingWarn.priceOk === false && (shippingWarn.label !== "Dropshipper" || (shippingWarn.traffic && !shippingWarn.traffic.market_ok)) && (
+                  <p className="text-[12px] text-warning mt-2 leading-relaxed">
+                    Also: the product costs about <strong>€{(shippingWarn.priceEur ?? 0).toLocaleString()}</strong>{" "}
+                    — under the €{(shippingWarn.minPriceEur ?? 25).toLocaleString()} minimum (too little margin).
                   </p>
                 )}
                 {shippingWarn.source !== "none" && (
