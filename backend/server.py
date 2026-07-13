@@ -6658,6 +6658,37 @@ _SIZE_HEADER_MAP = {
     'borstwijdte':      {'dk': 'Bryst',       'fr': 'Poitrine',           'fi': 'Rinta'},
     'schouderbreedte':  {'dk': 'Skulder',     'fr': 'Épaule',             'fi': 'Olkapää'},
     'mouwlengte':       {'dk': 'Ærme',        'fr': 'Manche',             'fi': 'Hiha'},
+    # ── terms found untranslated in the 2026-07-09 catalogue sweep (FR + DE sources) ──
+    'tailles':          {'dk': 'Størrelser',  'fr': 'Tailles',            'fi': 'Koot'},
+    'buste':            {'dk': 'Bryst',       'fr': 'Buste',              'fi': 'Rinta'},
+    'tour de buste':    {'dk': 'Brystvidde',  'fr': 'Tour de buste',      'fi': 'Rinnanympärys'},
+    'tour de manche':   {'dk': 'Ærmevidde',   'fr': 'Tour de manche',     'fi': 'Hihan ympärys'},
+    "tour d'épaule":    {'dk': 'Skuldervidde', 'fr': "Tour d'épaule",     'fi': 'Olkaleveys'},
+    "tour d'épaules":   {'dk': 'Skuldervidde', 'fr': "Tour d'épaules",    'fi': 'Olkaleveys'},
+    'épaules':          {'dk': 'Skulder',     'fr': 'Épaules',            'fi': 'Olkapää'},
+    'tour de hanches':  {'dk': 'Hoftevidde',  'fr': 'Tour de hanches',    'fi': 'Lantion ympärys'},
+    'largeur':          {'dk': 'Vidde',       'fr': 'Largeur',            'fi': 'Leveys'},
+    'largeur à plat aisselle à aisselle':
+                        {'dk': 'Bredde flad, ærmegab til ærmegab', 'fr': 'Largeur à plat aisselle à aisselle',
+                         'fi': 'Leveys kainalosta kainaloon'},
+    'longueur de la robe': {'dk': 'Kjolelængde', 'fr': 'Longueur de la robe', 'fi': 'Mekon pituus'},
+    'longueur des manches': {'dk': 'Ærmelængde', 'fr': 'Longueur des manches', 'fi': 'Hihan pituus'},
+    'longueur intérieure': {'dk': 'Indvendig længde', 'fr': 'Longueur intérieure', 'fi': 'Sisäpituus'},
+    'taille internationale': {'dk': 'International størrelse', 'fr': 'Taille internationale', 'fi': 'Kansainvälinen koko'},
+    'taille fr':        {'dk': 'FR-størrelse', 'fr': 'Taille FR',          'fi': 'FR-koko'},
+    'taille eu':        {'dk': 'EU-størrelse', 'fr': 'Taille EU',          'fi': 'EU-koko'},
+    'pointure':         {'dk': 'Skostørrelse', 'fr': 'Pointure',           'fi': 'Kengän koko'},
+    'sleeve length':    {'dk': 'Ærmelængde',  'fr': 'Longueur des manches', 'fi': 'Hihan pituus'},
+    'shoulder width':   {'dk': 'Skuldervidde', 'fr': "Largeur d'épaules",  'fi': 'Olkaleveys'},
+    'größe':            {'dk': 'Størrelse',   'fr': 'Taille',             'fi': 'Koko'},
+    'grösse':           {'dk': 'Størrelse',   'fr': 'Taille',             'fi': 'Koko'},
+    'brust':            {'dk': 'Bryst',       'fr': 'Poitrine',           'fi': 'Rinta'},
+    'hüfte':            {'dk': 'Hofte',       'fr': 'Hanches',            'fi': 'Lantio'},
+    'länge':            {'dk': 'Længde',      'fr': 'Longueur',           'fi': 'Pituus'},
+    'ärmellänge':       {'dk': 'Ærmelængde',  'fr': 'Longueur des manches', 'fi': 'Hihan pituus'},
+    'schulter':         {'dk': 'Skulder',     'fr': 'Épaule',             'fi': 'Olkapää'},
+    'schulterbreite':   {'dk': 'Skuldervidde', 'fr': "Largeur d'épaules", 'fi': 'Olkaleveys'},
+    'breite':           {'dk': 'Vidde',       'fr': 'Largeur',            'fi': 'Leveys'},
 }
 _SIZE_CHART_TITLE = {'dk': 'Størrelsesguide', 'fr': 'Guide des tailles', 'fi': 'Kokotaulukko'}
 
@@ -6673,9 +6704,101 @@ def _esc_html(s):
             .replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;'))
 
 
+# Deaccented index of the header map, so 'EPAULE' matches 'épaule' etc. Built once.
+_SIZE_HEADER_MAP_DEACC = None
+def _size_header_map_deacc():
+    global _SIZE_HEADER_MAP_DEACC
+    if _SIZE_HEADER_MAP_DEACC is None:
+        _SIZE_HEADER_MAP_DEACC = {_deaccent(k): v for k, v in _SIZE_HEADER_MAP.items()}
+    return _SIZE_HEADER_MAP_DEACC
+
+
+# Trailing unit suffix on a label: 'Longueur (cm)' / 'LÆNGDE CM' / 'Bust (in.)'.
+# Splitting it off is what lets 'longueur (cm)' hit the 'longueur' map entry —
+# the old exact-match missed EVERY '(cm)'-suffixed label (2026-07-09 sweep root cause).
+_UNIT_SUFFIX_RE = re.compile(r'\s*\(?\s*(cm|mm|in(?:ch(?:es)?)?|")\s*\.?\s*\)?\s*$', re.I)
+
+
+def _split_label_unit(h):
+    raw = re.sub(r'\s+', ' ', str(h if h is not None else '').strip())
+    m = _UNIT_SUFFIX_RE.search(raw)
+    if m and m.start() > 0:
+        return raw[:m.start()].strip(), f' ({m.group(1).lower()})'
+    return raw, ''
+
+
+# Known TARGET-language labels per store (all map output values) — an already-
+# localised label ('Længde (cm)' on dk) is recognised and kept, instead of being
+# sent to the LLM safety net on every publish.
+_KNOWN_TARGET = None
+def _known_target(store):
+    global _KNOWN_TARGET
+    if _KNOWN_TARGET is None:
+        _KNOWN_TARGET = {}
+        for m in list(_SIZE_HEADER_MAP.values()) + list(_MEASURE_OVERRIDE.values()):
+            for st, v in m.items():
+                _KNOWN_TARGET.setdefault(st, set()).add(_deaccent(v))
+    return _KNOWN_TARGET.get(store, set())
+
+
+def _map_label(h, store, measure=False):
+    """Dictionary translation of a chart label (unit-aware, accent-tolerant).
+    Returns the translated label, or None when the term is unknown."""
+    core, unit = _split_label_unit(h)
+    if not core:
+        return None
+    key = core.lower()
+    # a unit suffix means it's a MEASUREMENT column ('Taille (cm)' = waist, not size)
+    if measure or unit:
+        m = _MEASURE_OVERRIDE.get(key) or _MEASURE_OVERRIDE.get(_deaccent(key))
+        if m:
+            return m.get(store, core) + unit
+    m = _SIZE_HEADER_MAP.get(key) or _size_header_map_deacc().get(_deaccent(key))
+    if m:
+        return m.get(store, core) + unit
+    if _deaccent(key) in _known_target(store):
+        return core + unit          # already in the store's language — keep
+    return None
+
+
+# A cell that is a size/number, not a translatable label ('S', 'XL (42-44)', '36–38', '98').
+_SIZE_CELL_RE = re.compile(r'^(xxs|xs|s|m|l|x{1,3}l|[2-5]xl|one size|onesize|\d[\d ,.\-–/]*)'
+                           r'(\s*\(?[\d\-– ,./]*\)?)?$', re.I)
+
+# In-process cache for LLM-translated labels: (store, label.lower()) -> translation.
+_CHART_LABEL_CACHE = {}
+
+
+def _llm_chart_labels(labels, store):
+    """SAFETY NET for labels the dictionary doesn't know (any language): translate
+    them via a small Claude call, cached per label. Numbers/sizes never leave the
+    page — only textual labels are sent. On any failure the source text is kept
+    (the old behaviour), so this can only improve the result. Returns {label: out}."""
+    todo = sorted({l for l in labels if l and (store, l.lower()) not in _CHART_LABEL_CACHE})
+    if todo and ANTHROPIC_KEY and ANTHROPIC_KEY != 'VOELINJEYHIER':
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+            lang = {'dk': 'Danish', 'fr': 'French', 'fi': 'Finnish'}.get(store, 'the store language')
+            prompt = ('Translate these clothing size-chart labels into %s (common garment terms). '
+                      'Keep units like "(cm)" and codes (S, M, XL, EU, FR) unchanged; if a label is '
+                      'already %s, return it unchanged. Reply with ONLY a JSON object mapping every '
+                      'input label to its translation.\n%s'
+                      % (lang, lang, json.dumps(todo, ensure_ascii=False)))
+            msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=600,
+                                         messages=[{'role': 'user', 'content': prompt}])
+            txt = ''.join(getattr(b, 'text', '') for b in msg.content)
+            mm = re.search(r'\{.*\}', txt, re.S)
+            for k, v in (json.loads(mm.group(0)) if mm else {}).items():
+                if isinstance(v, str) and v.strip():
+                    _CHART_LABEL_CACHE[(store, str(k).lower())] = v.strip()
+        except Exception as e:
+            print(f"[size-chart] LLM label translate failed (keeping source): {e}")
+    return {l: _CHART_LABEL_CACHE.get((store, l.lower()), l) for l in labels}
+
+
 def _translate_size_header(h, store):
-    m = _SIZE_HEADER_MAP.get(re.sub(r'\s+', ' ', (h or '').strip().lower()))
-    return m.get(store, h) if m else h
+    return _map_label(h, store) or h
 
 
 def _strip_lead_num(s):
@@ -6686,29 +6809,40 @@ def _strip_lead_num(s):
 def _translate_measure_label(h, store):
     """Translate a first-column measurement label. Falls back to the header map,
     but overrides size/waist-ambiguous terms to their measurement meaning."""
-    key = re.sub(r'\s+', ' ', (h or '').strip().lower())
-    m = _MEASURE_OVERRIDE.get(key)
-    if m:
-        return m.get(store, h)
-    return _translate_size_header(h, store)
+    return _map_label(h, store, measure=True) or h
 
 
 def _size_chart_html(chart, store):
     """Render a scraped size chart to a clean, style-less HTML <table>, localised
-    to `store`: column headers AND first-column measurement labels are translated,
-    and leading "1./2." numbering is stripped. Styling and the heading are the
-    theme's job. Returns '' when there's no usable chart."""
+    to `store`: column headers AND first-column measurement labels are translated
+    (dictionary first — unit-aware and accent-tolerant — then an LLM safety net for
+    unknown terms in ANY source language), and leading "1./2." numbering is
+    stripped. Styling and the heading are the theme's job. Returns '' when there's
+    no usable chart."""
     if not isinstance(chart, dict) or not chart.get('rows'):
         return ''
-    headers = chart.get('headers') or []
-    th = ''.join(
-        f'<th>{_esc_html(_translate_size_header(_strip_lead_num(h), store))}</th>'
-        for h in headers)
+    headers = [_strip_lead_num(h) for h in (chart.get('headers') or [])]
+    firsts = [_strip_lead_num(r[0]) if r else '' for r in chart['rows']]
+
+    # dictionary pass; collect what it can't translate for one batched LLM call
+    th_out = {h: _map_label(h, store) for h in headers}
+    fc_out = {c: _map_label(c, store, measure=True) for c in firsts}
+    unknown = ([h for h, v in th_out.items() if v is None and h and not _SIZE_CELL_RE.match(h)]
+               + [c for c, v in fc_out.items() if v is None and c and not _SIZE_CELL_RE.match(c)])
+    if unknown:
+        llm = _llm_chart_labels(unknown, store)
+        for k, v in llm.items():
+            if th_out.get(k, '') is None:
+                th_out[k] = v
+            if fc_out.get(k, '') is None:
+                fc_out[k] = v
+
+    th = ''.join(f'<th>{_esc_html(th_out.get(h) or h)}</th>' for h in headers)
     body = ''
-    for row in chart['rows']:
+    for row, first in zip(chart['rows'], firsts):
         cells = list(row)
         if cells:
-            cells[0] = _translate_measure_label(_strip_lead_num(cells[0]), store)
+            cells[0] = fc_out.get(first) or first
         tds = ''.join(f'<td>{_esc_html(c)}</td>' for c in cells)
         body += f'<tr>{tds}</tr>'
     thead = f'<thead><tr>{th}</tr></thead>' if headers else ''
