@@ -596,9 +596,10 @@ def _traffic_check(url, host):
     aov = _import_price_eur(url) or TRAFFIC_AOV_FALLBACK
     aov = min(aov, TRAFFIC_AOV_CAP)
     est = visits * TRAFFIC_CONV * aov
+    bar = _traffic_bar_eur(host)
     return {'visits': visits, 'est_monthly_eur': round(est),
-            'market_ok': est >= TRAFFIC_THRESHOLD_EUR,
-            'threshold_eur': TRAFFIC_THRESHOLD_EUR}
+            'market_ok': est >= bar,
+            'threshold_eur': bar}
 
 
 @app.route('/api/classify_shipping')
