@@ -7539,6 +7539,260 @@ def api_known_competitors():
     return jsonify({'competitors': _known_comp_data()})
 
 
+# ── What-to-list funnel step 2: competitor STORES with LOCAL market traffic ────
+# Employee flow: What to list → product types → STORES → products. Per market
+# (dk/fr/fi) we list the known competitor stores with their SimilarWeb traffic IN
+# THAT COUNTRY (totalVisits × countryShare from the radeance~similarweb-scraper
+# Apify actor — the same source the winninghunter scraper's €-gate uses). Traffic
+# is cached in wtl_traffic.json (7 days; SimilarWeb moves slowly) and refreshed
+# by a background job or the weekly loop. Domains SimilarWeb has no data for get
+# total_visits 0 — itself a signal (too small).
+WTL_TRAFFIC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wtl_traffic.json')
+WTL_EXTRA_STORES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wtl_extra_stores.json')
+_WTL_TRAFFIC_TTL = 7 * 86400
+_WTL_MARKET_CC = {'dk': 'DK', 'fr': 'FR', 'fi': 'FI'}
+_WTL_TRAFFIC_LOCK = threading.Lock()
+
+
+def _wtl_traffic_load():
+    try:
+        with open(WTL_TRAFFIC_PATH, encoding='utf-8') as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _wtl_traffic_save(data):
+    try:
+        tmp = WTL_TRAFFIC_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, WTL_TRAFFIC_PATH)
+    except Exception as e:
+        print(f'[wtl] traffic cache save failed: {e}')
+
+
+def _wtl_extra_stores():
+    try:
+        with open(WTL_EXTRA_STORES_PATH, encoding='utf-8') as f:
+            return [str(d) for d in (json.load(f) or [])]
+    except Exception:
+        return []
+
+
+def _similarweb_bulk(hosts):
+    """One Apify actor run for many domains → {host: {'total_visits', 'shares'{CC:frac},
+    'monthly'{...}}}. Hosts without SimilarWeb data come back with total_visits 0."""
+    token = os.getenv('APIFY_TOKEN', '').strip()
+    hosts = sorted({h for h in hosts if h})
+    if not token or not hosts:
+        return {}
+    try:
+        r = req.post('https://api.apify.com/v2/acts/radeance~similarweb-scraper/runs',
+                     params={'token': token}, json={'urls': hosts}, timeout=30)
+        if r.status_code not in (200, 201):
+            print(f'[wtl] similarweb start failed: {r.status_code}')
+            return {}
+        run = (r.json() or {}).get('data') or {}
+        run_id, ds_id = run.get('id'), run.get('defaultDatasetId')
+        status, waited = run.get('status'), 0
+        while status in ('READY', 'RUNNING') and waited < 480:
+            time.sleep(8)
+            waited += 8
+            rr = req.get(f'https://api.apify.com/v2/actor-runs/{run_id}',
+                         params={'token': token}, timeout=30)
+            status = ((rr.json() or {}).get('data') or {}).get('status')
+        if status != 'SUCCEEDED':
+            print(f'[wtl] similarweb run ended {status}')
+            return {}
+        items = req.get(f'https://api.apify.com/v2/datasets/{ds_id}/items',
+                        params={'token': token, 'format': 'json', 'clean': 'true'},
+                        timeout=90).json()
+    except Exception as e:
+        print(f'[wtl] similarweb bulk failed: {e}')
+        return {}
+    out = {}
+    for it in (items if isinstance(items, list) else []):
+        dom = re.sub(r'^www\.', '', str(it.get('domain') or it.get('name') or '')
+                     .lower().strip().strip('/'))
+        if not dom:
+            m = re.match(r'https?://(?:www\.)?([^/]+)', str(it.get('url') or ''))
+            dom = m.group(1).lower() if m else ''
+        if not dom:
+            continue
+        try:
+            total = int(it.get('totalVisits') or 0)
+        except (TypeError, ValueError):
+            total = 0
+        shares = {}
+        for cs in (it.get('countryShare') or []):
+            try:
+                shares[str(cs.get('country') or '').upper()] = float(cs.get('share') or 0)
+            except (TypeError, ValueError):
+                continue
+        out[dom] = {'total_visits': total, 'shares': shares,
+                    'ts': datetime.datetime.utcnow().isoformat() + 'Z'}
+    # hosts the actor returned nothing for → cache an explicit zero (retry after TTL)
+    for h in hosts:
+        if h not in out:
+            out[h] = {'total_visits': 0, 'shares': {},
+                      'ts': datetime.datetime.utcnow().isoformat() + 'Z'}
+    return out
+
+
+def _wtl_all_domains():
+    doms = {c['domain'] for c in _known_comp_data()}
+    doms.update(_wtl_extra_stores())
+    return doms - _load_blocked_sources()
+
+
+def _wtl_refresh_traffic(force=False):
+    """Refresh stale/missing traffic entries (one bulk actor run). Lock-guarded."""
+    if not _WTL_TRAFFIC_LOCK.acquire(blocking=False):
+        return {'error': 'refresh already running'}
+    try:
+        cache = _wtl_traffic_load()
+        now = datetime.datetime.utcnow()
+        stale = []
+        for d in _wtl_all_domains():
+            e = cache.get(d)
+            if force or not e:
+                stale.append(d)
+                continue
+            try:
+                age = (now - datetime.datetime.fromisoformat(e['ts'].rstrip('Z'))).total_seconds()
+            except Exception:
+                age = _WTL_TRAFFIC_TTL + 1
+            if age > _WTL_TRAFFIC_TTL:
+                stale.append(d)
+        if not stale:
+            return {'refreshed': 0, 'total': len(cache)}
+        fresh = _similarweb_bulk(stale[:80])
+        cache.update(fresh)
+        _wtl_traffic_save(cache)
+        return {'refreshed': len(fresh), 'total': len(cache)}
+    finally:
+        _WTL_TRAFFIC_LOCK.release()
+
+
+@app.route('/api/wtl_stores')
+def api_wtl_stores():
+    """Step 2 of the What-to-list funnel: known competitor stores for a market,
+    with LOCAL SimilarWeb traffic (cached). Read-only; refresh runs via the job
+    endpoint below. ?store=dk|fr|fi &min_local= (default 2000, only used for the
+    market_ok flag — the frontend decides what to show)."""
+    store = (request.args.get('store') or 'dk').lower()
+    cc = _WTL_MARKET_CC.get(store, 'DK')
+    try:
+        min_local = int(request.args.get('min_local') or 2000)
+    except Exception:
+        min_local = 2000
+    cache = _wtl_traffic_load()
+    now = datetime.datetime.utcnow()
+    comps = {c['domain']: c for c in _known_comp_data()}
+    for d in _wtl_extra_stores():
+        comps.setdefault(d, {'domain': d, 'products': 0, 'last_import': None, 'imported_handles': []})
+    blocked = _load_blocked_sources()
+    out = []
+    missing = 0
+    for d, c in comps.items():
+        if d in blocked:
+            continue
+        t = cache.get(d)
+        total = (t or {}).get('total_visits') or 0
+        share = ((t or {}).get('shares') or {}).get(cc) or 0.0
+        local = int(total * share)
+        age_days = None
+        if t:
+            try:
+                age_days = round((now - datetime.datetime.fromisoformat(t['ts'].rstrip('Z'))).total_seconds() / 86400, 1)
+            except Exception:
+                age_days = None
+        else:
+            missing += 1
+        out.append({'domain': d, 'products': c.get('products') or 0,
+                    'last_import': c.get('last_import'),
+                    'imported_handles': c.get('imported_handles') or [],
+                    'total_visits': total, 'local_visits': local,
+                    'local_share': round(share, 3), 'traffic_age_days': age_days,
+                    'has_traffic_data': bool(t and total > 0),
+                    'market_ok': local >= min_local})
+    out.sort(key=lambda s: (-s['local_visits'], -s['products']))
+    return jsonify({'store': store, 'country': cc, 'min_local': min_local,
+                    'stores': out, 'traffic_missing': missing,
+                    'apify_configured': bool(os.getenv('APIFY_TOKEN', '').strip())})
+
+
+@app.route('/api/wtl_stores/refresh', methods=['POST'])
+def api_wtl_stores_refresh():
+    """Kick a background traffic refresh (one Apify run over stale domains).
+    Returns a job id pollable via /api/catalog_job/status."""
+    if not os.getenv('APIFY_TOKEN', '').strip():
+        return jsonify({'error': 'APIFY_TOKEN not configured on the server'}), 400
+    force = bool((request.get_json(silent=True) or {}).get('force'))
+    jid = _job_new('wtl_traffic', 'wtl')
+
+    def _runner():
+        try:
+            _job_set(jid, phase='SimilarWeb traffic ophalen')
+            res = _wtl_refresh_traffic(force=force)
+            _job_set(jid, status='done', result=res,
+                     finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+            _job_summary(jid, f"traffic ververst voor {res.get('refreshed', 0)} stores")
+        except Exception as e:
+            _job_error(jid, str(e))
+            _job_set(jid, status='error', finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+
+    threading.Thread(target=_runner, daemon=True).start()
+    return jsonify({'job_id': jid, 'status': 'running'})
+
+
+@app.route('/api/wtl_stores/add', methods=['POST'])
+def api_wtl_stores_add():
+    """Add a competitor store (bare domain or URL) to the funnel's store list."""
+    raw = str((request.get_json(silent=True) or {}).get('domain') or '').strip().lower()
+    m = re.match(r'(?:https?://)?(?:www\.)?([a-z0-9.-]+\.[a-z]{2,})', raw)
+    if not m:
+        return jsonify({'error': 'geen geldig domein'}), 400
+    dom = m.group(1)
+    if dom in _load_blocked_sources():
+        return jsonify({'error': f'{dom} staat op de blokkadelijst'}), 400
+    cur = _wtl_extra_stores()
+    if dom not in cur and dom not in {c['domain'] for c in _known_comp_data()}:
+        cur.append(dom)
+        try:
+            tmp = WTL_EXTRA_STORES_PATH + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(cur, f)
+            os.replace(tmp, WTL_EXTRA_STORES_PATH)
+        except Exception as e:
+            return jsonify({'error': f'opslaan mislukt: {e}'}), 500
+    return jsonify({'ok': True, 'domain': dom, 'extra_total': len(cur)})
+
+
+def _wtl_traffic_loop():
+    """Weekly self-refresh so the stores tab is always warm ('actief research'):
+    every 12h check the cache; when entries are stale/missing, run one bulk
+    refresh. Kill-switch WTL_TRAFFIC_LOOP=0."""
+    if os.getenv('WTL_TRAFFIC_LOOP', '1') == '0':
+        return
+    time.sleep(300)
+    while True:
+        try:
+            res = _wtl_refresh_traffic(force=False)
+            if res.get('refreshed'):
+                print(f"[wtl] weekly traffic refresh: {res}")
+        except Exception as e:
+            print(f'[wtl] traffic loop error: {e}')
+        time.sleep(12 * 3600)
+
+
+try:
+    threading.Thread(target=_wtl_traffic_loop, daemon=True, name='wtl-traffic').start()
+except Exception as _e:
+    print(f'[wtl] could not start traffic loop: {_e}')
+
+
 @app.route('/api/set_products_status', methods=['POST'])
 def api_set_products_status():
     """Bulk-set product status (ACTIVE/DRAFT) by product NAME across stores --

@@ -626,6 +626,32 @@ export const api = {
       "/api/known_competitors"
     ),
 
+  /** What-to-list funnel step 2: competitor stores with LOCAL SimilarWeb traffic
+   *  for a market (cached droplet-side, refreshed weekly / via wtlStoresRefresh). */
+  wtlStores: (store: "dk" | "fr" | "fi") =>
+    call<{
+      store: string;
+      country: string;
+      min_local: number;
+      traffic_missing: number;
+      apify_configured: boolean;
+      stores: WtlStore[];
+    }>(`/api/wtl_stores?store=${store}`),
+
+  /** Kick a background SimilarWeb refresh over stale store domains (poll via metaJobStatus). */
+  wtlStoresRefresh: (force = false) =>
+    call<{ job_id?: string; status?: string; error?: string }>("/api/wtl_stores/refresh", {
+      method: "POST",
+      body: { force },
+    }),
+
+  /** Add a competitor store (domain or URL) to the funnel's store list. */
+  wtlStoreAdd: (domain: string) =>
+    call<{ ok?: boolean; domain?: string; error?: string }>("/api/wtl_stores/add", {
+      method: "POST",
+      body: { domain },
+    }),
+
   /** Risers + new entrants on known competitors' bestseller pages vs ~a week ago
    *  (droplet-side weekly snapshots; skips products we already imported). Ranked
    *  with the SAME scoring as What-to-list (season + catalogue gap) for `store`. */
@@ -849,6 +875,21 @@ export const api = {
     dry_run?: boolean;
   }) => call<MetaFixLinksResponse>("/api/meta/fix_links", { method: "POST", body: params, authed: true }),
 };
+
+/** One competitor store in the What-to-list funnel (step 2). */
+export interface WtlStore {
+  domain: string;
+  products: number;
+  last_import: string | null;
+  imported_handles: string[];
+  total_visits: number;
+  /** SimilarWeb visits attributed to the market's country (total × country share). */
+  local_visits: number;
+  local_share: number;
+  traffic_age_days: number | null;
+  has_traffic_data: boolean;
+  market_ok: boolean;
+}
 
 export interface MetaFixLinkRow {
   ad_id: string;

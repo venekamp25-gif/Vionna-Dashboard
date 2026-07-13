@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { api } from "@/lib/api";
+import { api, WtlStore } from "@/lib/api";
+import { useProduct } from "@/lib/product";
+import { useStep } from "@/lib/step";
 import { StoreKey, STORE_CONFIG, STORE_KEYS } from "@/lib/store";
 import { Button } from "@/components/ui/Button";
 
@@ -101,6 +103,19 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
   const [movers, setMovers] = useState<Awaited<ReturnType<typeof api.bestsellerMovers>> | null>(null);
   const [moversLoading, setMoversLoading] = useState(false);
 
+  // ── Funnel: product type → stores (local traffic) → products → import ──
+  const { patch } = useProduct();
+  const { setStep } = useStep();
+  const [funnelType, setFunnelType] = useState<TypeRow | null>(null);
+  const [wtlStores, setWtlStores] = useState<Awaited<ReturnType<typeof api.wtlStores>> | null>(null);
+  const [storesLoading, setStoresLoading] = useState(false);
+  const [onlyEnough, setOnlyEnough] = useState(true);
+  const [trafficRefreshing, setTrafficRefreshing] = useState(false);
+  const [addDomain, setAddDomain] = useState("");
+  const [addMsg, setAddMsg] = useState<string | null>(null);
+  const [scanStore, setScanStore] = useState<WtlStore | null>(null);
+  const [onlyType, setOnlyType] = useState(true);
+
   // Known competitors (domains we've imported from) → one-click chips.
   useEffect(() => {
     if (!open) return;
@@ -121,12 +136,71 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
       .finally(() => setMoversLoading(false));
   }, [open, moversStore]);
 
-  const runScan = async (domain?: string, force = false) => {
+  // Stores list for the funnel market (viewStore once results exist, else first selection).
+  const funnelMarket: StoreKey = results ? viewStore : (selectedStores[0] ?? "dk");
+  useEffect(() => {
+    if (!open) return;
+    setStoresLoading(true);
+    api.wtlStores(funnelMarket)
+      .then(setWtlStores)
+      .catch(() => setWtlStores(null))
+      .finally(() => setStoresLoading(false));
+  }, [open, funnelMarket]);
+
+  const scrollToId = (id: string) =>
+    window.setTimeout(() => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" }), 60);
+
+  const refreshTraffic = async () => {
+    setTrafficRefreshing(true);
+    try {
+      const start = await api.wtlStoresRefresh();
+      if (!start.job_id) throw new Error(start.error || "could not start");
+      for (let i = 0; i < 120; i++) {
+        await new Promise((r) => setTimeout(r, 2500));
+        const j = await api.metaJobStatus(start.job_id).catch(() => null);
+        if (j && j.status !== "running") break;
+      }
+      setWtlStores(await api.wtlStores(funnelMarket));
+    } catch {
+      /* stores list simply stays as-is */
+    } finally {
+      setTrafficRefreshing(false);
+    }
+  };
+
+  const addStore = async () => {
+    const d = addDomain.trim();
+    if (!d) return;
+    setAddMsg(null);
+    try {
+      const r = await api.wtlStoreAdd(d);
+      if (r.error) {
+        setAddMsg(r.error);
+        return;
+      }
+      setAddDomain("");
+      setAddMsg(`✓ ${r.domain} added — press "Update traffic" to fetch its visitors`);
+      setWtlStores(await api.wtlStores(funnelMarket));
+    } catch (e) {
+      setAddMsg(e instanceof Error ? e.message : "failed");
+    }
+  };
+
+  /** One-click hand-off to the import screen: prefill the competitor URL and jump to Input. */
+  const importProduct = (url: string) => {
+    patch({ competitorUrl: url });
+    setStep(1);
+    onClose();
+  };
+
+  const runScan = async (domain?: string, force = false, fromStore?: WtlStore) => {
     const d = (domain ?? competitorDomain).trim();
     if (!d) return;
     if (domain) setCompetitorDomain(domain);
+    setScanStore(fromStore ?? (wtlStores?.stores ?? []).find((s) => s.domain === d) ?? null);
     setScanning(true);
     setScan(null);
+    scrollToId("wtl-products");
     try {
       setScan(await api.bestsellerScan(d, force));
     } catch (e) {
@@ -244,8 +318,9 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
           <div>
             <h2 className="text-[16px] font-semibold text-text">What to list</h2>
             <p className="text-[12px] text-text-faint mt-0.5">
-              A recommendation of which product types to list next, per market — from the season that&apos;s coming up
-              and what you&apos;ve already listed recently.
+              The full research flow in one place: <strong>① product types</strong> (season + your catalogue gaps) →{" "}
+              <strong>② stores</strong> (competitors with real local traffic) → <strong>③ products</strong> (their
+              bestsellers) → <strong>Import</strong>.
             </p>
           </div>
           <button type="button" onClick={onClose} className="text-text-dim hover:text-text text-xl leading-none">
@@ -411,6 +486,20 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
                             </div>
                             {keywordPills(t)}
                           </div>
+                          <div className="shrink-0 self-center">
+                            <Button
+                              variant={funnelType?.seed === t.seed ? "primary" : "secondary"}
+                              size="sm"
+                              onClick={() => {
+                                setFunnelType(t);
+                                setOnlyType(true);
+                                scrollToId("wtl-stores");
+                              }}
+                              title="Step 2: see which competitor stores in this market have enough local traffic — then open their bestsellers for this type"
+                            >
+                              Find stores →
+                            </Button>
+                          </div>
                         </div>
                       );
                     })}
@@ -573,33 +662,136 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
             )}
           </div>
 
-          {/* Competitor bestseller scanner (DSA step 4, automated) */}
-          <div className="mt-6 pt-4 border-t border-border">
-            <div className="text-[12px] font-semibold text-text mb-1">Competitor bestseller scanner</div>
+          {/* ② Stores — competitor stores with LOCAL market traffic (funnel step 2) */}
+          <div id="wtl-stores" className="mt-6 pt-4 border-t border-border">
+            <div className="text-[12px] font-semibold text-text mb-1">
+              ② Stores — competitors with real traffic in {STORE_CONFIG[funnelMarket].label}
+            </div>
             <p className="text-[11px] text-text-faint mb-2 leading-relaxed">
-              Pick a store you&apos;ve imported from before (or type any competitor domain) and press{" "}
-              <strong>Scan</strong> — it reads their <strong>best-selling</strong> page and shows their current
-              winners by product type, so you can check them against the recommendation above.
+              Competitor stores ranked by their SimilarWeb visitors <strong>inside this market&apos;s country</strong>
+              {wtlStores?.country ? ` (${wtlStores.country})` : ""}. Enough local traffic means shoppers there already
+              buy from them — so their bestsellers are proven for this market. Pick a store to open its bestsellers
+              {funnelType ? " for your chosen type" : ""}.
             </p>
-            {knownComps.length > 0 && (
-              <div className="flex items-center gap-1.5 flex-wrap mb-2">
-                {knownComps.map((c) => (
-                  <button
-                    key={c.domain}
-                    type="button"
-                    onClick={() => void runScan(c.domain)}
-                    title={`${c.products} products imported from here — click to scan`}
-                    className={`px-2.5 h-7 rounded-full text-[11px] border transition ${
-                      competitorDomain === c.domain
-                        ? "border-accent text-accent bg-[var(--accent-soft)]"
-                        : "border-border text-text-dim hover:border-accent hover:text-accent"
-                    }`}
-                  >
-                    {c.domain.replace(/^www\./, "")} <span className="text-text-faint">({c.products})</span>
+            {funnelType && (
+              <div className="mb-2">
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-accent/50 bg-[var(--accent-soft)] text-[11px] text-accent">
+                  Looking for: <strong>{funnelType.label}</strong>
+                  <button type="button" onClick={() => setFunnelType(null)} className="hover:text-text" title="Clear the chosen type">
+                    ✕
                   </button>
-                ))}
+                </span>
               </div>
             )}
+            <div className="flex items-center gap-3 flex-wrap mb-2">
+              <label className="flex items-center gap-1.5 text-[11px] text-text-dim cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={onlyEnough}
+                  onChange={(e) => setOnlyEnough(e.target.checked)}
+                  className="h-3.5 w-3.5 accent-[var(--accent)]"
+                />
+                Only stores with enough local traffic (≥{((wtlStores?.min_local ?? 2000) / 1000).toFixed(0)}k/mo)
+              </label>
+              <span className="flex-1" />
+              {wtlStores && wtlStores.traffic_missing > 0 && (
+                <span className="text-[11px] text-text-faint">{wtlStores.traffic_missing} without traffic data yet</span>
+              )}
+              {wtlStores?.apify_configured && (
+                <button
+                  type="button"
+                  onClick={() => void refreshTraffic()}
+                  disabled={trafficRefreshing}
+                  className="text-[11px] text-accent hover:underline disabled:opacity-50"
+                  title="Fetch fresh SimilarWeb numbers for stores whose data is missing or older than a week (~1-3 min)"
+                >
+                  {trafficRefreshing ? "Updating traffic… (~2 min)" : "↻ Update traffic"}
+                </button>
+              )}
+            </div>
+            {storesLoading ? (
+              <p className="text-[12px] text-text-faint">Loading stores…</p>
+            ) : !wtlStores || wtlStores.stores.length === 0 ? (
+              <p className="text-[12px] text-text-faint">No known competitor stores yet — add one below.</p>
+            ) : (
+              (() => {
+                const visible = wtlStores.stores.filter((s) => !onlyEnough || s.market_ok);
+                if (visible.length === 0)
+                  return (
+                    <p className="text-[12px] text-text-faint">
+                      No stores clear the local-traffic bar{wtlStores.traffic_missing > 0 ? " (some have no data yet — press “Update traffic”)" : ""} —
+                      untick the filter to see all {wtlStores.stores.length}.
+                    </p>
+                  );
+                const fmtV = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
+                return (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {visible.map((s) => (
+                      <button
+                        key={s.domain}
+                        type="button"
+                        onClick={() => void runScan(s.domain, false, s)}
+                        className="rounded-[10px] border border-border bg-bg-elev-2 px-3 py-2.5 text-left hover:border-accent transition group"
+                        title={`Open ${s.domain}'s bestsellers (step 3)`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className="text-[12px] font-semibold text-text truncate group-hover:text-accent">
+                            {s.domain.replace(/^www\./, "")}
+                          </span>
+                          <span className="flex-1" />
+                          {s.has_traffic_data ? (
+                            <span
+                              className={`text-[11px] font-semibold tabular-nums ${
+                                s.market_ok ? "text-green-600 dark:text-green-400" : "text-text-dim"
+                              }`}
+                              title={`${s.total_visits.toLocaleString("en-US")} total visits/mo, ${Math.round(s.local_share * 100)}% from ${wtlStores.country}`}
+                            >
+                              {fmtV(s.local_visits)}/mo in {wtlStores.country}
+                            </span>
+                          ) : (
+                            <span className="text-[11px] text-text-faint" title="SimilarWeb has no data (yet) — press “Update traffic”, or the store is too small">
+                              no traffic data
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[10px] text-text-faint mt-0.5">
+                          {s.products > 0 ? `${s.products} imported before` : "never imported"}
+                          {s.last_import ? ` · last ${s.last_import}` : ""}
+                          {s.has_traffic_data ? ` · ${Math.round(s.local_share * 100)}% local` : ""}
+                          <span className="text-accent opacity-0 group-hover:opacity-100"> · View bestsellers →</span>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                );
+              })()
+            )}
+            <div className="flex items-center gap-2 mt-2">
+              <input
+                type="text"
+                value={addDomain}
+                onChange={(e) => setAddDomain(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void addStore();
+                }}
+                placeholder="Add a store… e.g. maisonelorie.fr"
+                className="flex-1 px-3 h-8 rounded-[10px] bg-bg-elev-2 border border-border text-[11px] focus:outline-none focus:border-accent"
+              />
+              <Button variant="secondary" size="sm" onClick={() => void addStore()} disabled={!addDomain.trim()}>
+                + Add
+              </Button>
+            </div>
+            {addMsg && <p className="text-[11px] mt-1 text-text-dim">{addMsg}</p>}
+          </div>
+
+          {/* ③ Products — the chosen store's bestsellers (funnel step 3) */}
+          <div id="wtl-products" className="mt-6 pt-4 border-t border-border">
+            <div className="text-[12px] font-semibold text-text mb-1">③ Products — competitor bestsellers</div>
+            <p className="text-[11px] text-text-faint mb-2 leading-relaxed">
+              Pick a store above (or type any competitor domain) and it reads their <strong>best-selling</strong> page:
+              their current winners in sales order. <strong>Import →</strong> sends a product straight to the import
+              screen — no copy-pasting.
+            </p>
             <div className="flex items-center gap-2">
               <input
                 type="text"
@@ -679,37 +871,103 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
                     })}
                   </p>
                 )}
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                  {(scan.products ?? []).map((p) => (
-                    <a
-                      key={p.handle}
-                      href={p.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      title={`${p.title} — click to open (paste this URL in the import screen if it's a winner)`}
-                      className="rounded-[10px] border border-border bg-bg-elev-2 overflow-hidden hover:border-accent transition group"
-                    >
-                      {p.image ? (
-                        // eslint-disable-next-line @next/next/no-img-element
-                        <img src={p.image} alt="" className="w-full h-28 object-cover" loading="lazy" />
-                      ) : (
-                        <div className="w-full h-28 bg-bg-elev" />
+                {(() => {
+                  const all = scan.products ?? [];
+                  const typeCat = funnelType?.category ?? null;
+                  const matching = typeCat ? all.filter((p) => p.category === typeCat) : all;
+                  const products = onlyType && typeCat ? matching : all;
+                  const imported = new Set(scanStore?.imported_handles ?? []);
+                  return (
+                    <>
+                      {typeCat && (
+                        <div className="flex items-center gap-2 mb-2">
+                          <button
+                            type="button"
+                            onClick={() => setOnlyType(true)}
+                            className={`px-2.5 h-7 rounded-full text-[11px] border transition ${
+                              onlyType ? "border-accent text-accent bg-[var(--accent-soft)]" : "border-border text-text-dim"
+                            }`}
+                          >
+                            Only {funnelType?.label} ({matching.length})
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setOnlyType(false)}
+                            className={`px-2.5 h-7 rounded-full text-[11px] border transition ${
+                              !onlyType ? "border-accent text-accent bg-[var(--accent-soft)]" : "border-border text-text-dim"
+                            }`}
+                          >
+                            All types ({all.length})
+                          </button>
+                        </div>
                       )}
-                      <div className="px-2 py-1.5">
-                        <div className="text-[11px] text-text truncate group-hover:text-accent">
-                          <span className="text-text-faint">#{p.position}</span> {p.title}
+                      {products.length === 0 ? (
+                        <p className="text-[12px] text-text-faint">
+                          No {funnelType?.label} in their top {scan.count} — try another store, or show all types.
+                        </p>
+                      ) : (
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                          {products.map((p) => {
+                            const done = imported.has(p.handle);
+                            return (
+                              <div
+                                key={p.handle}
+                                className={`rounded-[10px] border bg-bg-elev-2 overflow-hidden transition group relative ${
+                                  done ? "border-border opacity-60" : "border-border hover:border-accent"
+                                }`}
+                              >
+                                {done && (
+                                  <span className="absolute top-1.5 left-1.5 z-10 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-bg-elev text-text-dim border border-border">
+                                    ✓ already imported
+                                  </span>
+                                )}
+                                {p.image ? (
+                                  // eslint-disable-next-line @next/next/no-img-element
+                                  <img src={p.image} alt="" className="w-full h-28 object-cover" loading="lazy" />
+                                ) : (
+                                  <div className="w-full h-28 bg-bg-elev" />
+                                )}
+                                <div className="px-2 py-1.5">
+                                  <div className="text-[11px] text-text truncate" title={p.title}>
+                                    <span className="text-text-faint">#{p.position}</span> {p.title}
+                                  </div>
+                                  <div className="text-[10px] text-text-faint">
+                                    {p.category}
+                                    {p.published_at ? ` · since ${p.published_at}` : ""}
+                                  </div>
+                                  <div className="flex items-center gap-1 mt-1.5">
+                                    <button
+                                      type="button"
+                                      onClick={() => importProduct(p.url)}
+                                      disabled={done}
+                                      className="flex-1 h-7 rounded-[8px] bg-accent text-on-accent text-[11px] font-semibold hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed"
+                                      title="Prefill the import screen with this product's URL"
+                                    >
+                                      Import →
+                                    </button>
+                                    <a
+                                      href={p.url}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="h-7 px-2 inline-flex items-center rounded-[8px] border border-border text-[11px] text-text-dim hover:border-accent hover:text-accent"
+                                      title="Open the product on the competitor's site"
+                                    >
+                                      ↗
+                                    </a>
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
                         </div>
-                        <div className="text-[10px] text-text-faint">
-                          {p.category}
-                          {p.published_at ? ` · since ${p.published_at}` : ""}
-                        </div>
-                      </div>
-                    </a>
-                  ))}
-                </div>
-                <p className="text-[11px] text-text-faint mt-2">
-                  Found a winner that fits the recommendation? Open it and paste its URL into the import screen.
-                </p>
+                      )}
+                      <p className="text-[11px] text-text-faint mt-2">
+                        <strong>Import →</strong> jumps to the import screen with the URL prefilled — the normal checks
+                        (shipping, brand) still run there before anything is created.
+                      </p>
+                    </>
+                  );
+                })()}
               </div>
             )}
           </div>
