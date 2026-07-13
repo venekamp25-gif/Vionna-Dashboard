@@ -475,6 +475,116 @@ def health():
     })
 
 
+# --- SimilarWeb traffic-gate bij import (user 2026-07-13) -------------------
+# DSA-research-regel: SimilarWeb-bezoekers/mnd x ~2% conversie x AOV >= EUR
+# 300k/mnd = bewezen markt; geen SimilarWeb-data = te kleine store. Net als de
+# verzendcheck: WAARSCHUWEN, nooit blokkeren — de medewerker beslist.
+TRAFFIC_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'traffic_cache.json')
+TRAFFIC_THRESHOLD_EUR = 300_000
+TRAFFIC_CONV = 0.02
+TRAFFIC_AOV_FALLBACK = 50.0
+TRAFFIC_AOV_CAP = 150.0        # nep-AOV's door valuta-verwarring niet laten winnen
+TRAFFIC_CACHE_TTL = 7 * 86400  # traffic verandert langzaam; 1 actor-run/store/week
+_TRAFFIC_RATE_TO_EUR = {'dk': 0.134, 'se': 0.091, 'no': 0.087, 'uk': 1.17,
+                        'us': 0.93, 'au': 0.61, 'ca': 0.68, 'ch': 1.07, 'pl': 0.235}
+
+
+def _traffic_cache_read():
+    try:
+        with open(TRAFFIC_CACHE_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _similarweb_visits(host):
+    """Maandbezoekers van een domein via de Apify SimilarWeb-actor (~$0.0005).
+    Cache 7 dagen. Return int (0 = SimilarWeb kent de site niet) of None bij
+    infra-falen (geen token / actor-fout / timeout)."""
+    cache = _traffic_cache_read()
+    hit = cache.get(host)
+    if hit and (time.time() - hit.get('ts', 0)) < TRAFFIC_CACHE_TTL:
+        return hit.get('visits')
+    token = os.getenv('APIFY_TOKEN', '').strip()
+    if not token:
+        return None
+    try:
+        r = req.post('https://api.apify.com/v2/acts/radeance~similarweb-scraper/runs',
+                          params={'token': token}, json={'urls': [host]}, timeout=30)
+        if r.status_code not in (200, 201):
+            return None
+        run = (r.json() or {}).get('data') or {}
+        run_id, ds_id = run.get('id'), run.get('defaultDatasetId')
+        status, waited = run.get('status'), 0
+        while status in ('READY', 'RUNNING') and waited < 90:
+            time.sleep(5)
+            waited += 5
+            rr = req.get(f'https://api.apify.com/v2/actor-runs/{run_id}',
+                              params={'token': token}, timeout=30)
+            status = ((rr.json() or {}).get('data') or {}).get('status')
+        if status != 'SUCCEEDED':
+            return None
+        items = req.get(f'https://api.apify.com/v2/datasets/{ds_id}/items',
+                             params={'token': token, 'format': 'json', 'clean': 'true'},
+                             timeout=60).json()
+        visits = 0
+        for it in items if isinstance(items, list) else []:
+            try:
+                visits = max(visits, int(it.get('totalVisits') or 0))
+            except (TypeError, ValueError):
+                pass
+        try:
+            cache[host] = {'visits': visits, 'ts': time.time()}
+            with open(TRAFFIC_CACHE_PATH, 'w', encoding='utf-8') as f:
+                json.dump(cache, f)
+        except Exception:
+            pass
+        return visits
+    except Exception as e:
+        print(f"[traffic] SimilarWeb-check faalde voor {host}: {e}")
+        return None
+
+
+def _import_price_eur(url):
+    """AOV-proxy: prijs van het te importeren product zelf (laagste variant,
+    valuta gegokt op TLD). None als niet leesbaar."""
+    try:
+        clean = url.split('?', 1)[0].rstrip('/')
+        if '/products/' not in clean:
+            return None
+        r = req.get(clean + '.json', timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+        if r.status_code != 200:
+            return None
+        variants = ((r.json() or {}).get('product') or {}).get('variants') or []
+        prices = []
+        for v in variants:
+            try:
+                p = float(v.get('price'))
+                if p > 0:
+                    prices.append(p)
+            except (TypeError, ValueError):
+                pass
+        if not prices:
+            return None
+        tld = clean.split('/')[2].rsplit('.', 1)[-1].lower()
+        return min(prices) * _TRAFFIC_RATE_TO_EUR.get(tld, 1.0)
+    except Exception:
+        return None
+
+
+def _traffic_check(url, host):
+    """Traffic-oordeel voor de import-gate, of None bij infra-falen."""
+    visits = _similarweb_visits(host)
+    if visits is None:
+        return None
+    aov = _import_price_eur(url) or TRAFFIC_AOV_FALLBACK
+    aov = min(aov, TRAFFIC_AOV_CAP)
+    est = visits * TRAFFIC_CONV * aov
+    return {'visits': visits, 'est_monthly_eur': round(est),
+            'market_ok': est >= TRAFFIC_THRESHOLD_EUR,
+            'threshold_eur': TRAFFIC_THRESHOLD_EUR}
+
+
 @app.route('/api/classify_shipping')
 def classify_shipping():
     """Classify the source store of a product URL as dropshipper / own-stock /
@@ -494,13 +604,25 @@ def classify_shipping():
                         'detail': f'{host} is manually flagged: {_blocked_reason(host)}. '
                                   'Products from this store should NOT be imported.',
                         'source': 'manual-blocklist', 'confidence': 'high'})
+    # SimilarWeb-traffic parallel aan de (trage) verzendclassificatie checken,
+    # zodat de gate er niet langzamer van wordt
+    import threading
+    _tr = {}
+    _tt = threading.Thread(target=lambda: _tr.update({'r': _traffic_check(url, host)}))
+    _tt.start()
+
+    def _with_traffic(payload):
+        _tt.join(timeout=100)
+        payload['traffic'] = _tr.get('r')
+        return jsonify(payload)
+
     try:
         from shipping_check import classify_detailed
         d = classify_detailed(url, skip_browser=True)
     except Exception as e:
         print(f"[classify_shipping] error for {url}: {e}")
         # Treat failures as 'Onbekend' so the import step can still warn (per user choice)
-        return jsonify({'label': 'Onbekend', 'detail': '', 'source': 'none', 'confidence': 'none', 'error': str(e)[:200]})
+        return _with_traffic({'label': 'Onbekend', 'detail': '', 'source': 'none', 'confidence': 'none', 'error': str(e)[:200]})
     # Billy J-class false negative: slow international shipping reads as
     # "dropshipper", but real brands (MESHKI etc.) ship slowly too. When the
     # classifier clears a store, double-check for brand markers and warn.
@@ -509,14 +631,14 @@ def classify_shipping():
             from shipping_check import looks_like_brand
             is_brand, sigs = looks_like_brand(host)
             if is_brand:
-                return jsonify({'label': 'Mogelijk eigen merk',
-                                'detail': f"shipping looks like dropship ({d['detail']}), BUT this store shows "
-                                          f"real-brand signals: {', '.join(sigs)}. Verify before importing!",
-                                'source': 'brand-signals', 'confidence': 'medium'})
+                return _with_traffic({'label': 'Mogelijk eigen merk',
+                                      'detail': f"shipping looks like dropship ({d['detail']}), BUT this store shows "
+                                                f"real-brand signals: {', '.join(sigs)}. Verify before importing!",
+                                      'source': 'brand-signals', 'confidence': 'medium'})
         except Exception as e:
             print(f"[classify_shipping] brand check failed: {e}")
-    return jsonify({'label': d['label'], 'detail': d['detail'],
-                    'source': d['source'], 'confidence': d['confidence']})
+    return _with_traffic({'label': d['label'], 'detail': d['detail'],
+                          'source': d['source'], 'confidence': d['confidence']})
 
 
 @app.route('/api/verify_products', methods=['POST'])

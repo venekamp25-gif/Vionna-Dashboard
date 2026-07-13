@@ -87,10 +87,14 @@ export function InputStep() {
   const [confirmBack, setConfirmBack] = useState(false);
 
   // Dropshipper check at import: classify the source store's shipping policy and
-  // warn before importing if it's NOT a confirmed dropshipper.
+  // warn before importing if it's NOT a confirmed dropshipper. Since 2026-07-13
+  // the same gate also checks SimilarWeb traffic (DSA market-size rule).
   const [checking, setChecking] = useState(false);
   const [shippingWarn, setShippingWarn] = useState<
-    { label: string; detail: string; source: string; confidence: string } | null
+    {
+      label: string; detail: string; source: string; confidence: string;
+      traffic?: { visits: number; est_monthly_eur: number; market_ok: boolean; threshold_eur: number } | null;
+    } | null
   >(null);
 
   // For multi-store: at least one store's keywords must be set.
@@ -159,17 +163,22 @@ export function InputStep() {
     setStep(2);
   };
 
-  // Gate: classify the source store first. Dropshipper → import straight through.
-  // Eigen voorraad / Onbekend → warn (with which case) and let the user decide.
+  // Gate: classify the source store first. Dropshipper with healthy traffic →
+  // import straight through. Eigen voorraad / Onbekend / too little SimilarWeb
+  // traffic (DSA rule: visits × 2% × AOV ≥ €300k/mo) → warn, user decides.
   const onSubmit = async () => {
     if (!canSubmit || checking) return;
     setChecking(true);
     try {
       const res = await api.classifyShipping(data.competitorUrl.trim());
-      if (res.label === "Dropshipper") {
+      const trafficOk = !res.traffic || res.traffic.market_ok; // null check = infra-falen, niet straffen
+      if (res.label === "Dropshipper" && trafficOk) {
         proceed();
       } else {
-        setShippingWarn({ label: res.label, detail: res.detail || "", source: res.source, confidence: res.confidence });
+        setShippingWarn({
+          label: res.label, detail: res.detail || "", source: res.source,
+          confidence: res.confidence, traffic: res.traffic ?? null,
+        });
       }
     } catch {
       // Classifier unreachable → treat as 'unknown' so the user is still warned.
@@ -430,7 +439,9 @@ export function InputStep() {
                     ? "Source doesn't look like a dropshipper"
                     : shippingWarn.label === "Mogelijk eigen merk"
                       ? "This may be a real brand — do not import"
-                      : "Couldn't determine delivery time"}
+                      : shippingWarn.label === "Dropshipper"
+                        ? "Source store's traffic is too low"
+                        : "Couldn't determine delivery time"}
                 </h3>
                 <p className="text-[13px] text-text-dim mt-1.5 leading-relaxed">
                   {shippingWarn.label === "Eigen voorraad" ? (
@@ -452,6 +463,16 @@ export function InputStep() {
                       this (e.g. Billy J, MESHKI) ship slowly from abroad but are NOT dropshippers — importing
                       their products has cost us a lot of cleanup before.
                     </>
+                  ) : shippingWarn.label === "Dropshipper" ? (
+                    <>
+                      Shipping checks out as dropshipper, but this store only gets{" "}
+                      <strong>{(shippingWarn.traffic?.visits ?? 0).toLocaleString()} visitors/month</strong>{" "}
+                      (SimilarWeb) — estimated revenue ≈ €
+                      {(shippingWarn.traffic?.est_monthly_eur ?? 0).toLocaleString()}/month, under the{" "}
+                      <strong>€{(shippingWarn.traffic?.threshold_eur ?? 300000).toLocaleString()}/month
+                      proven-market bar</strong>. A bestseller of a store this small is weak proof the
+                      product actually sells.
+                    </>
                   ) : (
                     <>
                       Couldn&apos;t find this store&apos;s delivery time (no readable shipping
@@ -459,6 +480,13 @@ export function InputStep() {
                     </>
                   )}
                 </p>
+                {shippingWarn.label !== "Dropshipper" && shippingWarn.traffic && !shippingWarn.traffic.market_ok && (
+                  <p className="text-[12px] text-warning mt-2 leading-relaxed">
+                    Also: only <strong>{shippingWarn.traffic.visits.toLocaleString()} visitors/month</strong> on
+                    SimilarWeb (est. €{shippingWarn.traffic.est_monthly_eur.toLocaleString()}/mo — under the
+                    €{shippingWarn.traffic.threshold_eur.toLocaleString()} market bar).
+                  </p>
+                )}
                 {shippingWarn.source !== "none" && (
                   <p className="text-[11px] text-text-faint mt-2 italic">
                     Based on {SHIPPING_SOURCE_LABEL[shippingWarn.source] ?? "the shipping policy"}

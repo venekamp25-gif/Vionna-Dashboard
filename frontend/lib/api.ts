@@ -313,6 +313,14 @@ export const api = {
         | "structured" | "policy" | "policy-js" | "llm" | "llm-sonnet" | "vision"
         | "manual-blocklist" | "brand-signals" | "none";
       confidence: "high" | "medium" | "low" | "none";
+      /** SimilarWeb market-size gate (DSA rule: visits × 2% × AOV ≥ €300k/mo).
+       *  null when the check itself couldn't run (no token / actor error). */
+      traffic?: {
+        visits: number;
+        est_monthly_eur: number;
+        market_ok: boolean;
+        threshold_eur: number;
+      } | null;
       error?: string;
     }>(`/api/classify_shipping?url=${encodeURIComponent(url)}`),
 
