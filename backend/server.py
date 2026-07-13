@@ -7630,7 +7630,14 @@ def _similarweb_bulk(hosts):
                 shares[str(cs.get('country') or '').upper()] = float(cs.get('share') or 0)
             except (TypeError, ValueError):
                 continue
-        out[dom] = {'total_visits': total, 'shares': shares,
+        # 3-month visit history (chronological) → month-over-month trend in the stores tab
+        monthly = []
+        for mv in (it.get('monthlyVisits') or []):
+            try:
+                monthly.append(int(mv.get('visits') or 0))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        out[dom] = {'total_visits': total, 'shares': shares, 'monthly': monthly[-6:],
                     'ts': datetime.datetime.utcnow().isoformat() + 'Z'}
     # hosts the actor returned nothing for → cache an explicit zero (retry after TTL)
     for h in hosts:
@@ -7710,14 +7717,46 @@ def api_wtl_stores():
                 age_days = None
         else:
             missing += 1
+        monthly = (t or {}).get('monthly') or []
+        trend_pct = None
+        if len(monthly) >= 2 and monthly[-2] > 0:
+            trend_pct = round((monthly[-1] - monthly[-2]) / monthly[-2] * 100)
         out.append({'domain': d, 'products': c.get('products') or 0,
                     'last_import': c.get('last_import'),
                     'imported_handles': c.get('imported_handles') or [],
                     'total_visits': total, 'local_visits': local,
                     'local_share': round(share, 3), 'traffic_age_days': age_days,
                     'has_traffic_data': bool(t and total > 0),
+                    'monthly_total': monthly, 'trend_pct': trend_pct,
                     'market_ok': local >= min_local})
-    out.sort(key=lambda s: (-s['local_visits'], -s['products']))
+
+    # ── Store score (0-100): the best store to mine sits on top. Local traffic is the
+    # backbone (log scale — 250k vs 25k matters, 251k vs 250k doesn't), with bonuses:
+    # rising month-over-month trend (store is heating up), imported-before (proven
+    # source for our workflow), and a high LOCAL share (truly a local player, not
+    # incidental spillover). Mirrors the what-to-list scoring philosophy.
+    import math
+    max_local = max([s['local_visits'] for s in out] + [1])
+    for s in out:
+        traffic = (math.log10(s['local_visits'] + 1) / math.log10(max_local + 1)) if max_local > 1 else 0.0
+        parts = {'local_traffic': round(traffic, 2)}
+        bonus = 0.0
+        if s['trend_pct'] is not None:
+            if s['trend_pct'] >= 15:
+                bonus += 0.15
+                parts['trend'] = 0.15
+            elif s['trend_pct'] <= -15:
+                bonus -= 0.10
+                parts['trend'] = -0.10
+        if s['products'] > 0:
+            bonus += 0.10
+            parts['proven_source'] = 0.10
+        if s['local_share'] >= 0.30:
+            bonus += 0.05
+            parts['local_player'] = 0.05
+        s['score'] = min(100, round(max(0.0, traffic + bonus) * 100))
+        s['score_parts'] = parts
+    out.sort(key=lambda s: (-s['score'], -s['local_visits'], -s['products']))
     return jsonify({'store': store, 'country': cc, 'min_local': min_local,
                     'stores': out, 'traffic_missing': missing,
                     'apify_configured': bool(os.getenv('APIFY_TOKEN', '').strip())})

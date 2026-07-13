@@ -723,7 +723,21 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
                       untick the filter to see all {wtlStores.stores.length}.
                     </p>
                   );
-                const fmtV = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
+                const n = (v: number) => v.toLocaleString("en-US");
+                const scoreTone = (sc: number) =>
+                  sc >= 60
+                    ? "bg-green-600/15 text-green-600 dark:text-green-400 border-green-600/40"
+                    : sc >= 30
+                      ? "bg-amber-500/15 text-amber-500 border-amber-500/40"
+                      : "bg-bg-elev text-text-faint border-border";
+                const scoreWhy = (s: WtlStore) => {
+                  const p = s.score_parts ?? {};
+                  const bits = [`local traffic ${Math.round((p.local_traffic ?? 0) * 100)}`];
+                  if (p.trend) bits.push(`${p.trend > 0 ? "+" : ""}${Math.round(p.trend * 100)} trend`);
+                  if (p.proven_source) bits.push(`+${Math.round(p.proven_source * 100)} proven source`);
+                  if (p.local_player) bits.push(`+${Math.round(p.local_player * 100)} local player`);
+                  return `Score ${s.score}/100 = ${bits.join(" · ")}. Highest score = mine this store first.`;
+                };
                 return (
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                     {visible.map((s) => (
@@ -735,6 +749,12 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
                         title={`Open ${s.domain}'s bestsellers (step 3)`}
                       >
                         <div className="flex items-center gap-2">
+                          <span
+                            className={`shrink-0 px-1.5 py-0.5 rounded-md border text-[11px] font-bold tabular-nums ${scoreTone(s.score)}`}
+                            title={scoreWhy(s)}
+                          >
+                            {s.score}
+                          </span>
                           <span className="text-[12px] font-semibold text-text truncate group-hover:text-accent">
                             {s.domain.replace(/^www\./, "")}
                           </span>
@@ -744,9 +764,9 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
                               className={`text-[11px] font-semibold tabular-nums ${
                                 s.market_ok ? "text-green-600 dark:text-green-400" : "text-text-dim"
                               }`}
-                              title={`${s.total_visits.toLocaleString("en-US")} total visits/mo, ${Math.round(s.local_share * 100)}% from ${wtlStores.country}`}
+                              title={`Exactly ${n(s.local_visits)} visits/month from ${wtlStores.country} (${n(s.total_visits)} total × ${Math.round(s.local_share * 100)}% ${wtlStores.country}-share)`}
                             >
-                              {fmtV(s.local_visits)}/mo in {wtlStores.country}
+                              {n(s.local_visits)}/mo in {wtlStores.country}
                             </span>
                           ) : (
                             <span className="text-[11px] text-text-faint" title="SimilarWeb has no data (yet) — press “Update traffic”, or the store is too small">
@@ -754,10 +774,25 @@ export function WhatToListModal({ open, onClose }: { open: boolean; onClose: () 
                             </span>
                           )}
                         </div>
-                        <div className="text-[10px] text-text-faint mt-0.5">
+                        <div className="text-[10px] text-text-faint mt-0.5 tabular-nums">
+                          {s.has_traffic_data && <>total {n(s.total_visits)}/mo · {Math.round(s.local_share * 100)}% local</>}
+                          {s.trend_pct !== null && s.trend_pct !== undefined && (
+                            <span
+                              className={
+                                s.trend_pct >= 15
+                                  ? " text-green-600 dark:text-green-400"
+                                  : s.trend_pct <= -15
+                                    ? " text-danger"
+                                    : ""
+                              }
+                              title="Total visits vs the previous month"
+                            >
+                              {" "}· {s.trend_pct >= 0 ? "↑ +" : "↓ "}{s.trend_pct}% m/m
+                            </span>
+                          )}
+                          {s.has_traffic_data && " · "}
                           {s.products > 0 ? `${s.products} imported before` : "never imported"}
                           {s.last_import ? ` · last ${s.last_import}` : ""}
-                          {s.has_traffic_data ? ` · ${Math.round(s.local_share * 100)}% local` : ""}
                           <span className="text-accent opacity-0 group-hover:opacity-100"> · View bestsellers →</span>
                         </div>
                       </button>

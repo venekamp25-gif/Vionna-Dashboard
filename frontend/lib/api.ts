@@ -888,6 +888,12 @@ export interface WtlStore {
   local_share: number;
   traffic_age_days: number | null;
   has_traffic_data: boolean;
+  /** Chronological total-visit history (per month) and month-over-month change. */
+  monthly_total: number[];
+  trend_pct: number | null;
+  /** 0-100 mine-this-store-first score (local traffic + trend/proven/local bonuses). */
+  score: number;
+  score_parts: Record<string, number>;
   market_ok: boolean;
 }
 
