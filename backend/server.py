@@ -12058,11 +12058,10 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns
         msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=4500,
                                       messages=[{'role': 'user', 'content': prompt}])
         txt = (msg.content[0].text if msg.content else '') or ''
-        m = re.search(r'\{.*\}', txt, re.S)
-        if not m:
+        data = _blog_first_json(txt)
+        if data is None:
             print(f"[blog] writer returned no JSON: {txt[:150]}")
             return None
-        data = json.loads(m.group(0))
     except Exception as e:
         print(f"[blog] writer failed: {e}")
         return None
@@ -12121,6 +12120,19 @@ BLOG_BANNED_BRANDS = [
     'gina tricot', 'lindex', 'kappahl', 'weekday', 'monki', 'samsøe', 'stine goya',
     'marimekko', 'andiata', 'cos', 'boozt', 'nelly', 'bik bok', 'cubus', 'ellos',
 ]
+
+
+def _blog_first_json(txt):
+    """First complete JSON object in a model response. Robust against trailing
+    commentary ('Extra data') and preamble; None when nothing parses."""
+    if not txt:
+        return None
+    try:
+        start = txt.index('{')
+        data, _ = json.JSONDecoder().raw_decode(txt[start:])
+        return data
+    except Exception:
+        return None
 
 
 def _blog_quality_violations(art, store, products=None):
@@ -12313,13 +12325,12 @@ def _blog_edit(store, art, products=None, violations=None):
         msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=16000,
                                       messages=[{'role': 'user', 'content': prompt}])
         txt = (msg.content[0].text if msg.content else '') or ''
-        m = re.search(r'\{.*\}', txt, re.S)
-        if not m:
+        data = _blog_first_json(txt)
+        if data is None:
             # usually output-cap truncation (the editor must echo the FULL body);
             # keeping the writer version is safe but skips the fixes
             print('[blog] editor returned no JSON; keeping writer version')
             return art
-        data = json.loads(m.group(0))
         body = data.get('body_html') or ''
         # Safety: the edit must not lose product links; if it did, keep the original.
         if body.count('/products/') < (art.get('body_html') or '').count('/products/'):
@@ -12416,10 +12427,9 @@ def _blog_qa_gate(store, art):
         msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=1500,
                                       messages=[{'role': 'user', 'content': prompt}])
         txt = (msg.content[0].text if msg.content else '') or ''
-        m = re.search(r'\{.*\}', txt, re.S)
-        if not m:
+        data = _blog_first_json(txt)
+        if data is None:
             return None
-        data = json.loads(m.group(0))
         return {'score': float(data.get('score') or 0),
                 'critical': [str(x) for x in (data.get('critical') or [])][:10],
                 'minor': [str(x) for x in (data.get('minor') or [])][:10]}
