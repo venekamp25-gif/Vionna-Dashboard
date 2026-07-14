@@ -11158,6 +11158,7 @@ BLOG_MEASURE_MIN_AGE_DAYS = int(os.getenv('BLOG_MEASURE_MIN_AGE_DAYS', '21'))
 # the unattended scheduler/bootstrap are visible without droplet log access.
 _BLOG_LAST = {'bootstrap': None, 'scheduled': None, 'learn': None, 'measure': None,
               'qa_failed': None, 'reddit': None}
+_BLOG_TRIED = {}   # (store, YYYY-MM-DD) -> failed attempts today (scheduler backoff)
 _BLOG_DOMAIN_CACHE = {}
 _BLOG_SCOPE_CACHE = {}   # store -> {'ts': epoch, 'write_content': bool|None}
 
@@ -11263,8 +11264,8 @@ BLOG_FALLBACK_TOPICS = {
          'cluster': ['lang nederdel', 'plisseret nederdel']},
         {'keyword': 'bukser til kontoret', 'category': 'pants',
          'cluster': ['habitbukser', 'vide bukser']},
-        {'keyword': 'sådan styler du en hvid skjorte', 'category': 'top',
-         'cluster': ['hvid bluse', 'skjorte outfit']},
+        {'keyword': 'bluser til hverdag og fest', 'category': 'top',
+         'cluster': ['bluse outfit', 'skjorte til kvinder', 'elegant top']},
     ],
     'fr': [
         {'keyword': "robe d'été", 'category': 'dress', 'months': [4, 5, 6, 7, 8],
@@ -11291,8 +11292,8 @@ BLOG_FALLBACK_TOPICS = {
          'cluster': ['pitkä hame', 'pliseehame']},
         {'keyword': 'housut töihin', 'category': 'pants',
          'cluster': ['leveälahkeiset housut', 'puvunhousut']},
-        {'keyword': 'valkoinen paita', 'category': 'top',
-         'cluster': ['valkoinen pusero', 'paita asu']},
+        {'keyword': 'naisten puserot arkeen ja juhlaan', 'category': 'top',
+         'cluster': ['pusero asu', 'siisti toppi', 'paita naisille']},
     ],
 }
 
@@ -11788,7 +11789,7 @@ def _blog_category_stock(store, cat, hdrs, _cache={}):
     if key in _cache:
         return _cache[key]
     try:
-        q = ('{ products(first:30, query:%s) { edges { node { id title } } } }'
+        q = ('{ products(first:50, query:%s) { edges { node { id title } } } }'
              % json.dumps(f"tag:'cat:{cat}' AND status:active"))
         r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
                           json={'query': q}, timeout=20)
@@ -11904,7 +11905,8 @@ def _blog_match_products(store, category, hdrs, n=6, keyword=None, exclude=None)
         query = ('{ products(first:%d, query:%s, sortKey:CREATED_AT, reverse:true) { edges { node { '
                  'id title handle productType description(truncateAt: 220) featuredImage{url} '
                  'priceRangeV2{minVariantPrice{amount currencyCode}} } } } }'
-                 % (min(n * 3, 50), json.dumps(q)))   # over-fetch: title-dedupe below shrinks the pool
+                 % (50, json.dumps(q)))   # deep over-fetch: sibling-heavy catalogues collapse
+                                          # to few unique titles (18 newest = 2 designs, 2026-07-14)
         try:
             r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
                               json={'query': query}, timeout=30)
@@ -12623,7 +12625,12 @@ def _blog_reddit_concerns(store, topic, limit=5):
                                       f'phrase a shopper would type on a fashion forum (2-4 words, no quotes). '
                                       f'Use the correct garment word, beware false friends (French "robe" = dress, '
                                       f'Danish "kjole" = dress): "{kw}"'}])
-        query = ((msg.content[0].text if msg.content else '') or '').strip().strip('"')[:60] or kw
+        raw = ((msg.content[0].text if msg.content else '') or '')
+        # haiku sometimes wraps the answer in markdown or adds commentary
+        # ('# pants\n\n(or "trousers"...)') — first line, plain words only
+        line = next((l for l in raw.splitlines() if l.strip()), '')
+        line = re.sub(r'[#*`"()\[\]]', ' ', line)
+        query = ' '.join(line.split()[:5])[:60] or kw
     except Exception:
         query = kw
     posts = _blog_reddit_fetch(query)
@@ -12819,16 +12826,24 @@ def _blog_generate_one(store, topic=None, published=None):
             return {'store': store, 'error': 'no topics available (no DataForSEO + no fallback)'}
     exclude = _blog_recent_product_handles(store)
     topic, products = None, []
-    for cand in candidates:
-        prods = _blog_match_products(store, cand.get('category'), hdrs, n=6,
-                                     keyword=cand.get('keyword'), exclude=exclude)
-        prods = _blog_products_fit_topic(store, cand, prods)
-        if cand.get('category') and len(prods) < BLOG_MIN_CATEGORY_STOCK:
-            print(f"[blog] {store}: topic '{cand.get('keyword')}' rejected — "
-                  f"only {len(prods)} genuinely fitting products")
-            continue
-        topic, products = cand, prods
-        break
+    # Relax ladder when nothing passes: (1) strict, (2) drop the variety-exclusions,
+    # (3) accept 2 fitting products. Publishing beats the variety rule; product-topic
+    # FIT itself never relaxes (that is a correctness rule, not a preference).
+    for excl, min_fit in ((exclude, BLOG_MIN_CATEGORY_STOCK),
+                          (None, BLOG_MIN_CATEGORY_STOCK),
+                          (None, 2)):
+        for cand in candidates:
+            prods = _blog_match_products(store, cand.get('category'), hdrs, n=6,
+                                         keyword=cand.get('keyword'), exclude=excl)
+            prods = _blog_products_fit_topic(store, cand, prods)
+            if cand.get('category') and len(prods) < min_fit:
+                print(f"[blog] {store}: topic '{cand.get('keyword')}' rejected — "
+                      f"only {len(prods)} genuinely fitting (need {min_fit})")
+                continue
+            topic, products = cand, prods
+            break
+        if topic is not None:
+            break
     if topic is None:
         return {'store': store, 'topic': candidates[0],
                 'error': 'no candidate topic has enough genuinely fitting products'}
@@ -13205,6 +13220,11 @@ def _blog_scheduler_loop():
                         continue
                     if not shopify_headers(st).get('X-Shopify-Access-Token'):
                         continue
+                    # max 2 attempts per store per day: the 10-min tick otherwise
+                    # retries a structural failure all hour and spams Slack each time
+                    fails = _BLOG_TRIED.get((st, today), 0)
+                    if fails >= 2:
+                        continue
                     try:
                         print(f'[blog] scheduled article for {st}…')
                         res = _blog_generate_one(st)
@@ -13214,12 +13234,18 @@ def _blog_scheduler_loop():
                                                    'url': art.get('storefront_url')}
                         print(f"[blog] {st}: {res.get('error') or art.get('storefront_url')}")
                         if res.get('error'):
-                            _blog_slack(f"🚨 Blog-run [{st.upper()}] faalde: {res['error']}")
+                            _BLOG_TRIED[(st, today)] = fails + 1
+                            if fails + 1 >= 2:
+                                _blog_slack(f"🚨 Blog-run [{st.upper()}] faalde 2x, opgegeven voor vandaag: "
+                                            f"{res['error']}")
                     except Exception as e:
                         _BLOG_LAST['scheduled'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
                                                    'store': st, 'error': str(e)[:200]}
                         print(f'[blog] scheduled {st} failed: {e}')
-                        _blog_slack(f"🚨 Blog-run [{st.upper()}] crashte: {str(e)[:180]}")
+                        _BLOG_TRIED[(st, today)] = fails + 1
+                        if fails + 1 >= 2:
+                            _blog_slack(f"🚨 Blog-run [{st.upper()}] crashte 2x, opgegeven voor vandaag: "
+                                        f"{str(e)[:150]}")
         except Exception as e:
             print(f'[blog] scheduler error: {e}')
         time.sleep(600)
