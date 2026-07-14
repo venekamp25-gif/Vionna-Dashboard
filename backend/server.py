@@ -7269,7 +7269,8 @@ _BS_CATEGORY_KEYWORDS = [
 ]
 
 
-_BS_JUNK_RE = re.compile(r'gift ?card|cadeaubon|e-?gift|parcel protection|shipping protection|'
+_BS_JUNK_RE = re.compile(r'gift ?card|cadeaubon|e-?gift|lahjakortti|gavekort|presentkort|'
+                         r'carte cadeau|geschenkkarte|parcel protection|shipping protection|'
                          r'route package|package protection|insurance|verzekering|priority processing', re.I)
 
 
@@ -7293,8 +7294,13 @@ def _bs_host(domain):
 # Vionna is womenswear: never surface men's/kids items from competitor
 # bestseller pages (some sources, e.g. vesperlorain, now sell menswear too).
 _BS_NOT_WOMENS_RE = re.compile(
-    r"pour hommes?|hommes?|(?<!wo)men'?s?|for men|menswear|herren|heren|"
-    r"herenmode|männer|til mænd|miesten|boys?|kids|kinder", re.I)
+    # NB: written with REAL word-boundary escapes — an earlier generation wrote literal
+    # backspace characters (0x08) here (bash-heredoc backslash collapse), silently
+    # killing most of this filter (found via a kekale.fi scan full of men's BOSS
+    # shirts, 2026-07-13). Never edit this via a shell heredoc.
+    r"pour hommes?|\bhommes?\b|(?<!wo)\bmen'?s?\b|for men\b|menswear|\bherren|\bheren\b|"
+    r"herenmode|männer|til mænd|\bherre\b|\bmiesten\b|\bmiehet\b|\blasten\b|"
+    r"\bboys?\b|\bkids\b|\bkinder\b|\benfants?\b", re.I)
 
 
 def _searchanise_handles(html, limit=20):
