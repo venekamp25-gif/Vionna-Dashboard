@@ -13182,8 +13182,65 @@ def _blog_seed_history():
         print(f"[blog] history seed failed: {e}")
 
 
+def _blog_sync_history_from_shopify(store, hdrs=None):
+    """Reconcile blog_history.jsonl with the articles that ACTUALLY exist in the
+    store (Shopify = source of truth). Articles created outside this process —
+    laptop backfills after a failed run, manual posts in the admin — are appended
+    with category (derived from the first linked product's cat: tag) and product
+    handles, so dedupe/cooldown/variety always see the full picture. This kills
+    the recurring split-brain that repeatedly skewed topic choice. Never raises."""
+    try:
+        hdrs = hdrs or shopify_headers(store)
+        if not hdrs.get('X-Shopify-Access-Token'):
+            return 0
+        blog_id = _blog_ensure(store, hdrs)
+        r = _shopify_call('get', shopify_url(store, f'blogs/{blog_id}/articles.json?limit=50'),
+                          hdrs, timeout=30)
+        if r.status_code != 200:
+            return 0
+        known = {row.get('article_id') for row in _blog_read_jsonl(BLOG_HISTORY_PATH)
+                 if row.get('store') == store}
+        shop = tokens.get(store, {}).get('shop') or STORES.get(store)
+        added = 0
+        for a in r.json().get('articles', []):
+            if a.get('id') in known:
+                continue
+            body = a.get('body_html') or ''
+            handles = list(dict.fromkeys(re.findall(r'href="/products/([^"?#]+)', body)))
+            cat = None
+            if handles:
+                try:
+                    q = '{ productByHandle(handle: %s) { tags } }' % json.dumps(handles[0])
+                    pr = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                                       json={'query': q}, timeout=20)
+                    tags = ((pr.json().get('data') or {}).get('productByHandle') or {}).get('tags') or []
+                    cat = next((t.split(':', 1)[1] for t in tags
+                                if isinstance(t, str) and t.startswith('cat:')), None)
+                except Exception:
+                    pass
+            ts = a.get('published_at') or a.get('created_at') or (datetime.datetime.utcnow().isoformat() + 'Z')
+            with open(BLOG_HISTORY_PATH, 'a', encoding='utf-8') as f:
+                f.write(json.dumps({
+                    'ts': ts, 'store': store, 'keyword': a.get('title'), 'category': cat,
+                    'source': 'shopify-sync', 'article_id': a.get('id'),
+                    'article_handle': a.get('handle'), 'title': a.get('title'),
+                    'url': f"https://{shop}/blogs/{BLOG_HANDLE}/{a.get('handle')}",
+                    'published': a.get('published_at') is not None,
+                    'products': handles[:8] or None,
+                }, ensure_ascii=False) + '\n')
+            added += 1
+        if added:
+            print(f"[blog] history sync {store}: +{added} artikelen uit Shopify overgenomen")
+        return added
+    except Exception as e:
+        print(f"[blog] history sync {store} failed: {e}")
+        return 0
+
+
 def _blog_scheduler_loop():
     _blog_seed_history()
+    for _st in BLOG_SCHED_STORES:
+        _blog_sync_history_from_shopify(_st)
     # One-shot bootstrap: a first real draft for every store that has never posted,
     # shortly after each (re)start. Idempotent — stores with history are skipped, so
     # a restart after fixing a store's token immediately produces its first draft.
@@ -13236,6 +13293,9 @@ def _blog_scheduler_loop():
                     if fails >= 2:
                         continue
                     try:
+                        _blog_sync_history_from_shopify(st)
+                        if _blog_store_posted_on(st, today):
+                            continue    # someone already posted today (laptop/manual)
                         print(f'[blog] scheduled article for {st}…')
                         res = _blog_generate_one(st)
                         art = (res.get('article') or {})
