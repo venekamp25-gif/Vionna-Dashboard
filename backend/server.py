@@ -7932,7 +7932,34 @@ def api_wtl_export():
     w = csv.writer(buf, delimiter=';')
     today = datetime.datetime.utcnow().strftime('%Y-%m-%d')
 
-    if what == 'stores':
+    if what == 'bestsellers':
+        # Single-store bestsellers export (the ③-Products view as a file): the full
+        # page-1 list incl. sub-€25 rows (flagged) so it mirrors the store 1:1.
+        domain = _bs_host(request.args.get('domain') or '')
+        if not domain:
+            return jsonify({'error': 'pass &domain=competitor.com'}), 400
+        payload, blocked = _bs_scan_cached(domain)
+        if not payload:
+            return jsonify({'error': f'scan mislukt: {blocked}'}), 502
+        payload = _bs_enrich(payload, domain)
+        bare = domain.replace('www.', '')
+        imported = set()
+        for s in stores:
+            if s['domain'].replace('www.', '') == bare:
+                imported = set(s.get('imported_handles') or [])
+                break
+        w.writerow(['Status', 'Positie', 'Titel', 'Type', 'Prijs', 'Prijs EUR', 'Onder EUR 25',
+                    'Ook bestseller bij', 'Sinds', 'Al geimporteerd', 'Product-URL'])
+        for pr in payload.get('products') or []:
+            w.writerow(['', pr.get('position'), pr.get('title'), pr.get('category'),
+                        pr.get('price'),
+                        pr.get('price_eur') if pr.get('price_eur') is not None else '',
+                        'JA' if pr.get('price_ok') is False else '',
+                        ', '.join(pr.get('also_at') or []),
+                        pr.get('published_at') or '',
+                        'JA' if pr.get('handle') in imported else '', pr.get('url')])
+        fname = f'wtl_bestsellers_{bare}_{today}.csv'
+    elif what == 'stores':
         w.writerow(['Score', 'Store', f'Bezoekers {cc}/mnd', 'Bezoekers totaal/mnd', '% lokaal',
                     'Trend m/m', 'Eerder geimporteerd', 'Laatste import', 'Bestseller-pagina'])
         for s in stores:

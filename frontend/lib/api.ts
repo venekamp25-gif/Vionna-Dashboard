@@ -670,14 +670,15 @@ export const api = {
       body: { markets },
     }),
 
-  /** Direct-download URL for the funnel CSV exports (stores list / product work list). */
+  /** Direct-download URL for the funnel CSV exports (stores / work list / one store's bestsellers). */
   wtlExportUrl: (
-    what: "stores" | "products",
+    what: "stores" | "products" | "bestsellers",
     store: "dk" | "fr" | "fi",
-    opts?: { category?: string; onlyOk?: boolean }
+    opts?: { category?: string; onlyOk?: boolean; domain?: string }
   ) =>
     `${BACKEND_URL}/api/wtl_export?what=${what}&store=${store}` +
     (opts?.category ? `&category=${encodeURIComponent(opts.category)}` : "") +
+    (opts?.domain ? `&domain=${encodeURIComponent(opts.domain)}` : "") +
     (opts?.onlyOk === false ? "&only_ok=0" : ""),
 
   /** Risers + new entrants on known competitors' bestseller pages vs ~a week ago

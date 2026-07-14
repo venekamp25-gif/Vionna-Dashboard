@@ -11,7 +11,6 @@ import { HistoryModal } from "./HistoryModal";
 import { ReportBugModal } from "./ReportBugModal";
 import { KeywordBackfillModal } from "./KeywordBackfillModal";
 import { KeywordResearchModal } from "./KeywordResearchModal";
-import { WhatToListModal } from "./WhatToListModal";
 import { CatalogMaintenanceModal } from "./CatalogMaintenanceModal";
 import { PlansModal } from "./PlansModal";
 import { useCatalogJobs } from "@/lib/catalogJobs";
@@ -23,7 +22,6 @@ export function Header() {
   const [bugOpen, setBugOpen]           = useState(false);
   const [backfillOpen, setBackfillOpen] = useState(false);
   const [researchOpen, setResearchOpen] = useState(false);
-  const [whatToListOpen, setWhatToListOpen] = useState(false);
   const [maintenanceOpen, setMaintenanceOpen] = useState(false);
   const [plansOpen, setPlansOpen] = useState(false);
   const [pendingPlans, setPendingPlans] = useState(0);
@@ -71,7 +69,7 @@ export function Header() {
     running?: boolean;
     divider?: boolean;
   }[] = [
-    { label: "What to list", desc: "Discover which product types to list now", action: () => setWhatToListOpen(true) },
+    { label: "What to list", desc: "Full research flow: types → stores → products (opens in a new tab)", action: () => window.open("/research", "_blank") },
     { label: "Keyword research", desc: "Best keywords for a type you already picked", action: () => setResearchOpen(true) },
     { label: "Keyword backfill", desc: "Regenerate copy for already-listed products", action: () => setBackfillOpen(true) },
     { label: "Catalogue maintenance", desc: "Bulk fixes (bold, channels, cutlines, duplicates)", action: () => setMaintenanceOpen(true), running: maintenanceRunning },
@@ -155,7 +153,6 @@ export function Header() {
       <PlansModal open={plansOpen} onClose={() => setPlansOpen(false)} onPendingCount={setPendingPlans} />
       <KeywordBackfillModal open={backfillOpen} onClose={() => setBackfillOpen(false)} />
       <KeywordResearchModal open={researchOpen} onClose={() => setResearchOpen(false)} />
-      <WhatToListModal open={whatToListOpen} onClose={() => setWhatToListOpen(false)} />
       <CatalogMaintenanceModal open={maintenanceOpen} onClose={() => setMaintenanceOpen(false)} />
     </>
   );

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Field, Label, Input, Textarea } from "@/components/ui/Field";
@@ -85,6 +85,22 @@ export function InputStep() {
   // Meta campaign creation) without re-importing. Read once on mount; survives refresh.
   const [lastProduct] = useState(() => loadLastProduct());
   const [confirmBack, setConfirmBack] = useState(false);
+
+  // Hand-off from the full-screen Research tab: /?import=<product-url> prefills
+  // the competitor URL (the research page opens the dashboard with this param).
+  useEffect(() => {
+    try {
+      const q = new URLSearchParams(window.location.search);
+      const imp = q.get("import");
+      if (imp && /^https?:\/\//i.test(imp)) {
+        patch({ competitorUrl: imp });
+        window.history.replaceState(null, "", window.location.pathname);
+      }
+    } catch {
+      /* no-op */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Dropshipper check at import: classify the source store's shipping policy and
   // warn before importing if it's NOT a confirmed dropshipper. Since 2026-07-13
