@@ -3977,9 +3977,30 @@ def _category_for_publish(data, title):
 # ============================================================================
 # DataForSEO keyword research (auto per-market keyword ideas at import time)
 # ----------------------------------------------------------------------------
-DFS_LOCATION = {'dk': 2208, 'fr': 2250, 'fi': 2246}   # Google location codes: Denmark/France/Finland
-DFS_LANGUAGE = {'dk': 'da', 'fr': 'fr', 'fi': 'fi'}
-DFS_LANG_NAME = {'dk': 'Danish', 'fr': 'French', 'fi': 'Finnish'}
+# Google location codes. Fashion = dk/fr/fi, Home Decor = nl/de/com. The keys are
+# disjoint per portal, so a lookup is unambiguous: 'nl' can only mean lighting.
+# ('com' = the international English store; US volumes are the closest usable proxy —
+# there is no "worldwide English" location code.)
+DFS_LOCATION = {'dk': 2208, 'fr': 2250, 'fi': 2246,
+                'nl': 2528, 'de': 2276, 'com': 2840}
+DFS_LANGUAGE = {'dk': 'da', 'fr': 'fr', 'fi': 'fi',
+                'nl': 'nl', 'de': 'de', 'com': 'en'}
+# NB: callers used to do DFS_LANG_NAME.get(store, 'Danish') — an unmapped market
+# silently got DANISH seeds. Every supported market is mapped here on purpose.
+DFS_LANG_NAME = {'dk': 'Danish', 'fr': 'French', 'fi': 'Finnish',
+                 'nl': 'Dutch', 'de': 'German', 'com': 'English'}
+
+# Which vertical a market belongs to — drives the niche wording in the LLM prompts
+# (a lighting keyword list run through the womenswear cleaner comes back EMPTY).
+LIGHT_MARKETS = ('nl', 'de', 'com')
+
+
+def _is_light_market(store):
+    return store in LIGHT_MARKETS
+
+
+def _niche_label(store):
+    return 'LIGHTING / home decor' if _is_light_market(store) else "WOMEN'S fashion"
 DFS_ENDPOINT = 'https://api.dataforseo.com/v3/dataforseo_labs/google/keyword_ideas/live'
 
 
@@ -4073,7 +4094,10 @@ def _dfs_keyword_ideas(seeds, store, min_volume=30, limit=12):
 
 # scaled per-market minimum monthly search volume (DK/FI are small markets;
 # the ≥20k rule is for big markets like DE/UK). Overridable per request.
-DFS_MIN_VOLUME = {'dk': 1800, 'fr': 4000, 'fi': 800}
+# Fashion thresholds are calibrated on garment search volume; lighting sits an
+# order lower, so reusing them would wipe every usable lighting keyword.
+DFS_MIN_VOLUME = {'dk': 1800, 'fr': 4000, 'fi': 800,
+                  'nl': 500, 'de': 900, 'com': 500}
 DFS_SUGGEST_ENDPOINT = 'https://api.dataforseo.com/v3/dataforseo_labs/google/keyword_suggestions/live'
 
 # stopwords + gender words (deaccented) to collapse near-duplicate variants
@@ -4093,6 +4117,12 @@ def _kw_signature(kw):
 
 # core womenswear category seeds per market (the "trending niche keywords" base).
 DFS_NICHE_SEEDS = {
+    'nl': ['hanglamp', 'wandlamp', 'tafellamp', 'vloerlamp', 'plafondlamp', 'buitenlamp',
+           'tuinverlichting', 'led strip', 'kroonluchter', 'bureaulamp', 'sfeerverlichting'],
+    'de': ['pendelleuchte', 'wandleuchte', 'tischlampe', 'stehlampe', 'deckenleuchte',
+           'aussenleuchte', 'gartenbeleuchtung', 'led strip', 'kronleuchter', 'schreibtischlampe'],
+    'com': ['pendant light', 'wall light', 'table lamp', 'floor lamp', 'ceiling light',
+            'outdoor light', 'garden lighting', 'led strip', 'chandelier', 'desk lamp'],
     'dk': ['kjole', 'cardigan', 'sweater', 'strik', 'bukser', 'jeans', 'nederdel', 'shorts', 'bluse',
            'top', 'jakke', 'frakke', 'blazer', 'sko', 'støvler', 'sandaler', 'taske', 'badedragt', 'jumpsuit'],
     'fr': ['robe', 'cardigan', 'pull', 'maille', 'pantalon', 'jean', 'jupe', 'short', 'blouse', 'top',
@@ -4105,6 +4135,27 @@ DFS_NICHE_SEEDS = {
 # results under clear names (e.g. "sac à main" → Handbags) that non-native staff
 # understand. Keys mirror DFS_NICHE_SEEDS.
 DFS_SEED_LABELS = {
+    'nl': {'hanglamp': 'Pendant lights', 'wandlamp': 'Wall lights', 'tafellamp': 'Table lamps',
+           'vloerlamp': 'Floor lamps', 'plafondlamp': 'Ceiling lights', 'bureaulamp': 'Desk lamps',
+           'buitenlamp': 'Outdoor lights', 'tuinverlichting': 'Garden lighting',
+           'solar lamp': 'Solar lights', 'led strip': 'LED strips', 'spotjes': 'Spots',
+           'kroonluchter': 'Chandeliers', 'nachtlampje': 'Night lights',
+           'sfeerverlichting': 'Ambient lighting', 'oplaadbare lamp': 'Rechargeable lamps',
+           'kinderlamp': 'Kids lighting'},
+    'de': {'pendelleuchte': 'Pendant lights', 'wandleuchte': 'Wall lights', 'tischlampe': 'Table lamps',
+           'stehlampe': 'Floor lamps', 'deckenleuchte': 'Ceiling lights', 'schreibtischlampe': 'Desk lamps',
+           'aussenleuchte': 'Outdoor lights', 'gartenbeleuchtung': 'Garden lighting',
+           'solarlampe': 'Solar lights', 'led strip': 'LED strips', 'spots': 'Spots',
+           'kronleuchter': 'Chandeliers', 'nachtlicht': 'Night lights',
+           'stimmungsbeleuchtung': 'Ambient lighting', 'akku lampe': 'Rechargeable lamps',
+           'kinderlampe': 'Kids lighting'},
+    'com': {'pendant light': 'Pendant lights', 'wall light': 'Wall lights', 'table lamp': 'Table lamps',
+            'floor lamp': 'Floor lamps', 'ceiling light': 'Ceiling lights', 'desk lamp': 'Desk lamps',
+            'outdoor light': 'Outdoor lights', 'garden lighting': 'Garden lighting',
+            'solar light': 'Solar lights', 'led strip': 'LED strips', 'spotlight': 'Spots',
+            'chandelier': 'Chandeliers', 'night light': 'Night lights',
+            'ambient lighting': 'Ambient lighting', 'rechargeable lamp': 'Rechargeable lamps',
+            'kids lamp': 'Kids lighting'},
     'dk': {'kjole': 'Dresses', 'cardigan': 'Cardigans', 'sweater': 'Sweaters', 'strik': 'Knitwear',
            'bukser': 'Trousers', 'jeans': 'Jeans', 'nederdel': 'Skirts', 'shorts': 'Shorts', 'bluse': 'Blouses',
            'top': 'Tops', 'jakke': 'Jackets', 'frakke': 'Coats', 'blazer': 'Blazers', 'sko': 'Shoes',
@@ -4130,6 +4181,15 @@ DFS_TYPE_CATEGORY = {
     'Trousers': 'pants', 'Jeans': 'pants', 'Shorts': 'pants',
     'Jumpsuits': 'jumpsuit', 'Swimwear': 'swimwear',
     'Shoes': 'shoes', 'Boots': 'shoes', 'Sandals': 'shoes', 'Bags': 'accessory',
+    # Home Decor. The lighting stores carry no cat:<x> tags yet, so the
+    # "how much did we list recently" signal stays empty for these — visibly
+    # empty rather than silently wrong.
+    'Pendant lights': 'pendant', 'Ceiling lights': 'ceiling', 'Wall lights': 'wall',
+    'Table lamps': 'table', 'Desk lamps': 'table', 'Floor lamps': 'floor',
+    'Outdoor lights': 'outdoor', 'Garden lighting': 'outdoor', 'Solar lights': 'outdoor',
+    'LED strips': 'led', 'Spots': 'spot', 'Chandeliers': 'chandelier',
+    'Night lights': 'night', 'Ambient lighting': 'ambient',
+    'Rechargeable lamps': 'rechargeable', 'Kids lighting': 'kids',
 }
 
 _SEASON_MONTHS = ['', 'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
@@ -4342,18 +4402,37 @@ def _dfs_clean_keywords_llm(keywords, store, max_tokens=2000):
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
         kws = [k.get('keyword') for k in keywords if k.get('keyword')]
-        prompt = ("From this list of search keywords for a WOMEN'S online fashion store, return ONLY the "
-                  "GENERIC keywords worth targeting: women's clothing / shoes / bags / accessories, or their "
-                  "styles, materials and types (e.g. 'summer dress', 'leather bag', 'linen trousers'). "
-                  "REMOVE, strictly:\n"
-                  "- ANY keyword containing a specific BRAND, LABEL, RETAILER, DESIGNER or SHOP name — well-known "
-                  "OR lesser-known/local ones, even if not listed here (e.g. Nike, Adidas, Longchamp, Polène, "
-                  "Zalando, Marimekko, Carhartt, Salomon, Timberland, Moncler, Stone Island, Arc'teryx, Ralph "
-                  "Lauren, Dico, Billi Bi, Ichi, Bruun, Mont Clare). If ANY word in the keyword is a proper-noun "
-                  "brand/label/model name rather than a generic garment, material, colour, style, fit or occasion, "
-                  "DROP the whole keyword.\n"
-                  "- men's-only or kids items, and anything unrelated to womenswear.\n"
-                  "Reply with ONLY a JSON array of the kept keywords, exactly as written.\n\n"
+        # NICHE-AWARE. Running lighting keywords through the womenswear cleaner
+        # returns an EMPTY list with no error — the single nastiest silent failure
+        # in this funnel. The brand rule is shared; the subject is not.
+        if _is_light_market(store):
+            subject = ("From this list of search keywords for an online LIGHTING / home-decor store, return "
+                       "ONLY the GENERIC keywords worth targeting: lamps and lighting or their types, places, "
+                       "styles, materials and finishes (e.g. 'pendant light', 'outdoor solar light', "
+                       "'rattan table lamp', 'dimmable led strip'). Colour and finish keywords are WANTED "
+                       "('black pendant light') — do NOT drop those.\n"
+                       "REMOVE, strictly:\n"
+                       "- ANY keyword containing a specific BRAND, RETAILER or SHOP name — well-known OR "
+                       "local (e.g. Philips, Hue, Osram, Ikea, Gamma, Karwei, Praxis, Kwantum, Lampenwelt, "
+                       "Paulmann, Ledvance, Eglo, Nordlux, Tom Dixon, Flos). If ANY word is a proper-noun "
+                       "brand/model name rather than a generic product, place, style, material or finish, "
+                       "DROP the whole keyword.\n"
+                       "- light BULBS on their own, spare parts, installation services, and anything that "
+                       "isn't a lamp or lighting product you could sell.\n")
+        else:
+            subject = ("From this list of search keywords for a WOMEN'S online fashion store, return ONLY the "
+                       "GENERIC keywords worth targeting: women's clothing / shoes / bags / accessories, or their "
+                       "styles, materials and types (e.g. 'summer dress', 'leather bag', 'linen trousers'). "
+                       "REMOVE, strictly:\n"
+                       "- ANY keyword containing a specific BRAND, LABEL, RETAILER, DESIGNER or SHOP name — well-known "
+                       "OR lesser-known/local ones, even if not listed here (e.g. Nike, Adidas, Longchamp, Polène, "
+                       "Zalando, Marimekko, Carhartt, Salomon, Timberland, Moncler, Stone Island, Arc'teryx, Ralph "
+                       "Lauren, Dico, Billi Bi, Ichi, Bruun, Mont Clare). If ANY word in the keyword is a proper-noun "
+                       "brand/label/model name rather than a generic garment, material, colour, style, fit or occasion, "
+                       "DROP the whole keyword.\n"
+                       "- men's-only or kids items, and anything unrelated to womenswear.\n")
+        prompt = (subject
+                  + "Reply with ONLY a JSON array of the kept keywords, exactly as written.\n\n"
                   + json.dumps(kws, ensure_ascii=False))
         msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=max_tokens,
                                      messages=[{'role': 'user', 'content': prompt}])
@@ -4411,14 +4490,27 @@ def _niche_seeds_for_type(product_type, store):
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        lang = DFS_LANG_NAME.get(store, 'Danish')
-        prompt = (f"A shopper searches for this women's fashion product type (given in Dutch or English): "
+        # No silent Danish fallback: an unmapped market used to get DANISH seeds
+        # with no error at all. Every supported market is in DFS_LANG_NAME.
+        lang = DFS_LANG_NAME.get(store)
+        if not lang:
+            print(f'[seeds] unknown market {store!r} — refusing to guess a language')
+            return [pt]
+        if _is_light_market(store):
+            noun, examples = ('lighting product', (
+                "Examples: 'hanglamp'/'pendant light' -> Dutch [\"hanglamp\",\"eettafel lamp\"]; "
+                "'wandlamp'/'wall light' -> German [\"wandleuchte\",\"wandlampe\"]; "
+                "'buitenlamp'/'outdoor light' -> English [\"outdoor light\",\"garden light\"]."))
+        else:
+            noun, examples = ("women's fashion product type", (
+                "Examples: 'jurk'/'dress' -> Danish [\"kjole\",\"sommerkjole\"]; 'jas'/'coat' -> French "
+                "[\"manteau\",\"veste\"]; 'broek'/'pants' -> Finnish [\"housut\",\"farkut\"]."))
+        prompt = (f"A shopper searches for this {noun} (given in Dutch or English): "
                   f"\"{pt}\". TRANSLATE it into {lang} and return 2-3 short broad search terms that "
-                  f"{lang}-speaking shoppers actually type — the {lang} word for this garment, plus at most one "
+                  f"{lang}-speaking shoppers actually type — the {lang} word for it, plus at most one "
                   f"common {lang} variant. 1-2 words each; use single compound words where {lang} does. "
                   f"The terms MUST be written in {lang}, NOT in the input language.\n"
-                  f"Examples: 'jurk'/'dress' -> Danish [\"kjole\",\"sommerkjole\"]; 'jas'/'coat' -> French "
-                  f"[\"manteau\",\"veste\"]; 'broek'/'pants' -> Finnish [\"housut\",\"farkut\"].\n"
+                  f"{examples}\n"
                   f"Return ONLY a JSON array of strings in {lang}.")
         msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=120,
                                      messages=[{'role': 'user', 'content': prompt}])
