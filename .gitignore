@@ -40,3 +40,9 @@ backend/blog_history.jsonl
 backend/deletion_log.jsonl
 backend/deletion_watch_state.json
 backend/plans.jsonl
+
+# Home Decor (lighting) Shopify tokens — NEVER commit (repo is public)
+lighting_tokens.json
+backend/lighting_tokens.json
+lighting_history.jsonl
+backend/lighting_history.jsonl

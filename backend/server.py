@@ -275,12 +275,88 @@ def save_tokens():
     except Exception:
         pass  # Silently ignore on read-only filesystems (Railway)
 
+
+# ── HOME DECOR (lighting) tokens — DELIBERATELY NOT IN `tokens` ──────────────
+# Every store key in `tokens` is swept automatically by background loops:
+# _size_chart_fill_loop (would write a bust/waist/hip chart onto a lamp — homeware
+# gets no cat: tag, so it lands in 'uncategorized' and inherits the store-wide
+# apparel chart) and _deletion_watch_check (iterates list(tokens), pings the
+# FASHION Slack webhook). Keeping lighting in its own dict is what makes the
+# Home Decor portal safe by construction rather than by remembering to exclude it.
+LIGHT_TOKENS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 'lighting_tokens.json')
+LIGHT_TOKENS = {}
+if os.path.exists(LIGHT_TOKENS_FILE):
+    try:
+        with open(LIGHT_TOKENS_FILE, encoding='utf-8') as f:
+            LIGHT_TOKENS = json.load(f) or {}
+    except Exception as _e:
+        print(f'[lighting] tokens file unreadable: {_e}')
+# Env fallback (same pattern as the fashion stores): SHOPIFY_NL_TOKEN + _DOMAIN etc.
+for _lk in ('nl', 'de', 'com'):
+    _lt = os.getenv(f'SHOPIFY_{_lk.upper()}_TOKEN')
+    _ls = os.getenv(f'SHOPIFY_{_lk.upper()}_DOMAIN')
+    if _lt and _ls and _lk not in LIGHT_TOKENS:
+        LIGHT_TOKENS[_lk] = {'shop': _ls, 'token': _lt}
+
+# Per-market localisation for lighting. Suffix .95 is what the live catalogue
+# actually uses (19.95 / 34.95 / 49.95 / 149.95 — verified 2026-07-15), NOT the
+# fashion .99/.95 split.
+LIGHT_LANGUAGE      = {'nl': 'Nederlands', 'de': 'Duits', 'com': 'Engels'}
+LIGHT_PRICE_SUFFIX  = {'nl': '.95', 'de': '.95', 'com': '.95'}
+LIGHT_BRAND         = os.getenv('LIGHT_BRAND', 'TLS')     # SKU prefix — never 'VIONNA-'
+
+_LIGHT_TOKEN_CACHE = {}      # key -> (token, expires_at)
+
+
+def _light_mint_token(store_key, entry):
+    """The DE store runs on a Dev-Dashboard app: no fixed shpat_ token, it mints a
+    short-lived one via the client-credentials grant. Cached until ~5 min before
+    expiry. Returns '' on failure (caller surfaces a clear error)."""
+    now = time.time()
+    hit = _LIGHT_TOKEN_CACHE.get(store_key)
+    if hit and hit[1] > now + 300:
+        return hit[0]
+    try:
+        r = req.post(f"https://{entry.get('shop')}/admin/oauth/access_token",
+                     json={'client_id': entry.get('client_id'),
+                           'client_secret': entry.get('client_secret'),
+                           'grant_type': 'client_credentials'}, timeout=20)
+        d = r.json() if r.status_code == 200 else {}
+        tok = d.get('access_token') or ''
+        if tok:
+            _LIGHT_TOKEN_CACHE[store_key] = (tok, now + int(d.get('expires_in') or 86400))
+            print(f'[lighting] minted {store_key} token (expires in {d.get("expires_in")}s)')
+        else:
+            print(f'[lighting] mint failed for {store_key}: HTTP {r.status_code}')
+        return tok
+    except Exception as e:
+        print(f'[lighting] mint error for {store_key}: {e}')
+        return ''
+
+
+def _shop_entry(store_key):
+    """{'shop','token'} for ANY portal's store. Fashion first, then lighting.
+    Lets the proven plumbing (_shopify_call, _build_image_payload,
+    _attach_images_one_by_one, _publish_to_default_channels, _find_product_by_handle)
+    serve Home Decor unchanged, while `tokens` stays fashion-only for the loops."""
+    ent = tokens.get(store_key)
+    if ent:
+        return ent
+    ent = LIGHT_TOKENS.get(store_key)
+    if not ent:
+        return {}
+    if not ent.get('token') and ent.get('auth') == 'client_credentials':
+        return {**ent, 'token': _light_mint_token(store_key, ent)}
+    return ent
+
+
 def shopify_headers(store_key):
-    t = tokens.get(store_key, {})
+    t = _shop_entry(store_key)
     return {'X-Shopify-Access-Token': t.get('token', ''), 'Content-Type': 'application/json'}
 
 def shopify_url(store_key, path):
-    shop = tokens.get(store_key, {}).get('shop') or STORES.get(store_key)
+    shop = _shop_entry(store_key).get('shop') or STORES.get(store_key)
     return f"https://{shop}/admin/api/{API_VERSION}/{path}"
 
 
@@ -14272,6 +14348,424 @@ try:
     threading.Thread(target=_deletion_watch_loop, daemon=True, name='deletion-watchdog').start()
 except Exception as _e:
     print(f'[delwatch] could not start watchdog thread: {_e}')
+
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HOME DECOR (verlichting) — The Light Supplier NL / DE / .com
+# ══════════════════════════════════════════════════════════════════════════════
+# Waarom een eigen pad i.p.v. de fashion-publish hergebruiken:
+#   * Vionna = 1 product PER KLEUR, aan elkaar geknoopt via Pipeline-theme
+#     metafields (theme.siblings/cutline) + een collectie per product, handle =
+#     slug(naam)-slug(kleur). _publish_one_variant WEIGERT een lege kleur.
+#   * The Light Supplier = 1 product per lamp met varianten eronder (geverifieerd
+#     2026-07-15: 65 producten, exact 1 handle met een kleur erin). Geen siblings,
+#     geen maten, geen maattabel.
+# De Shopify-plumbing (images, kanalen, idempotency) wordt WEL hergebruikt.
+
+# Lighting-claims die feitelijk fout kunnen zijn. Het fashion-equivalent
+# (_MATERIAL_WORDS) is 100% textiel en dus nutteloos hier; deze specs zijn
+# belangrijker dan een stofclaim — een verkeerde IP-rating op een badkamerlamp is
+# een veiligheidsclaim, geen marketingdetail.
+_LIGHT_SPEC_RE = re.compile(
+    r'\b(?:'
+    r'ip\s?-?\d{2}'                          # IP44, IP 65
+    r'|\d+(?:[.,]\d+)?\s?w(?:att)?\b'       # 5W, 7 watt
+    r'|\d+\s?(?:lm|lumen|lumens)\b'          # 800 lumen
+    r'|\d{3,5}\s?k\b'                        # 2700K
+    r'|kelvin'
+    r'|e\s?-?(?:14|27)\b|gu\s?-?10\b|g\s?-?9\b'   # fittingen
+    r'|dimbaar|dimmbar|dimmable'
+    r'|\d+(?:[.,]\d+)?\s?v(?:olt)?\b'
+    r'|energielabel|energieklasse|energy\s+class'
+    r')', re.I)
+
+
+def _light_spec_claims(text):
+    """Set of hard spec claims in a text (IP-rating, wattage, lumen, kelvin, cap,
+    dimmable, voltage). Normalised so '7 watt' and '7W' compare equal."""
+    out = set()
+    for m in _LIGHT_SPEC_RE.finditer(str(text or '')):
+        out.add(re.sub(r'[\s\-]+', '', m.group(0)).lower()
+                .replace('watt', 'w').replace('lumens', 'lm').replace('lumen', 'lm')
+                .replace('dimmbar', 'dimbaar').replace('dimmable', 'dimbaar'))
+    return out
+
+
+def _light_unverified_claims(generated_text, source_text):
+    """Spec claims in OUR copy that the competitor's own page never states.
+    Same principle as the fabric rule for fashion (user 2026-07-15): only claim
+    what the source actually says. Returns the offending claims."""
+    return sorted(_light_spec_claims(generated_text) - _light_spec_claims(source_text))
+
+
+def _light_slug(text):
+    return _publish_slug(text)
+
+
+def _light_make_sku(product_name, value):
+    n = (product_name or '').strip().replace(' ', '')
+    v = (value or '').strip().replace(' ', '')
+    return '-'.join(x for x in (LIGHT_BRAND, n, v) if x)
+
+
+def _light_price(store, price_raw):
+    """Lighting prices end in .95 across all three markets (verified against the
+    live catalogue). Returns None when there's no usable number."""
+    amount = _parse_money_amount(price_raw)
+    if amount is None:
+        return None
+    return f'{int(amount)}{LIGHT_PRICE_SUFFIX.get(store, ".95")}'
+
+
+def _rich_text_value(text):
+    """Shopify rich_text_field JSON. The lighting store defines custom.m_title_specs
+    as rich_text_field while Vionna's is multi_line_text_field — same key, different
+    type. Writing plain text there fails, so build the document shape."""
+    paras = [p.strip() for p in str(text or '').split('\n') if p.strip()]
+    if not paras:
+        return ''
+    return json.dumps({
+        'type': 'root',
+        'children': [{'type': 'paragraph',
+                      'children': [{'type': 'text', 'value': p}]} for p in paras],
+    }, ensure_ascii=False)
+
+
+def _light_collection_id(store, handle, hdrs):
+    """Resolve a collection handle -> id on a lighting store (custom + smart)."""
+    if not handle:
+        return None
+    try:
+        return _probe_collection_by_handle(store, handle, hdrs)
+    except Exception as e:
+        print(f'[lighting] collection lookup failed ({handle}): {e}')
+        return None
+
+
+@app.route('/api/lighting/status')
+def api_lighting_status():
+    """Which lighting stores are wired up. Read-only, NEVER exposes a token."""
+    out = {}
+    for k in ('nl', 'de', 'com'):
+        ent = LIGHT_TOKENS.get(k) or {}
+        out[k] = {
+            'configured': bool(ent.get('shop') and (ent.get('token') or ent.get('client_id'))),
+            'shop': ent.get('shop') or None,
+            'auth': ent.get('auth') or ('token' if ent.get('token') else None),
+            'language': LIGHT_LANGUAGE.get(k),
+        }
+    return jsonify({'stores': out,
+                    'ready': [k for k, v in out.items() if v['configured']],
+                    'brand': LIGHT_BRAND})
+
+
+@app.route('/api/lighting/publish', methods=['POST'])
+@require_droplet_token
+def api_lighting_publish():
+    """Publish ONE lamp to one or more lighting stores. Body:
+      { stores:['nl','de','com'], product_name, product_type, source_url,
+        option_name:'Kleur', option_values:['Zwart','Goud'],   # [] = single variant
+        price, compare_at_price, images:[url], images_by_value:{value:[url]},
+        content:{ nl:{description, meta_description, m_title_specs}, ... },
+        tags:[], kaching:true, bundle_collection:'handle', activate:false }
+    One Shopify product per store (NOT one per colour — that's the Vionna model).
+    Never touches the fashion stores: store keys are resolved from LIGHT_TOKENS.
+    """
+    data = request.json or {}
+    stores = [s for s in (data.get('stores') or []) if s in LIGHT_TOKENS]
+    if not stores:
+        return jsonify({'success': False,
+                        'error': 'No lighting store selected/configured. '
+                                 'Check /api/lighting/status.'}), 400
+    product_name = (data.get('product_name') or '').strip()
+    if not product_name:
+        return jsonify({'success': False, 'error': 'product_name is required'}), 400
+
+    option_name   = (data.get('option_name') or '').strip()
+    option_values = [str(v).strip() for v in (data.get('option_values') or []) if str(v).strip()]
+    images        = data.get('images') or []
+    images_by_val = data.get('images_by_value') or {}
+    content       = data.get('content') or {}
+    tags          = [t for t in (data.get('tags') or []) if str(t).strip()]
+    activate      = bool(data.get('activate'))
+    kaching       = bool(data.get('kaching'))
+    source_url    = (data.get('source_url') or '').strip()
+    product_type  = (data.get('product_type') or '').strip()
+    compare_at    = _publish_clean_money(data.get('compare_at_price'))
+
+    results = {}
+    for store in stores:
+        hdrs = shopify_headers(store)
+        if not hdrs.get('X-Shopify-Access-Token'):
+            results[store] = {'error': f'No usable token for {store} '
+                                       '(DE mints one per run — check the app credentials).'}
+            continue
+        base = shopify_url(store, '')
+        price = _light_price(store, data.get('price'))
+        if price is None:
+            results[store] = {'error': f'Invalid price {data.get("price")!r}'}
+            continue
+
+        handle = _light_slug(product_name)          # geen kleur-segment: 1 product per lamp
+        existing = _find_product_by_handle(store, handle, hdrs)
+        if existing:
+            # Zelfde idempotency-gedachte als fashion: nooit een Shopify-gesuffixte
+            # duplicate maken bij een retry/dubbelklik.
+            results[store] = {'product_id': existing.get('id'), 'reused': True,
+                              'status': existing.get('status'),
+                              'admin_url': f"https://{_shop_entry(store).get('shop','')}"
+                                           f"/admin/products/{existing.get('id')}"}
+            continue
+
+        c = content.get(store) or {}
+        body_html = _publish_to_html(c.get('description') or '')
+        variants = ([{'option1': v, 'price': price, 'compare_at_price': compare_at,
+                      'sku': _light_make_sku(product_name, v),
+                      'inventory_management': None} for v in option_values]
+                    if option_values else
+                    [{'price': price, 'compare_at_price': compare_at,
+                      'sku': _light_make_sku(product_name, ''),
+                      'inventory_management': None}])
+        payload = {'product': {
+            'title': product_name,
+            'handle': handle,
+            'body_html': body_html,
+            'product_type': product_type,
+            'tags': tags,
+            'status': 'draft',
+            'variants': variants,
+        }}
+        if option_values:
+            payload['product']['options'] = [{'name': option_name or 'Kleur',
+                                              'values': option_values}]
+        if kaching:
+            # Kaching Bundles heeft GEEN API; de bundel hangt aan het producttemplate
+            # + de collectie waarop de deal gericht staat (onderzocht 2026-07-15).
+            payload['product']['template_suffix'] = data.get('template_suffix') or 'kaching-standaard'
+
+        r = req.post(f'{base}products.json', headers=hdrs, json=payload, timeout=45)
+        if r.status_code not in (200, 201):
+            results[store] = {'error': f'create failed ({r.status_code}): {r.text[:200]}'}
+            continue
+        prod = r.json()['product']
+        pid  = prod['id']
+
+        # Afbeeldingen: exact dezelfde bewezen route als fashion (base64, één voor
+        # één — Higgsfield/concurrent-URL's kunnen verlopen voor Shopify ze ophaalt).
+        uploaded = _attach_images_one_by_one(store, pid, _build_image_payload(images, max_images=10), hdrs)
+
+        # Per-variant foto's (zelfde idee als fashion's per-kleur beelden).
+        img_by_url = {}
+        for up in (uploaded or []):
+            if up and up.get('src'):
+                img_by_url[up['src']] = up.get('id')
+        for var in prod.get('variants', []):
+            val = var.get('option1')
+            want = (images_by_val.get(val) or [None])[0] if val else None
+            img_id = None
+            if want:
+                # match op bestandsnaam: Shopify herschrijft de src bij upload
+                tail = want.rsplit('/', 1)[-1].split('?')[0][:40]
+                img_id = next((i for s, i in img_by_url.items() if tail and tail in s), None)
+            if not img_id and uploaded:
+                img_id = (uploaded[0] or {}).get('id')
+            if img_id:
+                try:
+                    req.put(shopify_url(store, f'variants/{var["id"]}.json'), headers=hdrs,
+                            json={'variant': {'id': var['id'], 'image_id': img_id}}, timeout=20)
+                except Exception as e:
+                    print(f'[lighting] variant image link failed: {e}')
+
+        mf_errors = []
+        # m_title_specs is op de lighting-store een rich_text_field (bij Vionna
+        # multi_line) — schrijf de juiste vorm, met fallback op platte tekst.
+        mts = (c.get('m_title_specs') or '').strip()
+        if mts:
+            rich = _rich_text_value(mts)
+            ok = False
+            for mf in ({'namespace': 'custom', 'key': 'm_title_specs',
+                        'value': rich, 'type': 'rich_text_field'},
+                       {'namespace': 'custom', 'key': 'm_title_specs',
+                        'value': mts, 'type': 'multi_line_text_field'}):
+                try:
+                    rr = req.post(shopify_url(store, f'products/{pid}/metafields.json'),
+                                  headers=hdrs, json={'metafield': mf}, timeout=20)
+                    if rr.status_code in (200, 201):
+                        ok = True
+                        break
+                except Exception as e:
+                    print(f'[lighting] m_title_specs error: {e}')
+            if not ok:
+                mf_errors.append('m_title_specs: both rich_text and plain failed')
+        meta_desc = (c.get('meta_description') or '').strip()
+        if meta_desc:
+            try:
+                rr = req.post(shopify_url(store, f'products/{pid}/metafields.json'), headers=hdrs,
+                              json={'metafield': {'namespace': 'global', 'key': 'description_tag',
+                                                  'value': meta_desc,
+                                                  'type': 'single_line_text_field'}}, timeout=20)
+                if rr.status_code not in (200, 201):
+                    mf_errors.append(f'description_tag: {rr.text[:100]}')
+            except Exception as e:
+                mf_errors.append(f'description_tag: {e}')
+
+        # Bundel-collectie (Kaching richt zijn deal daarop) — optioneel.
+        coll_handle = (data.get('bundle_collection') or '').strip()
+        if kaching and coll_handle:
+            cid = _light_collection_id(store, coll_handle, hdrs)
+            if cid:
+                try:
+                    req.post(f'{base}collects.json', headers=hdrs,
+                             json={'collect': {'product_id': pid, 'collection_id': cid}}, timeout=20)
+                except Exception as e:
+                    mf_errors.append(f'bundle collection: {e}')
+            else:
+                mf_errors.append(f'bundle collection {coll_handle!r} not found on {store}')
+
+        try:
+            for err in (_publish_to_default_channels(store, pid, hdrs) or []):
+                mf_errors.append(f'sales channels: {err}')
+        except Exception as e:
+            mf_errors.append(f'sales channels: {e}')
+
+        activated = False
+        if activate:
+            try:
+                ar = req.put(shopify_url(store, f'products/{pid}.json'), headers=hdrs,
+                             json={'product': {'id': pid, 'status': 'active'}}, timeout=20)
+                activated = ar.status_code in (200, 201)
+                if not activated:
+                    mf_errors.append(f'activate failed: {ar.text[:100]}')
+            except Exception as e:
+                mf_errors.append(f'activate failed: {e}')
+
+        shop_dom = _shop_entry(store).get('shop', '')
+        results[store] = {'product_id': pid, 'handle': handle,
+                          'admin_url': f'https://{shop_dom}/admin/products/{pid}' if shop_dom else '',
+                          'images': len(uploaded or []), 'variants': len(prod.get('variants', [])),
+                          'activated': activated, 'metafield_errors': mf_errors}
+
+        # ► Eigen logboek. NOOIT publish_history.jsonl: dat is tevens het
+        #   fashion-concurrentregister (_known_comp_data) + blog-gap-bron.
+        _append_history({
+            'store': store, 'product_name': product_name, 'product_id': pid,
+            'product_url': results[store]['admin_url'], 'source_url': source_url,
+            'image_count': len(uploaded or []), 'metafield_errors': mf_errors,
+            'product_type': product_type or None,
+            'option_name': option_name or None, 'option_values': option_values,
+            'kaching': kaching, 'published_live': activated,
+        }, portal=PORTAL_HOME_DECOR)
+
+    ok = any('product_id' in v for v in results.values())
+    return jsonify({'success': ok, 'results': results}), (200 if ok else 500)
+
+
+_LIGHT_TONE_EXAMPLE = """Eindelijk sfeervol licht waar je het wilt
+
+De Bottle is een oplaadbare tafellamp met een warme, gedempte gloed. Geen kabels, geen
+stopcontact in de buurt nodig: je zet hem neer waar je zit. Drie standen, dus van
+diner tot doorlezen.
+
+- Oplaadbaar: tot 8 uur licht op een volle accu
+- Traploos dimbaar: van gezellig laag tot goed leesbaar
+- Weerbestendig: mag ook mee naar het terras
+- Antislip voet: blijft staan op elke tafel
+- Warm licht: rustig voor de ogen, 's avonds
+
+De Bottle geeft je in een handbeweging de sfeer die een plafondlamp nooit haalt."""
+
+
+@app.route('/api/lighting/generate', methods=['POST'])
+@require_droplet_token
+def api_lighting_generate():
+    """Copy for ONE lighting product, per market. Body:
+      { store:'nl'|'de'|'com', product_name, product_title, source_text,
+        keywords:[], only_field?, current_* }
+    Returns {description, meta_description, m_title_specs, unverified_claims:[]}.
+    """
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        return jsonify({'error': 'Anthropic API key missing'}), 400
+    import anthropic
+
+    data          = request.json or {}
+    store         = (data.get('store') or 'nl').strip()
+    language      = LIGHT_LANGUAGE.get(store, 'Nederlands')
+    product_name  = (data.get('product_name') or '').strip()
+    product_title = (data.get('product_title') or '').strip()
+    source_text   = str(data.get('source_text') or '')
+    # GEEN _strip_color_kws hier: kleur/finish is voor verlichting een primair
+    # zoekwoord ("zwarte hanglamp"), niet een gedeelde-copy-probleem.
+    keywords      = [k for k in (data.get('keywords') or []) if str(k).strip()]
+    only_field    = (data.get('only_field') or '').strip()
+
+    # Specs die de CONCURRENT zelf noemt — alleen die mogen terugkomen.
+    known_specs = sorted(_light_spec_claims(source_text + ' ' + product_title))
+    spec_rule = (
+        'Noem UITSLUITEND deze technische specificaties, letterlijk zoals de bron ze geeft: '
+        + ', '.join(known_specs) + '. Verzin er geen bij.'
+        if known_specs else
+        'De bron noemt GEEN technische specificaties. Noem er dus ZELF ook geen: geen wattage, '
+        'geen lumen, geen IP-rating, geen kleurtemperatuur (Kelvin), geen fitting (E27/GU10), '
+        'geen "dimbaar". Beschrijf alleen wat je op de foto en in de tekst ziet.'
+    )
+
+    prompt = f"""Je bent productschrijver voor een verlichtingswinkel (The Light Supplier).
+Schrijf productcontent in het {language} voor een lamp genaamd "{product_name}".
+
+Producttitel van de bron: {product_title}
+Keywords (verwerk de relevantste natuurlijk): {', '.join(keywords[:12])}
+
+Alle informatie die we over dit product hebben (van de bron):
+---
+{source_text[:2500]}
+---
+
+Schrijf in exact deze stijl:
+---
+{_LIGHT_TONE_EXAMPLE}
+---
+
+Regels:
+- Gebruik de productnaam ({product_name}) in de eerste en de laatste zin
+- Eerste regel: korte pakkende zin over het gevoel/resultaat in de ruimte
+- Dan een alinea met de naam + waarvoor je hem gebruikt (welke kamer, welk moment)
+- Dan 5 bulletpoints: **eigenschap**: kort wat de klant eraan heeft
+- Slotzin over wat de lamp met de ruimte doet
+- Direct en warm, spreek de lezer aan met "je". Geen loze superlatieven, geen uitroeptekens-spam
+- Kleur/finish MAG je noemen (dit product heeft één beschrijving, kleuren zijn varianten)
+- {spec_rule}
+
+Geef ook:
+- meta_description: max 155 tekens, SEO voor {language}, verwerk 1-2 keywords natuurlijk
+- m_title_specs: één korte zin voor Google Shopping (wordt: {product_name} | m_title_specs)
+
+Antwoord uitsluitend als geldig JSON:
+{{"description": "...", "meta_description": "...", "m_title_specs": "..."}}"""
+
+    if only_field in ('description', 'meta_description', 'm_title_specs'):
+        prompt += f"\n\nGeef ALLEEN het veld {only_field} terug in de JSON."
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        msg = client.messages.create(model='claude-sonnet-4-5', max_tokens=1200,
+                                     messages=[{'role': 'user', 'content': prompt}])
+        txt = (msg.content[0].text if msg.content else '') or ''
+        m = re.search(r'\{.*\}', txt, re.S)
+        out = json.loads(m.group(0)) if m else {}
+    except Exception as e:
+        return jsonify({'error': f'Generation failed: {str(e)[:160]}'}), 502
+
+    # Vangnet: het model kan tóch een spec verzinnen. Warn, never block (Billy J-regel)
+    # — de medewerker beslist, maar ziet precies wat er niet klopt.
+    blob = ' '.join(str(out.get(k) or '') for k in ('description', 'meta_description', 'm_title_specs'))
+    unverified = _light_unverified_claims(blob, source_text + ' ' + product_title)
+    out['unverified_claims'] = unverified
+    out['source_specs'] = known_specs
+    if unverified:
+        print(f'[lighting] unverified spec claims for {product_name!r}: {unverified}')
+    return jsonify(out)
 
 
 if __name__ == '__main__':
