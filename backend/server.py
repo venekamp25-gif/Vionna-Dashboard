@@ -2099,6 +2099,54 @@ def _vitals_size_chart(page_html):
         return None
 
 
+_SIZE_LINK_TEXT_RE = re.compile(
+    r'size\s?guide|size\s?chart|maattabel|guide des tailles|kokotaulukko|'
+    r'st[oø]rrelsesguide|st[oø]rrelsestabel|st[oø]rrelsesskema|guía de tallas|tabella taglie',
+    re.I)
+
+
+def _linked_page_size_chart(page_html, page_url):
+    """Some competitors (bug #17's designbysi.dk) don't embed the size chart on
+    the product page at all — they link to it as a plain <a href="..."> (often a
+    generic store-wide page, e.g. in the footer, not product-specific). No known
+    app is involved, so none of the readers above fire. Follow any link whose text
+    reads like a size guide, then look for a <table> on that page, falling back to
+    a size-chart IMAGE (OCR) on it. Best-effort, never raises."""
+    try:
+        if not page_url:
+            return None
+        from urllib.parse import urljoin
+        seen = set()
+        for a in re.findall(r'<a\b[\s\S]*?</a>', page_html or '', re.I):
+            text = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', a)).strip()
+            if not text or not _SIZE_LINK_TEXT_RE.search(text):
+                continue
+            hm = re.search(r'href\s*=\s*["\']([^"\']+)["\']', a, re.I)
+            if not hm:
+                continue
+            href = hm.group(1).strip()
+            if not href or href.startswith('#') or href.lower().startswith('javascript:'):
+                continue
+            url = urljoin(page_url, href)
+            if url in seen:
+                continue
+            seen.add(url)
+            r = _scrape_get(url, timeout=15)
+            if r.status_code != 200 or not r.text:
+                continue
+            linked_html = r.text
+            chart = _extract_size_chart(linked_html)
+            if chart:
+                return chart
+            chart = _ocr_size_chart(linked_html, url)
+            if chart:
+                return chart
+        return None
+    except Exception as e:
+        print(f"[size-chart] linked-page failed: {e}")
+        return None
+
+
 def _detect_size_chart_hint(page_html):
     """When automatic extraction FAILS, sniff whether the page still clearly HAS a
     size chart (a known app / a size-chart image / a size-guide widget) so a human
@@ -2109,7 +2157,9 @@ def _detect_size_chart_hint(page_html):
     flag EVERY Shopify page as "Pify Size Chart app" because 'shopify' contains
     'pify' (bug #8 — the reported page was actually the Vitals app, mislabeled by
     that false positive). Vitals charts are now read by _vitals_size_chart above;
-    this hint only fires for Vitals pages whose chart couldn't be fetched/OCR'd."""
+    this hint only fires for Vitals pages whose chart couldn't be fetched/OCR'd.
+    Likewise 'size-guide link/button' (bug #17) is now attempted by
+    _linked_page_size_chart above and only surfaces here when that also fails."""
     try:
         h = (page_html or '').lower()
         # (regex marker, friendly app name). Order = specificity; first hit wins.
@@ -2143,12 +2193,13 @@ def _detect_size_chart_hint(page_html):
 def _extract_size_chart_full(page_html, page_url=''):
     """Size chart from a competitor page, trying in order: HTML <table> → Relentless
     app (inline JSON, no network) → SizeFox/SmartSize app API → Kiwi Sizing app API
-    → Vitals app → image OCR. Returns {headers, rows}."""
+    → Vitals app → a linked size-guide page → image OCR. Returns {headers, rows}."""
     return (_extract_size_chart(page_html)
             or _relentless_size_chart(page_html)
             or _smartsize_size_chart(page_html)
             or _kiwi_size_chart(page_html)
             or _vitals_size_chart(page_html)
+            or _linked_page_size_chart(page_html, page_url)
             or _ocr_size_chart(page_html, page_url))
 
 
