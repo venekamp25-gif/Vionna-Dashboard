@@ -257,6 +257,14 @@ export function KeywordReviewModal({
               + Add
             </Button>
           </div>
+
+          <p className="text-[10.5px] text-text-faint mt-3 leading-relaxed">
+            Fabric keywords (cashmere, wool, silk, linen…) are only suggested when the
+            competitor&apos;s own product info names that fabric — a wrong fabric claim on the
+            product page is a defect, so unverified ones are also removed automatically when
+            the copy is generated. Colour keywords stay visible but are never used in the
+            shared copy.
+          </p>
         </div>
 
         {/* Footer */}

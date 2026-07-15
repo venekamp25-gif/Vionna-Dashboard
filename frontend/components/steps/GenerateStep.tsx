@@ -43,11 +43,22 @@ type PendingCtx = {
   chosenName: string;
   canonicalColors: string[];
   productType: string;
-  competitor: { title: string; hostname: string; variants: number; price: string };
+  competitor: { title: string; hostname: string; variants: number; price: string; sourceText: string };
   images: { url: string; selected: boolean; variantIds: number[] }[];
   variantsByColor: ReturnType<typeof extractVariantsByColor>;
   imagesByColor: ReturnType<typeof groupImagesByColor>;
 };
+
+/** Plain-text competitor info (title + description). Source of truth for fabric
+ *  claims: fabric keywords (cashmere, wool, silk…) are only offered/used when this
+ *  text names that fabric — backend rule 2026-07-15. */
+function competitorSourceText(product: ScrapedProduct["product"]): string {
+  const body = (product?.body_html ?? "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return [product?.title ?? "", body].join(" ").trim().slice(0, 4000);
+}
 
 /** Title-case a colour string for use as a canonical key. */
 function canonicalize(color: string): string {
@@ -96,6 +107,7 @@ export function GenerateStep() {
         hostname: safeHostname(data.competitorUrl),
         variants: product?.variants?.length ?? 0,
         price: product?.variants?.[0]?.price ? `€${product.variants[0].price}` : "—",
+        sourceText: competitorSourceText(product),
       };
       const productType = guessProductType(product);
       const canonicalColors = extractColors(product).map(canonicalize);
@@ -152,6 +164,9 @@ export function GenerateStep() {
           stores: selectedStores,
           product_name: chosenName,
           competitor_title: product?.title ?? "",
+          // Competitor's own info — fabric keywords the competitor never mentions
+          // are dropped server-side before they reach the review popup.
+          description: competitorSourceText(product),
         });
         if (kr.configured && kr.results) {
           configured = true;
@@ -274,6 +289,7 @@ export function GenerateStep() {
           product_title: product?.title ?? "",
           keywords: storeKeywords,
           tone_references: toneRefs[store],
+          source_text: competitor.sourceText,
         });
         if (gen.error) throw new Error(`${store.toUpperCase()}: ${gen.error}`);
 

@@ -43,6 +43,10 @@ export interface CompetitorInfo {
   hostname: string;
   variants: number;
   price: string;
+  /** Competitor's own product info (title + description, plain text) — sent to
+   *  /api/generate as source_text so fabric keywords the competitor never
+   *  mentions are stripped from the copy. */
+  sourceText?: string;
 }
 
 export interface ProductVerify {

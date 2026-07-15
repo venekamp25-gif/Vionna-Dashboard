@@ -39,6 +39,9 @@ export function GeneratedContentCard() {
         current_meta_description: data.metaDescription,
         current_m_title_specs: data.mTitleSpecs,
         tone_references: toneRefs[store],
+        // Competitor's own info — keeps unverified fabric keywords out of
+        // per-field regenerations too (absent on old saved sessions = old behaviour).
+        source_text: data.competitor?.sourceText,
       });
       if (res.error) throw new Error(res.error);
       if (field === "description" && res.description) {

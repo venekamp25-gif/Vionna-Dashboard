@@ -130,6 +130,10 @@ export interface ScrapedProduct {
   product?: {
     title?: string;
     handle?: string;
+    /** Competitor's own description HTML (from the Shopify .json). Source of truth
+     *  for fabric claims: fabric keywords are only offered/used when the competitor
+     *  names that fabric here or in the title. */
+    body_html?: string;
     options?: { name: string; values: string[]; position?: number }[];
     variants?: {
       id?: number;
@@ -415,6 +419,10 @@ export const api = {
      * Claude uses them as style anchors (length, voice, bullet structure).
      */
     tone_references?: string[];
+    /** Competitor's own product info (title + description, plain text). When sent,
+     *  the backend strips fabric keywords the competitor never mentions — never
+     *  claim cashmere when the dress is wool/polyester. */
+    source_text?: string;
   }) => call<GenerateResponse>("/api/generate", { method: "POST", body: params }),
 
   /** Translate colour-variant names into a store's language. Dedicated (not folded

@@ -3917,6 +3917,7 @@ def _derive_seeds_llm(competitor_title, product_name, category, description):
             "search SEED terms in the LOCAL language of each market — the kind of common terms shoppers "
             "actually type, that other keywords contain. Use the garment TYPE and type+ONE attribute, "
             "each 1-2 words max. Prefer common single compound words where the language uses them.\n"
+            "NEVER use a fabric/material word (cashmere, wool, silk, linen, satin, leather, velvet...) unless the product info below explicitly names that exact material.\n"
             "Examples — dk: [\"kjole\",\"sommerkjole\",\"blomsterkjole\"]; fr: [\"robe\",\"robe été\",\"robe fleurie\"]; "
             "fi: [\"mekko\",\"kesämekko\",\"kukkamekko\"].\n"
             "Return ONLY compact JSON: {\"dk\":[..],\"fr\":[..],\"fi\":[..]} (dk=Danish, fr=French, fi=Finnish).\n\n"
@@ -4563,6 +4564,12 @@ def api_research_keywords():
             out['raw_seed_output'] = globals().get('_LAST_SEED_RAW', '')
         return jsonify(out)
     limit = int(body.get('limit', 12))
+    # Fabric rule (2026-07-15): only offer fabric keywords the COMPETITOR itself
+    # names in its title/description - 'kashmir strik' must never be suggested
+    # for a wool or polyester product.
+    _mat_src = '%s %s' % (body.get('competitor_title') or '',
+                          re.sub(r'<[^>]+>', ' ', str(body.get('description') or '')))
+    allowed_mats = _material_concepts_in(_mat_src)
     results = {}
     for st in stores:
         if st not in DFS_LOCATION:
@@ -4572,6 +4579,7 @@ def api_research_keywords():
         # floor (¼ of the niche threshold), then dedup variants + rank by volume.
         mv = int(body.get('min_volume') or max(150, DFS_MIN_VOLUME.get(st, 1000) // 4))
         best = {}
+        mats_dropped = 0
         for seed in st_seeds:
             for kw in _dfs_keyword_suggestions(seed, st, min_volume=mv, limit=20):
                 if 'error' in kw:
@@ -4579,6 +4587,9 @@ def api_research_keywords():
                 k = (kw.get('keyword') or '').strip().lower()
                 v = kw.get('volume') or 0
                 if not k or v < mv:
+                    continue
+                if _material_concepts_in(k) - allowed_mats:
+                    mats_dropped += 1          # fabric the competitor never mentioned
                     continue
                 if k not in best or v > (best[k].get('volume') or 0):
                     kw['seed'] = seed
@@ -4596,7 +4607,9 @@ def api_research_keywords():
         # Recommend a focused set (≈6) — these feed the copy, so fewer is better.
         _recommend_keywords(kws, st, top_n=int(body.get('recommend_count') or 6))
         results[st] = {'seeds': st_seeds, 'min_volume': mv, 'keywords': kws,
-                       'recommended_count': sum(1 for k in kws if k.get('recommended'))}
+                       'recommended_count': sum(1 for k in kws if k.get('recommended')),
+                       'materials_allowed': sorted(allowed_mats),
+                       'materials_dropped': mats_dropped}
     return jsonify({'configured': True, 'results': results})
 
 
@@ -6609,6 +6622,86 @@ def _strip_color_kws(keywords):
     return [k for k in (keywords or []) if not _is_color_kw(k)]
 
 
+# Fabric/material words -> concept (deaccented). Cross-language concepts so a French
+# source saying "laine" verifies a Danish "uld"-keyword. Deliberately FIBRES/FABRICS
+# only (a wrong fabric claim is a product-page defect) - style words like strik/knit
+# are not gated. 'merino' is its own concept: plain "uld" in the source does not
+# justify a merino claim.
+_MATERIAL_WORDS = {
+    'cashmere': 'cashmere', 'kashmir': 'cashmere', 'cachemire': 'cashmere',
+    'kasjmier': 'cashmere', 'kaschmir': 'cashmere', 'kasmir': 'cashmere',
+    'wool': 'wool', 'woolen': 'wool', 'woollen': 'wool', 'uld': 'wool', 'ulden': 'wool',
+    'uldne': 'wool', 'wol': 'wool', 'wollen': 'wool', 'laine': 'wool', 'villa': 'wool',
+    'villakangas': 'wool', 'lammeuld': 'wool', 'lambswool': 'wool',
+    'merino': 'merino', 'merinos': 'merino', 'merinould': 'merino',
+    'mohair': 'mohair',
+    'alpaca': 'alpaca', 'alpaka': 'alpaca', 'alpakka': 'alpaca',
+    'angora': 'angora',
+    'silk': 'silk', 'silke': 'silk', 'soie': 'silk', 'silkki': 'silk',
+    'zijde': 'silk', 'zijden': 'silk', 'seide': 'silk',
+    'linen': 'linen', 'linned': 'linen', 'hor': 'linen', 'lin': 'linen',
+    'pellava': 'linen', 'leinen': 'linen', 'linnen': 'linen',
+    'cotton': 'cotton', 'bomuld': 'cotton', 'coton': 'cotton', 'puuvilla': 'cotton',
+    'katoen': 'cotton', 'katoenen': 'cotton', 'baumwolle': 'cotton',
+    'leather': 'leather', 'laeder': 'leather', 'cuir': 'leather', 'nahka': 'leather',
+    'leder': 'leather',
+    'suede': 'suede', 'ruskind': 'suede', 'daim': 'suede', 'mokkanahka': 'suede',
+    'wildleder': 'suede',
+    'satin': 'satin', 'satijn': 'satin', 'satiini': 'satin',
+    'velvet': 'velvet', 'flojl': 'velvet', 'velour': 'velvet', 'velours': 'velvet',
+    'sametti': 'velvet', 'fluweel': 'velvet', 'samt': 'velvet',
+    'denim': 'denim',
+    'polyester': 'polyester', 'polyesteri': 'polyester',
+    'viscose': 'viscose', 'viskose': 'viscose', 'viskoosi': 'viscose',
+    'chiffon': 'chiffon', 'sifonki': 'chiffon',
+    'jersey': 'jersey',
+    'fleece': 'fleece',
+    'lace': 'lace', 'blonde': 'lace', 'blonder': 'lace', 'dentelle': 'lace', 'pitsi': 'lace',
+    'tweed': 'tweed',
+    'nylon': 'nylon',
+    'acrylic': 'acrylic', 'akryl': 'acrylic', 'akryyli': 'acrylic',
+    'elastan': 'elastane', 'elastane': 'elastane', 'spandex': 'elastane', 'lycra': 'elastane',
+    'tulle': 'tulle', 'tyl': 'tulle', 'tylli': 'tulle',
+    'organza': 'organza',
+    'crochet': 'crochet', 'haeklet': 'crochet', 'virkattu': 'crochet',
+    'bamboo': 'bamboo', 'bambus': 'bamboo', 'bambu': 'bamboo',
+    'lyocell': 'lyocell', 'tencel': 'lyocell', 'modal': 'modal',
+    'corduroy': 'corduroy',
+}
+# 'lin' (FR linen) must match as an exact token only: 'a-line', 'lining', 'lingerie'
+# would otherwise all read as linen via the compound-prefix rule.
+_MATERIAL_EXACT_ONLY = {'lin'}
+# Token prefixes that look like a material but are NOT a fabric claim:
+# lingerie != linen, 'silkeblod'/'silky' = silky-SOFT marketing, not silk.
+_MATERIAL_FALSE_PREFIXES = ('lingeri', 'lining', 'linning', 'silkeblod', 'silky')
+
+
+def _material_concepts_in(text):
+    """Set of fabric CONCEPTS named in the text. Compound-aware via prefix match
+    ('uldfrakke' -> wool, 'silkkimekko' -> silk, 'bomuldskjole' -> cotton) but never
+    suffix match: 'guld' must not read as wool and 'bomuld' (cotton) must not grant
+    'uld' (wool). Used on BOTH sides: what the competitor states, and what a keyword
+    claims."""
+    txt = _deaccent(text)
+    txt = re.sub(r'lace[\s\-]*up', ' ', txt)   # lace-up (veters) is not lace fabric
+    found = set()
+    for tok in re.split(r'[^a-z0-9]+', txt):
+        if not tok or tok.startswith(_MATERIAL_FALSE_PREFIXES):
+            continue
+        for w, concept in _MATERIAL_WORDS.items():
+            if tok == w or (w not in _MATERIAL_EXACT_ONLY and len(w) >= 3 and tok.startswith(w)):
+                found.add(concept)
+    return found
+
+
+def _strip_unverified_material_kws(keywords, source_text):
+    """Keep a fabric keyword ONLY when the competitor's own info (source_text =
+    title + scraped description) names that fabric - never claim cashmere when the
+    dress is wool/polyester (user rule 2026-07-15). Non-fabric keywords pass."""
+    allowed = _material_concepts_in(source_text)
+    return [k for k in (keywords or []) if not (_material_concepts_in(k) - allowed)]
+
+
 @app.route('/api/generate', methods=['POST'])
 def generate():
     if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
@@ -6622,6 +6715,13 @@ def generate():
     keywords      = data.get('keywords', [])
     # colour keywords never seed the SHARED description/meta/title
     keywords      = _strip_color_kws(keywords)
+    # Fabric keywords: usable ONLY when the competitor's own info (title + scraped
+    # description, sent by the frontend as source_text) names that fabric - never
+    # claim cashmere when the dress is wool/polyester (user rule 2026-07-15).
+    # Callers that don't send source_text keep the old behaviour.
+    source_text   = str(data.get('source_text') or '')
+    if source_text.strip():
+        keywords = _strip_unverified_material_kws(keywords, source_text)
     # When set, regenerate ONLY this single field — one of:
     #   'description' / 'meta_description' / 'm_title_specs'
     # The frontend uses this for per-field "↻" buttons in the Review screen.
@@ -6674,7 +6774,8 @@ Liviah er en bluse, som er nem at tage på, og som føles behagelig hele dagen."
         context_block = f"""Producttitel competitor: {product_title}
 Keywords (verwerk de relevantste): {', '.join(keywords[:12])}
 Productnaam: {product_name}
-Taal: {language}"""
+Taal: {language}
+Regel: noem geen specifieke stof of materiaal tenzij die letterlijk in de keywords of de producttitel hierboven staat (verkeerde stofclaim = productfout)."""
 
         if only_field == 'description':
             sub_prompt = f"""{context_block}
@@ -6692,6 +6793,7 @@ Regels:
 - Slotszin over hoe het voelt om te dragen
 - Rustige toon, geen hype, geen superlatieven
 - Noem GEEN specifieke kleur in de tekst — dit product komt in meerdere kleuren en de beschrijving is gedeeld over alle kleurvarianten (kleur wordt apart getoond)
+- Noem GEEN specifieke stof of materiaal (kasjmier, wol, zijde, linnen, satijn, leer, fluweel, ...) tenzij die stof letterlijk in de keywords of de competitor producttitel hierboven staat — een verkeerde stofclaim is een productfout. Bij twijfel: neutrale woorden zoals "zacht" of "soepel"
 
 Bestaande meta description (handhaaf consistentie): {current_meta_description!r}
 
@@ -6757,6 +6859,7 @@ Regels:
 - Slotszin over hoe het voelt om te dragen
 - Rustige toon, geen hype, geen superlatieven
 - Noem GEEN specifieke kleur in de tekst — dit product komt in meerdere kleuren en de beschrijving is gedeeld over alle kleurvarianten (kleur wordt apart getoond)
+- Noem GEEN specifieke stof of materiaal (kasjmier, wol, zijde, linnen, satijn, leer, fluweel, ...) tenzij die stof letterlijk in de keywords of de competitor producttitel hierboven staat — een verkeerde stofclaim is een productfout. Bij twijfel: neutrale woorden zoals "zacht" of "soepel"
 
 Geef ook (dit zijn de velden die het zwaarst meetellen voor Google — verwerk hierin de belangrijkste keywords uit de lijst hierboven, natuurlijk en leesbaar):
 - meta_description: max 155 tekens, SEO-geoptimaliseerd voor {language}. Verwerk 1-2 van de belangrijkste keywords op een natuurlijke manier.
