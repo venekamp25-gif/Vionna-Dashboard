@@ -159,8 +159,10 @@ export function SizeChartCard() {
         </div>
       ) : (
         <div className="text-[12px] text-text-faint mb-1">
-          The import found no size chart. Paste one below and it will show as the size-guide popup on
-          the product page.
+          The import found no size chart. <strong className="text-text-dim">No problem:</strong> at
+          publish, the store&apos;s standard chart for this product type is applied automatically, so
+          the product always gets a size-guide popup. Prefer the competitor&apos;s exact chart? Paste
+          it below and that one is used instead.
         </div>
       )}
 

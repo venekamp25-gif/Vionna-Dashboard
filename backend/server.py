@@ -2782,6 +2782,7 @@ def ensure_size_chart_definition():
 
 
 @app.route('/api/backfill_size_charts', methods=['POST'])
+@require_droplet_token
 def backfill_size_charts():
     """Bulk-write custom.size_chart from prepared per-store HTML.
     Body: {dry_run:bool(default true), limit:int(0=all), offset:int,
@@ -2923,6 +2924,7 @@ def touch_product():
 
 
 @app.route('/api/set_product_size_chart', methods=['POST'])
+@require_droplet_token
 def api_set_product_size_chart():
     """Manually set a size chart on an EXISTING product across stores. Body:
     {name, chart:{headers,rows}, stores, dry_run}. Localises the chart via
@@ -7243,6 +7245,227 @@ def api_backfill_source_urls():
                     'mapping_names_with_no_history': unmatched})
 
 
+# ── Standard size charts: store-gemiddelde per categorie (user rule 2026-07-15:
+# ieder product hoort een size guide te hebben; concurrent-chart eerst, anders dit) ──
+_STD_CHART_CACHE = {}          # store -> {'ts', 'by_cat': {cat: html}, 'overall': html|None}
+_STD_CHART_TTL = 24 * 3600
+# Non-apparel/afwijkende maatvoering: nooit een body-measurement chart uit ANDERE
+# categorieen erven (hun eigen meest-voorkomende chart, als die bestaat, mag wel).
+# De cat:<x> slugs zijn ENGELS (LLM-classifier): accessory/dress/knitwear/pants/
+# shoes/skirt/swim/top — geverifieerd op alle 3 stores 2026-07-15.
+_STD_NO_CROSS_CATS = {'accessory', 'accessories', 'shoes', 'bag', 'bags',
+                      'jewelry', 'jewellery'}
+
+
+def _product_cat_from_tags(tags):
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(',')]
+    return next((t.split(':', 1)[1].strip().lower() for t in (tags or [])
+                 if str(t).lower().startswith('cat:') and ':' in str(t)), None) or 'uncategorized'
+
+
+def _std_charts_compute(store):
+    """Eén catalogus-scan: meest voorkomende size_chart-HTML per categorie + de
+    overall meest voorkomende apparel-chart (vangnet voor categorieën zonder
+    eigen charts)."""
+    hdrs = shopify_headers(store)
+    q = ('query($c:String){ products(first:250, after:$c, query:"status:active"){ '
+         'pageInfo{ hasNextPage endCursor } edges{ node{ tags '
+         'metafield(namespace:"custom", key:"size_chart"){ value } } } } }')
+    import hashlib as _hl
+    import collections as _col
+    per_cat = _col.defaultdict(_col.Counter)
+    overall = _col.Counter()
+    by_hash = {}
+    cursor, pages = None, 0
+    while pages < 25:
+        pages += 1
+        r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                          json={'query': q, 'variables': {'c': cursor}}, timeout=45)
+        body = r.json() or {}
+        if body.get('errors'):
+            raise RuntimeError(str(body['errors'])[:150])
+        conn = ((body.get('data') or {}).get('products') or {})
+        for e in (conn.get('edges') or []):
+            n = e['node']
+            mv = (n.get('metafield') or {}).get('value')
+            if not mv or not mv.strip():
+                continue
+            cat = _product_cat_from_tags(n.get('tags'))
+            h = _hl.md5(mv.strip().encode('utf-8')).hexdigest()
+            by_hash[h] = mv
+            per_cat[cat][h] += 1
+            if cat not in _STD_NO_CROSS_CATS:
+                overall[h] += 1
+        pi = conn.get('pageInfo') or {}
+        if not pi.get('hasNextPage'):
+            break
+        cursor = pi.get('endCursor')
+    return {'by_cat': {c: by_hash[hc.most_common(1)[0][0]] for c, hc in per_cat.items() if hc},
+            'overall': by_hash[overall.most_common(1)[0][0]] if overall else None}
+
+
+def _std_chart_for(store, cat, force_refresh=False):
+    """(html, source) standaard-chart voor een categorie — 24h-gecachte scan.
+    (None, None) als er niets bruikbaars is (bijv. sieraden: geen body-chart)."""
+    now = time.time()
+    ent = _STD_CHART_CACHE.get(store)
+    if force_refresh or not ent or now - ent.get('ts', 0) > _STD_CHART_TTL:
+        try:
+            data = _std_charts_compute(store)
+            ent = {'ts': now}
+            ent.update(data)
+            _STD_CHART_CACHE[store] = ent
+        except Exception as e:
+            print(f'[size-chart] standard compute failed for {store}: {e}')
+            if not ent:
+                return None, None
+    cat = (cat or '').strip().lower() or 'uncategorized'
+    html = (ent.get('by_cat') or {}).get(cat)
+    if html:
+        return html, 'standard-cat'
+    if cat in _STD_NO_CROSS_CATS:
+        return None, None
+    ov = ent.get('overall')
+    return (ov, 'standard-store') if ov else (None, None)
+
+
+SC_FILL_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'size_chart_fill.json')
+
+
+def _size_chart_fill_store(store):
+    """Geef ieder ACTIEF product zonder custom.size_chart er een: eerst de echte
+    van de concurrent (re-scrape via source_url uit publish history — leest nu ook
+    charts op een aparte pagina), anders de store-standaard voor zijn categorie.
+    Overschrijft NOOIT een bestaande chart. Returns report-dict."""
+    hdrs = shopify_headers(store)
+    q = ('query($c:String){ products(first:250, after:$c, query:"status:active"){ '
+         'pageInfo{ hasNextPage endCursor } edges{ node{ id legacyResourceId title tags '
+         'metafield(namespace:"custom", key:"size_chart"){ value } } } } }')
+    gaps = []
+    cursor, pages = None, 0
+    while pages < 25:
+        pages += 1
+        r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                          json={'query': q, 'variables': {'c': cursor}}, timeout=45)
+        body = r.json() or {}
+        if body.get('errors'):
+            raise RuntimeError(str(body['errors'])[:150])
+        conn = ((body.get('data') or {}).get('products') or {})
+        for e in (conn.get('edges') or []):
+            n = e['node']
+            mv = (n.get('metafield') or {}).get('value')
+            if mv and mv.strip():
+                continue
+            gaps.append({'gid': n['id'], 'num': str(n.get('legacyResourceId') or ''),
+                         'title': n.get('title'), 'cat': _product_cat_from_tags(n.get('tags'))})
+        pi = conn.get('pageInfo') or {}
+        if not pi.get('hasNextPage'):
+            break
+        cursor = pi.get('endCursor')
+    # publish history: product_id -> source_url (concurrent-productpagina)
+    hist_src = {}
+    for h in _read_jsonl(HISTORY_PATH):
+        pid, srcu = str(h.get('product_id') or ''), (h.get('source_url') or '').strip()
+        if pid and srcu and h.get('store') == store:
+            hist_src[pid] = srcu
+    report = {'gaps': len(gaps), 'competitor': 0, 'standard_cat': 0,
+              'standard_store': 0, 'skipped': 0}
+    to_write = []
+    for g in gaps:
+        html, source = None, None
+        srcu = hist_src.get(g['num'])
+        if srcu:
+            try:
+                rr = _scrape_get(srcu, timeout=15)
+                if rr.status_code == 200:
+                    chart = _extract_size_chart_full(rr.text, srcu)
+                    if chart:
+                        html, source = _size_chart_html(chart, store), 'competitor'
+            except Exception:
+                pass
+            time.sleep(1.2)     # beleefd: ~1 concurrent-fetch per 1.2s
+        if not html:
+            html, source = _std_chart_for(store, g['cat'])
+        if not html:
+            report['skipped'] += 1
+            continue
+        report['competitor' if source == 'competitor'
+               else 'standard_cat' if source == 'standard-cat'
+               else 'standard_store'] += 1
+        to_write.append((g['gid'], html))
+    mut = ('mutation($mf:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$mf){ '
+           'userErrors{ field message } } }')
+    written, errors = 0, []
+    for i in range(0, len(to_write), 25):
+        batch = to_write[i:i + 25]
+        mfs = [{'ownerId': gid, 'namespace': 'custom', 'key': 'size_chart',
+                'type': 'multi_line_text_field', 'value': html} for gid, html in batch]
+        try:
+            rr = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                               json={'query': mut, 'variables': {'mf': mfs}}, timeout=45)
+            ue = (((rr.json() or {}).get('data') or {}).get('metafieldsSet') or {}).get('userErrors') or []
+            if ue:
+                errors.append(str(ue)[:150])
+            written += len(batch) - len(ue)
+        except Exception as e:
+            errors.append(str(e)[:120])
+    report['written'] = written
+    report['errors'] = errors[:5]
+    return report
+
+
+def _size_chart_fill_loop():
+    """Self-healing size guides: draait kort na iedere (re)start en daarna dagelijks.
+    De publish-fallback voorkomt NIEUWE gaten; deze loop dicht BESTAANDE (concurrent-
+    chart eerst, store-standaard daarna). Rapport in size_chart_fill.json."""
+    time.sleep(180)          # eerst de vers gedeployde server laten settelen
+    while True:
+        try:
+            with open(SC_FILL_STATE_PATH, encoding='utf-8') as f:
+                state = json.load(f) or {}
+        except Exception:
+            state = {}
+        for store in ('dk', 'fr', 'fi'):
+            if store not in tokens:
+                continue
+            try:
+                _std_chart_for(store, None, force_refresh=True)
+                rep = _size_chart_fill_store(store)
+                rep['at'] = datetime.datetime.utcnow().isoformat() + 'Z'
+                state[store] = rep
+                print(f'[size-chart] fill {store}: {rep}')
+            except Exception as e:
+                print(f'[size-chart] fill {store} failed: {e}')
+                state[store] = {'error': str(e)[:150],
+                                'at': datetime.datetime.utcnow().isoformat() + 'Z'}
+        try:
+            tmp = SC_FILL_STATE_PATH + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False)
+            os.replace(tmp, SC_FILL_STATE_PATH)
+        except Exception as e:
+            print(f'[size-chart] state save failed: {e}')
+        time.sleep(24 * 3600)
+
+
+threading.Thread(target=_size_chart_fill_loop, daemon=True, name='size-chart-fill').start()
+
+
+@app.route('/api/size_chart_fill_status')
+def api_size_chart_fill_status():
+    """Laatste self-heal run per store (read-only). written = charts toegevoegd;
+    competitor/standard_cat/standard_store = herkomst; skipped = geen bruikbare
+    chart beschikbaar (bijv. sieraden zonder enige eigen chart)."""
+    try:
+        with open(SC_FILL_STATE_PATH, encoding='utf-8') as f:
+            return jsonify(json.load(f) or {})
+    except FileNotFoundError:
+        return jsonify({'status': 'not run yet'})
+    except Exception as e:
+        return jsonify({'error': str(e)[:150]}), 500
+
+
 @app.route('/api/size_chart_audit')
 def api_size_chart_audit():
     """Read every ACTIVE product's custom.size_chart + cat:<x> tag + product type
@@ -7300,6 +7523,7 @@ def api_size_chart_audit():
 
 
 @app.route('/api/fill_missing_size_charts', methods=['POST'])
+@require_droplet_token
 def api_fill_missing_size_charts():
     """Fallback size charts: for each cat:<x>, take the MOST-COMMON existing chart
     on that store and write it ONLY to products in that category that currently
@@ -9611,6 +9835,17 @@ def publish_create_variant():
     _pub_cat = _category_for_publish(data, product_name)
     _cat_tags = ['cat:%s' % _pub_cat] if _pub_cat else []
 
+    # Ieder product krijgt een size guide (user rule 2026-07-15): geen chart bij
+    # de concurrent gevonden → de standaard store-chart voor deze categorie.
+    size_chart_source = 'competitor' if size_chart_html else None
+    if not size_chart_html:
+        try:
+            size_chart_html, size_chart_source = _std_chart_for(store, _pub_cat)
+            size_chart_html = size_chart_html or ''
+        except Exception as _sce:
+            print(f'[size-chart] standard fallback failed: {_sce}')
+            size_chart_html = ''
+
     hdrs = shopify_headers(store)
     base = shopify_url(store, '')
 
@@ -9653,7 +9888,8 @@ def publish_create_variant():
         'keywords':           data.get('keywords') or [],
         'category':           _pub_cat or None,
         'product_type':       product_type or None,
-        'size_chart_applied': bool(data.get('size_chart')),
+        'size_chart_applied': bool(size_chart_html),
+        'size_chart_source':  size_chart_source,
         'dfs_recommended':    data.get('dfs_recommended'),
         # Log the ACTUAL outcome (did it really go active?), not just the request.
         'published_live':     bool(result.get('activated')),
