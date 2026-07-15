@@ -517,7 +517,7 @@ export const api = {
 
   /** "What to list": product-TYPE view for a market — each type has an English
    *  label + localized term + demand/season + its top keywords. Gated. */
-  whatToList: (params: { store: "dk" | "fr" | "fi"; per_type?: number; force?: boolean }) =>
+  whatToList: (params: { store: "dk" | "fr" | "fi" | LightStore; per_type?: number; force?: boolean }) =>
     call<{
       configured: boolean;
       store?: string;

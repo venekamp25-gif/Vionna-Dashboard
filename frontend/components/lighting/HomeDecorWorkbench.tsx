@@ -15,6 +15,7 @@ import {
   type ScrapedProduct,
 } from "@/lib/api";
 import { useLightProduct, EMPTY_CONTENT, type LightContent } from "@/lib/lightProduct";
+import { LightWhatToList } from "./LightWhatToList";
 
 const STORES: LightStore[] = ["nl", "de", "com"];
 
@@ -67,6 +68,7 @@ export function HomeDecorWorkbench() {
   const [generating, setGenerating] = useState<LightStore | null>(null);
   const [publishing, setPublishing] = useState(false);
   const [results, setResults] = useState<Record<string, LightPublishResult> | null>(null);
+  const [researchMarket, setResearchMarket] = useState<LightStore>("nl");
 
   useEffect(() => {
     lightingApi.status().then(setStatus).catch(() => setStatus(null));
@@ -288,6 +290,39 @@ export function HomeDecorWorkbench() {
             </p>
           </div>
         )}
+
+        {/* ⓪ RESEARCH — optional starting point */}
+        <details className="rounded-2xl border border-border bg-bg-elev overflow-hidden group">
+          <summary className="px-6 lg:px-7 py-4 cursor-pointer list-none flex items-center justify-between">
+            <div>
+              <h2 className="text-[15px] font-semibold text-text tracking-tight">
+                Not sure what to list?
+              </h2>
+              <p className="text-[12px] text-text-dim mt-0.5">
+                See which lamp types people are searching for right now, per market.
+              </p>
+            </div>
+            <span className="text-text-faint text-[12px] group-open:rotate-180 transition-transform">▾</span>
+          </summary>
+          <div className="px-6 lg:px-7 pb-6">
+            <div className="flex gap-1.5 mb-4">
+              {STORES.map((s) => (
+                <button
+                  key={s}
+                  onClick={() => setResearchMarket(s)}
+                  className={`px-2.5 h-7 rounded-lg border text-[11.5px] transition ${
+                    researchMarket === s
+                      ? "border-accent bg-accent/10 text-accent"
+                      : "border-border text-text-dim hover:border-border-hover"
+                  }`}
+                >
+                  {LIGHT_STORE_CONFIG[s].flag} {LIGHT_STORE_CONFIG[s].label}
+                </button>
+              ))}
+            </div>
+            <LightWhatToList market={researchMarket} />
+          </div>
+        </details>
 
         {/* ① IMPORT */}
         <Section
