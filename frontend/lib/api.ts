@@ -645,6 +645,7 @@ export const api = {
       country: string;
       min_local: number;
       traffic_missing: number;
+      verdicts_missing: number;
       apify_configured: boolean;
       stores: WtlStore[];
     }>(`/api/wtl_stores?store=${store}`),
@@ -661,6 +662,13 @@ export const api = {
     call<{ ok?: boolean; domain?: string; error?: string }>("/api/wtl_stores/add", {
       method: "POST",
       body: { domain },
+    }),
+
+  /** Kick the dropship-check job (shipping policy + brand signals) for unchecked stores. */
+  wtlStoresClassify: (max = 10) =>
+    call<{ job_id?: string; status?: string; error?: string }>("/api/wtl_stores/classify", {
+      method: "POST",
+      body: { max },
     }),
 
   /** Kick a background Google-discovery run (hunt unknown local fashion stores). */
@@ -923,6 +931,9 @@ export interface WtlStore {
   /** 0-100 mine-this-store-first score (local traffic + trend/proven/local bonuses). */
   score: number;
   score_parts: Record<string, number>;
+  /** Cached dropship-verdict from the import-gate check (shipping policy + brand
+   *  signals); null = not checked yet. Warn-only — the employee decides. */
+  verdict: { label: string; detail: string; confidence: string; fresh: boolean } | null;
   market_ok: boolean;
 }
 

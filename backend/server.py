@@ -7795,6 +7795,7 @@ def api_wtl_stores():
         # concurrenten >= 50.000 bezoekers/mnd — VLAK, geen marktschaling.
         min_local = TRAFFIC_MIN_VISITS
     cache = _wtl_traffic_load()
+    verdicts = _wtl_verdicts_load()
     now = datetime.datetime.utcnow()
     comps = {c['domain']: c for c in _known_comp_data()}
     for d in _wtl_extra_stores():
@@ -7821,6 +7822,7 @@ def api_wtl_stores():
         trend_pct = None
         if len(monthly) >= 2 and monthly[-2] > 0:
             trend_pct = round((monthly[-1] - monthly[-2]) / monthly[-2] * 100)
+        v = verdicts.get(d.replace('www.', ''))
         out.append({'domain': d, 'products': c.get('products') or 0,
                     'last_import': c.get('last_import'),
                     'imported_handles': c.get('imported_handles') or [],
@@ -7828,6 +7830,9 @@ def api_wtl_stores():
                     'local_share': round(share, 3), 'traffic_age_days': age_days,
                     'has_traffic_data': bool(t and total > 0),
                     'monthly_total': monthly, 'trend_pct': trend_pct,
+                    'verdict': ({'label': v.get('label'), 'detail': v.get('detail'),
+                                 'confidence': v.get('confidence'), 'fresh': _wtl_verdict_fresh(v)}
+                                if v else None),
                     'market_ok': local >= min_local})
 
     # ── Store score (0-100): the best store to mine sits on top. Local traffic is the
@@ -7857,8 +7862,10 @@ def api_wtl_stores():
         s['score'] = min(100, round(max(0.0, traffic + bonus) * 100))
         s['score_parts'] = parts
     out.sort(key=lambda s: (-s['score'], -s['local_visits'], -s['products']))
+    verdicts_missing = sum(1 for s in out if not (s.get('verdict') or {}).get('fresh'))
     return jsonify({'store': store, 'country': cc, 'min_local': min_local,
                     'stores': out, 'traffic_missing': missing,
+                    'verdicts_missing': verdicts_missing,
                     'apify_configured': bool(os.getenv('APIFY_TOKEN', '').strip())})
 
 
@@ -7966,27 +7973,30 @@ def api_wtl_export():
                         'JA' if pr.get('handle') in imported else '', pr.get('url')])
         fname = f'wtl_bestsellers_{bare}_{today}.csv'
     elif what == 'stores':
-        w.writerow(['Score', 'Store', f'Bezoekers {cc}/mnd', 'Bezoekers totaal/mnd', '% lokaal',
-                    'Trend m/m', 'Eerder geimporteerd', 'Laatste import', 'Bestseller-pagina'])
+        w.writerow(['Score', 'Store', 'Verzend-oordeel', f'Bezoekers {cc}/mnd', 'Bezoekers totaal/mnd',
+                    '% lokaal', 'Trend m/m', 'Eerder geimporteerd', 'Laatste import', 'Bestseller-pagina'])
         for s in stores:
             if only_ok and not s.get('market_ok'):
                 continue
-            w.writerow([s['score'], s['domain'], s['local_visits'], s['total_visits'],
+            w.writerow([s['score'], s['domain'],
+                        ((s.get('verdict') or {}).get('label') or 'niet gecheckt'),
+                        s['local_visits'], s['total_visits'],
                         round((s.get('local_share') or 0) * 100),
                         (f"{s['trend_pct']:+d}%" if s.get('trend_pct') is not None else ''),
                         s.get('products') or 0, s.get('last_import') or '',
                         f"https://{s['domain']}/collections/all?sort_by=best-selling"])
         fname = f'wtl_stores_{store}_{today}.csv'
     else:
-        w.writerow(['Status', 'Store', 'Store-score', f'Bezoekers {cc}/mnd', 'Positie', 'Titel',
-                    'Type', 'Prijs', 'Prijs EUR', 'Ook bestseller bij', 'Sinds', 'Al geimporteerd',
-                    'Product-URL'])
+        w.writerow(['Status', 'Store', 'Verzend-oordeel', 'Store-score', f'Bezoekers {cc}/mnd',
+                    'Positie', 'Titel', 'Type', 'Prijs', 'Prijs EUR', 'Ook bestseller bij', 'Sinds',
+                    'Al geimporteerd', 'Product-URL'])
         picked = [s for s in stores if s.get('market_ok') or not only_ok][:12]
         for s in picked:
             payload, blocked = _bs_scan_cached(s['domain'])
+            s_verdict = ((s.get('verdict') or {}).get('label') or 'niet gecheckt')
             if not payload:
-                w.writerow(['', s['domain'], s['score'], s['local_visits'], '', f'(scan mislukt: {blocked})',
-                            '', '', '', '', '', '', ''])
+                w.writerow(['', s['domain'], s_verdict, s['score'], s['local_visits'], '',
+                            f'(scan mislukt: {blocked})', '', '', '', '', '', '', ''])
                 continue
             payload = _bs_enrich(payload, s['domain'])
             imported = set(s.get('imported_handles') or [])
@@ -7995,7 +8005,7 @@ def api_wtl_export():
                     continue
                 if p.get('price_ok') is False:
                     continue   # scraper rule: under €25-equivalent = not listed
-                w.writerow(['', s['domain'], s['score'], s['local_visits'], p.get('position'),
+                w.writerow(['', s['domain'], s_verdict, s['score'], s['local_visits'], p.get('position'),
                             p.get('title'), p.get('category'), p.get('price'),
                             p.get('price_eur') if p.get('price_eur') is not None else '',
                             ', '.join(p.get('also_at') or []),
@@ -8006,6 +8016,126 @@ def api_wtl_export():
     resp = app.response_class('﻿' + buf.getvalue(), mimetype='text/csv; charset=utf-8')
     resp.headers['Content-Disposition'] = f'attachment; filename="{fname}"'
     return resp
+
+
+# ── WTL store dropship-VERDICTS: is this store even a dropshipper? ─────────────
+# The stores tab ranks by market strength (traffic/score), but sourcing needs the
+# import-gate's judgement too: shipping policy + brand signals. Classification is
+# slow (LLM layers), so verdicts live in wtl_verdicts.json (30-day TTL, like the
+# Bron Audit) and are computed by a background job — the list itself only reads
+# the cache. WARN-only, never blocking (Billy J lesson: the human decides).
+WTL_VERDICTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wtl_verdicts.json')
+_WTL_VERDICT_TTL = 30 * 86400
+_WTL_VERDICT_LOCK = threading.Lock()
+
+
+def _wtl_verdicts_load():
+    try:
+        with open(WTL_VERDICTS_PATH, encoding='utf-8') as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _wtl_verdicts_save(data):
+    try:
+        tmp = WTL_VERDICTS_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, WTL_VERDICTS_PATH)
+    except Exception as e:
+        print(f'[wtl] verdicts save failed: {e}')
+
+
+def _wtl_classify_store(domain):
+    """Import-gate judgement for a whole STORE (homepage): manual blocklist →
+    shipping-policy classifier → brand-signal override. Returns a verdict dict."""
+    bare = domain.replace('www.', '')
+    ts = datetime.datetime.utcnow().isoformat() + 'Z'
+    if bare in _load_blocked_sources():
+        return {'label': 'Eigen voorraad', 'detail': f'handmatig geblokkeerd: {_blocked_reason(bare)}',
+                'source': 'manual-blocklist', 'confidence': 'high', 'ts': ts}
+    url = f'https://{bare}/'
+    try:
+        from shipping_check import classify_detailed
+        d = classify_detailed(url, skip_browser=True) or {}
+    except Exception as e:
+        return {'label': 'Onbekend', 'detail': str(e)[:120], 'source': 'none',
+                'confidence': 'none', 'ts': ts}
+    label = d.get('label') or 'Onbekend'
+    detail = d.get('detail') or ''
+    source = d.get('source') or 'none'
+    confidence = d.get('confidence') or 'none'
+    if label == 'Dropshipper':
+        try:
+            from shipping_check import looks_like_brand
+            is_brand, sigs = looks_like_brand(bare)
+            if is_brand:
+                label, source = 'Mogelijk eigen merk', 'brand-signals'
+                detail = ', '.join(sigs)[:160] if sigs else detail
+        except Exception:
+            pass
+    return {'label': label, 'detail': detail, 'source': source, 'confidence': confidence, 'ts': ts}
+
+
+def _wtl_verdict_fresh(v):
+    try:
+        age = (datetime.datetime.utcnow()
+               - datetime.datetime.fromisoformat((v or {}).get('ts', '1970-01-01').rstrip('Z'))).total_seconds()
+        return age < _WTL_VERDICT_TTL
+    except Exception:
+        return False
+
+
+def _wtl_classify_missing(domains, jid=None, cap=10):
+    """Classify domains without a fresh verdict, sequentially (slow LLM work), and
+    persist. Returns {classified: n, verdicts: {domain: label}}."""
+    if not _WTL_VERDICT_LOCK.acquire(blocking=False):
+        return {'error': 'classification already running'}
+    try:
+        cache = _wtl_verdicts_load()
+        todo = [d for d in domains if not _wtl_verdict_fresh(cache.get(d.replace('www.', '')))][:cap]
+        if jid:
+            _job_set(jid, phase='Verzendbeleid + merk-signalen checken', total=len(todo), processed=0)
+        out = {}
+        for d in todo:
+            bare = d.replace('www.', '')
+            v = _wtl_classify_store(bare)
+            cache[bare] = v
+            out[bare] = v['label']
+            _wtl_verdicts_save(cache)
+            if jid:
+                _job_inc(jid, processed=1)
+            print(f"[wtl] verdict {bare}: {v['label']} ({v['source']})")
+        return {'classified': len(todo), 'verdicts': out}
+    finally:
+        _WTL_VERDICT_LOCK.release()
+
+
+@app.route('/api/wtl_stores/classify', methods=['POST'])
+def api_wtl_stores_classify():
+    """Background job: run the dropship-check (shipping policy + brand signals) for
+    stores that don't have a fresh verdict yet. Body: {domains?: [...], max?: n}."""
+    body = request.get_json(silent=True) or {}
+    doms = [str(d).lower() for d in (body.get('domains') or [])] or sorted(_wtl_all_domains())
+    try:
+        cap = max(1, min(20, int(body.get('max') or 10)))
+    except Exception:
+        cap = 10
+    jid = _job_new('wtl_classify', 'wtl')
+
+    def _runner():
+        try:
+            res = _wtl_classify_missing(doms, jid=jid, cap=cap)
+            _job_set(jid, status='done', result=res,
+                     finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+            _job_summary(jid, f"{res.get('classified', 0)} store(s) gecheckt")
+        except Exception as e:
+            _job_error(jid, str(e))
+            _job_set(jid, status='error', finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+
+    threading.Thread(target=_runner, daemon=True).start()
+    return jsonify({'job_id': jid, 'status': 'running'})
 
 
 # ── WTL store DISCOVERY: hunt UNKNOWN local fashion dropshippers via Google ────
@@ -8216,6 +8346,17 @@ def _wtl_discover(markets, jid=None):
         except Exception as e:
             print(f'[wtl-disc] extra-stores save failed: {e}')
 
+    # dropship-verdict for the newly added stores right away (few, worth the wait)
+    if added:
+        if jid:
+            _job_set(jid, phase='Verzendbeleid nieuwe stores checken')
+        try:
+            vres = _wtl_classify_missing([a['domain'] for a in added], cap=len(added))
+            for a in added:
+                a['verdict'] = (vres.get('verdicts') or {}).get(a['domain'].replace('www.', ''))
+        except Exception as e:
+            print(f'[wtl-disc] verdicts failed: {e}')
+
     return {'markets': markets, 'candidates': len(cand), 'scanned': len(scanned),
             'added': added, 'gated': gated, 'skipped': skipped[:40]}
 
@@ -8298,6 +8439,12 @@ def _wtl_traffic_loop():
                         json.dump(st, f)
         except Exception as e:
             print(f'[wtl] discovery loop error: {e}')
+        try:
+            res = _wtl_classify_missing(sorted(_wtl_all_domains()), cap=5)
+            if res.get('classified'):
+                print(f"[wtl] weekly verdicts: {res}")
+        except Exception as e:
+            print(f'[wtl] verdict loop error: {e}')
         time.sleep(12 * 3600)
 
 

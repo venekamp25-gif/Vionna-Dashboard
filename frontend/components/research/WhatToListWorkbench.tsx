@@ -233,6 +233,26 @@ export function WhatToListWorkbench() {
     }
   };
 
+  const [classifying, setClassifying] = useState(false);
+  /** Dropship-check for stores without a fresh verdict (shipping policy + brand signals). */
+  const classifyStores = async () => {
+    setClassifying(true);
+    try {
+      const start = await api.wtlStoresClassify(10);
+      if (!start.job_id) throw new Error(start.error || "could not start");
+      for (let i = 0; i < 400; i++) {
+        await new Promise((r) => setTimeout(r, 3000));
+        const j = await api.metaJobStatus(start.job_id).catch(() => null);
+        if (j && j.status !== "running") break;
+      }
+      setWtlStores(await api.wtlStores(funnelMarket));
+    } catch {
+      /* list stays as-is */
+    } finally {
+      setClassifying(false);
+    }
+  };
+
   /** Google hunt for UNKNOWN local stores (the research scraper's method, server-side). */
   const discoverStores = async () => {
     setDiscovering(true);
@@ -724,7 +744,9 @@ export function WhatToListWorkbench() {
               <strong>inside this market&apos;s country</strong>
               {wtlStores?.country ? ` (${wtlStores.country})` : ""} as the backbone, plus bonuses for a rising trend,
               proven import source and a truly local player. The research bar: <strong>≥ 50,000 local visitors/month</strong>.
-              Pick a store to open its bestsellers{funnelType ? " for your chosen type" : ""}.
+              Every store also gets the import-gate&apos;s <strong>dropship-verdict</strong> (shipping policy +
+              brand signals) — big traffic does NOT mean it&apos;s a dropshipper. Pick a store to open its
+              bestsellers{funnelType ? " for your chosen type" : ""}.
             </>
           }
         >
@@ -775,6 +797,17 @@ export function WhatToListWorkbench() {
                 </button>
               </>
             )}
+            <button
+              type="button"
+              onClick={() => void classifyStores()}
+              disabled={classifying}
+              className="text-accent hover:underline disabled:opacity-50"
+              title="Run the import-gate check (shipping policy + brand signals) for stores that haven't been verified yet — the verdict chip appears on each card. Slow (~1 min per store), runs in the background."
+            >
+              {classifying
+                ? "Verifying dropshippers…"
+                : `🛡 Verify dropshippers${(wtlStores?.verdicts_missing ?? 0) > 0 ? ` (${wtlStores?.verdicts_missing})` : ""}`}
+            </button>
             <a
               href={api.wtlExportUrl("stores", funnelMarket, { onlyOk: false })}
               className="text-accent hover:underline"
@@ -862,7 +895,42 @@ export function WhatToListWorkbench() {
                           </span>
                         )}
                       </div>
-                      <div className="text-[10.5px] text-text-faint mt-1.5 tabular-nums">
+                      <div className="mt-1.5">
+                        {(() => {
+                          const v = s.verdict;
+                          const cls = !v
+                            ? "bg-bg-elev text-text-faint border-border"
+                            : v.label === "Dropshipper"
+                              ? "bg-green-600/15 text-green-600 dark:text-green-400 border-green-600/40"
+                              : v.label === "Mogelijk eigen merk"
+                                ? "bg-amber-500/15 text-amber-500 border-amber-500/40"
+                                : v.label === "Eigen voorraad"
+                                  ? "bg-danger/15 text-danger border-danger/40"
+                                  : "bg-bg-elev text-text-dim border-border";
+                          const txt = !v
+                            ? "shipping not verified"
+                            : v.label === "Dropshipper"
+                              ? "✓ dropshipper"
+                              : v.label === "Mogelijk eigen merk"
+                                ? "⚠ possible real brand"
+                                : v.label === "Eigen voorraad"
+                                  ? "⚠ own stock — don't source"
+                                  : "? shipping unknown";
+                          return (
+                            <span
+                              className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold border ${cls}`}
+                              title={
+                                v
+                                  ? `Import-gate verdict: ${v.label}${v.detail ? ` — ${v.detail}` : ""} (confidence: ${v.confidence}). Warn-only: you decide.`
+                                  : "Not checked against its shipping policy yet — press “🛡 Verify dropshippers”. Warn-only: you decide."
+                              }
+                            >
+                              {txt}
+                            </span>
+                          );
+                        })()}
+                      </div>
+                      <div className="text-[10.5px] text-text-faint mt-1 tabular-nums">
                         {s.has_traffic_data && <>total {n(s.total_visits)}/mo · {Math.round(s.local_share * 100)}% local</>}
                         {s.trend_pct !== null && s.trend_pct !== undefined && (
                           <span
