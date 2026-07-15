@@ -924,7 +924,7 @@ export function WhatToListWorkbench() {
                                     : "? shipping unknown";
                           const overlap =
                             v && (v.overlap_matches ?? 0) > 0
-                              ? ` Evidence: ${v.overlap_matches} of their bestsellers are also at other known stores (supplier catalog).`
+                              ? ` Hint (NO proof): ${v.overlap_matches} of their bestsellers are also sold by other known stores — a typical supplier-catalog pattern. Still verify on AliExpress yourself (🔍 on a product card) before marking.`
                               : "";
                           return (
                             <>
@@ -1233,6 +1233,17 @@ export function WhatToListWorkbench() {
                                   >
                                     ↗
                                   </a>
+                                  {p.image && (
+                                    <a
+                                      href={`https://lens.google.com/uploadbyurl?url=${encodeURIComponent(p.image)}`}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="h-8 px-2.5 inline-flex items-center rounded-[8px] border border-border text-[11.5px] text-text-dim hover:border-accent hover:text-accent"
+                                      title="Quick AliExpress check: opens this photo in Google Lens — if AliExpress/1688 listings show up in the matches, the product is supplier-catalog (then mark the store 'found on AliExpress' in step ②). The system can't verify this automatically; you look, you decide."
+                                    >
+                                      🔍
+                                    </a>
+                                  )}
                                 </div>
                               </div>
                             </div>
