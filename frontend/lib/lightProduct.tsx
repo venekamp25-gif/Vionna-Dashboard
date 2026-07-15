@@ -3,6 +3,7 @@
 import { createContext, useContext, useEffect, useRef, useState, ReactNode } from "react";
 import type { LightStore } from "@/lib/api";
 
+
 /** One market's generated copy. `unverifiedClaims` are spec claims (IP rating,
  *  wattage, lumen…) our copy makes that the competitor's page never stated —
  *  warn-only, the operator decides. */
@@ -80,6 +81,11 @@ const LIGHT_DRAFT_KEY = "home_decor_draft_v1";
 interface Ctx {
   draft: LightDraft;
   patch: (p: Partial<LightDraft>) => void;
+  /** Update ONE market's copy. Must be functional: callers generate several
+   *  markets in an await-loop, and a `{...draft.content}` spread built from the
+   *  render-time draft would drop every market but the last — silently, since
+   *  the only symptom is a publish button that stays greyed out. */
+  patchContent: (store: LightStore, p: Partial<LightContent>) => void;
   reset: () => void;
 }
 
@@ -109,6 +115,11 @@ export function LightProductProvider({ children }: { children: ReactNode }) {
   }, [draft]);
 
   const patch = (p: Partial<LightDraft>) => setDraft((d) => ({ ...d, ...p }));
+  const patchContent = (store: LightStore, p: Partial<LightContent>) =>
+    setDraft((d) => ({
+      ...d,
+      content: { ...d.content, [store]: { ...(d.content[store] ?? EMPTY_CONTENT), ...p } },
+    }));
   const reset = () => {
     setDraft(EMPTY_DRAFT);
     try {
@@ -119,7 +130,7 @@ export function LightProductProvider({ children }: { children: ReactNode }) {
   };
 
   return (
-    <LightProductContext.Provider value={{ draft, patch, reset }}>
+    <LightProductContext.Provider value={{ draft, patch, patchContent, reset }}>
       {children}
     </LightProductContext.Provider>
   );

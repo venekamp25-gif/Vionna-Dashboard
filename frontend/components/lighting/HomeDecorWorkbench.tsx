@@ -14,7 +14,7 @@ import {
   type LightPublishResult,
   type ScrapedProduct,
 } from "@/lib/api";
-import { useLightProduct, EMPTY_CONTENT, type LightContent } from "@/lib/lightProduct";
+import { useLightProduct, type LightContent } from "@/lib/lightProduct";
 import { LightWhatToList } from "./LightWhatToList";
 
 const STORES: LightStore[] = ["nl", "de", "com"];
@@ -61,7 +61,7 @@ function Section({
 }
 
 export function HomeDecorWorkbench() {
-  const { draft, patch, reset } = useLightProduct();
+  const { draft, patch, patchContent, reset } = useLightProduct();
   const [status, setStatus] = useState<LightStatusResponse | null>(null);
   const [scraping, setScraping] = useState(false);
   const [scrapeError, setScrapeError] = useState<string | null>(null);
@@ -164,7 +164,9 @@ export function HomeDecorWorkbench() {
         unverifiedClaims: r.unverified_claims ?? [],
         sourceSpecs: r.source_specs ?? [],
       };
-      patch({ content: { ...draft.content, [store]: c } });
+      // Functional update — generateAll() awaits several markets in a row, and a
+      // spread of the render-time draft.content would drop all but the last.
+      patchContent(store, c);
     } catch (e) {
       alert(`Copy failed for ${LIGHT_STORE_CONFIG[store].label}: ${e instanceof Error ? e.message : e}`);
     } finally {
@@ -175,11 +177,6 @@ export function HomeDecorWorkbench() {
   const generateAll = async () => {
     for (const s of draft.selectedStores) await generateFor(s);
   };
-
-  const patchContent = (store: LightStore, p: Partial<LightContent>) =>
-    patch({
-      content: { ...draft.content, [store]: { ...(draft.content[store] ?? EMPTY_CONTENT), ...p } },
-    });
 
   // ── Step 3: publish ───────────────────────────────────────────────────────
   const readyToPublish =
