@@ -1144,3 +1144,94 @@ export const plansApi = {
       `/api/plans/${id}/reject`, { method: "POST", authed: true }
     ),
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HOME DECOR (lighting) — The Light Supplier NL / DE / .com
+// Separate from the fashion API on purpose: a lamp is ONE product with its own
+// variants (no colour-sibling duplicates), it has no sizes or size chart, and
+// its copy rules are inverted (colour keywords are wanted, specs are guarded).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type LightStore = "nl" | "de" | "com";
+
+export const LIGHT_STORE_CONFIG: Record<LightStore, { label: string; language: string; flag: string }> = {
+  nl: { label: "Netherlands", language: "Dutch", flag: "🇳🇱" },
+  de: { label: "Germany", language: "German", flag: "🇩🇪" },
+  com: { label: "International", language: "English", flag: "🌍" },
+};
+
+export interface LightStatusResponse {
+  stores: Record<LightStore, {
+    configured: boolean;
+    shop: string | null;
+    auth: string | null;
+    language: string;
+  }>;
+  ready: LightStore[];
+  brand: string;
+  error?: string;
+}
+
+export interface LightGenerateResponse {
+  description?: string;
+  meta_description?: string;
+  m_title_specs?: string;
+  /** Spec claims our copy makes that the competitor's page never stated
+   *  (IP rating, wattage, lumen, kelvin, cap, dimmable). Warn-only. */
+  unverified_claims?: string[];
+  /** Spec claims the source itself states — these are safe to use. */
+  source_specs?: string[];
+  error?: string;
+}
+
+export interface LightPublishResult {
+  product_id?: number;
+  handle?: string;
+  admin_url?: string;
+  images?: number;
+  variants?: number;
+  activated?: boolean;
+  reused?: boolean;
+  status?: string;
+  metafield_errors?: string[];
+  error?: string;
+}
+
+export const lightingApi = {
+  /** Which lighting stores have working credentials. Never returns a token. */
+  status: () => call<LightStatusResponse>("/api/lighting/status"),
+
+  generate: (params: {
+    store: LightStore;
+    product_name: string;
+    product_title: string;
+    /** Competitor's own title + description — the ONLY source a spec claim may come from. */
+    source_text: string;
+    keywords?: string[];
+    only_field?: "description" | "meta_description" | "m_title_specs";
+  }) => call<LightGenerateResponse>("/api/lighting/generate", { method: "POST", body: params, authed: true }),
+
+  publish: (params: {
+    stores: LightStore[];
+    product_name: string;
+    product_type?: string;
+    source_url?: string;
+    /** The variant axis as the product really has it: Kleur / Color / Design / light colour. */
+    option_name?: string;
+    option_values?: string[];
+    price: string;
+    compare_at_price?: string;
+    images?: string[];
+    images_by_value?: Record<string, string[]>;
+    content: Partial<Record<LightStore, { description: string; meta_description: string; m_title_specs: string }>>;
+    tags?: string[];
+    /** Puts the product on the Kaching template so the bundle block renders. */
+    kaching?: boolean;
+    bundle_collection?: string;
+    activate?: boolean;
+  }) =>
+    call<{ success: boolean; results: Record<string, LightPublishResult>; error?: string }>(
+      "/api/lighting/publish",
+      { method: "POST", body: params, authed: true }
+    ),
+};
