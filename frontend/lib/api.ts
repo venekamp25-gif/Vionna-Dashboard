@@ -1224,14 +1224,24 @@ export const lightingApi = {
     images?: string[];
     images_by_value?: Record<string, string[]>;
     content: Partial<Record<LightStore, { description: string; meta_description: string; m_title_specs: string }>>;
+    /** Competitor's own text — the server re-checks the ACTUAL copy against it,
+     *  because the generate-time check says nothing about text edited afterwards. */
+    source_text?: string;
+    product_title?: string;
+    /** Publish despite unverified spec claims (warn-never-block; logged). */
+    ack_claims?: boolean;
     tags?: string[];
     /** Puts the product on the Kaching template so the bundle block renders. */
     kaching?: boolean;
     bundle_collection?: string;
     activate?: boolean;
   }) =>
-    call<{ success: boolean; results: Record<string, LightPublishResult>; error?: string }>(
-      "/api/lighting/publish",
-      { method: "POST", body: params, authed: true }
-    ),
+    call<{
+      success: boolean;
+      results: Record<string, LightPublishResult>;
+      /** 409: the server refused because the copy claims specs the source doesn't. */
+      needs_claim_ack?: boolean;
+      claim_report?: Record<string, { unverified: string[]; conflicting: string[] }>;
+      error?: string;
+    }>("/api/lighting/publish", { method: "POST", body: params, authed: true }),
 };

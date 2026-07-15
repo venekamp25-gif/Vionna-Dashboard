@@ -185,19 +185,15 @@ export function HomeDecorWorkbench() {
     draft.selectedStores.length > 0 &&
     draft.selectedStores.every((s) => (draft.content[s]?.description ?? "").trim().length > 0);
 
-  const runPublish = async () => {
+  /** Publishes. `ack` = the operator already said "yes, publish anyway" to the
+   *  server's spec warning. The server does the real check against the actual
+   *  text (this component's warning is only a generation-time snapshot). */
+  const runPublish = async (ack = false) => {
     if (!readyToPublish || publishing) return;
-    const claimed = draft.selectedStores.flatMap((s) => draft.content[s]?.unverifiedClaims ?? []);
-    if (claimed.length > 0) {
-      const ok = confirm(
-        `The copy claims specs the competitor never stated: ${[...new Set(claimed)].join(", ")}.\n\n` +
-          `A wrong IP rating or wattage is a product defect, not a typo. Publish anyway?`
-      );
-      if (!ok) return;
-    }
     setPublishing(true);
     setResults(null);
     try {
+      const selectedUrls = draft.images.filter((i) => i.selected).map((i) => i.url);
       const content: Parameters<typeof lightingApi.publish>[0]["content"] = {};
       for (const s of draft.selectedStores) {
         const c = draft.content[s];
@@ -217,14 +213,42 @@ export function HomeDecorWorkbench() {
         option_values: draft.optionValues,
         price: draft.price,
         compare_at_price: draft.compareAtPrice || undefined,
-        images: draft.images.filter((i) => i.selected).map((i) => i.url),
-        images_by_value: draft.imagesByValue,
+        images: selectedUrls,
+        // Only map variants to photos that are actually being uploaded —
+        // otherwise a de-selected photo would be requested for a variant.
+        images_by_value: Object.fromEntries(
+          Object.entries(draft.imagesByValue)
+            .map(([val, urls]) => [val, urls.filter((u) => selectedUrls.includes(u))])
+            .filter(([, urls]) => (urls as string[]).length > 0)
+        ),
         content,
+        source_text: draft.sourceText,
+        product_title: draft.competitorTitle,
+        ack_claims: ack,
         tags: draft.tags,
         kaching: draft.kaching,
         bundle_collection: draft.bundleCollection || undefined,
         activate: draft.activate,
       });
+
+      // The server refuses once when the copy claims specs the source doesn't.
+      // Warn-never-block: the operator can confirm and it goes through — but the
+      // decision is logged, not just remembered.
+      if (r.needs_claim_ack && !ack) {
+        const lines = Object.entries(r.claim_report ?? {}).map(([st, rep]) => {
+          const bits = [
+            rep.unverified.length ? `not stated by the source: ${rep.unverified.join(", ")}` : "",
+            rep.conflicting.length ? `CONTRADICTED by the source: ${rep.conflicting.join(", ")}` : "",
+          ].filter(Boolean);
+          return `${st.toUpperCase()} — ${bits.join(" · ")}`;
+        });
+        const ok = confirm(
+          `Check the specs before this goes live:\n\n${lines.join("\n")}\n\n` +
+            `A wrong IP rating or wattage is a product defect, not a typo. Publish anyway?`
+        );
+        if (ok) await runPublish(true);
+        return;
+      }
       setResults(r.results);
     } catch (e) {
       alert(`Publish failed: ${e instanceof Error ? e.message : e}`);
@@ -602,7 +626,9 @@ export function HomeDecorWorkbench() {
               </label>
 
               <button
-                onClick={runPublish}
+                // NOT onClick={runPublish}: that hands the MouseEvent to `ack`,
+                // and an event is truthy — the spec gate would be skipped.
+                onClick={() => void runPublish()}
                 disabled={!readyToPublish || publishing || knownNotConfigured}
                 className="px-4 h-10 rounded-[10px] bg-accent text-on-accent text-[13px] font-medium disabled:opacity-40 hover:opacity-90 transition"
                 title={

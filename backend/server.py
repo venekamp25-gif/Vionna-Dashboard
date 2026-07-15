@@ -305,6 +305,7 @@ for _lk in ('nl', 'de', 'com'):
 LIGHT_LANGUAGE      = {'nl': 'Nederlands', 'de': 'Duits', 'com': 'Engels'}
 LIGHT_PRICE_SUFFIX  = {'nl': '.95', 'de': '.95', 'com': '.95'}
 LIGHT_BRAND         = os.getenv('LIGHT_BRAND', 'TLS')     # SKU prefix — never 'VIONNA-'
+LIGHT_MAX_IMAGES    = 12                                  # frontend lets you pick up to 12
 
 _LIGHT_TOKEN_CACHE = {}      # key -> (token, expires_at)
 
@@ -2960,6 +2961,7 @@ def backfill_size_charts():
 
 
 @app.route('/api/theme_put_asset', methods=['POST'])
+@require_droplet_token
 def theme_put_asset():
     """Debug: PUT a theme asset via Admin Asset API (forces recompile of JSON
     templates that GitHub sync leaves stale). Body: {store, path, value}."""
@@ -2986,6 +2988,7 @@ def theme_put_asset():
 
 
 @app.route('/api/touch_product')
+@require_droplet_token
 def touch_product():
     """Debug: bump a product's updatedAt (productUpdate title->itself) to purge the
     storefront page cache, so a freshly-written metafield renders. By handle."""
@@ -4937,6 +4940,7 @@ def api_list_products_for_categorization():
 
 
 @app.route('/api/apply_category_tags', methods=['POST'])
+@require_droplet_token
 def api_apply_category_tags():
     """Write clean cat:<x> tags. Body: {store, dry_run(default true), replace(bool),
     assignments:[{id, category}]}. Adds cat:<category>; if replace, also strips the
@@ -5003,6 +5007,7 @@ def api_apply_category_tags():
 
 
 @app.route('/api/manage_category_collections', methods=['POST'])
+@require_droplet_token
 def api_manage_category_collections():
     """Normalise category collections to key on the clean cat:<x> tags.
     Body: {store, dry_run(default true)}. Repoints the 6 smart category collections
@@ -6586,6 +6591,7 @@ def plans_reject(plan_id):
 
 
 @app.route('/api/config/slack_webhook', methods=['POST'])
+@require_droplet_token
 def config_slack_webhook():
     """Store the Slack incoming-webhook URL for bug pings (gitignored file).
 
@@ -7376,6 +7382,7 @@ def _norm_name(s):
 
 
 @app.route('/api/backfill_source_urls', methods=['POST'])
+@require_droplet_token
 def api_backfill_source_urls():
     """One-time backfill: fill EMPTY `source_url` on existing publish_history.jsonl
     entries from a {product_name: competitor_url} mapping, matched by accent-
@@ -9193,6 +9200,7 @@ except Exception as _e:
 
 
 @app.route('/api/set_products_status', methods=['POST'])
+@require_droplet_token
 def api_set_products_status():
     """Bulk-set product status (ACTIVE/DRAFT) by product NAME across stores --
     e.g. unpublish everything sourced from a store that turned out not to be a
@@ -14460,36 +14468,101 @@ except Exception as _e:
 # (_MATERIAL_WORDS) is 100% textiel en dus nutteloos hier; deze specs zijn
 # belangrijker dan een stofclaim — een verkeerde IP-rating op een badkamerlamp is
 # een veiligheidsclaim, geen marketingdetail.
-_LIGHT_SPEC_RE = re.compile(
-    r'\b(?:'
-    r'ip\s?-?\d{2}'                          # IP44, IP 65
-    r'|\d+(?:[.,]\d+)?\s?w(?:att)?\b'       # 5W, 7 watt
-    r'|\d+\s?(?:lm|lumen|lumens)\b'          # 800 lumen
-    r'|\d{3,5}\s?k\b'                        # 2700K
-    r'|kelvin'
-    r'|e\s?-?(?:14|27)\b|gu\s?-?10\b|g\s?-?9\b'   # fittingen
-    r'|dimbaar|dimmbar|dimmable'
-    r'|\d+(?:[.,]\d+)?\s?v(?:olt)?\b'
-    r'|energielabel|energieklasse|energy\s+class'
-    r')', re.I)
+# Lighting-claims die feitelijk fout kunnen zijn. Het fashion-equivalent
+# (_MATERIAL_WORDS) is 100% textiel en dus nutteloos hier; deze specs zijn
+# belangrijker dan een stofclaim — een verkeerde IP-rating op een badkamerlamp is
+# een veiligheidsclaim, geen marketingdetail.
+#
+# v2 (na adversariële review): waarde+eenheid als ÉÉN claim, ontkenning telt als
+# een eigen claim, label-vóór-waarde ("Lumen: 800") wordt gelezen, en afmetingen
+# ("40 W x 60 H cm") zijn geen wattage.
+
+# Afmetingen eerst wegknippen, anders leest "40 W x 60 H cm" als 40 watt.
+# De maatletter staat in het wild VOOR ("L60", "Ø30") én NA het getal ("40W",
+# "60H"), dus beide toestaan. De 'x' is de disambiguator: een losse "7W" blijft
+# gewoon wattage, alleen een A×B(-×C)-reeks is een afmeting.
+_LIGHT_DIM_TERM = r'(?:[ølwhbdt]\s*)?\d+(?:[.,]\d+)?\s*(?:[ølwhbdt]\b)?\s*(?:cm|mm|m)?'
+_LIGHT_DIM_RE = re.compile(
+    _LIGHT_DIM_TERM + r'\s*[x×]\s*' + _LIGHT_DIM_TERM
+    + r'(?:\s*[x×]\s*' + _LIGHT_DIM_TERM + r')?', re.I)
+
+# Netspanning is een constante, geen productclaim — nooit flaggen.
+_LIGHT_MAINS_RE = re.compile(r'\b2[23]0\s*-?\s*240?\s*v(?:olt)?\b|\b2[23]0\s*v(?:olt)?\b', re.I)
+
+_LIGHT_NEG_RE = re.compile(
+    r'\b(?:niet|geen|non|not|nicht|kein[e]?)\s+(?:\w+\s+){0,2}?'
+    r'(dimbaar|dimbare|dimmbar|dimmable|waterdicht|wasserdicht|waterproof)\b', re.I)
+
+# (regex, normalisatie-functie) — elke match wordt één canonieke claim.
+_LIGHT_SPEC_PATTERNS = [
+    # IP-rating: IP44, IP 44, IP65-rated
+    (re.compile(r'\bip\s*-?\s*(\d{2})\b', re.I), lambda m: 'ip' + m.group(1)),
+    # wattage, ook label-eerst ("Wattage: 7", "Vermogen: 7 W")
+    (re.compile(r'\b(?:wattage|vermogen|leistung|power)\s*[:=]\s*(\d+(?:[.,]\d+)?)\s*(?:w(?:att)?s?)?\b', re.I),
+     lambda m: 'w' + m.group(1).replace(',', '.')),
+    (re.compile(r'\b(\d+(?:[.,]\d+)?)\s*(?:w\b|watts?\b)', re.I),
+     lambda m: 'w' + m.group(1).replace(',', '.')),
+    # lumen, ook label-eerst
+    (re.compile(r'\b(?:lumen|lumens|lm)\s*[:=]\s*(\d+(?:[.,]\d+)?)\b', re.I),
+     lambda m: 'lm' + m.group(1).replace(',', '.')),
+    (re.compile(r'\b(\d+(?:[.,]\d+)?)\s*(?:lm\b|lumens?\b)', re.I),
+     lambda m: 'lm' + m.group(1).replace(',', '.')),
+    # kleurtemperatuur: 2700K, 2700 Kelvin, 2.700 K, "warmweiss 3000 K"
+    (re.compile(r'\b(\d{1,2}[.\s]?\d{3})\s*(?:k\b|kelvin\b)', re.I),
+     lambda m: 'k' + re.sub(r'[.\s]', '', m.group(1))),
+    # fitting/voet — ruimer dan v1 (was alleen E14/E27/GU10/G9)
+    (re.compile(r'\b(e|gu|g|mr|gx|ar)\s*-?\s*(\d{1,3}(?:\.\d)?)\b', re.I),
+     lambda m: (m.group(1) + m.group(2)).lower().replace('.', '')),
+    # spanning (netspanning is er al uitgeknipt)
+    (re.compile(r'\b(\d+(?:[.,]\d+)?)\s*v(?:olt)?\b', re.I),
+     lambda m: 'v' + m.group(1).replace(',', '.')),
+    # dimbaar (positief; de ontkenning wordt apart afgehandeld)
+    (re.compile(r'\bdimbaar|dimbare|dimmbar|dimmable\b', re.I), lambda m: 'dimbaar'),
+    # energielabel
+    (re.compile(r'\b(?:energielabel|energieklasse|energy\s+class)\s*[:=]?\s*([a-g](?:\+{1,3})?)\b', re.I),
+     lambda m: 'energy' + m.group(1).lower()),
+]
 
 
 def _light_spec_claims(text):
-    """Set of hard spec claims in a text (IP-rating, wattage, lumen, kelvin, cap,
-    dimmable, voltage). Normalised so '7 watt' and '7W' compare equal."""
+    """Canonieke spec-claims in een tekst: {'ip44', 'w7', 'k2700', 'e27', 'dimbaar'}.
+    Waarde EN eenheid zitten in de claim, zodat 'IP44' en 'IP65' verschillende
+    claims zijn (v1 vergeleek soms alleen het bestaan van het woord).
+    Ontkenning wordt een eigen claim ('not:dimbaar'), zodat "niet dimbaar" nooit
+    als "dimbaar" gelezen wordt."""
+    t = str(text or '')
+    t = _LIGHT_DIM_RE.sub(' ', t)        # afmetingen zijn geen wattage
+    t = _LIGHT_MAINS_RE.sub(' ', t)      # 230V is een constante
     out = set()
-    for m in _LIGHT_SPEC_RE.finditer(str(text or '')):
-        out.add(re.sub(r'[\s\-]+', '', m.group(0)).lower()
-                .replace('watt', 'w').replace('lumens', 'lm').replace('lumen', 'lm')
-                .replace('dimmbar', 'dimbaar').replace('dimmable', 'dimbaar'))
+    for m in _LIGHT_NEG_RE.finditer(t):
+        word = m.group(1).lower()
+        out.add('not:' + ('dimbaar' if word.startswith(('dim',)) else 'waterproof'))
+    t_pos = _LIGHT_NEG_RE.sub(' ', t)    # ontkende specs niet ook positief tellen
+    for rx, norm in _LIGHT_SPEC_PATTERNS:
+        for m in rx.finditer(t_pos):
+            try:
+                out.add(norm(m))
+            except Exception:
+                continue
     return out
 
 
 def _light_unverified_claims(generated_text, source_text):
-    """Spec claims in OUR copy that the competitor's own page never states.
-    Same principle as the fabric rule for fashion (user 2026-07-15): only claim
-    what the source actually says. Returns the offending claims."""
-    return sorted(_light_spec_claims(generated_text) - _light_spec_claims(source_text))
+    """Spec-claims in ONZE copy die de bron zelf nergens noemt. Zelfde principe als
+    de stofregel voor fashion (2026-07-15), andere feiten. Een ontkenning in de
+    bron ('niet dimbaar') maakt de positieve claim automatisch ongeverifieerd,
+    want 'dimbaar' zit dan niet in de bron-set."""
+    ours = _light_spec_claims(generated_text)
+    theirs = _light_spec_claims(source_text)
+    return sorted(c for c in (ours - theirs) if not c.startswith('not:'))
+
+
+def _light_spec_conflicts(generated_text, source_text):
+    """Claims die de bron ACTIEF tegenspreekt — erger dan 'niet genoemd'.
+    Bron zegt 'niet dimbaar', wij schrijven 'dimbaar'."""
+    ours = _light_spec_claims(generated_text)
+    theirs = _light_spec_claims(source_text)
+    return sorted(c for c in ours if ('not:' + c) in theirs)
 
 
 def _light_slug(text):
@@ -14561,6 +14634,8 @@ def api_lighting_publish():
         option_name:'Kleur', option_values:['Zwart','Goud'],   # [] = single variant
         price, compare_at_price, images:[url], images_by_value:{value:[url]},
         content:{ nl:{description, meta_description, m_title_specs}, ... },
+        source_text, product_title,          # bron voor de spec-gate
+        ack_claims:false,                    # true = publiceer ondanks waarschuwing
         tags:[], kaching:true, bundle_collection:'handle', activate:false }
     One Shopify product per store (NOT one per colour — that's the Vionna model).
     Never touches the fashion stores: store keys are resolved from LIGHT_TOKENS.
@@ -14586,6 +14661,35 @@ def api_lighting_publish():
     source_url    = (data.get('source_url') or '').strip()
     product_type  = (data.get('product_type') or '').strip()
     compare_at    = _publish_clean_money(data.get('compare_at_price'))
+    source_text   = str(data.get('source_text') or '')
+
+    # SPEC-GATE, server-side. De check bij het genereren zegt niets over de tekst
+    # die nu écht gepubliceerd wordt: die kan handmatig bewerkt zijn of uit een
+    # oud concept komen. Hercontroleer de echte tekst tegen de echte bron.
+    # Warn-never-block: ack_claims=true publiceert alsnog, maar het oordeel gaat
+    # mee het logboek in.
+    claim_report = {}
+    if source_text.strip():
+        src_blob = source_text + ' ' + (data.get('product_title') or '')
+        for st, c in (content or {}).items():
+            blob = ' '.join(str((c or {}).get(k) or '')
+                            for k in ('description', 'meta_description', 'm_title_specs'))
+            if not blob.strip():
+                continue
+            unv = _light_unverified_claims(blob, src_blob)
+            con = _light_spec_conflicts(blob, src_blob)
+            if unv or con:
+                claim_report[st] = {'unverified': unv, 'conflicting': con}
+    if claim_report and not bool(data.get('ack_claims')):
+        return jsonify({
+            'success': False,
+            'needs_claim_ack': True,
+            'claim_report': claim_report,
+            'error': ('The copy states specs the competitor never does'
+                      + (' — and some the source CONTRADICTS'
+                         if any(v['conflicting'] for v in claim_report.values()) else '')
+                      + '. Fix the text, or resend with ack_claims to publish anyway.'),
+        }), 409
 
     results = {}
     for store in stores:
@@ -14644,33 +14748,59 @@ def api_lighting_publish():
         prod = r.json()['product']
         pid  = prod['id']
 
-        # Afbeeldingen: exact dezelfde bewezen route als fashion (base64, één voor
-        # één — Higgsfield/concurrent-URL's kunnen verlopen voor Shopify ze ophaalt).
-        uploaded = _attach_images_one_by_one(store, pid, _build_image_payload(images, max_images=10), hdrs)
+        # Afbeeldingen: dezelfde bewezen transport-route als fashion (base64 per
+        # stuk — concurrent-URL's kunnen verlopen voordat Shopify ze ophaalt),
+        # maar we uploaden PER FOTO zodat we het Shopify-id exact aan zijn
+        # bron-URL kunnen knopen. Bestandsnaam-matching is hier eerder de
+        # variant-foto's gaan verwisselen (kleur staat achteraan de naam, en de
+        # eerste 40 tekens zijn identiek voor '..._warm_wit' en '..._warm_zwart').
+        mf_errors = []
+        url_to_img_id = {}
+        uploaded_n = 0
+        wanted_imgs = [u for u in (images or []) if isinstance(u, str) and u.startswith('http')]
+        if len(wanted_imgs) > LIGHT_MAX_IMAGES:
+            # Nooit stil afkappen: zeg wat er niet mee ging.
+            mf_errors.append(f'images: only the first {LIGHT_MAX_IMAGES} of '
+                             f'{len(wanted_imgs)} photos were uploaded (Shopify cap)')
+            wanted_imgs = wanted_imgs[:LIGHT_MAX_IMAGES]
+        for u in wanted_imgs:
+            payload_img = _build_image_payload([u], max_images=1)
+            if not payload_img:
+                mf_errors.append(f'image skipped (unreadable): {u[:70]}')
+                continue
+            got = _attach_images_one_by_one(store, pid, payload_img, hdrs)
+            got_id = (got[0] or {}).get('id') if got else None
+            if got_id:
+                url_to_img_id[u] = got_id
+                uploaded_n += 1
+            else:
+                mf_errors.append(f'image upload failed: {u[:70]}')
+        uploaded = uploaded_n
 
-        # Per-variant foto's (zelfde idee als fashion's per-kleur beelden).
-        img_by_url = {}
-        for up in (uploaded or []):
-            if up and up.get('src'):
-                img_by_url[up['src']] = up.get('id')
+        # Per-variant foto's. Alleen een EXACTE match telt; kunnen we een variant
+        # niet koppelen, dan krijgt hij geen eigen foto (Shopify toont dan de
+        # hoofdfoto) en zeggen we dat — nooit stil foto #1 erop plakken.
+        unlinked = []
         for var in prod.get('variants', []):
             val = var.get('option1')
-            want = (images_by_val.get(val) or [None])[0] if val else None
-            img_id = None
-            if want:
-                # match op bestandsnaam: Shopify herschrijft de src bij upload
-                tail = want.rsplit('/', 1)[-1].split('?')[0][:40]
-                img_id = next((i for s, i in img_by_url.items() if tail and tail in s), None)
-            if not img_id and uploaded:
-                img_id = (uploaded[0] or {}).get('id')
-            if img_id:
-                try:
-                    req.put(shopify_url(store, f'variants/{var["id"]}.json'), headers=hdrs,
-                            json={'variant': {'id': var['id'], 'image_id': img_id}}, timeout=20)
-                except Exception as e:
-                    print(f'[lighting] variant image link failed: {e}')
-
-        mf_errors = []
+            if not val:
+                continue
+            wanted = [w for w in (images_by_val.get(val) or []) if w in url_to_img_id]
+            if not wanted:
+                if images_by_val.get(val):
+                    unlinked.append(val)      # foto bestond, maar is niet geüpload/geselecteerd
+                continue
+            img_id = url_to_img_id[wanted[0]]
+            try:
+                vr = req.put(shopify_url(store, f'variants/{var["id"]}.json'), headers=hdrs,
+                             json={'variant': {'id': var['id'], 'image_id': img_id}}, timeout=20)
+                if vr.status_code not in (200, 201):
+                    mf_errors.append(f'variant photo {val}: {vr.status_code} {vr.text[:80]}')
+            except Exception as e:
+                mf_errors.append(f'variant photo {val}: {e}')
+        if unlinked:
+            mf_errors.append('no own photo linked for: ' + ', '.join(unlinked[:6])
+                             + ' (they show the main photo)')
         # m_title_specs is op de lighting-store een rich_text_field (bij Vionna
         # multi_line) — schrijf de juiste vorm, met fallback op platte tekst.
         mts = (c.get('m_title_specs') or '').strip()
@@ -14736,7 +14866,7 @@ def api_lighting_publish():
         shop_dom = _shop_entry(store).get('shop', '')
         results[store] = {'product_id': pid, 'handle': handle,
                           'admin_url': f'https://{shop_dom}/admin/products/{pid}' if shop_dom else '',
-                          'images': len(uploaded or []), 'variants': len(prod.get('variants', [])),
+                          'images': uploaded, 'variants': len(prod.get('variants', [])),
                           'activated': activated, 'metafield_errors': mf_errors}
 
         # ► Eigen logboek. NOOIT publish_history.jsonl: dat is tevens het
@@ -14744,10 +14874,13 @@ def api_lighting_publish():
         _append_history({
             'store': store, 'product_name': product_name, 'product_id': pid,
             'product_url': results[store]['admin_url'], 'source_url': source_url,
-            'image_count': len(uploaded or []), 'metafield_errors': mf_errors,
+            'image_count': uploaded, 'metafield_errors': mf_errors,
             'product_type': product_type or None,
             'option_name': option_name or None, 'option_values': option_values,
             'kaching': kaching, 'published_live': activated,
+            # Wat de operator wist op het moment van publiceren.
+            'claim_report': claim_report.get(store) or None,
+            'claims_acknowledged': bool(claim_report.get(store)) and bool(data.get('ack_claims')),
         }, portal=PORTAL_HOME_DECOR)
 
     ok = any('product_id' in v for v in results.values())
@@ -14793,10 +14926,18 @@ def api_lighting_generate():
     only_field    = (data.get('only_field') or '').strip()
 
     # Specs die de CONCURRENT zelf noemt — alleen die mogen terugkomen.
-    known_specs = sorted(_light_spec_claims(source_text + ' ' + product_title))
+    # Let op: dit zijn GENORMALISEERDE claims ('w7', 'k2700'), geen letterlijke
+    # brontekst — de prompt mag ze dus niet als citaat presenteren.
+    known_specs = sorted(c for c in _light_spec_claims(source_text + ' ' + product_title)
+                         if not c.startswith('not:'))
+    denied_specs = sorted(c[4:] for c in _light_spec_claims(source_text + ' ' + product_title)
+                          if c.startswith('not:'))
     spec_rule = (
-        'Noem UITSLUITEND deze technische specificaties, letterlijk zoals de bron ze geeft: '
-        + ', '.join(known_specs) + '. Verzin er geen bij.'
+        'De bron noemt deze technische specificaties: ' + ', '.join(known_specs)
+        + '. Alleen DEZE mag je gebruiken, met de exacte waarde uit de brontekst hierboven. '
+          'Verzin er geen bij.'
+        + (' De bron zegt expliciet dat het product NIET is: ' + ', '.join(denied_specs)
+           + ' — beweer dat dus zeker niet.' if denied_specs else '')
         if known_specs else
         'De bron noemt GEEN technische specificaties. Noem er dus ZELF ook geen: geen wattage, '
         'geen lumen, geen IP-rating, geen kleurtemperatuur (Kelvin), geen fitting (E27/GU10), '
@@ -14852,11 +14993,14 @@ Antwoord uitsluitend als geldig JSON:
     # Vangnet: het model kan tóch een spec verzinnen. Warn, never block (Billy J-regel)
     # — de medewerker beslist, maar ziet precies wat er niet klopt.
     blob = ' '.join(str(out.get(k) or '') for k in ('description', 'meta_description', 'm_title_specs'))
-    unverified = _light_unverified_claims(blob, source_text + ' ' + product_title)
+    src_blob = source_text + ' ' + product_title
+    unverified = _light_unverified_claims(blob, src_blob)
+    conflicts = _light_spec_conflicts(blob, src_blob)
     out['unverified_claims'] = unverified
+    out['conflicting_claims'] = conflicts      # bron zegt het TEGENDEEL
     out['source_specs'] = known_specs
-    if unverified:
-        print(f'[lighting] unverified spec claims for {product_name!r}: {unverified}')
+    if unverified or conflicts:
+        print(f'[lighting] {product_name!r}: unverified={unverified} conflicting={conflicts}')
     return jsonify(out)
 
 
