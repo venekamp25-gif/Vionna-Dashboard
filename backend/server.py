@@ -7439,18 +7439,32 @@ def _size_chart_fill_loop():
                 state = json.load(f) or {}
         except Exception:
             state = {}
+        all_ok = True
         for store in ('dk', 'fr', 'fi'):
             if store not in tokens:
                 continue
-            try:
-                _std_chart_for(store, None, force_refresh=True)
-                rep = _size_chart_fill_store(store)
-                rep['at'] = datetime.datetime.utcnow().isoformat() + 'Z'
-                state[store] = rep
-                print(f'[size-chart] fill {store}: {rep}')
-            except Exception as e:
-                print(f'[size-chart] fill {store} failed: {e}')
-                state[store] = {'error': str(e)[:150],
+            # Netwerkblips (DNS/connect naar de Shopify-host) mogen een store niet
+            # 24u ongevuld laten — 3 pogingen met backoff (FI, 2026-07-15).
+            last_err = None
+            for attempt in range(3):
+                try:
+                    _std_chart_for(store, None, force_refresh=True)
+                    rep = _size_chart_fill_store(store)
+                    rep['at'] = datetime.datetime.utcnow().isoformat() + 'Z'
+                    if attempt:
+                        rep['attempts'] = attempt + 1
+                    state[store] = rep
+                    print(f'[size-chart] fill {store}: {rep}')
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    print(f'[size-chart] fill {store} attempt {attempt + 1}/3 failed: {e}')
+                    if attempt < 2:
+                        time.sleep(20 * (attempt + 1))
+            if last_err is not None:
+                all_ok = False
+                state[store] = {'error': str(last_err)[:150], 'attempts': 3,
                                 'at': datetime.datetime.utcnow().isoformat() + 'Z'}
         try:
             tmp = SC_FILL_STATE_PATH + '.tmp'
@@ -7459,7 +7473,8 @@ def _size_chart_fill_loop():
             os.replace(tmp, SC_FILL_STATE_PATH)
         except Exception as e:
             print(f'[size-chart] state save failed: {e}')
-        time.sleep(24 * 3600)
+        # Alles gelukt → normale dagritme; anders over een uur opnieuw proberen.
+        time.sleep(24 * 3600 if all_ok else 3600)
 
 
 threading.Thread(target=_size_chart_fill_loop, daemon=True, name='size-chart-fill').start()
