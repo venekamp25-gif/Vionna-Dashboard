@@ -7363,12 +7363,25 @@ def _size_chart_fill_store(store):
         if not pi.get('hasNextPage'):
             break
         cursor = pi.get('endCursor')
-    # publish history: product_id -> source_url (concurrent-productpagina)
+    # publish history: product_id -> source_url (concurrent-productpagina).
+    # NB: er bestaat GEEN globale jsonl-reader in dit bestand (_read_jsonl is een
+    # geneste functie elders) — inline lezen, corrupte regels overslaan.
     hist_src = {}
-    for h in _read_jsonl(HISTORY_PATH):
-        pid, srcu = str(h.get('product_id') or ''), (h.get('source_url') or '').strip()
-        if pid and srcu and h.get('store') == store:
-            hist_src[pid] = srcu
+    try:
+        with open(HISTORY_PATH, encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    h = json.loads(line)
+                except Exception:
+                    continue
+                pid, srcu = str(h.get('product_id') or ''), (h.get('source_url') or '').strip()
+                if pid and srcu and h.get('store') == store:
+                    hist_src[pid] = srcu
+    except FileNotFoundError:
+        pass
     report = {'gaps': len(gaps), 'competitor': 0, 'standard_cat': 0,
               'standard_store': 0, 'skipped': 0}
     to_write = []
