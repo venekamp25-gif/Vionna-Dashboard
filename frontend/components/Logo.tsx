@@ -1,4 +1,17 @@
-export function Logo({ withText = true, size = 28 }: { withText?: boolean; size?: number }) {
+/** Wordmark. `label` names the portal (FASHION / HOME DECOR); the mark paints
+ *  with var(--accent) — NOT a hardcoded green — so a portal that re-skins the
+ *  accent gets a matching mark instead of a stray fashion green. */
+export function Logo({
+  withText = true,
+  size = 28,
+  label = "FASHION",
+  sub = "Listing Dashboard",
+}: {
+  withText?: boolean;
+  size?: number;
+  label?: string;
+  sub?: string;
+}) {
   return (
     <div className="flex items-center gap-3 group">
       <svg
@@ -13,8 +26,8 @@ export function Logo({ withText = true, size = 28 }: { withText?: boolean; size?
       >
         <defs>
           <linearGradient id="logoGrad" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
-            <stop offset="0" stopColor="#10b981" />
-            <stop offset="1" stopColor="#059669" />
+            <stop offset="0" stopColor="var(--accent)" />
+            <stop offset="1" stopColor="var(--accent-hover)" />
           </linearGradient>
         </defs>
         <path d="M4 6 L16 26 L28 6" stroke="url(#logoGrad)" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
@@ -22,9 +35,9 @@ export function Logo({ withText = true, size = 28 }: { withText?: boolean; size?
       </svg>
       {withText && (
         <div className="flex flex-col leading-none">
-          <span className="text-[16px] font-bold tracking-[0.18em] text-text">FASHION</span>
+          <span className="text-[16px] font-bold tracking-[0.18em] text-text">{label}</span>
           <span className="text-[10px] font-medium tracking-[0.12em] text-text-faint uppercase mt-[3px]">
-            Listing Dashboard
+            {sub}
           </span>
         </div>
       )}

@@ -82,7 +82,16 @@ export function Header() {
   return (
     <>
       <header className="bg-bg-elev border-b border-border h-15 flex items-center justify-between px-8 lg:px-12 xl:px-16 sticky top-0 z-50 backdrop-blur">
-        <Logo />
+        <div className="flex items-center gap-5">
+          <Logo />
+          <a
+            href="/"
+            className="text-[12px] text-text-faint hover:text-text transition-colors whitespace-nowrap"
+            title="Back to the portal picker (Fashion / Home Decor)"
+          >
+            ← All portals
+          </a>
+        </div>
         <div className="flex items-center gap-3">
           <BackendStatusBadge />
           <StoreToggle />

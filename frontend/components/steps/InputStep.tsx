@@ -86,8 +86,9 @@ export function InputStep() {
   const [lastProduct] = useState(() => loadLastProduct());
   const [confirmBack, setConfirmBack] = useState(false);
 
-  // Hand-off from the full-screen Research tab: /?import=<product-url> prefills
-  // the competitor URL (the research page opens the dashboard with this param).
+  // Hand-off from the full-screen Research tab: /fashion?import=<product-url>
+  // prefills the competitor URL. (Reads whatever path it's mounted on, so the
+  // move from "/" to "/fashion" — "/" is now the portal picker — is safe.)
   useEffect(() => {
     try {
       const q = new URLSearchParams(window.location.search);

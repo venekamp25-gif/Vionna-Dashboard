@@ -298,7 +298,8 @@ export function WhatToListWorkbench() {
 
   /** Hand-off to the dashboard: open it in a new tab with the URL prefilled. */
   const importProduct = (url: string) => {
-    window.open(`/?import=${encodeURIComponent(url)}`, "_blank");
+    // /fashion, NOT "/" — "/" is the portal picker; InputStep reads ?import= there.
+    window.open(`/fashion?import=${encodeURIComponent(url)}`, "_blank");
   };
 
   const runScan = async (domain?: string, force = false, fromStore?: WtlStore) => {
