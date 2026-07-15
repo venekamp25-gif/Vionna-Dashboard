@@ -664,6 +664,13 @@ export const api = {
       body: { domain },
     }),
 
+  /** Manual sourcing judgement: mark/unmark a store as AliExpress-verified source. */
+  wtlStoreOverride: (domain: string, override: "ali-verified" | null) =>
+    call<{ ok?: boolean; override?: string | null; error?: string }>("/api/wtl_stores/override", {
+      method: "POST",
+      body: { domain, override },
+    }),
+
   /** Kick the dropship-check job (shipping policy + brand signals) for unchecked stores. */
   wtlStoresClassify: (max = 10) =>
     call<{ job_id?: string; status?: string; error?: string }>("/api/wtl_stores/classify", {
@@ -933,7 +940,18 @@ export interface WtlStore {
   score_parts: Record<string, number>;
   /** Cached dropship-verdict from the import-gate check (shipping policy + brand
    *  signals); null = not checked yet. Warn-only — the employee decides. */
-  verdict: { label: string; detail: string; confidence: string; fresh: boolean } | null;
+  verdict: {
+    label: string;
+    detail: string;
+    confidence: string;
+    fresh: boolean;
+    /** Manual employee judgement: products FOUND on AliExpress → usable source
+     *  despite fast/own-stock shipping. Survives re-checks. */
+    override?: "ali-verified" | null;
+    /** Supplier-catalog evidence: N of their bestsellers also at other known stores. */
+    overlap_matches?: number | null;
+    overlap_of?: number | null;
+  } | null;
   market_ok: boolean;
 }
 

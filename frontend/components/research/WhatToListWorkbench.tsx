@@ -895,38 +895,83 @@ export function WhatToListWorkbench() {
                           </span>
                         )}
                       </div>
-                      <div className="mt-1.5">
+                      <div className="mt-1.5 flex items-center gap-1.5 flex-wrap">
                         {(() => {
                           const v = s.verdict;
-                          const cls = !v
-                            ? "bg-bg-elev text-text-faint border-border"
-                            : v.label === "Dropshipper"
-                              ? "bg-green-600/15 text-green-600 dark:text-green-400 border-green-600/40"
-                              : v.label === "Mogelijk eigen merk"
-                                ? "bg-amber-500/15 text-amber-500 border-amber-500/40"
-                                : v.label === "Eigen voorraad"
-                                  ? "bg-danger/15 text-danger border-danger/40"
-                                  : "bg-bg-elev text-text-dim border-border";
-                          const txt = !v
-                            ? "shipping not verified"
-                            : v.label === "Dropshipper"
-                              ? "✓ dropshipper"
-                              : v.label === "Mogelijk eigen merk"
-                                ? "⚠ possible real brand"
-                                : v.label === "Eigen voorraad"
-                                  ? "⚠ own stock — don't source"
-                                  : "? shipping unknown";
+                          const ali = v?.override === "ali-verified";
+                          const warned = v && (v.label === "Eigen voorraad" || v.label === "Mogelijk eigen merk");
+                          const cls = ali
+                            ? "bg-green-600/15 text-green-600 dark:text-green-400 border-green-600/40"
+                            : !v
+                              ? "bg-bg-elev text-text-faint border-border"
+                              : v.label === "Dropshipper"
+                                ? "bg-green-600/15 text-green-600 dark:text-green-400 border-green-600/40"
+                                : v.label === "Mogelijk eigen merk"
+                                  ? "bg-amber-500/15 text-amber-500 border-amber-500/40"
+                                  : v.label === "Eigen voorraad"
+                                    ? "bg-danger/15 text-danger border-danger/40"
+                                    : "bg-bg-elev text-text-dim border-border";
+                          const txt = ali
+                            ? "✓ source ok — on AliExpress"
+                            : !v
+                              ? "shipping not verified"
+                              : v.label === "Dropshipper"
+                                ? "✓ dropshipper"
+                                : v.label === "Mogelijk eigen merk"
+                                  ? "⚠ possible real brand"
+                                  : v.label === "Eigen voorraad"
+                                    ? "⚠ own stock — check AliExpress"
+                                    : "? shipping unknown";
+                          const overlap =
+                            v && (v.overlap_matches ?? 0) > 0
+                              ? ` Evidence: ${v.overlap_matches} of their bestsellers are also at other known stores (supplier catalog).`
+                              : "";
                           return (
-                            <span
-                              className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold border ${cls}`}
-                              title={
-                                v
-                                  ? `Import-gate verdict: ${v.label}${v.detail ? ` — ${v.detail}` : ""} (confidence: ${v.confidence}). Warn-only: you decide.`
-                                  : "Not checked against its shipping policy yet — press “🛡 Verify dropshippers”. Warn-only: you decide."
-                              }
-                            >
-                              {txt}
-                            </span>
+                            <>
+                              <span
+                                className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold border ${cls}`}
+                                title={
+                                  ali
+                                    ? `Marked by an employee: products found on AliExpress, so this store is a usable source even with fast shipping (original verdict: ${v?.label ?? "?"}).${overlap}`
+                                    : v
+                                      ? `Import-gate verdict: ${v.label}${v.detail ? ` — ${v.detail}` : ""} (confidence: ${v.confidence}). Fast shipping alone doesn't disqualify a store — if you find its products on AliExpress, mark it OK.${overlap} Warn-only: you decide.`
+                                      : "Not checked against its shipping policy yet — press “🛡 Verify dropshippers”. Warn-only: you decide."
+                                }
+                              >
+                                {txt}
+                              </span>
+                              {(warned || ali) && (
+                                <span
+                                  role="button"
+                                  tabIndex={0}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    const next = ali ? null : ("ali-verified" as const);
+                                    if (
+                                      next &&
+                                      !confirm(
+                                        `Mark ${s.domain.replace(/^www\./, "")} as a VERIFIED source?\n\nOnly do this after actually finding their products on AliExpress.`
+                                      )
+                                    )
+                                      return;
+                                    void api
+                                      .wtlStoreOverride(s.domain, next)
+                                      .then(() => api.wtlStores(funnelMarket))
+                                      .then(setWtlStores)
+                                      .catch(() => {});
+                                  }}
+                                  onKeyDown={(e) => e.stopPropagation()}
+                                  className="text-[10px] text-accent hover:underline cursor-pointer"
+                                  title={
+                                    ali
+                                      ? "Remove the AliExpress-verified mark"
+                                      : "Found their products on AliExpress? Click to mark this store as a usable source (remembered for everyone)."
+                                  }
+                                >
+                                  {ali ? "unmark" : "found on AliExpress →"}
+                                </span>
+                              )}
+                            </>
                           );
                         })()}
                       </div>

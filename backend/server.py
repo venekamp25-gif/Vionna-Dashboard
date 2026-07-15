@@ -7831,7 +7831,10 @@ def api_wtl_stores():
                     'has_traffic_data': bool(t and total > 0),
                     'monthly_total': monthly, 'trend_pct': trend_pct,
                     'verdict': ({'label': v.get('label'), 'detail': v.get('detail'),
-                                 'confidence': v.get('confidence'), 'fresh': _wtl_verdict_fresh(v)}
+                                 'confidence': v.get('confidence'), 'fresh': _wtl_verdict_fresh(v),
+                                 'override': v.get('override'),
+                                 'overlap_matches': v.get('overlap_matches'),
+                                 'overlap_of': v.get('overlap_of')}
                                 if v else None),
                     'market_ok': local >= min_local})
 
@@ -7978,8 +7981,9 @@ def api_wtl_export():
         for s in stores:
             if only_ok and not s.get('market_ok'):
                 continue
-            w.writerow([s['score'], s['domain'],
-                        ((s.get('verdict') or {}).get('label') or 'niet gecheckt'),
+            _v = s.get('verdict') or {}
+            _vl = (_v.get('label') or 'niet gecheckt') + (' (AliExpress geverifieerd)' if _v.get('override') == 'ali-verified' else '')
+            w.writerow([s['score'], s['domain'], _vl,
                         s['local_visits'], s['total_visits'],
                         round((s.get('local_share') or 0) * 100),
                         (f"{s['trend_pct']:+d}%" if s.get('trend_pct') is not None else ''),
@@ -7993,7 +7997,8 @@ def api_wtl_export():
         picked = [s for s in stores if s.get('market_ok') or not only_ok][:12]
         for s in picked:
             payload, blocked = _bs_scan_cached(s['domain'])
-            s_verdict = ((s.get('verdict') or {}).get('label') or 'niet gecheckt')
+            _v = s.get('verdict') or {}
+            s_verdict = (_v.get('label') or 'niet gecheckt') + (' (AliExpress geverifieerd)' if _v.get('override') == 'ali-verified' else '')
             if not payload:
                 w.writerow(['', s['domain'], s_verdict, s['score'], s['local_visits'], '',
                             f'(scan mislukt: {blocked})', '', '', '', '', '', '', ''])
@@ -8085,7 +8090,44 @@ def _wtl_classify_store(domain):
                 detail = ', '.join(sigs)[:160] if sigs else detail
         except Exception:
             pass
-    return {'label': label, 'detail': detail, 'source': source, 'confidence': confidence, 'ts': ts}
+    out = {'label': label, 'detail': detail, 'source': source, 'confidence': confidence, 'ts': ts}
+    # Fast delivery ≠ unusable source: attach the supplier-catalog signal so the UI
+    # can say "their products are also at N other stores (AliExpress-catalog)".
+    if label in ('Eigen voorraad', 'Mogelijk eigen merk'):
+        m, own = _wtl_catalog_overlap(bare)
+        out['overlap_matches'] = m
+        out['overlap_of'] = own
+    return out
+
+
+def _wtl_catalog_overlap(domain):
+    """Supplier-catalog signal: how many of this store's bestsellers also appear at
+    OTHER scanned stores (same _bs_sig). Products sold by multiple stores are almost
+    certainly AliExpress-catalog — which makes even a fast-shipping store a usable
+    SOURCE (user rule 2026-07-13: designbysi ships fast, but its products are on
+    AliExpress, so it's fine). Uses whatever scans are cached; returns (matches, own)."""
+    try:
+        payload, _blocked = _bs_scan_cached(domain)
+        if not payload:
+            return 0, 0
+        bare = domain.replace('www.', '')
+        other_sigs = set()
+        for h, hit in _BS_CACHE.items():
+            if h.replace('www.', '') == bare:
+                continue
+            for p in (hit.get('payload') or {}).get('products') or []:
+                sig = _bs_sig(p.get('title'), p.get('handle'))
+                if sig:
+                    other_sigs.add(sig)
+        own = payload.get('products') or []
+        matches = 0
+        for p in own:
+            sig = _bs_sig(p.get('title'), p.get('handle'))
+            if sig and sig in other_sigs:
+                matches += 1
+        return matches, len(own)
+    except Exception:
+        return 0, 0
 
 
 def _wtl_verdict_fresh(v):
@@ -8115,6 +8157,9 @@ def _wtl_classify_missing(domains, jid=None, cap=10):
         for d in todo:
             bare = d.replace('www.', '')
             v = _wtl_classify_store(bare)
+            prev = cache.get(bare) or {}
+            if prev.get('override'):
+                v['override'] = prev['override']    # manual judgement survives re-checks
             cache[bare] = v
             out[bare] = v['label']
             _wtl_verdicts_save(cache)
@@ -8150,6 +8195,33 @@ def api_wtl_stores_classify():
 
     threading.Thread(target=_runner, daemon=True).start()
     return jsonify({'job_id': jid, 'status': 'running'})
+
+
+@app.route('/api/wtl_stores/override', methods=['POST'])
+def api_wtl_stores_override():
+    """Manual sourcing judgement per store: {'domain', 'override': 'ali-verified'|null}.
+    'ali-verified' = the employee FOUND the store's products on AliExpress, so it's a
+    usable source even with fast/own-stock shipping (user rule 2026-07-13). Survives
+    automatic re-classification; null clears it."""
+    body = request.get_json(silent=True) or {}
+    dom = str(body.get('domain') or '').lower().replace('www.', '').strip()
+    override = body.get('override')
+    if not dom:
+        return jsonify({'error': 'domain required'}), 400
+    if override not in ('ali-verified', None):
+        return jsonify({'error': "override must be 'ali-verified' or null"}), 400
+    cache = _wtl_verdicts_load()
+    v = cache.get(dom) or {'label': 'Onbekend', 'detail': '', 'source': 'none',
+                           'confidence': 'none', 'ts': datetime.datetime.utcnow().isoformat() + 'Z'}
+    if override:
+        v['override'] = override
+        v['override_ts'] = datetime.datetime.utcnow().isoformat() + 'Z'
+    else:
+        v.pop('override', None)
+        v.pop('override_ts', None)
+    cache[dom] = v
+    _wtl_verdicts_save(cache)
+    return jsonify({'ok': True, 'domain': dom, 'override': v.get('override')})
 
 
 # ── WTL store DISCOVERY: hunt UNKNOWN local fashion dropshippers via Google ────
