@@ -128,6 +128,21 @@ STORE_SIZE_OPTION  = {'dk': 'Størrelse', 'fr': 'Taille', 'fi': 'Koko'}
 # Append-only publish log — every successful create_variant call gets one entry.
 # We use a JSON-lines file rather than a database so it's trivial to inspect on the droplet.
 HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'publish_history.jsonl')
+# Home Decor (verlichting) schrijft NOOIT in het fashion-log: publish_history.jsonl
+# is tevens het concurrent-register (_known_comp_data) en voedt de blog-gap-analyse.
+# Een aparte file maakt vervuiling fysiek onmogelijk. Zie ook PORTALS hieronder.
+LIGHTING_HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     'lighting_history.jsonl')
+PORTAL_FASHION = 'fashion'
+PORTAL_HOME_DECOR = 'home-decor'
+_HISTORY_PATH_BY_PORTAL = {PORTAL_FASHION: HISTORY_PATH,
+                           PORTAL_HOME_DECOR: LIGHTING_HISTORY_PATH}
+
+
+def _history_portal(entry):
+    """Verticaal van een history-regel. Regels van vóór de portal-split hebben
+    geen veld en zijn per definitie fashion."""
+    return (entry or {}).get('portal') or PORTAL_FASHION
 
 # Per-user draft storage. Each employee's auto-save state lives in `drafts/<email>.json`
 # so drafts survive cross-device (any browser they log into).
@@ -160,9 +175,11 @@ def _run_backup():
         day  = time.strftime('%Y-%m-%d')
         dest = os.path.join(BACKUP_DIR, day)
         os.makedirs(dest, exist_ok=True)
-        for fname in ('publish_history.jsonl', 'bug_reports.jsonl', 'blog_history.jsonl',
+        for fname in ('publish_history.jsonl', 'lighting_history.jsonl', 'bug_reports.jsonl',
+                      'blog_history.jsonl',
                       'blog_performance.jsonl', 'blog_views.json', 'blog_playbook.json',
-                      'bs_snapshots.jsonl', 'known_sources.json', 'blocked_sources.json'):
+                      'bs_snapshots.jsonl', 'known_sources.json', 'blocked_sources.json',
+                      'wtl_verdicts.json', 'wtl_traffic.json', 'size_chart_fill.json'):
             src = os.path.join(_BASE_DIR, fname)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dest, fname))
@@ -7169,11 +7186,16 @@ def _size_chart_html(chart, store):
     return f'<table>{thead}<tbody>{body}</tbody></table>'
 
 
-def _append_history(entry):
-    """Best-effort write to publish_history.jsonl. Never raise — history is observability."""
+def _append_history(entry, portal=PORTAL_FASHION):
+    """Best-effort write to the portal's publish log. Never raise — history is
+    observability. Home Decor goes to its OWN file: the fashion log doubles as the
+    competitor register (_known_comp_data) + blog-gap source, so a lighting domain
+    in there would end up in the Vionna research funnel permanently."""
     try:
-        entry = {**entry, 'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'}
-        with open(HISTORY_PATH, 'a', encoding='utf-8') as f:
+        entry = {**entry, 'portal': portal,
+                 'timestamp': datetime.datetime.utcnow().isoformat() + 'Z'}
+        path = _HISTORY_PATH_BY_PORTAL.get(portal, HISTORY_PATH)
+        with open(path, 'a', encoding='utf-8') as f:
             f.write(json.dumps(entry, ensure_ascii=False) + '\n')
     except Exception as e:
         print(f"[history] append failed (ignored): {e}")
@@ -8037,6 +8059,8 @@ def _known_comp_data():
                     e = json.loads(line)
                 except Exception:
                     continue
+                if _history_portal(e) != PORTAL_FASHION:
+                    continue          # nooit een lampenwinkel in de fashion-bronnen
                 su = (e.get('source_url') or '').strip()
                 if su:
                     _add(su, e.get('product_name'), e.get('timestamp'))
@@ -9202,13 +9226,16 @@ def history():
         limit = 200
     filter_store = (request.args.get('store') or '').strip().lower()
     filter_product = (request.args.get('product') or '').strip().lower()
+    # ?portal=home-decor leest het lighting-log; default = fashion (eigen bestand).
+    _portal = (request.args.get('portal') or PORTAL_FASHION).strip().lower()
+    _path = _HISTORY_PATH_BY_PORTAL.get(_portal, HISTORY_PATH)
 
-    if not os.path.exists(HISTORY_PATH):
+    if not os.path.exists(_path):
         return jsonify({'entries': [], 'total': 0})
 
     entries = []
     try:
-        with open(HISTORY_PATH, 'r', encoding='utf-8') as f:
+        with open(_path, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -13433,9 +13460,12 @@ def _blog_gap_keywords(store, _cache={}):
                 with open(HISTORY_PATH, 'r', encoding='utf-8') as f:
                     for line in f:
                         try:
-                            src = (json.loads(line).get('source_url') or '').strip()
+                            _row = json.loads(line)
                         except Exception:
                             continue
+                        if _history_portal(_row) != PORTAL_FASHION:
+                            continue      # lighting-bronnen horen niet in fashion-blogresearch
+                        src = (_row.get('source_url') or '').strip()
                         m = re.match(r'https?://([^/]+)/', src + '/')
                         if m:
                             cnt[m.group(1).lower().lstrip('w.')] += 1
