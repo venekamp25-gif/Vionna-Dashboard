@@ -7329,16 +7329,58 @@ def _searchanise_handles(html, limit=20):
     return out[:limit]
 
 
+BS_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bs_cache.json')
+
+
+def _bs_cache_load():
+    """Warm _BS_CACHE from disk at startup — the in-memory cache used to be wiped by
+    every deploy/restart, making all consumers re-scan every store in bursts until
+    stores rate-limited us (designbysi 429, 2026-07-13)."""
+    try:
+        with open(BS_CACHE_PATH, encoding='utf-8') as f:
+            data = json.load(f) or {}
+        _BS_CACHE.update(data)
+        print(f'[bestsellers] cache warmed from disk: {len(data)} stores')
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f'[bestsellers] cache load failed: {e}')
+
+
+def _bs_cache_save():
+    try:
+        tmp = BS_CACHE_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(_BS_CACHE, f, ensure_ascii=False)
+        os.replace(tmp, BS_CACHE_PATH)
+    except Exception as e:
+        print(f'[bestsellers] cache save failed: {e}')
+
+
 def _bs_scan(host, limit=20):
     """Scan one competitor's best-selling page. Returns (payload, None) or
-    (None, blocked_reason)."""
+    (None, blocked_reason). Retries once on 429 (we're being rate-limited,
+    usually because of our own scan bursts)."""
     url = f'https://{host}/collections/all?sort_by=best-selling'
-    try:
-        r = _scrape_get(url, timeout=15)
-    except Exception as e:
-        return None, f'could not reach the store ({str(e)[:60]})'
+    r = None
+    for attempt in (0, 1):
+        try:
+            r = _scrape_get(url, timeout=15)
+        except Exception as e:
+            return None, f'could not reach the store ({str(e)[:60]})'
+        if r.status_code != 429:
+            break
+        if attempt == 0:
+            try:
+                wait = min(int(r.headers.get('Retry-After') or 8), 20)
+            except (TypeError, ValueError):
+                wait = 8
+            time.sleep(wait)
     if r.status_code == 404:
         return None, 'this store hides its "all products" page (404) — the bestseller trick doesn\'t work here'
+    if r.status_code == 429:
+        return None, ('store is rate-limiting the scanner (HTTP 429) — it was scanned a lot recently; '
+                      'try again in a few minutes')
     if r.status_code != 200:
         return None, f'store blocked the request (HTTP {r.status_code})'
     html = r.text
@@ -7402,8 +7444,17 @@ def _bs_scan_cached(host, force=False):
         return out, None
     payload, blocked = _bs_scan(host)
     if blocked:
+        # Serve a STALE cache entry over an error — a day-old bestseller list is far
+        # more useful than "blocked" (typical during 429 rate-limit windows).
+        if hit:
+            out = dict(hit['payload'])
+            out['from_cache'] = True
+            out['stale'] = True
+            out['cache_age_seconds'] = int(now_ts - hit['ts'])
+            return out, None
         return None, blocked
     _BS_CACHE[host] = {'ts': now_ts, 'at': datetime.datetime.utcnow().isoformat() + 'Z', 'payload': payload}
+    _bs_cache_save()
     out = dict(payload)
     out['from_cache'] = False
     out['cache_age_seconds'] = 0
@@ -7456,6 +7507,9 @@ def _bs_enrich(payload, host):
         sig = _bs_sig(p.get('title'), p.get('handle'))
         p['also_at'] = sorted(sig_map.get(sig) or []) if sig else []
     return payload
+
+
+_bs_cache_load()
 
 
 @app.route('/api/bestseller_scan')
