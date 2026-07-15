@@ -8055,7 +8055,17 @@ def _wtl_classify_store(domain):
     if bare in _load_blocked_sources():
         return {'label': 'Eigen voorraad', 'detail': f'handmatig geblokkeerd: {_blocked_reason(bare)}',
                 'source': 'manual-blocklist', 'confidence': 'high', 'ts': ts}
+    # Classify a real PRODUCT page — the import-gate's proven path. Homepages give
+    # the shipping classifier far less to work with (tested: homepage = Onbekend
+    # where the product page yields a verdict).
     url = f'https://{bare}/'
+    try:
+        r = _scrape_get(f'https://{bare}/products.json?limit=1', timeout=12)
+        prods = (r.json() or {}).get('products') or []
+        if prods and prods[0].get('handle'):
+            url = f"https://{bare}/products/{prods[0]['handle']}"
+    except Exception:
+        pass
     try:
         from shipping_check import classify_detailed
         d = classify_detailed(url, skip_browser=True) or {}
@@ -8082,6 +8092,10 @@ def _wtl_verdict_fresh(v):
     try:
         age = (datetime.datetime.utcnow()
                - datetime.datetime.fromisoformat((v or {}).get('ts', '1970-01-01').rstrip('Z'))).total_seconds()
+        # 'Onbekend' is usually a transient failure (blocked fetch, hiccup) — never
+        # let it occupy the 30-day cache; retry it on the next run.
+        if (v or {}).get('label') == 'Onbekend':
+            return False
         return age < _WTL_VERDICT_TTL
     except Exception:
         return False
