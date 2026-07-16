@@ -1002,43 +1002,76 @@ def duplicate_detail():
     def imgfile(n):
         return _img_key(((n.get('featuredImage') or {}) or {}).get('url') or '')
 
+    # Group by theme.siblings, not by handle prefix. The handle base misses
+    # members Shopify suffixed differently -- "aline", "aline-1", "aline-copy"
+    # and "aline-handtasche" are one colour set but four different bases -- and
+    # that split is exactly where a duplicate Noir hid for three weeks. Fall
+    # back to the handle base only when siblings isn't set.
     groups = {}
     for n in prods:
-        base = re.sub(r'-\d+$', '', n.get('handle') or '')
-        groups.setdefault(base, []).append(n)
+        sib = (((n.get('siblings') or {}) or {}).get('value') or '').strip()
+        key = ('sib:' + sib) if sib else ('h:' + re.sub(r'-\d+$', '', n.get('handle') or ''))
+        groups.setdefault(key, []).append(n)
 
     out = []
-    for base, members in groups.items():
+    for key, members in groups.items():
         if len(members) < 2:
             continue
-        if not all(re.fullmatch(re.escape(base) + r'(-\d+)?', m.get('handle') or '') for m in members):
+        base = key.split(':', 1)[1]
+        if key.startswith('h:') and not all(
+                re.fullmatch(re.escape(base) + r'(-\d+)?', m.get('handle') or '') for m in members):
             continue
-        items, imgs = [], {}
+        items, imgs, cuts = [], {}, {}
         for m in members:
             f = imgfile(m)
             if f:
                 imgs[f] = imgs.get(f, 0) + 1
+            cut = ((m.get('cutline') or {}) or {}).get('value') or ''
+            ck = _deaccent(cut).strip()
+            if ck:
+                cuts[ck] = cuts.get(ck, 0) + 1
             items.append({
                 'handle': m.get('handle'),
                 'title': m.get('title'),
                 'status': (m.get('status') or '').upper(),
-                'cutline': ((m.get('cutline') or {}) or {}).get('value') or '',
+                'cutline': cut,
                 'siblings': ((m.get('siblings') or {}) or {}).get('value') or '',
                 'image': f,
             })
+        # Two products can be duplicates on the image OR on the colour: a real
+        # duplicate that got a fresh photo (a second Noir bag shot with another
+        # scarf) has distinct image bytes, so comparing filenames alone calls it
+        # "distinct". Comparing the swatch catches it.
         same_img = any(c >= 2 for c in imgs.values())
+        repeat_colour = sorted(k for k, v in cuts.items() if v >= 2)
+        one_colour_all = len(cuts) == 1 and sum(cuts.values()) == len(members)
+        if same_img:
+            verdict = 'POSSIBLE-DUP (shared image)'
+        elif one_colour_all and len(imgs) == len(members):
+            # Every member carries the same swatch but a different photo: the
+            # colour was mis-derived from the handle (e.g. "Handtasche"), so the
+            # group is unreviewable until the cutlines name real colours. Not a
+            # duplicate verdict -- archiving these would kill real colourways.
+            verdict = f'BROKEN-SWATCH (all {len(members)} share cutline "{items[0]["cutline"]}")'
+        elif repeat_colour:
+            verdict = 'POSSIBLE-DUP (repeated colour: ' + ', '.join(repeat_colour) + ')'
+        else:
+            verdict = 'distinct (different images + colours)'
         out.append({
             'base': base,
             'count': len(members),
             'distinct_images': len(imgs),
-            'verdict': 'POSSIBLE-DUP (shared image)' if same_img else 'distinct (different images)',
+            'distinct_colours': len(cuts),
+            'verdict': verdict,
             'items': items,
         })
-    out.sort(key=lambda g: (-1 if g['verdict'].startswith('POSSIBLE') else 0, -g['count']))
+    _rank = lambda v: -2 if v.startswith('POSSIBLE') else (-1 if v.startswith('BROKEN') else 0)
+    out.sort(key=lambda g: (_rank(g['verdict']), -g['count']))
     return jsonify({
         'store': store,
         'group_count': len(out),
         'possible_dup_groups': sum(1 for g in out if g['verdict'].startswith('POSSIBLE')),
+        'broken_swatch_groups': sum(1 for g in out if g['verdict'].startswith('BROKEN')),
         'groups': out,
     })
 
@@ -1085,7 +1118,24 @@ _SIZE_OPT_RE  = re.compile(r'size|maat|taille|størrelse|talla', re.I)
 _HANDLE_NOISE_WORDS = re.compile(
     r'^(dress|top|skirt|blouse|coat|jacket|shirt|pants|jeans|mini|maxi|midi|'
     r'womens?|men|mens|kids?|lace|satin|silk|cotton|linen|long|short|'
-    r'sleeve|sleeveless|knit|woven|with|and|the|of|for|new|sale)$', re.I
+    r'sleeve|sleeveless|knit|woven|with|and|the|of|for|new|sale|'
+    # Non-English product-type nouns. The source stores are German/French/Nordic,
+    # so this list being English-only is what let "aline-handtasche" resolve its
+    # colour to "Handtasche" (see _derive_color_from_handle).
+    r'handtasche|tasche|sonnenbrille|brille|kleid|abendkleid|abend|sommerkleid|'
+    r'sommer|winter|schal|tuch|schuhe|stiefel|guertel|hut|jacke|mantel|hose|'
+    r'rock|hemd|pullover|strickjacke|akzent|akzenten|'
+    r'sac|sacoche|lunettes|robe|echarpe|foulard|chaussures|bottes|ceinture|'
+    r'chapeau|veste|manteau|pantalon|jupe|chemisier|chemise|pull|'
+    r'handbag|bag|purse|sunglasses|glasses|scarf|shoes|boots|belt|hat|trousers|'
+    r'sweater|bandana|shawl|'
+    r'taske|solbriller|kjole|toerklaede|sko|stoevler|baelte|jakke|frakke|'
+    r'bukser|nederdel|skjorte|troeje|'
+    r'tas|handtas|zonnebril|jurk|sjaal|schoenen|laarzen|riem|hoed|jas|broek|trui|'
+    r'laukku|kaesilaukku|aurinkolasit|mekko|huivi|kengaet|saappaat|vyoe|hattu|'
+    r'takki|housut|hame|pusero|paita|neule|'
+    # Duplicate/placeholder leftovers that must never read as a colour.
+    r'copy|kopie|duplicate|default|product|item)$', re.I
 )
 _HANDLE_COLOR_MODIFIER = re.compile(
     r'^(light|dark|deep|bright|hot|baby|dusty|royal|navy|forest|burnt|rose|ice|'
@@ -1096,7 +1146,18 @@ _HANDLE_COLOR_MODIFIER = re.compile(
 def _derive_color_from_handle(handle):
     """Extract a colour name from a product handle when there's no Color
     option. Mirrors the frontend's extractColors fallback so backend +
-    frontend agree on what counts as 'the colour' for sibling discovery."""
+    frontend agree on what counts as 'the colour' for sibling discovery.
+
+    Returns None unless the token really names a colour. Taking the last token
+    on faith is what created the Aline mess: a German source handle
+    ("aline-handtasche") yielded colour "Handtasche", which then (a) became the
+    swatch label on every variant and (b) made _publish_make_handle collapse
+    all colours onto one handle, so Shopify auto-suffixed -1/-2/-3 and the
+    group looked like duplicate products. It also mis-read product names
+    ("margaux") and sizes ("53cm") as colours. Refusing lets the publish guard
+    ask for the colour rather than invent one -- same rule as the fabric- and
+    length-claim guards: never assert an attribute the source doesn't support.
+    """
     if not handle:
         return None
     tokens = [
@@ -1108,8 +1169,12 @@ def _derive_color_from_handle(handle):
     last = tokens[-1]
     # Two-word colours: "royal-blue", "dusty-pink", "light-grey"
     if len(tokens) >= 2 and _HANDLE_COLOR_MODIFIER.match(tokens[-2]):
-        return f'{tokens[-2].capitalize()} {last.capitalize()}'
-    return last.capitalize()
+        candidate = f'{tokens[-2].capitalize()} {last.capitalize()}'
+    else:
+        candidate = last.capitalize()
+    # _is_color_kw is the same multi-language vocabulary that keeps colour words
+    # out of the shared copy, so both paths agree on what "a colour" means.
+    return candidate if _is_color_kw(candidate) else None
 
 
 def _ensure_color_option(product):
@@ -5908,14 +5973,17 @@ _FLAGGED_FIXES = [
     ('fr', 10489682231643, 'cutline', "Floral Pétrole"),
     ('fr', 10497793491291, 'cutline', "Floral Pétrole"),
     ('fr', 10544873046363, 'cutline', "Bordeaux"),
-    ('fr', 10544918757723, 'archive', None),
-    ('fr', 10544934453595, 'archive', None),
-    ('fr', 10544939434331, 'archive', None),
-    ('fr', 10544945267035, 'archive', None),
-    ('fr', 10544946479451, 'archive', None),
-    ('fr', 10544947495259, 'archive', None),
-    ('fr', 10544947724635, 'archive', None),
-    ('fr', 10544949920091, 'archive', None),
+    # The 8 Aline handbags (10544918757723 / 10544934453595 / 10544939434331 /
+    # 10544945267035 / 10544946479451 / 10544947495259 / 10544947724635 /
+    # 10544949920091) were flagged 'archive' here on 2026-06-27 as "duplicate
+    # copies". Re-reviewed against the product photos on 2026-07-16: they are
+    # SEVEN genuine colour siblings (Noir/Bordeaux/Rouge/Blanc/Cognac/Rose/
+    # Beige) plus one real duplicate (aline-1 repeats Noir). They only looked
+    # like duplicates because _derive_color_from_handle read "Handtasche" as
+    # the colour, which collapsed every colour onto the handle "aline" and let
+    # Shopify auto-suffix -1/-2/-3. Their cutlines are now the real colours and
+    # venek decided on 2026-07-16 to keep all 8 live, so archiving them would
+    # pull 7 real colourways off the storefront. Entries removed deliberately.
     ('fr', 10544984228187, 'cutline', "Noir"),
     ('fr', 10544992780635, 'archive', None),
     ('fr', 10550467035483, 'archive', None),
@@ -6901,6 +6969,13 @@ _COLOR_WORDS = {
     "turquoise", "turkoois", "turkoosi", "teal", "aqua", "mint", "menthe", "mintgroen",
     "guld", "gold", "dore", "doree", "silver", "solv", "argent", "argente", "kulta", "kultainen", "hopea", "metallic",
     "multicolor", "multicolour", "multi", "kleurrijk", "colorful", "colore", "monivarinen",
+    # Swatch values already in use across the stores that name a shade or a
+    # variant-specific print rather than a base colour. They belong here for the
+    # same reason as the rest: they vary per variant, so they must stay out of
+    # the shared copy -- and _derive_color_from_handle validates against this
+    # set, so omitting them would reject legitimate cutlines like "Sarcelle".
+    "sarcelle", "petrole", "petrol", "petroli", "leopard", "leopardi", "panter",
+    "floral", "fleuri", "fleurie", "blomstret", "kukkakuvio", "gebloemd", "bloemen",
 }
 
 
@@ -14956,21 +15031,124 @@ def _light_collection_id(store, handle, hdrs):
         return None
 
 
+def _light_probe(store_key):
+    """Read-only reachability test for one lighting store: GET shop.json.
+    Returns (ok, detail). Proves the credentials actually WORK — 'configured'
+    only ever meant 'a value is present', which said nothing about DE, whose
+    token is minted per run and can fail at mint time."""
+    ent = _shop_entry(store_key)          # mints for DE when needed
+    if not ent.get('shop'):
+        return False, 'no shop domain'
+    if not ent.get('token'):
+        return False, ('could not mint a token (check the app credentials)'
+                       if (LIGHT_TOKENS.get(store_key) or {}).get('auth') == 'client_credentials'
+                       else 'no token')
+    try:
+        r = req.get(shopify_url(store_key, 'shop.json'),
+                    headers=shopify_headers(store_key), timeout=15)
+        if r.status_code == 200:
+            shop = (r.json() or {}).get('shop') or {}
+            return True, shop.get('name') or ent.get('shop')
+        if r.status_code in (401, 403):
+            return False, f'store rejected the token (HTTP {r.status_code}) — re-authorise this store'
+        return False, f'HTTP {r.status_code}'
+    except Exception as e:
+        return False, f'could not reach the store ({str(e)[:60]})'
+
+
 @app.route('/api/lighting/status')
 def api_lighting_status():
-    """Which lighting stores are wired up. Read-only, NEVER exposes a token."""
+    """Which lighting stores are wired up. Read-only, NEVER exposes a token.
+    ?probe=1 additionally TESTS each store with a read-only shop.json call —
+    'configured' alone only means a value is present, not that it works."""
+    probe = request.args.get('probe') in ('1', 'true', 'yes')
     out = {}
     for k in ('nl', 'de', 'com'):
         ent = LIGHT_TOKENS.get(k) or {}
-        out[k] = {
+        info = {
             'configured': bool(ent.get('shop') and (ent.get('token') or ent.get('client_id'))),
             'shop': ent.get('shop') or None,
             'auth': ent.get('auth') or ('token' if ent.get('token') else None),
             'language': LIGHT_LANGUAGE.get(k),
         }
+        if probe and info['configured']:
+            ok, detail = _light_probe(k)
+            info['connected'] = ok
+            info['detail'] = detail
+        out[k] = info
     return jsonify({'stores': out,
                     'ready': [k for k, v in out.items() if v['configured']],
+                    'connected': [k for k, v in out.items() if v.get('connected')] if probe else None,
+                    'probed': probe,
                     'brand': LIGHT_BRAND})
+
+
+_LIGHT_SHOP_RE = re.compile(r'^[a-z0-9][a-z0-9-]*\.myshopify\.com$', re.I)
+
+
+@app.route('/api/lighting/credentials', methods=['POST'])
+@require_droplet_token
+def api_lighting_credentials():
+    """Store The Light Supplier's Shopify credentials so the Home Decor portal can
+    publish. Body: {"stores": {"nl": {"shop","token"}, "com": {...},
+                    "de": {"shop","client_id","client_secret","auth":"client_credentials"}}}
+    Accepts the raw lightsupplier-sync/tokens.json shape (extra keys like `scope`
+    are ignored). Writes backend/lighting_tokens.json (gitignored, 0600) and
+    applies it to the running process immediately. Gated. NEVER logs or returns a
+    secret value — the response only says WHICH stores are now configured."""
+    body = request.get_json(silent=True) or {}
+    incoming = body.get('stores') or body       # tolerate a bare tokens.json paste
+    if not isinstance(incoming, dict):
+        return jsonify({'error': 'Expected a JSON object of stores.'}), 400
+
+    cleaned, problems = {}, []
+    for key in ('nl', 'de', 'com'):
+        ent = incoming.get(key)
+        if not isinstance(ent, dict):
+            continue                              # store simply not supplied
+        shop = str(ent.get('shop') or ent.get('domain') or '').strip().lower()
+        if not _LIGHT_SHOP_RE.match(shop):
+            problems.append(f'{key}: "shop" must be a <name>.myshopify.com domain')
+            continue
+        token = str(ent.get('token') or ent.get('access_token') or '').strip()
+        cid = str(ent.get('client_id') or '').strip()
+        csec = str(ent.get('client_secret') or '').strip()
+        if token:
+            cleaned[key] = {'shop': shop, 'token': token}
+        elif cid and csec:
+            # DE runs on a Dev-Dashboard app: no fixed token, minted per run.
+            cleaned[key] = {'shop': shop, 'client_id': cid, 'client_secret': csec,
+                            'auth': 'client_credentials'}
+        else:
+            problems.append(f'{key}: needs either a token, or client_id + client_secret')
+    if not cleaned:
+        return jsonify({'error': 'No usable store credentials found.',
+                        'problems': problems}), 400
+
+    try:
+        tmp = LIGHT_TOKENS_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(cleaned, f, ensure_ascii=False)
+        try:
+            os.chmod(tmp, 0o600)                  # no-op on Windows dev, real on the droplet
+        except Exception:
+            pass
+        os.replace(tmp, LIGHT_TOKENS_FILE)
+    except Exception as e:
+        return jsonify({'error': f'Could not save: {str(e)[:80]}'}), 500
+
+    # Apply to the running process so it works without a restart.
+    LIGHT_TOKENS.clear()
+    LIGHT_TOKENS.update(cleaned)
+    _LIGHT_TOKEN_CACHE.clear()                    # force a fresh mint for DE
+    print(f'[lighting] credentials saved for: {sorted(cleaned)}')   # names only, never values
+
+    results = {}
+    for k in sorted(cleaned):
+        ok, detail = _light_probe(k)
+        results[k] = {'connected': ok, 'detail': detail}
+    return jsonify({'ok': True, 'saved': sorted(cleaned), 'problems': problems,
+                    'results': results})
 
 
 @app.route('/api/lighting/publish', methods=['POST'])

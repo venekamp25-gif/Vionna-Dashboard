@@ -16,6 +16,7 @@ import {
 } from "@/lib/api";
 import { useLightProduct, type LightContent } from "@/lib/lightProduct";
 import { LightWhatToList } from "./LightWhatToList";
+import { LightStoreConnect } from "./LightStoreConnect";
 
 const STORES: LightStore[] = ["nl", "de", "com"];
 
@@ -302,15 +303,7 @@ export function HomeDecorWorkbench() {
       </header>
 
       <main className="w-full max-w-4xl mx-auto px-6 py-8 space-y-5">
-        {knownNotConfigured && (
-          <div className="rounded-2xl border border-warning/40 bg-warning/10 p-5">
-            <h2 className="text-[14px] font-semibold text-text">The lighting stores aren&apos;t connected yet</h2>
-            <p className="text-[12.5px] text-text-dim mt-1.5 leading-relaxed">
-              You can already import a lamp and write the copy — publishing needs the Shopify
-              credentials for The Light Supplier on the server first. Everything below stays saved.
-            </p>
-          </div>
-        )}
+        <LightStoreConnect status={status} onChanged={setStatus} />
 
         {/* ⓪ RESEARCH — optional starting point */}
         <details className="rounded-2xl border border-border bg-bg-elev overflow-hidden group">

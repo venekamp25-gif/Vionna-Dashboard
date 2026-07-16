@@ -1166,13 +1166,38 @@ export const LIGHT_STORE_CONFIG: Record<LightStore, { label: string; language: s
 
 export interface LightStatusResponse {
   stores: Record<LightStore, {
+    /** A credential is PRESENT — says nothing about whether it works. */
     configured: boolean;
     shop: string | null;
     auth: string | null;
     language: string;
+    /** Only with probe=1: the store actually answered a read-only call. */
+    connected?: boolean;
+    /** Shop name on success, or why it failed. */
+    detail?: string;
   }>;
   ready: LightStore[];
+  connected: LightStore[] | null;
+  probed: boolean;
   brand: string;
+  error?: string;
+}
+
+/** One store's credentials, exactly as lightsupplier-sync/tokens.json holds them:
+ *  a fixed token (NL/.com) or a Dev-Dashboard app that mints one (DE). */
+export interface LightCredentialEntry {
+  shop: string;
+  token?: string;
+  client_id?: string;
+  client_secret?: string;
+  auth?: string;
+}
+
+export interface LightCredentialsResponse {
+  ok?: boolean;
+  saved?: LightStore[];
+  problems?: string[];
+  results?: Record<string, { connected: boolean; detail: string }>;
   error?: string;
 }
 
@@ -1202,8 +1227,21 @@ export interface LightPublishResult {
 }
 
 export const lightingApi = {
-  /** Which lighting stores have working credentials. Never returns a token. */
-  status: () => call<LightStatusResponse>("/api/lighting/status"),
+  /** Which lighting stores are wired up. Never returns a token.
+   *  `probe` additionally TESTS each store with a read-only call — "configured"
+   *  alone only means a value is present. */
+  status: (probe = false) =>
+    call<LightStatusResponse>(`/api/lighting/status${probe ? "?probe=1" : ""}`),
+
+  /** Save The Light Supplier's Shopify credentials on the server (gated).
+   *  The values go straight to your own droplet over HTTPS and are never stored
+   *  in the browser, logged, or returned. */
+  saveCredentials: (stores: Partial<Record<LightStore, LightCredentialEntry>>) =>
+    call<LightCredentialsResponse>("/api/lighting/credentials", {
+      method: "POST",
+      body: { stores },
+      authed: true,
+    }),
 
   generate: (params: {
     store: LightStore;
