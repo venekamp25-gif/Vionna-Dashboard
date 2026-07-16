@@ -7953,6 +7953,123 @@ def api_size_chart_audit():
                     'distinct_charts': distinct, 'gaps': gaps})
 
 
+# ── product_type ⇆ cat:<x> consistency (detectie + gated correctie) ──────────
+def _product_type_conflicts(store):
+    """Read-only scan van één store. Een CONFLICT = de Shopify product_type
+    impliceert een ANDERE categorie dan de betrouwbare cat:<x> tag (bv. 'Daphne'
+    zonnebril met product_type='dress' maar cat:accessory). Returns
+    (conflicts, stats). Raiset bij een GraphQL-fout."""
+    hdrs = shopify_headers(store)
+    q = ('query($c:String){ products(first:250, after:$c, query:"status:active"){ '
+         'pageInfo{ hasNextPage endCursor } edges{ node{ id legacyResourceId title '
+         'productType tags } } } }')
+    conflicts = []
+    stats = {'checked': 0, 'uncategorized_skipped': 0, 'missing_product_type': 0}
+    cursor, pages = None, 0
+    while pages < 25:
+        pages += 1
+        r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                          json={'query': q, 'variables': {'c': cursor}}, timeout=45)
+        body = r.json() or {}
+        if body.get('errors'):
+            raise RuntimeError(str(body['errors'])[:200])
+        conn = ((body.get('data') or {}).get('products') or {})
+        for e in (conn.get('edges') or []):
+            n = e['node']
+            stats['checked'] += 1
+            cat = _product_cat_from_tags(n.get('tags'))
+            pt = (n.get('productType') or '').strip()
+            if cat == 'uncategorized':
+                stats['uncategorized_skipped'] += 1
+                continue
+            if not pt:
+                stats['missing_product_type'] += 1
+            implied = _cat_from_product_type(pt)
+            # Alleen een ECHTE tegenspraak telt: product_type wijst duidelijk naar
+            # een andere categorie. Onbekende/lege product_type is geen conflict
+            # (wordt apart geteld) — we willen geen false positives corrigeren.
+            if implied is not None and implied != cat:
+                conflicts.append({
+                    'id': str(n.get('legacyResourceId') or ''),
+                    'gid': n['id'],
+                    'title': n.get('title'),
+                    'cat': cat,
+                    'product_type': pt,
+                    'implied_cat': implied,
+                    'suggested': _product_type_for_publish(pt, cat),
+                })
+        pi = conn.get('pageInfo') or {}
+        if not pi.get('hasNextPage'):
+            break
+        cursor = pi.get('endCursor')
+    stats['conflicts'] = len(conflicts)
+    return conflicts, stats
+
+
+@app.route('/api/product_type_audit')
+def api_product_type_audit():
+    """READ-ONLY detectie: bestaande producten waar product_type de cat:<x> tag
+    tegenspreekt (Google Merchant leest product_type; de cat: tag is de
+    betrouwbare, beschrijving-gedreven bron). ?store=dk beperkt tot één store;
+    zonder ?store worden alle geauthede fashion stores (dk/fr/fi) gescand."""
+    want = request.args.get('store')
+    stores = [want] if want else [s for s in ('dk', 'fr', 'fi') if s in tokens]
+    out = {}
+    for store in stores:
+        if store not in tokens:
+            out[store] = {'error': f'not authed for {store}'}
+            continue
+        try:
+            conflicts, stats = _product_type_conflicts(store)
+            out[store] = {**stats, 'items': conflicts}
+        except Exception as ex:
+            out[store] = {'error': str(ex)[:200]}
+    return jsonify(out)
+
+
+@app.route('/api/product_type_fix', methods=['POST'])
+@require_droplet_token
+def api_product_type_fix():
+    """Corrigeer product_type waar het cat:<x> tegenspreekt. VEILIG BY DEFAULT:
+    schrijft NIETS tenzij body {"apply": true} — anders is dit een dry-run die het
+    plan teruggeeft. Body: {store?, apply?}. Token-gated (live-store writes)."""
+    body = request.get_json(silent=True) or {}
+    apply_ = bool(body.get('apply'))
+    want = body.get('store')
+    stores = [want] if want else [s for s in ('dk', 'fr', 'fi') if s in tokens]
+    out = {'apply': apply_, 'stores': {}}
+    for store in stores:
+        if store not in tokens:
+            out['stores'][store] = {'error': f'not authed for {store}'}
+            continue
+        try:
+            conflicts, stats = _product_type_conflicts(store)
+        except Exception as ex:
+            out['stores'][store] = {'error': str(ex)[:200]}
+            continue
+        rep = {**stats, 'planned': [{'id': c['id'], 'title': c['title'],
+                                     'from': c['product_type'], 'to': c['suggested'],
+                                     'cat': c['cat']} for c in conflicts]}
+        if apply_:
+            hdrs = shopify_headers(store)
+            written, errs = 0, []
+            for c in conflicts:
+                try:
+                    rr = _shopify_call('put', shopify_url(store, f"products/{c['id']}.json"),
+                                       hdrs, json={'product': {'id': int(c['id']),
+                                                   'product_type': c['suggested']}}, timeout=30)
+                    if rr.status_code in (200, 201):
+                        written += 1
+                    else:
+                        errs.append(f"{c['id']}: {rr.status_code} {rr.text[:80]}")
+                except Exception as ex:
+                    errs.append(f"{c['id']}: {str(ex)[:80]}")
+            rep['written'] = written
+            rep['errors'] = errs[:10]
+        out['stores'][store] = rep
+    return jsonify(out)
+
+
 @app.route('/api/fill_missing_size_charts', methods=['POST'])
 @require_droplet_token
 def api_fill_missing_size_charts():
@@ -10336,6 +10453,8 @@ def publish_create_variant():
         'keywords':           data.get('keywords') or [],
         'category':           _pub_cat or None,
         'product_type':       product_type or None,
+        'sizes':              sizes,
+        'size_guard_applied': _size_guarded,   # accessory clothing-size collapse fired
         'size_chart_applied': bool(size_chart_html),
         'size_chart_source':  size_chart_source,
         'dfs_recommended':    data.get('dfs_recommended'),
