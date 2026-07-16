@@ -3977,6 +3977,116 @@ def _category_for_publish(data, title):
     return _classify_category(title, raw)[0]
 
 
+# --- Accessory size guard (user rule 2026-07-16) ---------------------------
+# Accessories (cat:accessory — bags, jewellery, sunglasses, belts, scarves,
+# hats, gloves…) must NEVER inherit the clothing size default XS/S/M/L/XL. The
+# publish flow seeds those sizes for EVERY product (frontend default at
+# product.tsx + the `data.get('sizes', ['XS','S','M','L','XL'])` fallback in the
+# publish routes), which is what put bogus "Taille: XS–XL" on sunglasses and
+# handbags (Daphne, Aline). Sizes are never scraped from the competitor, so any
+# accessory reaching publish carries that clothing default.
+#
+# When the resolved category is 'accessory' and the sizes are PURE clothing
+# alpha-sizes, collapse them to a single localized One Size. Genuine non-alpha
+# sizes a competitor might supply (cm / numeric, e.g. a belt in 80/90/100) are
+# left untouched. Shoes are deliberately NOT collapsed — they need real numeric
+# sizing (a separate concern), not One Size.
+STORE_ONE_SIZE = {'dk': 'One Size', 'fr': 'Taille unique', 'fi': 'Yksi koko'}
+_CLOTHING_ALPHA_SIZES = {
+    'xxs', 'xs', 's', 'm', 'l', 'xl', 'xxl', 'xxxl', '2xl', '3xl', '4xl',
+    'x-small', 'small', 'medium', 'large', 'x-large', 'xx-large',
+}
+
+
+def _guard_accessory_sizes(store, category, sizes):
+    """Prevention for the accessory-size bug. Returns (sizes, changed):
+    for cat:accessory whose sizes are all clothing alpha-sizes, returns
+    ([localized One Size], True); otherwise returns (sizes, False)."""
+    if (category or '').strip().lower() != 'accessory':
+        return sizes, False
+    norm = [str(s).strip().lower() for s in (sizes or []) if str(s).strip()]
+    if not norm:
+        return sizes, False
+    if all(s in _CLOTHING_ALPHA_SIZES for s in norm):
+        return [STORE_ONE_SIZE.get(store, 'One Size')], True
+    return sizes, False
+
+
+# ============================================================================
+# product_type reconciliation  (root-cause fix, 2026-07-16)
+# ----------------------------------------------------------------------------
+# The frontend's guessProductType() matches only TITLE+HANDLE and blindly falls
+# back to "dress" for anything it doesn't recognise — so 'Daphne' (sunglasses)
+# and 'Aline' (a handbag) landed on the live store as product_type='dress' while
+# carrying the correct, description-driven cat:accessory tag. product_type is a
+# free-text hint Google Merchant uses for categorisation, so a wrong value here
+# mis-categorises the product (and nearly fed a dress size-chart to a sunglass).
+#
+# Fix: at publish, let product_type RIDE ON the description-driven LLM category
+# (`_category_for_publish`). On conflict we trust the LLM category, not the
+# title guess; and we never invent a blind 'dress' for unknowns.
+
+# canonical cat:<x> slug → human-readable Shopify product_type label
+CAT_TO_PRODUCT_TYPE = {
+    'dress':     'Dress',
+    'knitwear':  'Knitwear',
+    'top':       'Top',
+    'pants':     'Trousers',
+    'skirt':     'Skirt',
+    'outerwear': 'Outerwear',
+    'accessory': 'Accessory',
+    'shoes':     'Shoes',
+    'swim':      'Swimwear',
+}
+
+# reverse: which cat:<x> does a free-text product_type STRING imply? Order matters
+# (outerwear before top so "jacket" wins over a stray "top"). Multilingual so an
+# existing DA/FR/FI product_type is understood too. None = can't tell.
+_PT_TO_CAT = [
+    ('outerwear', re.compile(r'jacket|coat|blazer|parka|gilet|outerwear|trench|puffer|frakke|jakke|manteau|veste|takki|mantel', re.I)),
+    ('swim',      re.compile(r'swim|bikini|badedragt|maillot|badpak|uimapuku', re.I)),
+    ('shoes',     re.compile(r'shoe|boot|sandal|sneaker|loafer|heel|footwear|pump|espadrille|mule|\bsko\b|st(ø|o)vle|chaussure|kenk|jalkine|saapas', re.I)),
+    ('accessory', re.compile(r'accessor|handbag|\bbag\b|purse|clutch|tote|jewel|necklace|earring|bracelet|\bring\b|belt|scarf|\bhat\b|sunglass|glove|handtas|\btas\b|taske|smykke|\bsac\b|bijoux|collier|laukku|koru|solbrille|huivi|b(æ|ae)lte|t(ø|o)rkl(æ|ae)de', re.I)),
+    ('knitwear',  re.compile(r'knit|sweater|cardigan|hoodie|sweatshirt|jumper|pullover|strik|tr(ø|o)je|neule|poncho|gebreid', re.I)),
+    ('skirt',     re.compile(r'skirt|nederdel|jupe|hame|\brok\b|shorts', re.I)),
+    ('pants',     re.compile(r'trouser|\bpant|jean|legging|chino|broek|pantalon|housut|bukser', re.I)),
+    ('top',       re.compile(r'blouse|shirt|\btop\b|t-shirt|\btee\b|tank|tunic|camisole|bodysuit|bluse|paita|overdel|peplum', re.I)),
+    ('dress',     re.compile(r'dress|jumpsuit|playsuit|kjole|robe|mekko|jurk|gown', re.I)),
+]
+
+
+def _cat_from_product_type(pt):
+    """Best-effort: the cat:<x> a free-text product_type implies, or None."""
+    s = (pt or '').strip().lower()
+    if not s:
+        return None
+    if s in CATEGORY_TAGS:
+        return s
+    for cat, rx in _PT_TO_CAT:
+        if rx.search(s):
+            return cat
+    return None
+
+
+def _product_type_for_publish(incoming_pt, category):
+    """Reconcile the Shopify product_type against the LLM cat:<x> category.
+
+    - No category resolved     → keep the incoming value as-is (may be ''); we do
+                                  NOT invent 'dress'.
+    - incoming CONSISTENT with category → keep it (more specific word, also good
+                                  for the Nano Banana image prompts).
+    - incoming CONTRADICTS category (Daphne=sunglasses guessed 'dress', cat=
+                                  accessory) → trust the LLM, write its label.
+    - incoming empty/unknown   → the category's canonical label.
+    """
+    incoming = (incoming_pt or '').strip()
+    if not category:
+        return incoming
+    if _cat_from_product_type(incoming) == category:
+        return incoming
+    return CAT_TO_PRODUCT_TYPE.get(category, category.capitalize())
+
+
 # ============================================================================
 # DataForSEO keyword research (auto per-market keyword ideas at import time)
 # ----------------------------------------------------------------------------
@@ -6895,6 +7005,84 @@ def _strip_unverified_material_kws(keywords, source_text):
     return [k for k in (keywords or []) if not (_material_concepts_in(k) - allowed)]
 
 
+# ── Kledinglengte-claims (Millie-fix 2026-07-16) ────────────────────────────
+# Zelfde principe als de stof-regel: claim een LENGTE (lang/kort/maxi/midi/...)
+# alleen als de concurrent-bron die noemt. Concepten zijn cross-language, zodat
+# een Deense bron een Finse claim kan verifiëren.
+#   long  = maxi / vloer- of enkellengte
+#   midi  = knie / kuit
+#   short = mini / boven de knie
+# Losse tokens (na deaccent). 'maxi'/'midi' mogen ook als compound-prefix
+# (maxikjole, midimekko); de rest EXACT — 'lang'/'kort'-prefix geeft anders
+# 'langsom'(traag)/'langaermet'(lange mouw) enz.
+_LENGTH_WORDS_EXACT = {
+    'long': 'long', 'longue': 'long', 'longs': 'long', 'longues': 'long',
+    'lang': 'long', 'lange': 'long', 'langt': 'long', 'pitka': 'long',
+    'gulvlang': 'long', 'ankellang': 'long', 'nilkkapituinen': 'long',
+    'midi': 'midi', 'knielang': 'midi', 'knaelang': 'midi', 'knelang': 'midi',
+    'knielengte': 'midi', 'polvipituinen': 'midi', 'polvimittainen': 'midi',
+    'genou': 'midi', 'knee': 'midi',
+    'mini': 'short', 'kort': 'short', 'korte': 'short', 'kortere': 'short',
+    'lyhyt': 'short', 'court': 'short', 'courte': 'short', 'courts': 'short',
+    'courtes': 'short', 'short': 'short',
+}
+_LENGTH_PREFIX = {'maxi': 'long', 'midi': 'midi'}   # veilige, distinctieve compounds
+
+# Mouw-markers: een lengte-woord in/naast een mouw-woord = mouwlengte, niet
+# kledinglengte. Finse compound 'pitkahihainen' bevat 'hiha'.
+_SLEEVE_ROOTS = ('sleeve', 'arme', 'aerme', 'aermer', 'aermet', 'ermet', 'ermer',
+                 'hiha', 'manche', 'mouw', 'hihai', 'hihat')
+# Meetlabels + FR-uitdrukking die vóór het matchen worden weggeknipt.
+_LENGTH_FALSE_CTX = re.compile(
+    r'\b(?:au|le)\s+long\b'          # FR 'au long de' / 'le long de'
+    r'|longueur\w*|lengte\w*|laengde\w*|laenge\w*|pituus\w*'
+    r'|lengde\w*', re.I)
+# Alleen het maat-ZELFSTANDIGNAAMWOORD wegknippen ('pituus'/'lengte'/'længde'/
+# 'longueur'). NIET het bijvoeglijke '-pituinen' — 'polvipituinen' (knielengte)
+# is juist een echte lengteclaim en moet blijven staan.
+
+
+def _length_concepts_in(text):
+    """Set of garment-LENGTH concepts a text claims: {'long','midi','short'}.
+    Sleeve length, measurement nouns and the FR 'au long de' idiom are excluded,
+    so 'manches courtes', 'longueur de la robe' and 'tout au long' never trigger."""
+    txt = _deaccent(text)
+    txt = _LENGTH_FALSE_CTX.sub(' ', txt)
+    toks = [t for t in re.split(r'[^a-z0-9]+', txt) if t]
+    # welke tokens zijn mouw-context?
+    is_sleeve = [any(r in t for r in _SLEEVE_ROOTS) for t in toks]
+    found = set()
+    for i, t in enumerate(toks):
+        concept = _LENGTH_WORDS_EXACT.get(t)
+        if not concept:
+            for pfx, c in _LENGTH_PREFIX.items():
+                if t.startswith(pfx) and len(t) >= len(pfx):
+                    concept = c
+                    break
+        if not concept:
+            continue
+        # mouwlengte uitsluiten: token zelf een mouw-compound, of een buur is mouw
+        if is_sleeve[i]:
+            continue
+        if (i > 0 and is_sleeve[i - 1]) or (i + 1 < len(toks) and is_sleeve[i + 1]):
+            continue
+        found.add(concept)
+    return found
+
+
+def _strip_unverified_length_kws(keywords, source_text):
+    """Keep a length keyword ('lange jurk') ONLY when the competitor's own info
+    names that length — never claim a maxi dress when it's knee-length (Millie,
+    2026-07-16). Non-length keywords pass untouched."""
+    allowed = _length_concepts_in(source_text)
+    return [k for k in (keywords or []) if not (_length_concepts_in(k) - allowed)]
+
+
+def _unverified_length_claims(generated_text, source_text):
+    """Length concepts OUR copy states that the source never does. Warn-only."""
+    return sorted(_length_concepts_in(generated_text) - _length_concepts_in(source_text))
+
+
 @app.route('/api/generate', methods=['POST'])
 def generate():
     if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
@@ -6915,6 +7103,11 @@ def generate():
     source_text   = str(data.get('source_text') or '')
     if source_text.strip():
         keywords = _strip_unverified_material_kws(keywords, source_text)
+        # Lengte-keywords ('lange jurk') alleen als de bron die lengte noemt —
+        # nooit een maxi claimen bij een knielange jurk (Millie, 2026-07-16).
+        keywords = _strip_unverified_length_kws(keywords, source_text)
+    # Bron voor de lengte-detectie hieronder (title + gescrapte beschrijving).
+    _len_src = source_text + ' ' + product_title
     # When set, regenerate ONLY this single field — one of:
     #   'description' / 'meta_description' / 'm_title_specs'
     # The frontend uses this for per-field "↻" buttons in the Review screen.
@@ -6987,6 +7180,7 @@ Regels:
 - Rustige toon, geen hype, geen superlatieven
 - Noem GEEN specifieke kleur in de tekst — dit product komt in meerdere kleuren en de beschrijving is gedeeld over alle kleurvarianten (kleur wordt apart getoond)
 - Noem GEEN specifieke stof of materiaal (kasjmier, wol, zijde, linnen, satijn, leer, fluweel, ...) tenzij die stof letterlijk in de keywords of de competitor producttitel hierboven staat — een verkeerde stofclaim is een productfout. Bij twijfel: neutrale woorden zoals "zacht" of "soepel"
+- Noem GEEN specifieke LENGTE of pasvorm van het kledingstuk (lang, kort, maxi, midi, mini, knielengte, tot de enkel, vloerlengte, ...) tenzij die lengte letterlijk in de keywords of de competitor producttitel hierboven staat — een verkeerde lengteclaim (bijv. "lange jurk" terwijl hij knielang is) is een productfout. Beschrijf bij twijfel de snit of het silhouet zonder een lengte vast te leggen. (MOUWlengte mag wel — dat is iets anders dan de lengte van het kledingstuk.)
 
 Bestaande meta description (handhaaf consistentie): {current_meta_description!r}
 
@@ -7030,7 +7224,11 @@ Antwoord ALLEEN als geldig JSON:
         text = msg.content[0].text.strip()
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match:
-            return jsonify(json.loads(match.group()))
+            out = json.loads(match.group())
+            _blob = ' '.join(str(out.get(k) or '') for k in
+                             ('description', 'meta_description', 'm_title_specs'))
+            out['unverified_length'] = _unverified_length_claims(_blob, _len_src)
+            return jsonify(out)
         return jsonify({'error': 'Kon respons niet parsen', 'raw': text}), 500
 
     # ── Full generation (default — all three fields at once) ──
@@ -7053,6 +7251,7 @@ Regels:
 - Rustige toon, geen hype, geen superlatieven
 - Noem GEEN specifieke kleur in de tekst — dit product komt in meerdere kleuren en de beschrijving is gedeeld over alle kleurvarianten (kleur wordt apart getoond)
 - Noem GEEN specifieke stof of materiaal (kasjmier, wol, zijde, linnen, satijn, leer, fluweel, ...) tenzij die stof letterlijk in de keywords of de competitor producttitel hierboven staat — een verkeerde stofclaim is een productfout. Bij twijfel: neutrale woorden zoals "zacht" of "soepel"
+- Noem GEEN specifieke LENGTE of pasvorm van het kledingstuk (lang, kort, maxi, midi, mini, knielengte, tot de enkel, vloerlengte, ...) tenzij die lengte letterlijk in de keywords of de competitor producttitel hierboven staat — een verkeerde lengteclaim (bijv. "lange jurk" terwijl hij knielang is) is een productfout. Beschrijf bij twijfel de snit of het silhouet zonder een lengte vast te leggen. (MOUWlengte mag wel — dat is iets anders dan de lengte van het kledingstuk.)
 
 Geef ook (dit zijn de velden die het zwaarst meetellen voor Google — verwerk hierin de belangrijkste keywords uit de lijst hierboven, natuurlijk en leesbaar):
 - meta_description: max 155 tekens, SEO-geoptimaliseerd voor {language}. Verwerk 1-2 van de belangrijkste keywords op een natuurlijke manier.
@@ -7070,7 +7269,14 @@ Antwoord uitsluitend als geldig JSON zonder extra tekst:
     text = msg.content[0].text.strip()
     match = re.search(r'\{.*\}', text, re.DOTALL)
     if match:
-        return jsonify(json.loads(match.group()))
+        out = json.loads(match.group())
+        _blob = ' '.join(str(out.get(k) or '') for k in
+                         ('description', 'meta_description', 'm_title_specs'))
+        out['unverified_length'] = _unverified_length_claims(_blob, _len_src)
+        if out['unverified_length']:
+            print(f"[generate] {product_name!r} claims length {out['unverified_length']} "
+                  f"not in source")
+        return jsonify(out)
     return jsonify({'error': 'Kon respons niet parsen', 'raw': text}), 500
 
 
@@ -10066,6 +10272,17 @@ def publish_create_variant():
     _pub_cat = _category_for_publish(data, product_name)
     _cat_tags = ['cat:%s' % _pub_cat] if _pub_cat else []
 
+    # Prevention (user rule 2026-07-16): no clothing sizes on accessories.
+    sizes, _size_guarded = _guard_accessory_sizes(store, _pub_cat, sizes)
+    if _size_guarded:
+        print(f"[publish] accessory size-guard: '{product_name}' (cat:{_pub_cat}) "
+              f"→ sizes forced to {sizes} (was clothing XS–XL)")
+
+    # product_type rijdt mee op DEZELFDE LLM-categorie i.p.v. de titel-gok van de
+    # frontend (die blind 'dress' teruggaf voor o.a. zonnebrillen/handtassen). Bij
+    # conflict wint de categorie; onbekend → leeg, nooit een blinde 'dress'.
+    product_type = _product_type_for_publish(product_type, _pub_cat)
+
     # Ieder product krijgt een size guide (user rule 2026-07-15): geen chart bij
     # de concurrent gevonden → de standaard store-chart voor deze categorie.
     size_chart_source = 'competitor' if size_chart_html else None
@@ -10171,6 +10388,17 @@ def publish():
     _pub_category = _category_for_publish(data, product_name)
     _cat_tags = ['cat:%s' % _pub_category] if _pub_category else []
     print(f"[publish] category='{_pub_category}' → tags {_cat_tags}")
+
+    # Prevention (user rule 2026-07-16): no clothing sizes on accessories.
+    sizes, _size_guarded = _guard_accessory_sizes(store, _pub_category, sizes)
+    if _size_guarded:
+        print(f"[publish] accessory size-guard: '{product_name}' (cat:{_pub_category}) "
+              f"→ sizes forced to {sizes} (was clothing XS–XL)")
+
+    # product_type rijdt mee op de LLM-categorie i.p.v. de titel-gok (blinde
+    # 'dress' voor onbekende types). Bij conflict wint de categorie.
+    product_type = _product_type_for_publish(product_type, _pub_category)
+    print(f"[publish] product_type reconciled → '{product_type}'")
 
     hdrs    = shopify_headers(store)
     base    = shopify_url(store, '')

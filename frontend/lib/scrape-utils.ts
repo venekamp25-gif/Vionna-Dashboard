@@ -70,26 +70,46 @@ function titleCase(s: string): string {
     .join(" ");
 }
 
+// Order matters: non-apparel (accessory/shoes/swim) and outerwear come BEFORE the
+// generic apparel words so a "solbriller" / "handtas" title is recognised instead
+// of silently falling through. Multilingual (EN/NL/DA/FR/FI).
 const TYPE_MAP: [string, RegExp][] = [
+  ["sunglasses", /sunglass|zonnebril|solbrille|lunettes|aurinkolasi/i],
+  ["bag",        /handbag|handtas|\btas(je|se)?\b|\bbag\b|\bsac\b|clutch|tote|laukku|purse/i],
+  ["jewellery",  /necklace|earring|bracelet|jewel|halsk(æ|ae)de|(ø|o)rering|armb(å|a)nd|collier|boucle|bijoux|koru|smykke/i],
+  ["scarf",      /scarf|sjaal|t(ø|o)rkl(æ|ae)de|foulard|huivi/i],
+  ["belt",       /\bbelt\b|\briem\b|b(æ|ae)lte|ceinture|vy(ö|o)/i],
+  ["hat",        /\bhat\b|\bcap\b|hoed|\bhue\b|chapeau|hattu/i],
+  ["shoes",      /shoe|boot|sandal|sneaker|loafer|espadrille|\bmule\b|\bheel|pump|schoen|st(ø|o)vle|\bsko\b|chaussure|kenk|jalkine|saapas/i],
+  ["swimsuit",   /swim|bikini|badpak|badedragt|maillot|uimapuku/i],
   ["jacket",   /jacket|jas|veste|jakke/i],
-  ["coat",     /coat|mantel|manteau/i],
+  ["coat",     /coat|mantel|manteau|frakke/i],
   ["blazer",   /blazer/i],
   ["blouse",   /blouse|top|shirt/i],
-  ["skirt",    /skirt|rok|jupe|nederdel/i],
-  ["trousers", /trouser|pant|broek|pantalon|bukser/i],
-  ["dress",    /dress|jurk|robe|kjole/i],
+  ["skirt",    /skirt|rok|jupe|nederdel|hame/i],
+  ["trousers", /trouser|pant|broek|pantalon|bukser|housut/i],
+  ["dress",    /dress|jurk|robe|kjole|mekko/i],
   ["jumpsuit", /jumpsuit|overall/i],
   ["cardigan", /cardigan|vest/i],
-  ["sweater",  /sweater|sweatshirt|pullover|trui|hoodie/i],
+  ["sweater",  /sweater|sweatshirt|pullover|trui|hoodie|strik|neule/i],
 ];
 
-/** Guess product type (for Nano Banana prompts) from title+handle. */
+/**
+ * Guess product type (for Nano Banana image prompts) from title+handle.
+ *
+ * Returns "" when nothing matches — NOT a blind "dress". The old blind default
+ * put product_type='dress' on sunglasses ('Daphne') and handbags ('Aline'). The
+ * authoritative Shopify product_type is now set at publish from the description-
+ * driven LLM category (backend _product_type_for_publish); this title guess is
+ * only a hint for image-gen and the editable field, so an empty guess is safer
+ * than a wrong one. Image-gen callers already fall back with `|| "dress"`.
+ */
 export function guessProductType(product: ScrapedProduct["product"]): string {
   const text = `${product?.title ?? ""} ${product?.handle ?? ""}`.toLowerCase();
   for (const [type, re] of TYPE_MAP) {
     if (re.test(text)) return type;
   }
-  return "dress";  // sensible default for Vionna
+  return "";  // unknown → let the publish-time LLM category decide
 }
 
 /** Normalize a Shopify CDN image URL (handles protocol-relative '//...'). */

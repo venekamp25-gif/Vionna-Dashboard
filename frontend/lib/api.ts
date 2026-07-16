@@ -176,6 +176,10 @@ export interface GenerateResponse {
   description?: string;
   meta_description?: string;
   m_title_specs?: string;
+  /** Garment-length concepts the copy states that the competitor's source never
+   *  did (e.g. ["long"] when the dress is knee-length). Warn-only — the reviewer
+   *  decides. Empty/absent when nothing was invented. */
+  unverified_length?: string[];
   error?: string;
 }
 

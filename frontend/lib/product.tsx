@@ -108,6 +108,10 @@ export interface StoreContent {
   cutline: string;
   price: string;
   colorLabels: Record<string, string>;
+  /** Garment-length claims the copy makes that the competitor source didn't
+   *  verify (["long"] etc.). Drives the amber length warning in the review so a
+   *  wrong length (the Millie case) is caught before publish. */
+  unverifiedLength?: string[];
 }
 
 const DEFAULT_PRICE_BY_STORE: Record<StoreKey, string> = {

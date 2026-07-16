@@ -51,6 +51,16 @@ export function GeneratedContentCard() {
       } else if (field === "m_title_specs" && res.m_title_specs) {
         patch({ mTitleSpecs: res.m_title_specs });
       }
+      // Keep the length warning honest after a regenerate — if the fresh text no
+      // longer invents a length, the banner clears (and vice versa).
+      if (res.unverified_length && data.contentByStore[store]) {
+        patch({
+          contentByStore: {
+            ...data.contentByStore,
+            [store]: { ...data.contentByStore[store], unverifiedLength: res.unverified_length },
+          },
+        });
+      }
     } catch (e) {
       alert(`Regenerate failed: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
@@ -69,6 +79,23 @@ export function GeneratedContentCard() {
         </span>
       }
     >
+      {(() => {
+        const len = data.contentByStore?.[store]?.unverifiedLength ?? [];
+        if (len.length === 0) return null;
+        const words: Record<string, string> = { long: "long / maxi", midi: "midi / knee-length", short: "short / mini" };
+        return (
+          <div className="mb-4 rounded-[10px] border border-warning/40 bg-warning/10 px-3 py-2.5">
+            <div className="text-[12px] text-text">
+              ⚠ This copy calls it a <strong>{len.map((l) => words[l] ?? l).join(", ")}</strong> dress, but the
+              competitor&apos;s page never states that length.
+            </div>
+            <div className="text-[11px] text-text-dim mt-1 leading-relaxed">
+              A wrong length is a product defect (this is the Millie case). Check the real length and edit the
+              text — or regenerate — before publishing. Sleeve length isn&apos;t counted here.
+            </div>
+          </div>
+        );
+      })()}
       <Field>
         <LabelWithRegenerate
           regenerating={regenerating.description}

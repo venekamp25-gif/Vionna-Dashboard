@@ -324,6 +324,7 @@ export function GenerateStep() {
           cutline,
           price: existingPrice || defaultPriceByStore[store],
           colorLabels,
+          unverifiedLength: gen.unverified_length ?? [],
         };
       }
 
