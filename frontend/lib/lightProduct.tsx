@@ -30,6 +30,15 @@ export interface LightImage {
   value?: string;
 }
 
+/** A researched keyword for one market. Same idea as the fashion flow: real
+ *  Google volume per market, the operator ticks what the copy may use. */
+export interface LightKeyword {
+  keyword: string;
+  volume: number | null;
+  recommended: boolean;
+  selected: boolean;
+}
+
 export interface LightDraft {
   competitorUrl: string;
   /** Competitor title + description, plain text. The ONLY source a spec claim may come from. */
@@ -46,6 +55,8 @@ export interface LightDraft {
   images: LightImage[];
   imagesByValue: Record<string, string[]>;
   selectedStores: LightStore[];
+  /** Researched keywords per market; the ticked ones seed the copy. */
+  keywords: Partial<Record<LightStore, LightKeyword[]>>;
   content: Partial<Record<LightStore, LightContent>>;
   tags: string[];
   kaching: boolean;
@@ -66,6 +77,7 @@ export const EMPTY_DRAFT: LightDraft = {
   images: [],
   imagesByValue: {},
   selectedStores: ["nl"],
+  keywords: {},
   content: {},
   tags: [],
   kaching: true,
@@ -86,6 +98,11 @@ interface Ctx {
    *  render-time draft would drop every market but the last — silently, since
    *  the only symptom is a publish button that stays greyed out. */
   patchContent: (store: LightStore, p: Partial<LightContent>) => void;
+  /** Replace one market's keyword list. Functional for the same reason as
+   *  patchContent: research runs per market in an await-loop. */
+  setKeywords: (store: LightStore, kws: LightKeyword[]) => void;
+  /** Tick/untick one keyword for one market. */
+  toggleKeyword: (store: LightStore, keyword: string) => void;
   reset: () => void;
 }
 
@@ -120,6 +137,19 @@ export function LightProductProvider({ children }: { children: ReactNode }) {
       ...d,
       content: { ...d.content, [store]: { ...(d.content[store] ?? EMPTY_CONTENT), ...p } },
     }));
+  const setKeywords = (store: LightStore, kws: LightKeyword[]) =>
+    setDraft((d) => ({ ...d, keywords: { ...d.keywords, [store]: kws } }));
+  const toggleKeyword = (store: LightStore, keyword: string) =>
+    setDraft((d) => ({
+      ...d,
+      keywords: {
+        ...d.keywords,
+        [store]: (d.keywords[store] ?? []).map((k) =>
+          k.keyword === keyword ? { ...k, selected: !k.selected } : k
+        ),
+      },
+    }));
+
   const reset = () => {
     setDraft(EMPTY_DRAFT);
     try {
@@ -130,7 +160,9 @@ export function LightProductProvider({ children }: { children: ReactNode }) {
   };
 
   return (
-    <LightProductContext.Provider value={{ draft, patch, patchContent, reset }}>
+    <LightProductContext.Provider
+      value={{ draft, patch, patchContent, setKeywords, toggleKeyword, reset }}
+    >
       {children}
     </LightProductContext.Provider>
   );

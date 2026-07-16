@@ -4198,25 +4198,55 @@ def _dfs_headers():
     return {'Authorization': 'Basic ' + tok, 'Content-Type': 'application/json'}
 
 
-def _derive_seeds_llm(competitor_title, product_name, category, description):
-    """Claude → 2-3 local-language search seed phrases per store from the product.
-    Returns {'dk':[...], 'fr':[...], 'fi':[...]}. Falls back to {} on failure."""
+def _derive_seeds_llm(competitor_title, product_name, category, description, stores=None):
+    """Claude → 2-3 local-language search seed phrases per market.
+
+    `stores` defaults to the fashion markets for backwards compatibility. The
+    prompt AND the parsed keys follow the requested markets: this used to be
+    hardcoded to dk/fr/fi with a womenswear framing, so a lighting product got
+    NOTHING back and the caller silently fell through to using the product NAME
+    (a brand like "AMBIENTIFY Bottle") as the search seed — junk, with no error.
+    Returns {market: [seed, ...]}, or {} on failure.
+    """
+    stores = [s for s in (stores or ['dk', 'fr', 'fi']) if s in DFS_LANG_NAME]
+    if not stores:
+        return {}
     if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
         return {}
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        langs = ', '.join(f'{s}={DFS_LANG_NAME[s]}' for s in stores)
+        shape = '{' + ','.join(f'"{s}":[..]' for s in stores) + '}'
+        if _is_light_market(stores[0]):
+            head = (
+                "You are a home-LIGHTING e-commerce SEO researcher. For the lamp below, output 3-4 SHORT, "
+                "BROAD search SEED terms in the LOCAL language of each market — the kind of common terms "
+                "shoppers actually type, that other keywords contain. Use the lamp TYPE and type+ONE "
+                "attribute (room, style or finish), each 1-2 words max. Prefer common single compound "
+                "words where the language uses them.\n"
+                "Colour/finish IS wanted (a lamp is one product, so \"zwarte hanglamp\" is a real search).\n"
+                "NEVER use a technical spec (wattage, lumen, IP rating, kelvin, E27/GU10) unless the "
+                "product info below explicitly states it.\n"
+                "Examples — nl: [\"hanglamp\",\"eettafel lamp\",\"zwarte hanglamp\"]; "
+                "de: [\"pendelleuchte\",\"esstisch lampe\"]; com: [\"pendant light\",\"dining table light\"].\n"
+            )
+        else:
+            head = (
+                "You are a fashion e-commerce SEO researcher. For the product below, output 3-4 SHORT, BROAD "
+                "search SEED terms in the LOCAL language of each market — the kind of common terms shoppers "
+                "actually type, that other keywords contain. Use the garment TYPE and type+ONE attribute, "
+                "each 1-2 words max. Prefer common single compound words where the language uses them.\n"
+                "NEVER use a fabric/material word (cashmere, wool, silk, linen, satin, leather, velvet...) unless the product info below explicitly names that exact material.\n"
+                "NEVER use a garment-length word (long, maxi, midi, mini, short, knee-length) unless the product info below explicitly states that length.\n"
+                "Examples — dk: [\"kjole\",\"sommerkjole\",\"blomsterkjole\"]; fr: [\"robe\",\"robe été\",\"robe fleurie\"]; "
+                "fi: [\"mekko\",\"kesämekko\",\"kukkamekko\"].\n"
+            )
         prompt = (
-            "You are a fashion e-commerce SEO researcher. For the product below, output 3-4 SHORT, BROAD "
-            "search SEED terms in the LOCAL language of each market — the kind of common terms shoppers "
-            "actually type, that other keywords contain. Use the garment TYPE and type+ONE attribute, "
-            "each 1-2 words max. Prefer common single compound words where the language uses them.\n"
-            "NEVER use a fabric/material word (cashmere, wool, silk, linen, satin, leather, velvet...) unless the product info below explicitly names that exact material.\n"
-            "Examples — dk: [\"kjole\",\"sommerkjole\",\"blomsterkjole\"]; fr: [\"robe\",\"robe été\",\"robe fleurie\"]; "
-            "fi: [\"mekko\",\"kesämekko\",\"kukkamekko\"].\n"
-            "Return ONLY compact JSON: {\"dk\":[..],\"fr\":[..],\"fi\":[..]} (dk=Danish, fr=French, fi=Finnish).\n\n"
-            f"Product name: {product_name}\nCompetitor title: {competitor_title}\n"
-            f"Category: {category}\nDescription: {(description or '')[:500]}\n"
+            head
+            + f"Return ONLY compact JSON: {shape} ({langs}).\n\n"
+            + f"Product name: {product_name}\nCompetitor title: {competitor_title}\n"
+            + f"Category: {category}\nDescription: {(description or '')[:500]}\n"
         )
         msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=300,
                                      messages=[{'role': 'user', 'content': prompt}])
@@ -4225,7 +4255,7 @@ def _derive_seeds_llm(competitor_title, product_name, category, description):
         m = re.search(r'\{.*\}', txt, re.S)
         data = json.loads(m.group(0)) if m else {}
         out = {}
-        for st in ('dk', 'fr', 'fi'):
+        for st in stores:
             v = data.get(st) or []
             out[st] = [str(s).strip() for s in v if str(s).strip()][:3]
         return out
@@ -4920,7 +4950,8 @@ def api_research_keywords():
     body = request.get_json(silent=True) or {}
     stores = body.get('stores') or ['dk', 'fr', 'fi']
     seeds = _derive_seeds_llm(body.get('competitor_title', ''), body.get('product_name', ''),
-                              body.get('category', ''), body.get('description', ''))
+                              body.get('category', ''), body.get('description', ''),
+                              stores=stores)
     if not _dfs_configured():
         out = {'configured': False, 'seeds': seeds,
                'message': 'DataForSEO not configured — set DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD env vars. '
@@ -4939,7 +4970,13 @@ def api_research_keywords():
     for st in stores:
         if st not in DFS_LOCATION:
             continue
-        st_seeds = seeds.get(st) or ([body.get('product_name')] if body.get('product_name') else [])
+        st_seeds = seeds.get(st) or []
+        if not st_seeds:
+            # Laatste redmiddel. De productnaam is een MERKnaam ('AMBIENTIFY Bottle',
+            # 'Millie') en dus een slechte zoekterm — zeg het, val er niet stil op terug.
+            st_seeds = [body.get('product_name')] if body.get('product_name') else []
+            print(f'[keywords] no seeds derived for {st!r} — falling back to the product '
+                  f'name, which is a brand and will research poorly')
         # import = relevance-first: on-topic suggestions per seed, moderate scaled
         # floor (¼ of the niche threshold), then dedup variants + rank by volume.
         mv = int(body.get('min_volume') or max(150, DFS_MIN_VOLUME.get(st, 1000) // 4))

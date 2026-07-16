@@ -62,7 +62,7 @@ function Section({
 }
 
 export function HomeDecorWorkbench() {
-  const { draft, patch, patchContent, reset } = useLightProduct();
+  const { draft, patch, patchContent, setKeywords, toggleKeyword, reset } = useLightProduct();
   const [status, setStatus] = useState<LightStatusResponse | null>(null);
   const [scraping, setScraping] = useState(false);
   const [scrapeError, setScrapeError] = useState<string | null>(null);
@@ -70,6 +70,8 @@ export function HomeDecorWorkbench() {
   const [publishing, setPublishing] = useState(false);
   const [results, setResults] = useState<Record<string, LightPublishResult> | null>(null);
   const [researchMarket, setResearchMarket] = useState<LightStore>("nl");
+  const [kwLoading, setKwLoading] = useState(false);
+  const [kwNote, setKwNote] = useState<string | null>(null);
 
   useEffect(() => {
     lightingApi.status().then(setStatus).catch(() => setStatus(null));
@@ -146,7 +148,52 @@ export function HomeDecorWorkbench() {
     }
   };
 
-  // ── Step 2: copy per market ───────────────────────────────────────────────
+  // ── Step 2a: keyword research per market ──────────────────────────────────
+  /** Real Google search volume per market, same engine as the fashion flow. The
+   *  seeds are derived from the product itself — never the product NAME, which
+   *  is a brand ("AMBIENTIFY Bottle") and researches badly. */
+  const researchKeywords = async () => {
+    if (!draft.sourceText || kwLoading || draft.selectedStores.length === 0) return;
+    setKwLoading(true);
+    setKwNote(null);
+    try {
+      const r = await api.researchKeywords({
+        stores: draft.selectedStores,
+        product_name: draft.productName,
+        competitor_title: draft.competitorTitle,
+        description: draft.sourceText,
+      });
+      if (!r.configured) {
+        setKwNote(r.message || "Keyword research isn't switched on for this server yet.");
+        return;
+      }
+      let found = 0;
+      for (const s of draft.selectedStores) {
+        const kws = (r.results?.[s]?.keywords ?? [])
+          .filter((k) => k.keyword)
+          .map((k) => ({
+            keyword: k.keyword,
+            volume: k.volume ?? null,
+            recommended: !!k.recommended,
+            // Pre-tick what the engine recommends; the operator adjusts.
+            selected: !!k.recommended,
+          }));
+        found += kws.length;
+        setKeywords(s, kws);
+      }
+      if (found === 0) {
+        setKwNote(
+          "No keywords came back — usually the search volume for this lamp type is below the threshold, not that there's no demand."
+        );
+      }
+    } catch (e) {
+      setKwNote(e instanceof Error ? e.message : String(e));
+    } finally {
+      setKwLoading(false);
+    }
+  };
+
+  // ── Step 2b: copy per market ──────────────────────────────────────────────
   const generateFor = async (store: LightStore) => {
     if (!draft.sourceText) return;
     setGenerating(store);
@@ -156,6 +203,7 @@ export function HomeDecorWorkbench() {
         product_name: draft.productName,
         product_title: draft.competitorTitle,
         source_text: draft.sourceText,
+        keywords: (draft.keywords[store] ?? []).filter((k) => k.selected).map((k) => k.keyword),
       });
       if (r.error) throw new Error(r.error);
       const c: LightContent = {
@@ -463,7 +511,7 @@ export function HomeDecorWorkbench() {
             step={2}
             done={haveCopy}
             title="Write the copy"
-            hint="Each market gets its own text in its own language. Colour and finish are welcome here — a lamp is one product, so “zwarte hanglamp” is a keyword, not a problem."
+            hint="Each market gets its own text in its own language. Find the keywords first if you want the copy built around what people actually search for. Colour and finish are welcome here — a lamp is one product, so “zwarte hanglamp” is a keyword, not a problem."
           >
             <div className="flex flex-wrap items-center gap-2 mb-4">
               {STORES.map((s) => {
@@ -491,6 +539,14 @@ export function HomeDecorWorkbench() {
               })}
               <span className="flex-1" />
               <button
+                onClick={researchKeywords}
+                disabled={kwLoading || !!generating || draft.selectedStores.length === 0}
+                className="px-3 h-8 rounded-[10px] border border-border text-[12px] text-text-dim hover:border-accent hover:text-accent disabled:opacity-40 transition"
+                title="Find what people actually search for this lamp type, per market"
+              >
+                {kwLoading ? "Researching…" : "🔍 Find keywords"}
+              </button>
+              <button
                 onClick={generateAll}
                 disabled={!!generating || draft.selectedStores.length === 0}
                 className="px-3 h-8 rounded-[10px] bg-accent text-on-accent text-[12px] font-medium disabled:opacity-40 hover:opacity-90 transition"
@@ -498,6 +554,55 @@ export function HomeDecorWorkbench() {
                 {generating ? `Writing ${LIGHT_STORE_CONFIG[generating].label}…` : "Generate copy"}
               </button>
             </div>
+
+            {kwNote && <p className="text-[11.5px] text-text-dim mb-3">{kwNote}</p>}
+
+            {/* Keyword picker per market — ticked ones seed the copy */}
+            {draft.selectedStores.some((s) => (draft.keywords[s] ?? []).length > 0) && (
+              <div className="rounded-xl border border-border bg-bg-elev-2 p-4 mb-4">
+                <p className="text-[11.5px] text-text-dim mb-3 leading-relaxed">
+                  Real monthly searches per market. Ticked keywords are woven into the copy — starred
+                  ones are the engine&apos;s pick. Colour and finish are fair game here (&ldquo;zwarte
+                  hanglamp&rdquo; is a real search); specs the source never states are not.
+                </p>
+                <div className="space-y-3">
+                  {draft.selectedStores.map((s) => {
+                    const kws = draft.keywords[s] ?? [];
+                    if (kws.length === 0) return null;
+                    const picked = kws.filter((k) => k.selected).length;
+                    return (
+                      <div key={s}>
+                        <div className="text-[11px] text-text-faint mb-1.5">
+                          {LIGHT_STORE_CONFIG[s].flag} {LIGHT_STORE_CONFIG[s].label} · {picked} of {kws.length} selected
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {kws.map((k) => (
+                            <button
+                              key={k.keyword}
+                              onClick={() => toggleKeyword(s, k.keyword)}
+                              className={`px-2 py-1 rounded-lg border text-[11.5px] transition ${
+                                k.selected
+                                  ? "border-accent bg-accent/10 text-accent"
+                                  : "border-border text-text-dim hover:border-border-hover"
+                              }`}
+                              title={k.volume != null ? `${k.volume.toLocaleString("en-US")} searches/month` : "volume unknown"}
+                            >
+                              {k.recommended && <span className="mr-1">★</span>}
+                              {k.keyword}
+                              {k.volume != null && (
+                                <span className="ml-1.5 text-text-faint tabular-nums">
+                                  {k.volume.toLocaleString("en-US")}
+                                </span>
+                              )}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
 
             {allClaims.length > 0 && (
               <div className="rounded-xl border border-danger/40 bg-danger/10 p-3 mb-4">

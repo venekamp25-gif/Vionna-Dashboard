@@ -444,7 +444,10 @@ export const api = {
    *  store. DORMANT until DATAFORSEO_LOGIN/PASSWORD are set on the server →
    *  returns { configured: false } and callers keep the manual/legacy keywords. */
   researchKeywords: (params: {
-    stores: ("dk" | "fr" | "fi")[];
+    /** Fashion markets (dk/fr/fi) or Home Decor markets (nl/de/com). The backend
+     *  branches the seed + cleaner prompts on the market's vertical — mixing the
+     *  two in one call would frame lamps as womenswear. */
+    stores: ("dk" | "fr" | "fi" | LightStore)[];
     product_name: string;
     competitor_title: string;
     category?: string;
@@ -455,10 +458,10 @@ export const api = {
     call<{
       configured: boolean;
       message?: string;
-      seeds?: Partial<Record<"dk" | "fr" | "fi", string[]>>;
+      seeds?: Partial<Record<"dk" | "fr" | "fi" | LightStore, string[]>>;
       results?: Partial<
         Record<
-          "dk" | "fr" | "fi",
+          "dk" | "fr" | "fi" | LightStore,
           {
             seeds: string[];
             min_volume?: number;
