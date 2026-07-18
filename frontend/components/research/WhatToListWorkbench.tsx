@@ -142,7 +142,7 @@ export function WhatToListWorkbench() {
   const [storeSort, setStoreSort] = useState<"score" | "new" | "stale">("score");
   const [hideEmpty, setHideEmpty] = useState(false);
   const [hideMarked, setHideMarked] = useState(false);
-  const [onlyDropshippers, setOnlyDropshippers] = useState(false);
+  const [onlyDropshippers, setOnlyDropshippers] = useState(true);
   const [trafficRefreshing, setTrafficRefreshing] = useState(false);
   const [discovering, setDiscovering] = useState(false);
   const [discoverMsg, setDiscoverMsg] = useState<string | null>(null);
