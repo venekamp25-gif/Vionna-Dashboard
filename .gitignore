@@ -69,3 +69,6 @@ known_sources.json
 backend/known_sources.json
 size_chart_fill.json
 backend/size_chart_fill.json
+
+wtl_discover_seen.json
+backend/wtl_discover_seen.json

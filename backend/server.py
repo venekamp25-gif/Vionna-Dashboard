@@ -180,7 +180,8 @@ def _run_backup():
                       'blog_performance.jsonl', 'blog_views.json', 'blog_playbook.json',
                       'bs_snapshots.jsonl', 'known_sources.json', 'blocked_sources.json',
                       'wtl_verdicts.json', 'wtl_traffic.json', 'size_chart_fill.json',
-                      'wtl_store_marks.json', 'wtl_extra_stores.json'):
+                      'wtl_store_marks.json', 'wtl_extra_stores.json',
+                      'wtl_discover_seen.json', 'wtl_discover_state.json'):
             src = os.path.join(_BASE_DIR, fname)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dest, fname))
@@ -9469,10 +9470,34 @@ def api_wtl_stores_opened():
 # homepage language) → womens-bestseller check (_bs_scan) → market-size gate
 # (revenue bar + visitor floor, market-scaled) → passers land in the extra-stores
 # list + traffic cache, so they appear in the stores tab immediately.
+# Zoekopdrachten die DROPSHIPPERS opleveren i.p.v. merken (2026-07-18).
+# De oude set ('kjole "gratis fragt" shop') is een gewone consumenten-zoekopdracht:
+# pagina 1 daarvan IS Zalando/Boozt/Nelly. We zoeken nu op wat een dropship-winkel
+# WEL heeft en een merk niet:
+#   * cdn.shopify.com in de broncode  -> het is gegarandeerd Shopify
+#   * lange levertijden ("7-14 dage") -> vanuit China, geen eigen voorraad
+#   * "Powered by Shopify"-footer      -> standaardthema, niet aangepast door een merk
+# Elke vorm staat er twee keer (met en zonder inurl:), want Google geeft op
+# gestapelde operators soms 0 rijen terug.
 _GD_QUERIES = {
-    'dk': ['kjole "gratis fragt" shop', 'dame kjoler online shop tilbud'],
-    'fr': ['robe "livraison gratuite" boutique', 'robe femme boutique en ligne promo'],
-    'fi': ['mekko "ilmainen toimitus" verkkokauppa', 'naisten mekot verkkokauppa tarjous'],
+    'dk': ['kjole "cdn.shopify.com" inurl:products site:.dk',
+           'kjole "cdn.shopify.com" site:.dk',
+           'dame tøj "cdn.shopify.com" inurl:collections site:.dk',
+           '"levering 7-14 dage" tøj shop',
+           '"drevet af Shopify" dame kjoler',
+           'kjole dame "gratis fragt" site:.shop OR site:.store'],
+    'fr': ['robe "cdn.shopify.com" inurl:products site:.fr',
+           'robe "cdn.shopify.com" site:.fr',
+           'vêtements femme "cdn.shopify.com" inurl:collections site:.fr',
+           '"livraison 7 à 14 jours" vêtements boutique',
+           '"propulsé par Shopify" robe femme',
+           'robe femme "livraison gratuite" site:.shop OR site:.store'],
+    'fi': ['mekko "cdn.shopify.com" inurl:products site:.fi',
+           'mekko "cdn.shopify.com" site:.fi',
+           'naisten vaatteet "cdn.shopify.com" inurl:collections site:.fi',
+           '"toimitusaika 7-14" vaatteet verkkokauppa',
+           '"Shopify-alusta" naisten mekot',
+           'naisten mekko "ilmainen toimitus" site:.shop OR site:.store'],
 }
 _GD_MARKET_TLDS = {'dk': ('.dk',), 'fr': ('.fr', '.be'), 'fi': ('.fi',)}
 _GD_MARKET_LANGS = {'dk': ('da', 'dk'), 'fr': ('fr',), 'fi': ('fi',)}
@@ -9487,8 +9512,72 @@ _GD_RETAILERS = ('karwei', 'gamma', 'praxis', 'bonprix', 'azazie', 'whatnot', 'n
                  'aldi', 'otto.', 'veepee', 'vinted', 'boozt', 'asos', 'ellos', 'nelly',
                  'zara', 'mango', 'only', 'veromoda', 'cellbes', 'bubbleroom')
 _GD_MIN_WOMENS = 5     # fewer bestsellers = not a womens-fashion store
-_GD_MAX_NEW = 6        # cap on new stores added per market per run
+_GD_MAX_NEW = 12       # cap on new stores added per market per run (was 6)
+
+# TOELATING tot de lijst is iets anders dan GESCHIKT als bron.
+# De sourcing-drempels (TRAFFIC_THRESHOLD_EUR/TRAFFIC_MIN_VISITS, het doc-minimum)
+# eisen DK 77k / FI 73k / FR 231k bezoekers per maand — in een land van 5,9 miljoen
+# is dat per definitie een gevestigd MERK. Die lat als toegangspoort gebruiken
+# filterde dus precies de dropshippers weg die we zoeken (bug #22).
+# Discovery krijgt daarom eigen, lage drempels; de sourcing-funnel houdt de zijne.
+GD_MIN_VISITS = 8_000            # genoeg om 'levend' te zijn, niet 'gevestigd'
+GD_MIN_EST_EUR = 40_000          # idem voor de omzetschatting
+# SimilarWeb geeft total_visits 0 voor élke host zonder profiel — precies de jonge
+# dropshipper. Zo'n store afwijzen op ontbrekende data is de fout omgekeerd maken.
+GD_ALLOW_UNKNOWN_TRAFFIC = True
 WTL_DISCOVER_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wtl_discover_state.json')
+# Al beoordeelde kandidaten. Zonder dit bevraagt elke run dezelfde ~30 dode
+# domeinen opnieuw (traag) en verbrandt hij zijn budget op oud nieuws i.p.v.
+# echt nieuwe winkels (bug #21: "not showing any new stores").
+WTL_DISCOVER_SEEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      'wtl_discover_seen.json')
+# Per afwijsreden hoe lang we het onthouden. Een niet-Shopify-winkel wordt dat
+# niet snel; te weinig bestsellers kan over 2 weken anders zijn.
+_GD_SEEN_TTL_DAYS = {'geen Shopify': 30, 'niet lokaal': 90, 'te weinig bestsellers': 14,
+                     'onder de marktgrootte-lat': 14, 'merk/eigen voorraad': 60}
+_GD_SEEN_DEFAULT_TTL = 14
+
+
+def _gd_seen_load():
+    try:
+        with open(WTL_DISCOVER_SEEN_PATH, encoding='utf-8') as f:
+            return json.load(f) or {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f'[wtl-disc] seen load failed: {e}')
+        return {}
+
+
+def _gd_seen_save(data):
+    try:
+        tmp = WTL_DISCOVER_SEEN_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, WTL_DISCOVER_SEEN_PATH)
+    except Exception as e:
+        print(f'[wtl-disc] seen save failed: {e}')
+
+
+def _gd_remember(seen, domain, market, reason):
+    """Noteer waarom een kandidaat afviel, zodat de volgende run 'm overslaat."""
+    seen[domain] = {'reason': str(reason)[:80], 'market': market,
+                    'ts': datetime.datetime.utcnow().isoformat() + 'Z'}
+
+
+def _gd_seen_fresh(seen, domain):
+    """Is dit domein recent genoeg afgewezen om over te slaan?"""
+    e = seen.get(domain)
+    if not e:
+        return False
+    reason = str(e.get('reason') or '')
+    ttl = next((v for k, v in _GD_SEEN_TTL_DAYS.items() if k in reason), _GD_SEEN_DEFAULT_TTL)
+    try:
+        age = (datetime.datetime.utcnow()
+               - datetime.datetime.fromisoformat(str(e.get('ts', '')).rstrip('Z'))).days
+        return age < ttl
+    except Exception:
+        return False
 
 
 _DOC_MIN_KW_VOLUME = 20_000   # DOC-MINIMUM ("2. Product Research DSA.pdf" stap 1):
@@ -9551,7 +9640,7 @@ def _gd_google(queries_by_market):
             r = req.post('https://api.apify.com/v2/acts/apify~google-search-scraper/runs',
                          params={'token': token},
                          json={'queries': '\n'.join(queries), 'resultsPerPage': 30,
-                               'maxPagesPerQuery': 1, 'countryCode': m}, timeout=30)
+                               'maxPagesPerQuery': 2, 'countryCode': m}, timeout=30)
             if r.status_code not in (200, 201):
                 print(f'[wtl-disc] google run {m} start failed: {r.status_code}')
                 continue
@@ -9581,7 +9670,7 @@ def _gd_google(queries_by_market):
     return out
 
 
-def _wtl_discover(markets, jid=None):
+def _wtl_discover(markets, jid=None, ignore_seen=False):
     """Run the discovery pipeline for the given markets; passers are added to the
     extra-stores list (+ traffic cache) and show up in the stores tab immediately."""
     import statistics
@@ -9589,11 +9678,12 @@ def _wtl_discover(markets, jid=None):
     if not markets:
         return {'error': 'geen geldige markten'}
     known = _wtl_all_domains() | _load_blocked_sources()
+    seen = {} if ignore_seen else _gd_seen_load()
     queries = {}
     for m in markets:
         qs = list(_GD_QUERIES[m])
         qs += [t for t in _gd_wtl_terms(m) if t not in qs]
-        queries[m] = qs[:6]
+        queries[m] = qs[:12]      # was 6 — de trechter begon te smal
     if jid:
         _job_set(jid, phase='Google doorzoeken', total=None)
     results = _gd_google(queries)
@@ -9604,6 +9694,8 @@ def _wtl_discover(markets, jid=None):
         if (not d or d in known or d in cand
                 or any(s in d for s in _GD_SKIP) or any(s in d for s in _GD_RETAILERS)):
             continue
+        if _gd_seen_fresh(seen, d):
+            continue          # recent al beoordeeld — niet opnieuw bevragen
         cand[d] = (m, term)
     print(f'[wtl-disc] {len(results)} results -> {len(cand)} unknown candidates')
 
@@ -9617,21 +9709,25 @@ def _wtl_discover(markets, jid=None):
         if per_market >= _GD_MAX_NEW * 3:
             continue
         if not _gd_is_shopify(d):
+            _gd_remember(seen, d, m, 'geen Shopify')
             skipped.append({'domain': d, 'market': m, 'reason': 'geen Shopify'})
             continue
         if not _gd_is_local(d, m):
+            _gd_remember(seen, d, m, 'niet lokaal')
             skipped.append({'domain': d, 'market': m, 'reason': f'niet lokaal voor {m.upper()}'})
             continue
-        payload, blocked = _bs_scan(d)
+        # gecachet: een herhaalde run mag dezelfde winkel niet opnieuw scannen
+        payload, blocked = _bs_scan_cached(d)
         n = len((payload or {}).get('products') or [])
         if blocked or n < _GD_MIN_WOMENS:
+            _gd_remember(seen, d, m, blocked or 'te weinig bestsellers')
             skipped.append({'domain': d, 'market': m,
                             'reason': blocked or f'maar {n} vrouwenmode-bestsellers'})
             continue
         scanned[d] = (m, term, payload)
     print(f'[wtl-disc] {len(scanned)} local Shopify womens stores found')
 
-    added, gated = [], []
+    added, gated, rejected = [], [], []
     if scanned:
         if jid:
             _job_set(jid, phase='SimilarWeb marktgrootte-gate')
@@ -9649,18 +9745,43 @@ def _wtl_discover(markets, jid=None):
                       TRAFFIC_AOV_CAP) * TRAFFIC_BASKET
             est = visits * TRAFFIC_CONV * aov
             ratio = min(1.0, (_TRAFFIC_POP_M.get(m) or _TRAFFIC_ANCHOR_POP_M) / _TRAFFIC_ANCHOR_POP_M)
-            bar, floor = TRAFFIC_THRESHOLD_EUR * ratio, TRAFFIC_MIN_VISITS * ratio
-            ok = est >= bar and visits >= floor
+            # Discovery-drempels, NIET de sourcing-lat (zie GD_MIN_* hierboven).
+            bar, floor = GD_MIN_EST_EUR * ratio, GD_MIN_VISITS * ratio
+            unknown_traffic = visits == 0
+            ok = (est >= bar and visits >= floor) or (unknown_traffic and GD_ALLOW_UNKNOWN_TRAFFIC)
             row = {'domain': d, 'market': m, 'term': term, 'visits': visits,
                    'est_eur': round(est), 'bar_eur': round(bar), 'floor': round(floor),
+                   'traffic_unknown': unknown_traffic,
                    'bestsellers': len(payload['products'])}
-            if ok and per_market_added.get(m, 0) < _GD_MAX_NEW:
-                if d not in extra:
-                    extra.append(d)
-                per_market_added[m] = per_market_added.get(m, 0) + 1
-                added.append(row)
-            else:
-                gated.append({**row, 'reason': 'onder de marktgrootte-lat' if not ok else 'cap bereikt'})
+            if not ok:
+                _gd_remember(seen, d, m, 'onder de marktgrootte-lat')
+                gated.append({**row, 'reason': 'onder de marktgrootte-lat'})
+                continue
+            if per_market_added.get(m, 0) >= _GD_MAX_NEW:
+                gated.append({**row, 'reason': 'cap bereikt'})   # NIET onthouden: volgende run mag
+                continue
+            # ── DROPSHIP-POORT ──────────────────────────────────────────────
+            # Dit stond vroeger NA het toevoegen en was dus alleen een etiketje;
+            # er hield nooit iets een merk tegen (bug #22). Nu beslist het.
+            verdict = _wtl_classify_store(d)
+            label = (verdict or {}).get('label')
+            if label in ('Eigen voorraad', 'Mogelijk eigen merk'):
+                # Uitzondering (regel designbysi, 2026-07-13): snel leveren
+                # diskwalificeert niet als de producten uit de leverancierscatalogus
+                # komen — dat zie je aan overlap met andere bekende winkels.
+                overlap, _of = _wtl_catalog_overlap(d)
+                if overlap < 2:
+                    _gd_remember(seen, d, m, 'merk/eigen voorraad')
+                    rejected.append({**row, 'verdict': label,
+                                     'detail': (verdict or {}).get('detail'),
+                                     'reason': f'{label} — geen dropshipper'})
+                    continue
+                row['overlap_matches'] = overlap
+            row['verdict'] = verdict
+            if d not in extra:
+                extra.append(d)
+            per_market_added[m] = per_market_added.get(m, 0) + 1
+            added.append(row)
         try:
             tmp = WTL_EXTRA_STORES_PATH + '.tmp'
             with open(tmp, 'w', encoding='utf-8') as f:
@@ -9669,19 +9790,25 @@ def _wtl_discover(markets, jid=None):
         except Exception as e:
             print(f'[wtl-disc] extra-stores save failed: {e}')
 
-    # dropship-verdict for the newly added stores right away (few, worth the wait)
-    if added:
-        if jid:
-            _job_set(jid, phase='Verzendbeleid nieuwe stores checken')
-        try:
-            vres = _wtl_classify_missing([a['domain'] for a in added], cap=len(added))
-            for a in added:
-                a['verdict'] = (vres.get('verdicts') or {}).get(a['domain'].replace('www.', ''))
-        except Exception as e:
-            print(f'[wtl-disc] verdicts failed: {e}')
+    # (Het verdict is al bij de poort bepaald — geen tweede ronde nodig.)
+    _gd_seen_save(seen)
+
+    # Waarom vond deze run weinig? De medewerker moet dat kunnen ZIEN, anders
+    # blijft 'er gebeurt niks' het enige signaal (bugs #21/#22).
+    why = []
+    if not cand:
+        why.append('alle zoekresultaten waren al bekend of eerder beoordeeld — '
+                   'probeer "opnieuw beoordelen" om het geheugen te negeren')
+    if rejected:
+        why.append(f'{len(rejected)} winkel(s) afgewezen: geen dropshipper (merk/eigen voorraad)')
+    if gated:
+        why.append(f'{len(gated)} winkel(s) onder de lat of over de cap')
+    if skipped:
+        why.append(f'{len(skipped)} kandidaat viel af op Shopify/land/te weinig damesmode')
 
     return {'markets': markets, 'candidates': len(cand), 'scanned': len(scanned),
-            'added': added, 'gated': gated, 'skipped': skipped[:40]}
+            'added': added, 'gated': gated, 'rejected': rejected,
+            'skipped': skipped[:40], 'why': why}
 
 
 @app.route('/api/wtl_discover', methods=['POST'])
@@ -9692,15 +9819,19 @@ def api_wtl_discover():
         return jsonify({'error': 'APIFY_TOKEN not configured on the server'}), 400
     body = request.get_json(silent=True) or {}
     markets = [str(m).lower() for m in (body.get('markets') or ['dk', 'fr', 'fi'])]
+    # 'opnieuw beoordelen': negeer het geheugen van eerder afgewezen kandidaten.
+    ignore_seen = bool(body.get('ignore_seen'))
     jid = _job_new('wtl_discover', 'wtl')
 
     def _runner():
         try:
-            res = _wtl_discover(markets, jid=jid)
+            res = _wtl_discover(markets, jid=jid, ignore_seen=ignore_seen)
             _job_set(jid, status='done', result=res,
                      finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
-            _job_summary(jid, f"{len(res.get('added') or [])} nieuwe store(s) toegevoegd, "
-                              f"{len(res.get('gated') or [])} onder de lat")
+            n_add, n_rej = len(res.get('added') or []), len(res.get('rejected') or [])
+            _job_summary(jid, f"{n_add} dropshipper(s) toegevoegd"
+                              + (f", {n_rej} merk/eigen-voorraad afgewezen" if n_rej else "")
+                              + (f" — {res['why'][0]}" if n_add == 0 and res.get('why') else ""))
         except Exception as e:
             _job_error(jid, str(e))
             _job_set(jid, status='error', finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
