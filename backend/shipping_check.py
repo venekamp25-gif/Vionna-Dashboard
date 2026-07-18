@@ -66,25 +66,37 @@ POLICY_PATHS = (
     "/pages/lieferzeit",
     "/pages/conditions-livraison",
     "/pages/livraison-et-retours",
+    # Fins
+    "/pages/toimitus",
+    "/pages/toimitusehdot",
+    "/pages/toimitus-ja-palautus",
+    "/pages/toimitustavat",
+    "/pages/usein-kysytyt-kysymykset",
 )
 
 _SHIPPING_WORDS = ("verzend", "shipping", "delivery", "levering", "livraison",
-                   "versand", "fragt", "leverans", "lieferzeit", "leveringstid")
+                   "versand", "fragt", "leverans", "lieferzeit", "leveringstid",
+                   # Fins ontbrak volledig -> elke FI-winkel gaf 'Onbekend'.
+                   # 'toimitus' dekt toimitusaika/toimitustavat/toimituskulut.
+                   "toimitus", "lähetys")
 
 _URL_SHIPPING_HINTS = ("shipping", "verzend", "deliver", "lever", "fragt", "leverans",
-                       "livraison", "versand", "expedition", "expédition")
+                       "livraison", "versand", "expedition", "expédition",
+                       "toimitus", "lahetys")
 
 SHIPPING_CONTEXT_NEAR = (
     "shipping", "delivery", "verzend", "levering", "leveranstid", "leveringstid",
     "fragt", "frakt", "leverans", "lieferzeit", "livraison", "versand",
     "verzendtijd", "levertijd", "verzendbeleid", "deliver", "arrive", "bezorg",
+    "toimitus", "toimitusaika", "lähetys",
 )
 
 # Return/warranty words that must NOT be near a number we treat as delivery time
 _RETURN_NEG = ("retour", "return", "refund", "garantie", "guarantee", "warranty",
                "tilbagebetaling", "terugbetaling", "remboursement", "rückgabe",
                "widerruf", "ångerrätt", "retur", "money back", "money-back",
-               "exchange", "ruilen", "umtausch", "échange")
+               "exchange", "ruilen", "umtausch", "échange",
+               "palautus", "palautusoikeus", "peruutus", "hyvitys")
 
 # Processing-context words: a duration sitting next to one of these inside a
 # delivery section is the order-processing time, not the transit time — skip it
@@ -107,12 +119,19 @@ _NOISE_NEG = (
 )
 
 # ── Duration parsing (idea 1+4: unit-aware — biz days / calendar days / weeks / hours) ──
-_WEEK = r"weken|weke|weeks|week|wochen|woche|semaines|semaine|veckor|vecka|uger|uge|uke"
-_HOUR = r"uren|uur|hours|hour|stunden|stunde|heures|heure|timmar|timer|timen"
+_WEEK = (r"weken|weke|weeks|week|wochen|woche|semaines|semaine|veckor|vecka|uger|uge|uke|"
+         r"viikkoa|viikkoon|viikon|viikkoa|viikko")
+_HOUR = (r"uren|uur|hours|hour|stunden|stunde|heures|heure|timmar|timer|timen|"
+         r"tuntia|tunnin|tunti")
 _DAY  = (r"werkdagen|werkdage|werktagen|werktage|vardagar|arbetsdagar|arbejdsdage|"
          r"hverdage|hverdager|jours\s*ouvr\w*|business\s*days|werkdag|"
+         # Fins: arkipäivä/työpäivä = WERKdag, dus vóór het kale 'päivä' zetten —
+         # regex-alternatieven gaan van links naar rechts.
+         r"arkipäivää|arkipäivän|arkipäivä|arkipäiviä|"
+         r"työpäivää|työpäivän|työpäivä|"
+         r"päivää|päivän|päiviä|päivä|"
          r"dagen|dagar|dage|tage|jours|jour|days|day|dag")
-_SEP = r"(?:[-–—]|t/m|tot\s+en\s+met|tot|to|till|bis)"  # no bare '/' (kills "24/7 days")
+_SEP = r"(?:[-–—]|t/m|tot\s+en\s+met|tot|to|till|bis|à|jusqu'à)"  # no bare '/' (kills "24/7 days")
 _DUR_RE = re.compile(
     rf"(\d{{1,2}})(?:\s*{_SEP}\s*(\d{{1,2}}))?\s*(?P<unit>{_WEEK}|{_HOUR}|{_DAY})",
     re.IGNORECASE,
@@ -627,9 +646,9 @@ _BRAND_LINK_SIGNALS = (
 )
 _BRAND_TEXT_SIGNALS = (
     (r"design(?:ed)?\s+in[\-\s]?house|our design team|eigen ontwerp|our atelier", "in-house designs"),
-    (r"visit (?:one of )?our stores?|in onze winkel", "own stores"),
+    (r"visit (?:one of )?our stores?\b|in onze winkel", "own stores"),
     (r"become a (?:stockist|retailer)|wholesale (?:portal|inquir|application)", "wholesale program"),
-    (r"as seen in|featured in", "press features"),
+    (r"as seen in\b|featured in\b", "press features"),
     (r"founded in (?:19|20)\d\d|est\.?\s?(?:19|20)\d\d|opgericht in (?:19|20)\d\d", "established year"),
 )
 
