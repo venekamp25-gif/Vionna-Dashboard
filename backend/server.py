@@ -9498,8 +9498,14 @@ _GD_TELLS = {
            '"gratis fragt" tilbud', '"14 dages returret" shop'],
     'fr': ['"cdn.shopify.com"', '"propulsé par Shopify"', '"livraison 7 à 14 jours"',
            '"livraison gratuite" promo', '"satisfait ou remboursé" boutique'],
-    'fi': ['"cdn.shopify.com"', '"Shopify-alusta"', '"toimitusaika 7-14"',
-           '"ilmainen toimitus" tarjous', '"14 päivän palautusoikeus" verkkokauppa'],
+    # GEVERIFIEERD 2026-07-18 op echte Finse Shopify-winkels (kekale.fi,
+    # artforheart.fi): "Shopify-alusta" en "toimitusaika 7-14" staan er NERGENS —
+    # dat waren gokjes, en FI leverde daardoor 0 van de 120 kandidaten op. Wat er
+    # wél staat: toimitus/toimituskulut/ilmainen toimitus. Plus twee kale
+    # winkelzoekopdrachten: Google indexeert 'cdn.shopify.com' in beeld-URL's
+    # slecht, dus laat de Shopify-CHECK het filterwerk doen i.p.v. de zoekopdracht.
+    'fi': ['"cdn.shopify.com"', '"ilmainen toimitus" verkkokauppa',
+           '"toimituskulut" verkkokauppa', 'verkkokauppa', 'netistä'],
 }
 
 
