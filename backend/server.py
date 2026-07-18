@@ -9479,26 +9479,53 @@ def api_wtl_stores_opened():
 #   * "Powered by Shopify"-footer      -> standaardthema, niet aangepast door een merk
 # Elke vorm staat er twee keer (met en zonder inurl:), want Google geeft op
 # gestapelde operators soms 0 rijen terug.
-_GD_QUERIES = {
-    'dk': ['kjole "cdn.shopify.com" inurl:products site:.dk',
-           'kjole "cdn.shopify.com" site:.dk',
-           'dame tøj "cdn.shopify.com" inurl:collections site:.dk',
-           '"levering 7-14 dage" tøj shop',
-           '"drevet af Shopify" dame kjoler',
-           'kjole dame "gratis fragt" site:.shop OR site:.store'],
-    'fr': ['robe "cdn.shopify.com" inurl:products site:.fr',
-           'robe "cdn.shopify.com" site:.fr',
-           'vêtements femme "cdn.shopify.com" inurl:collections site:.fr',
-           '"livraison 7 à 14 jours" vêtements boutique',
-           '"propulsé par Shopify" robe femme',
-           'robe femme "livraison gratuite" site:.shop OR site:.store'],
-    'fi': ['mekko "cdn.shopify.com" inurl:products site:.fi',
-           'mekko "cdn.shopify.com" site:.fi',
-           'naisten vaatteet "cdn.shopify.com" inurl:collections site:.fi',
-           '"toimitusaika 7-14" vaatteet verkkokauppa',
-           '"Shopify-alusta" naisten mekot',
-           'naisten mekko "ilmainen toimitus" site:.shop OR site:.store'],
+# Zoekopdrachten worden OPGEBOUWD uit producttermen x dropship-signalen, zodat
+# er tientallen unieke zoekopdrachten ontstaan i.p.v. een handvol vaste.
+# GEMETEN 2026-07-18 met de echte Apify-actor:
+#   * `inurl:products` erbij  -> 0 rijen. Nooit gebruiken.
+#   * simpele vorm            -> ~10 rijen (resultsPerPage=30 wordt genegeerd).
+# Dus: veel korte, gevarieerde zoekopdrachten i.p.v. weinig slimme.
+_GD_TERMS = {
+    'dk': ['kjole', 'dametøj', 'bluse', 'nederdel', 'strik', 'bukser', 'jakke', 'sko dame'],
+    'fr': ['robe', 'vêtements femme', 'blouse', 'jupe', 'maille', 'pantalon femme',
+           'veste femme', 'chaussures femme'],
+    'fi': ['mekko', 'naisten vaatteet', 'pusero', 'hame', 'neule', 'housut naiset',
+           'takki naiset', 'kengät naiset'],
 }
+# Wat een dropshipper WEL op zijn site heeft en een merk niet.
+_GD_TELLS = {
+    'dk': ['"cdn.shopify.com"', '"drevet af Shopify"', '"levering 7-14 dage"',
+           '"gratis fragt" tilbud', '"14 dages returret" shop'],
+    'fr': ['"cdn.shopify.com"', '"propulsé par Shopify"', '"livraison 7 à 14 jours"',
+           '"livraison gratuite" promo', '"satisfait ou remboursé" boutique'],
+    'fi': ['"cdn.shopify.com"', '"Shopify-alusta"', '"toimitusaika 7-14"',
+           '"ilmainen toimitus" tarjous', '"14 päivän palautusoikeus" verkkokauppa'],
+}
+
+
+def _gd_build_queries(market, limit=30):
+    """Term x signaal, plus een paar generieke-TLD varianten. Levert tientallen
+    unieke zoekopdrachten — nodig omdat elke query maar ~10 rijen geeft."""
+    tlds = _GD_MARKET_TLDS.get(market) or ()
+    terms = _GD_TERMS.get(market) or []
+    tells = _GD_TELLS.get(market) or []
+    out = []
+    for i, term in enumerate(terms):
+        for j, tell in enumerate(tells):
+            if tlds:
+                out.append(f'{term} {tell} site:{tlds[0]}')
+            # elke derde combinatie ook op generieke TLD's (.shop/.store zijn
+            # populair bij dropshippers en vallen buiten de landextensie)
+            if (i + j) % 3 == 0:
+                out.append(f'{term} {tell} site:.shop OR site:.store')
+    seen, uniq = set(), []
+    for q in out:
+        if q not in seen:
+            seen.add(q)
+            uniq.append(q)
+    return uniq[:limit]
+
+
 _GD_MARKET_TLDS = {'dk': ('.dk',), 'fr': ('.fr', '.be'), 'fi': ('.fi',)}
 _GD_MARKET_LANGS = {'dk': ('da', 'dk'), 'fr': ('fr',), 'fi': ('fi',)}
 _GD_GENERIC_TLDS = ('.com', '.net', '.co', '.shop', '.store', '.online', '.eu', '.site')
@@ -9512,7 +9539,7 @@ _GD_RETAILERS = ('karwei', 'gamma', 'praxis', 'bonprix', 'azazie', 'whatnot', 'n
                  'aldi', 'otto.', 'veepee', 'vinted', 'boozt', 'asos', 'ellos', 'nelly',
                  'zara', 'mango', 'only', 'veromoda', 'cellbes', 'bubbleroom')
 _GD_MIN_WOMENS = 5     # fewer bestsellers = not a womens-fashion store
-_GD_MAX_NEW = 12       # cap on new stores added per market per run (was 6)
+_GD_MAX_NEW = 25       # cap on new stores added per market per run (was 6)
 
 # TOELATING tot de lijst is iets anders dan GESCHIKT als bron.
 # De sourcing-drempels (TRAFFIC_THRESHOLD_EUR/TRAFFIC_MIN_VISITS, het doc-minimum)
@@ -9520,8 +9547,14 @@ _GD_MAX_NEW = 12       # cap on new stores added per market per run (was 6)
 # is dat per definitie een gevestigd MERK. Die lat als toegangspoort gebruiken
 # filterde dus precies de dropshippers weg die we zoeken (bug #22).
 # Discovery krijgt daarom eigen, lage drempels; de sourcing-funnel houdt de zijne.
-GD_MIN_VISITS = 8_000            # genoeg om 'levend' te zijn, niet 'gevestigd'
-GD_MIN_EST_EUR = 40_000          # idem voor de omzetschatting
+# GEMETEN (job_23, 2026-07-18): met een omzet-lat vielen ommellinen.fi (8.701
+# bezoekers), mastoura.shop (8.677 / EUR33.840) en aimn.fi af — precies de kleine
+# dropshippers die we zoeken. Erger: een winkel met 0 bezoekers (onbekend bij
+# SimilarWeb) kwam er WEL in. Bewijs van leven strafte je dus af.
+# Kwaliteit wordt nu bepaald door de DROPSHIP-POORT, niet door omvang. Traffic is
+# alleen nog een levenscheck: helemaal dood = niet interessant.
+GD_MIN_VISITS = 300              # alleen 'is er iets van leven', geen omvangseis
+GD_MIN_EST_EUR = 0               # geen omzet-lat meer bij toelating
 # SimilarWeb geeft total_visits 0 voor élke host zonder profiel — precies de jonge
 # dropshipper. Zo'n store afwijzen op ontbrekende data is de fout omgekeerd maken.
 GD_ALLOW_UNKNOWN_TRAFFIC = True
@@ -9640,7 +9673,7 @@ def _gd_google(queries_by_market):
             r = req.post('https://api.apify.com/v2/acts/apify~google-search-scraper/runs',
                          params={'token': token},
                          json={'queries': '\n'.join(queries), 'resultsPerPage': 30,
-                               'maxPagesPerQuery': 2, 'countryCode': m}, timeout=30)
+                               'maxPagesPerQuery': 3, 'countryCode': m}, timeout=30)
             if r.status_code not in (200, 201):
                 print(f'[wtl-disc] google run {m} start failed: {r.status_code}')
                 continue
@@ -9674,16 +9707,16 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
     """Run the discovery pipeline for the given markets; passers are added to the
     extra-stores list (+ traffic cache) and show up in the stores tab immediately."""
     import statistics
-    markets = [m for m in (markets or []) if m in _GD_QUERIES]
+    markets = [m for m in (markets or []) if m in _GD_TERMS]
     if not markets:
         return {'error': 'geen geldige markten'}
     known = _wtl_all_domains() | _load_blocked_sources()
     seen = {} if ignore_seen else _gd_seen_load()
     queries = {}
     for m in markets:
-        qs = list(_GD_QUERIES[m])
+        qs = _gd_build_queries(m, limit=26)
         qs += [t for t in _gd_wtl_terms(m) if t not in qs]
-        queries[m] = qs[:12]      # was 6 — de trechter begon te smal
+        queries[m] = qs[:30]      # elke query geeft maar ~10 rijen
     if jid:
         _job_set(jid, phase='Google doorzoeken', total=None)
     results = _gd_google(queries)
@@ -9727,7 +9760,7 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
         scanned[d] = (m, term, payload)
     print(f'[wtl-disc] {len(scanned)} local Shopify womens stores found')
 
-    added, gated, rejected = [], [], []
+    added, gated, rejected, uncertain = [], [], [], []
     if scanned:
         if jid:
             _job_set(jid, phase='SimilarWeb marktgrootte-gate')
@@ -9748,7 +9781,9 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
             # Discovery-drempels, NIET de sourcing-lat (zie GD_MIN_* hierboven).
             bar, floor = GD_MIN_EST_EUR * ratio, GD_MIN_VISITS * ratio
             unknown_traffic = visits == 0
-            ok = (est >= bar and visits >= floor) or (unknown_traffic and GD_ALLOW_UNKNOWN_TRAFFIC)
+            # Onbekende traffic mag door (SimilarWeb kent jonge winkels niet), maar
+            # een winkel met BEWEZEN bezoekers mag daar nooit onder vallen.
+            ok = (visits >= floor) or (unknown_traffic and GD_ALLOW_UNKNOWN_TRAFFIC)
             row = {'domain': d, 'market': m, 'term': term, 'visits': visits,
                    'est_eur': round(est), 'bar_eur': round(bar), 'floor': round(floor),
                    'traffic_unknown': unknown_traffic,
@@ -9761,22 +9796,51 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
                 gated.append({**row, 'reason': 'cap bereikt'})   # NIET onthouden: volgende run mag
                 continue
             # ── DROPSHIP-POORT ──────────────────────────────────────────────
-            # Dit stond vroeger NA het toevoegen en was dus alleen een etiketje;
-            # er hield nooit iets een merk tegen (bug #22). Nu beslist het.
-            verdict = _wtl_classify_store(d)
-            label = (verdict or {}).get('label')
-            if label in ('Eigen voorraad', 'Mogelijk eigen merk'):
-                # Uitzondering (regel designbysi, 2026-07-13): snel leveren
-                # diskwalificeert niet als de producten uit de leverancierscatalogus
-                # komen — dat zie je aan overlap met andere bekende winkels.
-                overlap, _of = _wtl_catalog_overlap(d)
-                if overlap < 2:
-                    _gd_remember(seen, d, m, 'merk/eigen voorraad')
-                    rejected.append({**row, 'verdict': label,
-                                     'detail': (verdict or {}).get('detail'),
-                                     'reason': f'{label} — geen dropshipper'})
-                    continue
+            # Vroeger draaide dit NA het toevoegen: een etiketje, geen poort, dus
+            # er hield nooit iets een merk tegen (bug #22). Nu beslist het, en het
+            # eist POSITIEF bewijs — 'Onbekend' liet eerder finlayson.fi binnen,
+            # een groot Fins merk met een B2B-signaal.
+            verdict = _wtl_classify_store(d) or {}
+            label = verdict.get('label')
+            # Catalogus-overlap = leverancierscatalogus = dropshipper, ook bij snelle
+            # levering (regel designbysi, 2026-07-13). Sterkste positieve bewijs.
+            overlap, _of = _wtl_catalog_overlap(d)
+            if overlap >= 2:
+                verdict['override'] = 'catalog-overlap'
                 row['overlap_matches'] = overlap
+            elif label in ('Eigen voorraad', 'Mogelijk eigen merk'):
+                _gd_remember(seen, d, m, 'merk/eigen voorraad')
+                rejected.append({**row, 'verdict': label, 'detail': verdict.get('detail'),
+                                 'reason': f'{label} — geen dropshipper'})
+                continue
+            else:
+                # Onafhankelijk merk-signaal (wholesale/B2B, eigen fabricage, ...).
+                try:
+                    from shipping_check import looks_like_brand
+                    is_brand, sigs = looks_like_brand(d)
+                except Exception:
+                    is_brand, sigs = False, []
+                if is_brand:
+                    _gd_remember(seen, d, m, 'merk/eigen voorraad')
+                    rejected.append({**row, 'verdict': label or 'merk-signaal',
+                                     'detail': ', '.join(sigs or [])[:120],
+                                     'reason': 'merksignalen — geen dropshipper'})
+                    continue
+                if label != 'Dropshipper':
+                    # Geen bewijs voor OF tegen. Niet stilletjes toelaten als
+                    # dropshipper, maar ook niet weggooien: apart tonen.
+                    uncertain.append({**row, 'verdict': label or 'onbekend',
+                                      'detail': verdict.get('detail'),
+                                      'reason': 'verzendbeleid onduidelijk — zelf beoordelen'})
+                    continue
+            # Verdict bewaren, anders toont de lijst 'niet gecheckt' en doet de
+            # classify-taak straks hetzelfde werk nog eens.
+            try:
+                _vc = _wtl_verdicts_load()
+                _vc[d.replace('www.', '')] = verdict
+                _wtl_verdicts_save(_vc)
+            except Exception as _ve:
+                print(f'[wtl-disc] verdict save failed for {d}: {_ve}')
             row['verdict'] = verdict
             if d not in extra:
                 extra.append(d)
@@ -9801,6 +9865,9 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
                    'probeer "opnieuw beoordelen" om het geheugen te negeren')
     if rejected:
         why.append(f'{len(rejected)} winkel(s) afgewezen: geen dropshipper (merk/eigen voorraad)')
+    if uncertain:
+        why.append(f'{len(uncertain)} winkel(s) met onduidelijk verzendbeleid — staan apart, '
+                   'zelf te beoordelen')
     if gated:
         why.append(f'{len(gated)} winkel(s) onder de lat of over de cap')
     if skipped:
@@ -9808,7 +9875,7 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
 
     return {'markets': markets, 'candidates': len(cand), 'scanned': len(scanned),
             'added': added, 'gated': gated, 'rejected': rejected,
-            'skipped': skipped[:40], 'why': why}
+            'uncertain': uncertain, 'skipped': skipped[:40], 'why': why}
 
 
 @app.route('/api/wtl_discover', methods=['POST'])
