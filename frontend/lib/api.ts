@@ -655,15 +655,7 @@ export const api = {
   /** What-to-list funnel step 2: competitor stores with LOCAL SimilarWeb traffic
    *  for a market (cached droplet-side, refreshed weekly / via wtlStoresRefresh). */
   wtlStores: (store: "dk" | "fr" | "fi") =>
-    call<{
-      store: string;
-      country: string;
-      min_local: number;
-      traffic_missing: number;
-      verdicts_missing: number;
-      apify_configured: boolean;
-      stores: WtlStore[];
-    }>(`/api/wtl_stores?store=${store}`),
+    call<WtlStoresResponse>(`/api/wtl_stores?store=${store}`),
 
   /** Kick a background SimilarWeb refresh over stale store domains (poll via metaJobStatus). */
   wtlStoresRefresh: (force = false) =>
@@ -953,6 +945,18 @@ export const api = {
 };
 
 /** One competitor store in the What-to-list funnel (step 2). */
+/** One market's store list. The stores step merges several of these — a store
+ *  can exist in more than one market with its own local visitor count. */
+export interface WtlStoresResponse {
+  store: string;
+  country: string;
+  min_local: number;
+  traffic_missing: number;
+  verdicts_missing: number;
+  apify_configured: boolean;
+  stores: WtlStore[];
+}
+
 export interface WtlStore {
   domain: string;
   products: number;

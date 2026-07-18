@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { api, WtlStore } from "@/lib/api";
+import { useCallback, useEffect, useState } from "react";
+import { api, WtlStore, WtlStoresResponse } from "@/lib/api";
 import { StoreKey, STORE_CONFIG, STORE_KEYS } from "@/lib/store";
 import { Button } from "@/components/ui/Button";
 
@@ -119,7 +119,9 @@ function Section({
  * ③ products (their bestsellers) → Import (opens the dashboard prefilled).
  */
 export function WhatToListWorkbench() {
-  const [selectedStores, setSelectedStores] = useState<StoreKey[]>(["dk"]);
+  // Alle markten standaard aan: je wilt weten wat je in ELKE winkel kunt listen,
+  // niet alleen in Denemarken.
+  const [selectedStores, setSelectedStores] = useState<StoreKey[]>(["dk", "fr", "fi"]);
   const [busy, setBusy] = useState(false);
   const [results, setResults] = useState<Partial<Record<StoreKey, StoreResult>> | null>(null);
   const [viewStore, setViewStore] = useState<StoreKey>("dk");
@@ -136,7 +138,10 @@ export function WhatToListWorkbench() {
   const [funnelType, setFunnelType] = useState<TypeRow | null>(null);
   const [wtlStores, setWtlStores] = useState<Awaited<ReturnType<typeof api.wtlStores>> | null>(null);
   const [storesLoading, setStoresLoading] = useState(false);
-  const [onlyEnough, setOnlyEnough] = useState(true);
+  // UIT by default: dit is de SOURCING-lat (>=50k lokale bezoekers). Die eist in
+  // DK ~77k bezoekers om de omzetdrempel te halen — per definitie een gevestigd
+  // merk. Als weergavefilter verborg hij precies de dropshippers die je zoekt.
+  const [onlyEnough, setOnlyEnough] = useState(false);
   // Worklist controls. Both filters default OFF — warn-never-block: nothing is
   // hidden unless the operator asks for it.
   const [storeSort, setStoreSort] = useState<"score" | "new" | "stale">("score");
@@ -161,13 +166,65 @@ export function WhatToListWorkbench() {
   }, [moversStore]);
 
   const funnelMarket: StoreKey = results ? viewStore : (selectedStores[0] ?? "dk");
-  useEffect(() => {
+  // Welke markten toont de stores-stap? Standaard alle drie — je wilt weten wat
+  // er te halen valt in élke winkel, niet alleen in Denemarken.
+  const [storeMarkets, setStoreMarkets] = useState<StoreKey[]>(["dk", "fr", "fi"]);
+  const storeMarketsKey = storeMarkets.join(",");
+
+  /** Haalt de gekozen markten op en voegt ze samen op domein. Dezelfde winkel
+   *  kan in meerdere landen bestaan met eigen lokale bezoekersaantallen; we
+   *  tonen 'm één keer, op zijn STERKSTE markt, met de andere als chip. */
+  const loadStores = useCallback(async (markets: StoreKey[]) => {
     setStoresLoading(true);
-    api.wtlStores(funnelMarket)
-      .then(setWtlStores)
-      .catch(() => setWtlStores(null))
-      .finally(() => setStoresLoading(false));
-  }, [funnelMarket]);
+    try {
+      const per = await Promise.all(
+        markets.map((m) =>
+          api
+            .wtlStores(m)
+            .then((r) => ({ m, r }))
+            .catch(() => null)
+        )
+      );
+      const ok = per.filter(Boolean) as { m: StoreKey; r: WtlStoresResponse }[];
+      if (ok.length === 0) {
+        setWtlStores(null);
+        return;
+      }
+      const byDomain = new Map<string, WtlStore & { _market: StoreKey; _also: StoreKey[] }>();
+      for (const { m, r } of ok) {
+        for (const st of r.stores ?? []) {
+          const prev = byDomain.get(st.domain);
+          if (!prev) {
+            byDomain.set(st.domain, { ...st, _market: m, _also: [] });
+          } else if (st.score > prev.score) {
+            // sterkere markt wint; de vorige wordt een 'ook in'-chip
+            byDomain.set(st.domain, {
+              ...st,
+              _market: m,
+              _also: [...prev._also, prev._market].filter((x) => x !== m),
+            });
+          } else if (!prev._also.includes(m)) {
+            prev._also.push(m);
+          }
+        }
+      }
+      const base = ok[0].r;
+      setWtlStores({
+        ...base,
+        country: markets.length > 1 ? "its market" : base.country,
+        traffic_missing: ok.reduce((n, x) => n + (x.r.traffic_missing ?? 0), 0),
+        verdicts_missing: ok.reduce((n, x) => n + (x.r.verdicts_missing ?? 0), 0),
+        stores: [...byDomain.values()],
+      });
+    } finally {
+      setStoresLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadStores(storeMarkets);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storeMarketsKey]);
 
   const scrollToId = (id: string) =>
     window.setTimeout(() => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" }), 60);
@@ -231,7 +288,7 @@ export function WhatToListWorkbench() {
         const j = await api.metaJobStatus(start.job_id).catch(() => null);
         if (j && j.status !== "running") break;
       }
-      setWtlStores(await api.wtlStores(funnelMarket));
+      await loadStores(storeMarkets);
     } catch {
       /* stores list simply stays as-is */
     } finally {
@@ -251,7 +308,7 @@ export function WhatToListWorkbench() {
         const j = await api.metaJobStatus(start.job_id).catch(() => null);
         if (j && j.status !== "running") break;
       }
-      setWtlStores(await api.wtlStores(funnelMarket));
+      await loadStores(storeMarkets);
     } catch {
       /* list stays as-is */
     } finally {
@@ -264,7 +321,7 @@ export function WhatToListWorkbench() {
     setDiscovering(true);
     setDiscoverMsg(null);
     try {
-      const start = await api.wtlDiscover([funnelMarket]);
+      const start = await api.wtlDiscover(storeMarkets);
       if (!start.job_id) throw new Error(start.error || "could not start");
       let summary = "";
       for (let i = 0; i < 200; i++) {
@@ -276,7 +333,7 @@ export function WhatToListWorkbench() {
         }
       }
       setDiscoverMsg(summary ? `✓ ${summary}` : "✓ done");
-      setWtlStores(await api.wtlStores(funnelMarket));
+      await loadStores(storeMarkets);
     } catch (e) {
       setDiscoverMsg(e instanceof Error ? e.message : "failed");
     } finally {
@@ -296,7 +353,7 @@ export function WhatToListWorkbench() {
       }
       setAddDomain("");
       setAddMsg(`✓ ${r.domain} added — press "Update traffic" to fetch its visitors`);
-      setWtlStores(await api.wtlStores(funnelMarket));
+      await loadStores(storeMarkets);
     } catch (e) {
       setAddMsg(e instanceof Error ? e.message : "failed");
     }
@@ -313,7 +370,7 @@ export function WhatToListWorkbench() {
   const markStore = async (domain: string, mark: "skip" | "later" | null) => {
     try {
       await api.wtlStoreMark(domain, mark, mark === "later" ? { days: 14 } : undefined);
-      setWtlStores(await api.wtlStores(funnelMarket));
+      await loadStores(storeMarkets);
     } catch (e) {
       alert(`Could not save that: ${e instanceof Error ? e.message : e}`);
     }
@@ -334,7 +391,7 @@ export function WhatToListWorkbench() {
     try {
       setScan(await api.bestsellerScan(d, force));
       // The scan just refreshed the cache, so the worklist counts changed.
-      api.wtlStores(funnelMarket).then(setWtlStores).catch(() => {});
+      void loadStores(storeMarkets);
     } catch (e) {
       setScan({ ok: false, blocked: e instanceof Error ? e.message : "scan failed" });
     } finally {
@@ -822,10 +879,39 @@ export function WhatToListWorkbench() {
                 onChange={(e) => setOnlyDropshippers(e.target.checked)}
                 className="h-3.5 w-3.5 accent-[var(--accent)]"
               />
-              <span title="Hides stores that failed the import-gate's dropship-verdict (own stock / possible real brand) and stores not checked yet. Press “🛡 Verify dropshippers” first to classify more of them.">
-                Only dropshippers
+              <span title="Hides stores the import-gate PROVED are not dropshippers (own stock / real brand). Stores that haven't been checked yet stay visible with a 'not checked' chip — press “🛡 Verify dropshippers” to classify them.">
+                Hide proven brands
               </span>
             </label>
+            <span className="flex items-center gap-1 text-text-dim">
+              Markets
+              {(["dk", "fr", "fi"] as StoreKey[]).map((m) => {
+                const on = storeMarkets.includes(m);
+                return (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() =>
+                      setStoreMarkets((prev) =>
+                        prev.includes(m)
+                          ? prev.length > 1
+                            ? prev.filter((x) => x !== m)
+                            : prev
+                          : [...prev, m]
+                      )
+                    }
+                    className={`px-1.5 h-6 rounded-md border text-[11px] transition ${
+                      on
+                        ? "border-accent bg-accent/10 text-accent"
+                        : "border-border text-text-faint hover:border-border-hover"
+                    }`}
+                    title={`${STORE_CONFIG[m].label} — click to ${on ? "hide" : "show"}`}
+                  >
+                    {STORE_CONFIG[m].label}
+                  </button>
+                );
+              })}
+            </span>
             <label className="flex items-center gap-1.5 text-text-dim">
               Sort
               <select
@@ -906,13 +992,19 @@ export function WhatToListWorkbench() {
               // employee found its products on AliExpress despite a different verdict.
               const isDropshipper = (s: WtlStore) =>
                 s.verdict?.override === "ali-verified" || s.verdict?.label === "Dropshipper";
+              // "Alleen dropshippers" verbergt BEWEZEN niet-dropshippers, niet het
+              // ongecontroleerde. Anders verdwijnen 24 winkels die misschien juist
+              // wél goed zijn — je ziet ze met een 'niet gecheckt'-chip.
+              const isConfirmedNotDropshipper = (s: WtlStore) =>
+                !isDropshipper(s) &&
+                (s.verdict?.label === "Eigen voorraad" || s.verdict?.label === "Mogelijk eigen merk");
               const visible = wtlStores.stores
                 .filter((s) => !onlyEnough || s.market_ok)
                 // Both opt-in. "0 new" only hides stores we ACTUALLY scanned —
                 // never-scanned ones (bs_new_count === null) always stay visible.
                 .filter((s) => !hideEmpty || s.bs_new_count === null || s.bs_new_count > 0)
                 .filter((s) => !hideMarked || !s.mark)
-                .filter((s) => !onlyDropshippers || isDropshipper(s))
+                .filter((s) => !onlyDropshippers || !isConfirmedNotDropshipper(s))
                 .slice()
                 .sort((a, b) => {
                   // Marked stores always sink, whatever the sort.
@@ -1008,7 +1100,9 @@ export function WhatToListWorkbench() {
                             }`}
                             title={`Exactly ${n(s.local_visits)} visits/month from ${wtlStores.country} (${n(s.total_visits)} total × ${Math.round(s.local_share * 100)}% ${wtlStores.country}-share)`}
                           >
-                            {n(s.local_visits)}/mo in {wtlStores.country}
+                            {n(s.local_visits)}/mo in{" "}
+                            {STORE_CONFIG[(s as WtlStore & { _market?: StoreKey })._market ?? funnelMarket]?.label ??
+                              wtlStores.country}
                           </span>
                         ) : (
                           <span className="text-[11px] text-text-faint" title="SimilarWeb has no data (yet) — press “Update traffic”, or the store is too small">
@@ -1077,8 +1171,7 @@ export function WhatToListWorkbench() {
                                       return;
                                     void api
                                       .wtlStoreOverride(s.domain, next)
-                                      .then(() => api.wtlStores(funnelMarket))
-                                      .then(setWtlStores)
+                                      .then(() => loadStores(storeMarkets))
                                       .catch(() => {});
                                   }}
                                   onKeyDown={(e) => e.stopPropagation()}
