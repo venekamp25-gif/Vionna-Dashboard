@@ -9736,10 +9736,20 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
     # en die allemaal bevragen kost uren. SERP-volgorde = relevantievolgorde, dus
     # we nemen de bovenste. De rest komt bij een volgende run — afgewezen
     # kandidaten worden onthouden, dus je loopt niet dezelfde lijst opnieuw af.
-    _GD_MAX_CANDIDATES = 300
-    if len(cand) > _GD_MAX_CANDIDATES:
-        print(f'[wtl-disc] {len(cand)} kandidaten -> eerste {_GD_MAX_CANDIDATES} deze run')
-        cand = dict(list(cand.items())[:_GD_MAX_CANDIDATES])
+    # PER MARKT begrenzen. Eerst nam ik simpelweg de eerste 300 uit de lijst, maar
+    # die staat op marktvolgorde — dus DK vulde de hele quota en FR/FI kwamen niet
+    # eens aan de beurt (gemeten: alle 11 vondsten waren .dk).
+    _GD_MAX_PER_MARKET = 120
+    trimmed, per_m = {}, {}
+    for _d, (_m, _t) in cand.items():
+        if per_m.get(_m, 0) >= _GD_MAX_PER_MARKET:
+            continue
+        per_m[_m] = per_m.get(_m, 0) + 1
+        trimmed[_d] = (_m, _t)
+    if len(trimmed) < len(cand):
+        print(f'[wtl-disc] {len(cand)} kandidaten -> {len(trimmed)} deze run '
+              f'(max {_GD_MAX_PER_MARKET} per markt: {per_m})')
+    cand = trimmed
 
     scanned, skipped = {}, []
     if jid:
@@ -9853,12 +9863,15 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
                                      'reason': 'merksignalen — geen dropshipper'})
                     continue
                 if label != 'Dropshipper':
-                    # Geen bewijs voor OF tegen. Niet stilletjes toelaten als
-                    # dropshipper, maar ook niet weggooien: apart tonen.
+                    # Geen bewijs voor OF tegen — en dat is de NORMALE uitkomst:
+                    # gemeten kregen 11 van de 11 winkels 'Onbekend', omdat het
+                    # verzendbeleid zelden leesbaar is. Ze daarom weigeren gaf 0
+                    # resultaten. Warn-never-block: ze komen binnen met een
+                    # 'niet gecheckt'-chip, zichtbaar als onbevestigd, en de
+                    # medewerker kan ze met 'Verify dropshippers' alsnog toetsen.
+                    row['unverified'] = True
                     uncertain.append({**row, 'verdict': label or 'onbekend',
-                                      'detail': verdict.get('detail'),
-                                      'reason': 'verzendbeleid onduidelijk — zelf beoordelen'})
-                    continue
+                                      'reason': 'verzendbeleid onduidelijk — nog niet bevestigd'})
             # Verdict bewaren, anders toont de lijst 'niet gecheckt' en doet de
             # classify-taak straks hetzelfde werk nog eens.
             try:
@@ -9892,8 +9905,8 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
     if rejected:
         why.append(f'{len(rejected)} winkel(s) afgewezen: geen dropshipper (merk/eigen voorraad)')
     if uncertain:
-        why.append(f'{len(uncertain)} winkel(s) met onduidelijk verzendbeleid — staan apart, '
-                   'zelf te beoordelen')
+        why.append(f'{len(uncertain)} winkel(s) toegevoegd maar NIET bevestigd als dropshipper '
+                   '(verzendbeleid onleesbaar) — check ze met "Verify dropshippers"')
     if gated:
         why.append(f'{len(gated)} winkel(s) onder de lat of over de cap')
     if skipped:
@@ -9921,9 +9934,13 @@ def api_wtl_discover():
             res = _wtl_discover(markets, jid=jid, ignore_seen=ignore_seen)
             _job_set(jid, status='done', result=res,
                      finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
-            n_add, n_rej = len(res.get('added') or []), len(res.get('rejected') or [])
-            _job_summary(jid, f"{n_add} dropshipper(s) toegevoegd"
-                              + (f", {n_rej} merk/eigen-voorraad afgewezen" if n_rej else "")
+            n_add = len(res.get('added') or [])
+            n_rej = len(res.get('rejected') or [])
+            n_unv = sum(1 for a in (res.get('added') or []) if a.get('unverified'))
+            _job_summary(jid, f"{n_add} store(s) toegevoegd"
+                              + (f" ({n_add - n_unv} bevestigd dropshipper, {n_unv} nog te checken)"
+                                 if n_unv else "")
+                              + (f", {n_rej} merk afgewezen" if n_rej else "")
                               + (f" — {res['why'][0]}" if n_add == 0 and res.get('why') else ""))
         except Exception as e:
             _job_error(jid, str(e))
