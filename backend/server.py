@@ -9912,9 +9912,23 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
     if skipped:
         why.append(f'{len(skipped)} kandidaat viel af op Shopify/land/te weinig damesmode')
 
+    # Trechter PER MARKT. Zonder dit zag je alleen een totaal, en toen alle
+    # vondsten .dk bleken kon ik niet zien waar FR/FI omviel (de afvallijst werd
+    # op 40 afgekapt en die waren toevallig allemaal DK).
+    import collections as _c
+    funnel = {}
+    for m in markets:
+        reasons = _c.Counter(s.get('reason', '')[:40] for s in skipped if s.get('market') == m)
+        funnel[m] = {
+            'candidates': sum(1 for v in cand.values() if v[0] == m),
+            'passed_checks': sum(1 for v in scanned.values() if v[0] == m),
+            'added': sum(1 for a in added if a.get('market') == m),
+            'rejected': sum(1 for a in rejected if a.get('market') == m),
+            'top_drop_reasons': dict(reasons.most_common(4)),
+        }
     return {'markets': markets, 'candidates': len(cand), 'scanned': len(scanned),
             'added': added, 'gated': gated, 'rejected': rejected,
-            'uncertain': uncertain, 'skipped': skipped[:40], 'why': why}
+            'uncertain': uncertain, 'skipped': skipped[:120], 'funnel': funnel, 'why': why}
 
 
 @app.route('/api/wtl_discover', methods=['POST'])
