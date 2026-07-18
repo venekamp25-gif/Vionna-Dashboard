@@ -179,7 +179,8 @@ def _run_backup():
                       'blog_history.jsonl',
                       'blog_performance.jsonl', 'blog_views.json', 'blog_playbook.json',
                       'bs_snapshots.jsonl', 'known_sources.json', 'blocked_sources.json',
-                      'wtl_verdicts.json', 'wtl_traffic.json', 'size_chart_fill.json'):
+                      'wtl_verdicts.json', 'wtl_traffic.json', 'size_chart_fill.json',
+                      'wtl_store_marks.json', 'wtl_extra_stores.json'):
             src = os.path.join(_BASE_DIR, fname)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dest, fname))
@@ -8499,6 +8500,27 @@ def _bs_scan_cached(host, force=False):
     return out, None
 
 
+def _bs_cached_only(host):
+    """READ-ONLY blik in de bestseller-cache: (payload, leeftijd_sec) of (None, None).
+
+    Doet NOOIT een HTTP-request. Bewust NIET _bs_scan_cached hergebruiken: die
+    scant live bij een cache-MISS én bij een STALE entry, dus aanroepen vanuit de
+    stores-lijst zou ~378 requests per page-load afvuren (18 stores x ~21 GETs) —
+    exact de 429-storm die designbysi opleverde. Erger nog: een 429 zet in
+    _scrape_get een host-brede cooldown van 30-300s aan, waardoor ook gewone
+    product-imports uit die host stuklopen.
+
+    _BS_CACHE bewaart de sleutel zoals gescand (soms mét www), terwijl andere
+    consumers 'm strippen — daarom alle drie de vormen proberen.
+    """
+    bare = (host or '').replace('www.', '')
+    for key in (host, bare, 'www.' + bare):
+        hit = _BS_CACHE.get(key)
+        if hit and hit.get('payload'):
+            return hit['payload'], int(time.time() - hit.get('ts', 0))
+    return None, None
+
+
 # ── Product-level quality signals (ported from the research scraper, 2026-07-13) ──
 _MIN_PRICE_EUR = 25.0   # user rule 2026-07-12: under €25-equivalent = too little margin
 
@@ -8891,6 +8913,7 @@ def api_wtl_stores():
     cache = _wtl_traffic_load()
     verdicts = _wtl_verdicts_load()
     now = datetime.datetime.utcnow()
+    marks = _wtl_marks_load()
     comps = {c['domain']: c for c in _known_comp_data()}
     for d in _wtl_extra_stores():
         comps.setdefault(d, {'domain': d, 'products': 0, 'last_import': None, 'imported_handles': []})
@@ -8917,9 +8940,28 @@ def api_wtl_stores():
         if len(monthly) >= 2 and monthly[-2] > 0:
             trend_pct = round((monthly[-1] - monthly[-2]) / monthly[-2] * 100)
         v = verdicts.get(d.replace('www.', ''))
+        # Werklijst-signaal: hoeveel bestsellers heb je hier NOG NIET geïmporteerd?
+        # Puur uit de cache (geen enkel HTTP-request). Nooit gescand -> None, NOOIT
+        # 0: 'nog niet gescand' mag niet als 'uitgeput' gelezen worden.
+        _pl, _age = _bs_cached_only(d)
+        _imported = {h.lower() for h in (c.get('imported_handles') or [])}
+        if _pl:
+            _prods = _pl.get('products') or []
+            _new = sum(1 for p in _prods if (p.get('handle') or '').lower() not in _imported)
+            _bs = {'bs_scanned': True, 'bs_total': len(_prods), 'bs_new_count': _new,
+                   'bs_age_seconds': _age, 'bs_stale': _age is not None and _age >= _BS_TTL}
+        else:
+            _bs = {'bs_scanned': False, 'bs_total': None, 'bs_new_count': None,
+                   'bs_age_seconds': None, 'bs_stale': False}
+        _mk = marks.get(d.replace('www.', '')) or {}
         out.append({'domain': d, 'products': c.get('products') or 0,
                     'last_import': c.get('last_import'),
                     'imported_handles': c.get('imported_handles') or [],
+                    'mark': _mk.get('mark') if _wtl_mark_active(_mk) else None,
+                    'mark_note': _mk.get('note') if _wtl_mark_active(_mk) else None,
+                    'snooze_until': _mk.get('snooze_until') if _wtl_mark_active(_mk) else None,
+                    'last_opened_at': _mk.get('last_opened_at'),
+                    **_bs,
                     'total_visits': total, 'local_visits': local,
                     'local_share': round(share, 3), 'traffic_age_days': age_days,
                     'has_traffic_data': bool(t and total > 0),
@@ -9136,6 +9178,53 @@ def _wtl_verdicts_load():
         return {}
 
 
+WTL_MARKS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              'wtl_store_marks.json')
+# Handmatige markering per store. EIGEN bestand, bewust NIET in wtl_verdicts.json:
+# _wtl_classify_missing herschrijft daar de hele entry per domein en draagt alleen
+# `override` met de hand over — een mark zou bij de volgende classify-run stil
+# verdwijnen. Bovendien telt een 'Onbekend'-verdict altijd als niet-vers, wat de
+# verdicts_missing-teller zou opblazen.
+# Sleutel = bare domein, GLOBAAL over dk/fr/fi: 'niks voor ons' is een oordeel over
+# de winkel zelf, niet over één markt. (Wil je ooit per markt: sleutel dan op
+# "<domein>|<markt>" en migreer de losse domein-sleutels als fallback.)
+# NB: dit is de FASHION-funnel; Home Decor heeft zijn eigen lighting_*-bestanden.
+
+
+def _wtl_marks_load():
+    try:
+        with open(WTL_MARKS_PATH, encoding='utf-8') as f:
+            return json.load(f) or {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f'[wtl] marks load failed: {e}')
+        return {}
+
+
+def _wtl_marks_save(data):
+    try:
+        tmp = WTL_MARKS_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, WTL_MARKS_PATH)
+    except Exception as e:
+        print(f'[wtl] marks save failed: {e}')
+
+
+def _wtl_mark_active(m):
+    """Is de markering nu van kracht? Een 'later' met verlopen snooze telt niet meer."""
+    if not m or not m.get('mark'):
+        return False
+    until = m.get('snooze_until')
+    if until:
+        try:
+            return datetime.datetime.utcnow() < datetime.datetime.fromisoformat(until.rstrip('Z'))
+        except Exception:
+            return True
+    return True
+
+
 def _wtl_verdicts_save(data):
     try:
         tmp = WTL_VERDICTS_PATH + '.tmp'
@@ -9316,6 +9405,60 @@ def api_wtl_stores_override():
     cache[dom] = v
     _wtl_verdicts_save(cache)
     return jsonify({'ok': True, 'domain': dom, 'override': v.get('override')})
+
+
+@app.route('/api/wtl_stores/mark', methods=['POST'])
+@require_droplet_token
+def api_wtl_stores_mark():
+    """Handmatige markering per store: {'domain', 'mark': 'skip'|'later'|null,
+    'note'?, 'days'?}. 'skip' = niks voor ons; 'later' = even niet (sluimert
+    `days` dagen, standaard 14). null wist de markering. Warn-never-block: een
+    gemarkeerde store wordt NOOIT verborgen, alleen gedimd en lager gesorteerd."""
+    body = request.get_json(silent=True) or {}
+    dom = str(body.get('domain') or '').lower().replace('www.', '').strip()
+    mark = body.get('mark')
+    if not dom:
+        return jsonify({'error': 'domain required'}), 400
+    if mark not in ('skip', 'later', None):
+        return jsonify({'error': "mark must be 'skip', 'later' or null"}), 400
+    marks = _wtl_marks_load()
+    if mark is None:
+        marks.pop(dom, None)
+    else:
+        entry = dict(marks.get(dom) or {})
+        entry['mark'] = mark
+        entry['note'] = str(body.get('note') or '')[:200]
+        entry['ts'] = datetime.datetime.utcnow().isoformat() + 'Z'
+        entry.pop('snooze_until', None)
+        if mark == 'later':
+            try:
+                days = max(1, min(int(body.get('days') or 14), 365))
+            except (TypeError, ValueError):
+                days = 14
+            entry['snooze_until'] = (datetime.datetime.utcnow()
+                                     + datetime.timedelta(days=days)).isoformat() + 'Z'
+        marks[dom] = entry
+    _wtl_marks_save(marks)
+    return jsonify({'ok': True, 'domain': dom, 'mark': (marks.get(dom) or {}).get('mark'),
+                    'snooze_until': (marks.get(dom) or {}).get('snooze_until')})
+
+
+@app.route('/api/wtl_stores/opened', methods=['POST'])
+@require_droplet_token
+def api_wtl_stores_opened():
+    """Stempel dat een store net bekeken is. Nodig omdat `last_import` alleen
+    beweegt als er echt GEPUBLICEERD wordt — je kunt een store openen, niks
+    bruikbaars vinden, en dan zegt de lijst morgen nog steeds niets."""
+    body = request.get_json(silent=True) or {}
+    dom = str(body.get('domain') or '').lower().replace('www.', '').strip()
+    if not dom:
+        return jsonify({'error': 'domain required'}), 400
+    marks = _wtl_marks_load()
+    entry = dict(marks.get(dom) or {})
+    entry['last_opened_at'] = datetime.datetime.utcnow().isoformat() + 'Z'
+    marks[dom] = entry
+    _wtl_marks_save(marks)
+    return jsonify({'ok': True, 'domain': dom, 'last_opened_at': entry['last_opened_at']})
 
 
 # ── WTL store DISCOVERY: hunt UNKNOWN local fashion dropshippers via Google ────

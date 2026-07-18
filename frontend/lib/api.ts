@@ -679,6 +679,23 @@ export const api = {
       body: { domain },
     }),
 
+  /** Mark a store: 'skip' (not for us), 'later' (snooze `days`, default 14), or
+   *  null to clear. Warn-never-block — a marked store is dimmed, never hidden. */
+  wtlStoreMark: (domain: string, mark: "skip" | "later" | null, opts?: { note?: string; days?: number }) =>
+    call<{ ok?: boolean; mark?: string | null; snooze_until?: string | null; error?: string }>(
+      "/api/wtl_stores/mark",
+      { method: "POST", body: { domain, mark, ...(opts ?? {}) }, authed: true }
+    ),
+
+  /** Stamp "I just looked at this store" — last_import only moves on a publish,
+   *  so without this a fruitless visit leaves no trace. Fire-and-forget. */
+  wtlStoreOpened: (domain: string) =>
+    call<{ ok?: boolean; last_opened_at?: string }>("/api/wtl_stores/opened", {
+      method: "POST",
+      body: { domain },
+      authed: true,
+    }),
+
   /** Manual sourcing judgement: mark/unmark a store as AliExpress-verified source. */
   wtlStoreOverride: (domain: string, override: "ali-verified" | null) =>
     call<{ ok?: boolean; override?: string | null; error?: string }>("/api/wtl_stores/override", {
@@ -953,6 +970,25 @@ export interface WtlStore {
   /** 0-100 mine-this-store-first score (local traffic + trend/proven/local bonuses). */
   score: number;
   score_parts: Record<string, number>;
+  /** Worklist signals, read from the CACHED bestseller scan only — this endpoint
+   *  never makes an outbound request. `bs_scanned: false` means we have no scan
+   *  yet, and then bs_new_count is null — NEVER 0, because "never scanned" must
+   *  not read as "mined dry". */
+  bs_scanned: boolean;
+  /** Bestsellers here you have NOT imported yet. null = never scanned. */
+  bs_new_count: number | null;
+  bs_total: number | null;
+  bs_age_seconds: number | null;
+  /** Cached scan is older than its TTL — the count may have drifted. */
+  bs_stale: boolean;
+  /** Manual judgement the system can't make: 'skip' = not for us,
+   *  'later' = snoozed until snooze_until. Never hides the store. */
+  mark: "skip" | "later" | null;
+  mark_note: string | null;
+  snooze_until: string | null;
+  /** Last time someone opened this store in the funnel — moves even when the
+   *  visit produced nothing to import (last_import only moves on publish). */
+  last_opened_at: string | null;
   /** Cached dropship-verdict from the import-gate check (shipping policy + brand
    *  signals); null = not checked yet. Warn-only — the employee decides. */
   verdict: {

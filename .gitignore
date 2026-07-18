@@ -46,3 +46,26 @@ lighting_tokens.json
 backend/lighting_tokens.json
 lighting_history.jsonl
 backend/lighting_history.jsonl
+
+# What-to-list research state (competitor domains, traffic, verdicts, scan cache).
+# publish-update.bat does `git add -A` into a PUBLIC repo — these must never ride along.
+wtl_verdicts.json
+backend/wtl_verdicts.json
+wtl_traffic.json
+backend/wtl_traffic.json
+wtl_extra_stores.json
+backend/wtl_extra_stores.json
+wtl_store_marks.json
+backend/wtl_store_marks.json
+wtl_discover_state.json
+backend/wtl_discover_state.json
+bs_cache.json
+backend/bs_cache.json
+bs_snapshots.jsonl
+backend/bs_snapshots.jsonl
+blocked_sources.json
+backend/blocked_sources.json
+known_sources.json
+backend/known_sources.json
+size_chart_fill.json
+backend/size_chart_fill.json

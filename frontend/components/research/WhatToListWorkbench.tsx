@@ -137,6 +137,11 @@ export function WhatToListWorkbench() {
   const [wtlStores, setWtlStores] = useState<Awaited<ReturnType<typeof api.wtlStores>> | null>(null);
   const [storesLoading, setStoresLoading] = useState(false);
   const [onlyEnough, setOnlyEnough] = useState(true);
+  // Worklist controls. Both filters default OFF — warn-never-block: nothing is
+  // hidden unless the operator asks for it.
+  const [storeSort, setStoreSort] = useState<"score" | "new" | "stale">("score");
+  const [hideEmpty, setHideEmpty] = useState(false);
+  const [hideMarked, setHideMarked] = useState(false);
   const [trafficRefreshing, setTrafficRefreshing] = useState(false);
   const [discovering, setDiscovering] = useState(false);
   const [discoverMsg, setDiscoverMsg] = useState<string | null>(null);
@@ -302,6 +307,17 @@ export function WhatToListWorkbench() {
     window.open(`/fashion?import=${encodeURIComponent(url)}`, "_blank");
   };
 
+  /** Mark a store (or clear it). Warn-never-block: a marked store is dimmed and
+   *  sorted down, never removed. */
+  const markStore = async (domain: string, mark: "skip" | "later" | null) => {
+    try {
+      await api.wtlStoreMark(domain, mark, mark === "later" ? { days: 14 } : undefined);
+      setWtlStores(await api.wtlStores(funnelMarket));
+    } catch (e) {
+      alert(`Could not save that: ${e instanceof Error ? e.message : e}`);
+    }
+  };
+
   const runScan = async (domain?: string, force = false, fromStore?: WtlStore) => {
     const d = (domain ?? competitorDomain).trim();
     if (!d) return;
@@ -310,8 +326,14 @@ export function WhatToListWorkbench() {
     setScanning(true);
     setScan(null);
     scrollToId("step-products");
+    // Stamp "looked at" up front: last_import only moves on a PUBLISH, so a visit
+    // that finds nothing would otherwise leave no trace and the store keeps
+    // resurfacing. Fire-and-forget — never let this block the scan.
+    void api.wtlStoreOpened(d).catch(() => {});
     try {
       setScan(await api.bestsellerScan(d, force));
+      // The scan just refreshed the cache, so the worklist counts changed.
+      api.wtlStores(funnelMarket).then(setWtlStores).catch(() => {});
     } catch (e) {
       setScan({ ok: false, blocked: e instanceof Error ? e.message : "scan failed" });
     } finally {
@@ -772,6 +794,38 @@ export function WhatToListWorkbench() {
               />
               Only stores with enough local traffic (≥{((wtlStores?.min_local ?? 50000) / 1000).toFixed(0)}k/mo)
             </label>
+            <label className="flex items-center gap-1.5 text-text-dim cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={hideEmpty}
+                onChange={(e) => setHideEmpty(e.target.checked)}
+                className="h-3.5 w-3.5 accent-[var(--accent)]"
+              />
+              <span title="Only hides stores we actually scanned and found nothing new in. Never-scanned stores always stay visible.">
+                Hide stores with nothing new
+              </span>
+            </label>
+            <label className="flex items-center gap-1.5 text-text-dim cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={hideMarked}
+                onChange={(e) => setHideMarked(e.target.checked)}
+                className="h-3.5 w-3.5 accent-[var(--accent)]"
+              />
+              Hide marked
+            </label>
+            <label className="flex items-center gap-1.5 text-text-dim">
+              Sort
+              <select
+                value={storeSort}
+                onChange={(e) => setStoreSort(e.target.value as "score" | "new" | "stale")}
+                className="h-7 px-1.5 rounded-md bg-bg-elev-2 border border-border text-[11.5px] text-text focus:outline-none focus:border-accent"
+              >
+                <option value="score">Score</option>
+                <option value="new">Most new products</option>
+                <option value="stale">Longest untouched</option>
+              </select>
+            </label>
             <span className="flex-1" />
             {wtlStores && wtlStores.traffic_missing > 0 && (
               <span className="text-text-faint">{wtlStores.traffic_missing} without traffic data yet</span>
@@ -836,7 +890,34 @@ export function WhatToListWorkbench() {
             <p className="text-[12px] text-text-faint">No known competitor stores yet — add one below.</p>
           ) : (
             (() => {
-              const visible = wtlStores.stores.filter((s) => !onlyEnough || s.market_ok);
+              const visible = wtlStores.stores
+                .filter((s) => !onlyEnough || s.market_ok)
+                // Both opt-in. "0 new" only hides stores we ACTUALLY scanned —
+                // never-scanned ones (bs_new_count === null) always stay visible.
+                .filter((s) => !hideEmpty || s.bs_new_count === null || s.bs_new_count > 0)
+                .filter((s) => !hideMarked || !s.mark)
+                .slice()
+                .sort((a, b) => {
+                  // Marked stores always sink, whatever the sort.
+                  const am = a.mark ? 1 : 0;
+                  const bm = b.mark ? 1 : 0;
+                  if (am !== bm) return am - bm;
+                  if (storeSort === "new") {
+                    // Unscanned sort as -1: below stores with real finds, above
+                    // stores proven empty — they're an unknown, not a dead end.
+                    const av = a.bs_new_count ?? -1;
+                    const bv = b.bs_new_count ?? -1;
+                    if (av !== bv) return bv - av;
+                    return b.score - a.score;
+                  }
+                  if (storeSort === "stale") {
+                    const at = a.last_opened_at ? Date.parse(a.last_opened_at) : 0;
+                    const bt = b.last_opened_at ? Date.parse(b.last_opened_at) : 0;
+                    if (at !== bt) return at - bt; // longest-unopened first
+                    return b.score - a.score;
+                  }
+                  return 0; // 'score' = keep the backend order
+                });
               if (visible.length === 0)
                 return (
                   <p className="text-[12px] text-text-faint">
@@ -860,14 +941,31 @@ export function WhatToListWorkbench() {
                 if (p.local_player) bits.push(`+${Math.round(p.local_player * 100)} local player`);
                 return `Score ${s.score}/100 = ${bits.join(" · ")}. Highest score = mine this store first.`;
               };
+              const totalNew = visible.reduce((sum, s) => sum + (s.bs_new_count ?? 0), 0);
+              const unscanned = visible.filter((s) => !s.bs_scanned).length;
               return (
-                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                <>
+                <div className="flex items-baseline gap-2 mb-2 text-[11.5px] text-text-faint">
+                  <span>
+                    {visible.length} of {wtlStores.stores.length} stores
+                    {totalNew > 0 && <> · <strong className="text-accent">{totalNew} products still to mine</strong></>}
+                    {unscanned > 0 && <> · {unscanned} not scanned yet</>}
+                  </span>
+                  <span className="flex-1" />
+                  <span>
+                    sorted by{" "}
+                    {storeSort === "new" ? "most new" : storeSort === "stale" ? "longest untouched" : "score"}
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 max-h-[560px] overflow-y-auto pr-1">
                   {visible.map((s) => (
                     <button
                       key={s.domain}
                       type="button"
                       onClick={() => void runScan(s.domain, false, s)}
-                      className="rounded-[12px] border border-border bg-bg-elev-2 px-4 py-3.5 text-left hover:border-accent transition group"
+                      className={`rounded-[12px] border border-border bg-bg-elev-2 px-4 py-3.5 text-left hover:border-accent transition group ${
+                        s.mark || s.bs_new_count === 0 ? "opacity-60 hover:opacity-100" : ""
+                      }`}
                       title={`Open ${s.domain}'s bestsellers (step 3)`}
                     >
                       <div className="flex items-center gap-2.5">
@@ -997,9 +1095,118 @@ export function WhatToListWorkbench() {
                         {s.last_import ? ` · last ${s.last_import}` : ""}
                         <span className="text-accent opacity-0 group-hover:opacity-100"> · View bestsellers →</span>
                       </div>
+
+                      {/* Worklist row: what's left here + the manual marks. */}
+                      <div className="mt-2 flex items-center gap-1.5 flex-wrap">
+                        {(() => {
+                          // THREE distinct states. Never render "0 new" for a store we
+                          // never scanned — that would read as "mined dry" and make the
+                          // operator skip a virgin store.
+                          if (!s.bs_scanned)
+                            return (
+                              <span
+                                className="text-[10px] px-1.5 py-0.5 rounded border border-border text-text-faint"
+                                title="No bestseller scan cached yet — open it to find out what's here. (The list never scans by itself; that's what caused rate-limiting before.)"
+                              >
+                                not scanned yet
+                              </span>
+                            );
+                          const age = s.bs_age_seconds ?? 0;
+                          const ago =
+                            age < 3600
+                              ? `${Math.max(1, Math.round(age / 60))}m ago`
+                              : age < 86400
+                                ? `${Math.round(age / 3600)}h ago`
+                                : `${Math.round(age / 86400)}d ago`;
+                          const fresh = (s.bs_new_count ?? 0) > 0;
+                          return (
+                            <span
+                              className={`text-[10px] px-1.5 py-0.5 rounded border font-semibold ${
+                                fresh
+                                  ? "bg-green-600/15 text-green-600 dark:text-green-400 border-green-600/40"
+                                  : "border-border text-text-faint"
+                              }`}
+                              title={
+                                fresh
+                                  ? `${s.bs_new_count} of ${s.bs_total} bestsellers here are not in your catalogue yet. Scanned ${ago}${s.bs_stale ? " — older than a day, so this may have drifted" : ""}.`
+                                  : `All ${s.bs_total} cached bestsellers are already imported. Scanned ${ago}${s.bs_stale ? " — older than a day, they may have restocked since" : ""}.`
+                              }
+                            >
+                              {fresh ? `${s.bs_new_count} new` : "0 new"}
+                              <span className="font-normal opacity-70"> · {ago}</span>
+                              {s.bs_stale && <span className="font-normal opacity-70"> ·⚠</span>}
+                            </span>
+                          );
+                        })()}
+
+                        {s.mark && (
+                          <span
+                            className="text-[10px] px-1.5 py-0.5 rounded border border-border text-text-faint"
+                            title={
+                              s.mark === "skip"
+                                ? "Marked as not for us"
+                                : `Snoozed${s.snooze_until ? ` until ${s.snooze_until.slice(0, 10)}` : ""}`
+                            }
+                          >
+                            {s.mark === "skip" ? "✕ not for us" : "⏳ later"}
+                          </span>
+                        )}
+
+                        <span className="flex-1" />
+
+                        {/* stopPropagation on BOTH handlers, or marking fires the
+                            card's runScan and yanks the page down to step ③. */}
+                        {s.mark ? (
+                          <span
+                            role="button"
+                            tabIndex={0}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void markStore(s.domain, null);
+                            }}
+                            onKeyDown={(e) => e.stopPropagation()}
+                            className="text-[10px] text-accent hover:underline cursor-pointer"
+                            title="Bring this store back into the list"
+                          >
+                            undo
+                          </span>
+                        ) : (
+                          <>
+                            <span
+                              role="button"
+                              tabIndex={0}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void markStore(s.domain, "later");
+                              }}
+                              onKeyDown={(e) => e.stopPropagation()}
+                              className="text-[10px] text-text-faint hover:text-accent hover:underline cursor-pointer"
+                              title="Nothing here for now — sink it for 2 weeks, then it comes back"
+                            >
+                              later
+                            </span>
+                            <span
+                              role="button"
+                              tabIndex={0}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (!confirm(`Mark ${s.domain.replace(/^www\./, "")} as NOT for us?\n\nIt stays in the list, just dimmed and sorted last. You can undo it any time.`))
+                                  return;
+                                void markStore(s.domain, "skip");
+                              }}
+                              onKeyDown={(e) => e.stopPropagation()}
+                              className="text-[10px] text-text-faint hover:text-danger hover:underline cursor-pointer"
+                              title="Wrong style, wrong prices — keep it out of the way"
+                            >
+                              not for us
+                            </span>
+                          </>
+                        )}
+                      </div>
                     </button>
                   ))}
                 </div>
+                </>
               );
             })()
           )}
