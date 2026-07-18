@@ -1272,6 +1272,27 @@ export const lightingApi = {
   status: (probe = false) =>
     call<LightStatusResponse>(`/api/lighting/status${probe ? "?probe=1" : ""}`),
 
+  /** Collections on a lighting store — populates the bundle picker at publish. */
+  bundleCollections: (store: LightStore) =>
+    call<{ store?: string; collections: { title: string; handle: string; products: number }[]; error?: string }>(
+      `/api/lighting/bundle_collections?store=${store}`,
+      { authed: true }
+    ),
+
+  /** Read the COMPETITOR's bundle from their product page and suggest which of
+   *  your own bundle collections matches. Kaching exposes its deal config in the
+   *  page, so a competitor on the same app is fully readable; on another app we
+   *  say what we saw and make no suggestion rather than guessing. */
+  bundleSuggest: (url: string, store: LightStore) =>
+    call<{
+      detected: { qty: number; discount: number; type: string }[];
+      detected_app: string | null;
+      readable: boolean;
+      summary: string;
+      suggestion: { handle: string; title: string; score: number; why: string[] } | null;
+      error?: string;
+    }>(`/api/lighting/bundle_suggest?url=${encodeURIComponent(url)}&store=${store}`, { authed: true }),
+
   /** Save The Light Supplier's Shopify credentials on the server (gated).
    *  The values go straight to your own droplet over HTTPS and are never stored
    *  in the browser, logged, or returned. */

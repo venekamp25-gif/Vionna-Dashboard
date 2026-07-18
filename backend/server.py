@@ -15718,6 +15718,161 @@ Antwoord uitsluitend als geldig JSON:
     return jsonify(out)
 
 
+# ── Bundel-suggestie bij import (Kaching blijft leidend) ────────────────────
+# Kaching heeft geen API en bewaart zijn deals in app-eigen opslag (geverifieerd:
+# niets in product- of shop-metafields). MAAR de app rendert zijn config wel als
+# JSON in de productpagina. Dus: de bundel van een concurrent UITLEZEN kan, en de
+# eigen bundel TOEWIJZEN gebeurt via de collectie waar de deal op staat.
+
+def _bundle_tiers_from_html(html):
+    """Staffels uit een productpagina: [{'qty', 'discount', 'type'}]. Leeg als de
+    winkel geen leesbare bundel-app draait."""
+    m = re.search(r'kaching-bundles-deal-block-settings[^>]*>\s*(\{.*?\})\s*</script>',
+                  html or '', re.S)
+    if not m:
+        return [], None
+    try:
+        bars = (json.loads(m.group(1)).get('dealBars') or [])
+    except Exception:
+        return [], 'Kaching'
+    out = []
+    for b in bars:
+        try:
+            qty = int(b.get('quantity') or 0)
+        except (TypeError, ValueError):
+            continue
+        try:
+            val = float(b.get('discountValue') or 0)
+        except (TypeError, ValueError):
+            val = 0.0
+        if qty >= 1:
+            out.append({'qty': qty, 'discount': round(val), 'type': b.get('discountType') or 'default'})
+    out.sort(key=lambda x: x['qty'])
+    return out, 'Kaching'
+
+
+def _bundle_app_hint(html):
+    """Welke bundel-app draait hier, als we de staffels NIET kunnen lezen."""
+    for name, pat in (('Vitals', r'vitals'), ('Rebolt', r'rebolt[_-]?bundles'),
+                      ('UpCart', r'upcart'), ('Selleasy', r'selleasy'),
+                      ('Zoorix', r'zoorix'), ('Bold Bundles', r'bold[_-]?bundle')):
+        if re.search(pat, html or '', re.I):
+            return name
+    return None
+
+
+_NUM_RE = re.compile(r'\d+')
+
+
+def _bundle_match_score(collection_name, tiers):
+    """Hoe goed past een eigen bundel-collectie bij de staffels van de concurrent?
+
+    De namen zijn door de eigenaar bedacht ('Bundel 2+4 · 25/38%'), dus we scoren
+    op de GETALLEN die erin staan: aantallen wegen zwaarder dan kortingen, want
+    '2 en 4 stuks' is de kern van het aanbod. Transparant: de UI toont waarom.
+    """
+    nums = {int(x) for x in _NUM_RE.findall(collection_name or '')}
+    if not nums or not tiers:
+        return 0, []
+    score, why = 0, []
+    for t in tiers:
+        if t['qty'] > 1 and t['qty'] in nums:
+            score += 3
+            why.append(f"{t['qty']}x")
+        if t['discount'] and t['discount'] in nums:
+            score += 2
+            why.append(f"{t['discount']}%")
+    return score, why
+
+
+@app.route('/api/lighting/bundle_collections')
+@require_droplet_token
+def api_lighting_bundle_collections():
+    """Collecties van een lighting-store, voor de bundel-keuzelijst bij import.
+    Read-only. ?store=nl"""
+    store = (request.args.get('store') or 'nl').strip()
+    if store not in LIGHT_TOKENS:
+        return jsonify({'error': f'{store} not configured', 'collections': []}), 400
+    hdrs = shopify_headers(store)
+    if not hdrs.get('X-Shopify-Access-Token'):
+        return jsonify({'error': 'no usable token', 'collections': []}), 400
+    q = ('{ collections(first:100){ edges{ node{ title handle '
+         'productsCount{count} } } } }')
+    try:
+        r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                          json={'query': q}, timeout=30)
+        body = r.json() or {}
+    except Exception as e:
+        return jsonify({'error': str(e)[:120], 'collections': []}), 502
+    if body.get('errors'):
+        return jsonify({'error': str(body['errors'])[:150], 'collections': []}), 502
+    cols = [{'title': e['node']['title'], 'handle': e['node']['handle'],
+             'products': (e['node'].get('productsCount') or {}).get('count', 0)}
+            for e in (((body.get('data') or {}).get('collections') or {}).get('edges') or [])]
+    cols.sort(key=lambda c: c['title'].lower())
+    return jsonify({'store': store, 'collections': cols})
+
+
+@app.route('/api/lighting/bundle_suggest')
+@require_droplet_token
+def api_lighting_bundle_suggest():
+    """Lees de bundel van een CONCURRENT en stel de best passende eigen
+    bundel-collectie voor. ?url=<productpagina>&store=nl
+
+    Geeft altijd eerlijk terug wat er gezien is:
+      detected: []        -> geen leesbare bundel (andere app of geen bundel)
+      detected_app: 'X'   -> er draait wel iets, maar niet leesbaar
+      suggestion: null    -> geen voorstel; medewerker kiest zelf
+    """
+    url = _extract_first_url((request.args.get('url') or '').strip())
+    store = (request.args.get('store') or 'nl').strip()
+    if not url or not url.startswith(('http://', 'https://')):
+        return jsonify({'error': 'a full product URL is required'}), 400
+    try:
+        r = _scrape_get(url, timeout=20)
+        html = r.text if r.status_code == 200 else ''
+    except Exception as e:
+        return jsonify({'error': f'could not read that page ({str(e)[:60]})'}), 502
+
+    tiers, app_name = _bundle_tiers_from_html(html)
+    hint = app_name or _bundle_app_hint(html)
+    # staffels van 1x zonder korting zijn de 'losse' regel, geen aanbod
+    real = [t for t in tiers if t['qty'] > 1 or t['discount'] > 0]
+
+    cols, suggestion = [], None
+    if store in LIGHT_TOKENS:
+        try:
+            hdrs = shopify_headers(store)
+            q = '{ collections(first:100){ edges{ node{ title handle } } } }'
+            rr = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                               json={'query': q}, timeout=30)
+            cols = [{'title': e['node']['title'], 'handle': e['node']['handle']}
+                    for e in ((((rr.json() or {}).get('data') or {}).get('collections') or {}).get('edges') or [])]
+        except Exception as e:
+            print(f'[lighting] bundle_suggest collections failed: {e}')
+
+    if real and cols:
+        ranked = []
+        for c in cols:
+            sc, why = _bundle_match_score(c['title'] + ' ' + c['handle'], real)
+            if sc > 0:
+                ranked.append({'handle': c['handle'], 'title': c['title'],
+                               'score': sc, 'why': sorted(set(why))})
+        ranked.sort(key=lambda x: -x['score'])
+        if ranked:
+            suggestion = ranked[0]
+
+    return jsonify({
+        'url': url,
+        'detected': real,
+        'detected_app': hint,
+        'readable': bool(real),
+        'suggestion': suggestion,
+        'summary': (' · '.join(f"{t['qty']}x −{t['discount']}%" if t['type'] == 'percentage'
+                               else f"{t['qty']}x" for t in real) if real else ''),
+    })
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print(f"\nVionna Dashboard running on http://localhost:{port}\n")

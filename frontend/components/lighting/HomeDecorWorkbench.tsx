@@ -72,10 +72,29 @@ export function HomeDecorWorkbench() {
   const [researchMarket, setResearchMarket] = useState<LightStore>("nl");
   const [kwLoading, setKwLoading] = useState(false);
   const [kwNote, setKwNote] = useState<string | null>(null);
+  // Bundle picker: your own collections + what the competitor runs.
+  const [collections, setCollections] = useState<{ title: string; handle: string; products: number }[]>([]);
+  const [bundleInfo, setBundleInfo] = useState<{
+    summary: string;
+    detected_app: string | null;
+    readable: boolean;
+    suggestion: { handle: string; title: string; why: string[] } | null;
+  } | null>(null);
 
   useEffect(() => {
     lightingApi.status().then(setStatus).catch(() => setStatus(null));
   }, []);
+
+  // Bundle collections come from the first connected store — the deal lives in
+  // Kaching, we only decide which collection the product lands in.
+  useEffect(() => {
+    const first = status?.ready?.[0];
+    if (!first) return;
+    lightingApi
+      .bundleCollections(first)
+      .then((r) => setCollections(r.collections ?? []))
+      .catch(() => setCollections([]));
+  }, [status]);
 
   const configured = status?.ready ?? [];
   // `status === null` means we couldn't ASK (backend hiccup) — that's not the same
@@ -141,6 +160,17 @@ export function HomeDecorWorkbench() {
         price: draft.price || firstPrice,
         content: {},
       });
+      // Read the competitor's bundle so we can suggest a matching one of yours.
+      // Never blocks the import — no readable bundle just means no suggestion.
+      lightingApi
+        .bundleSuggest(url, draft.selectedStores[0] ?? "nl")
+        .then((b) => {
+          setBundleInfo(b);
+          if (b.suggestion && !draft.bundleCollection) {
+            patch({ bundleCollection: b.suggestion.handle });
+          }
+        })
+        .catch(() => setBundleInfo(null));
     } catch (e) {
       setScrapeError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -697,19 +727,63 @@ export function HomeDecorWorkbench() {
                 </span>
               </label>
 
-              {draft.kaching && (
-                <label className="block ml-6">
-                  <span className="text-[11px] text-text-dim">
-                    Bundle collection handle — <strong>this is what turns the bundle on</strong>
-                  </span>
-                  <input
-                    value={draft.bundleCollection}
-                    onChange={(e) => patch({ bundleCollection: e.target.value })}
-                    placeholder="bundel-deals"
-                    className="w-full mt-1 px-3 h-9 rounded-[10px] bg-bg-elev-2 border border-border text-[12px] focus:outline-none focus:border-accent"
-                  />
-                </label>
-              )}
+              <div className="ml-6">
+                <span className="text-[11px] text-text-dim">
+                  Bundle — <strong>this is what turns the Kaching deal on</strong>
+                </span>
+
+                {/* What the competitor runs, and which of yours matches it. */}
+                {bundleInfo && (
+                  <div className="mt-1.5 mb-2 rounded-[10px] border border-border bg-bg-elev-2 px-3 py-2">
+                    {bundleInfo.readable ? (
+                      <>
+                        <p className="text-[11.5px] text-text">
+                          Competitor runs: <strong>{bundleInfo.summary}</strong>
+                        </p>
+                        {bundleInfo.suggestion ? (
+                          <p className="text-[11px] text-text-dim mt-1">
+                            Closest of yours: <strong className="text-accent">{bundleInfo.suggestion.title}</strong>
+                            {bundleInfo.suggestion.why.length > 0 && (
+                              <> — matched on {bundleInfo.suggestion.why.join(", ")}</>
+                            )}
+                            {draft.bundleCollection === bundleInfo.suggestion.handle
+                              ? " · selected"
+                              : ""}
+                          </p>
+                        ) : (
+                          <p className="text-[11px] text-text-dim mt-1">
+                            None of your bundle collections matches those numbers — pick one below.
+                          </p>
+                        )}
+                      </>
+                    ) : (
+                      <p className="text-[11.5px] text-text-dim">
+                        {bundleInfo.detected_app
+                          ? `They run ${bundleInfo.detected_app}, which doesn't expose its deal — pick a bundle yourself.`
+                          : "No bundle found on the competitor's page — pick one yourself if you want one."}
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                <select
+                  value={draft.bundleCollection}
+                  onChange={(e) => patch({ bundleCollection: e.target.value })}
+                  className="w-full mt-1 px-2 h-9 rounded-[10px] bg-bg-elev-2 border border-border text-[12px] text-text focus:outline-none focus:border-accent"
+                >
+                  <option value="">No bundle</option>
+                  {collections.map((c) => (
+                    <option key={c.handle} value={c.handle}>
+                      {c.title}
+                      {bundleInfo?.suggestion?.handle === c.handle ? "  ← suggested" : ""}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-[10.5px] text-text-faint mt-1">
+                  The product is added to this collection, and your Kaching deal for that collection
+                  does the rest. {collections.length === 0 && "Connect a store to load your collections."}
+                </p>
+              </div>
 
               <label className="flex items-start gap-2.5 cursor-pointer">
                 <input
