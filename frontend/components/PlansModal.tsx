@@ -33,7 +33,7 @@ export function PlansModal({ open, onClose, onPendingCount }: Props) {
       setPlans(r.entries);
       onPendingCount?.(r.pending_count);
     } catch {
-      setError("Kon plannen niet laden — is de backend bereikbaar?");
+      setError("Could not load plans — is the backend reachable?");
     } finally {
       setLoading(false);
     }
@@ -64,7 +64,7 @@ export function PlansModal({ open, onClose, onPendingCount }: Props) {
         await refresh();
       }
     } catch {
-      setError("Actie mislukt — probeer het opnieuw.");
+      setError("That didn't work — please try again.");
     } finally {
       setBusy(null);
     }

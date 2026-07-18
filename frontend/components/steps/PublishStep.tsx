@@ -544,7 +544,7 @@ function StoreResultCard({
       setRetryMsg(stillBroken ? "Een paar punten blijven openstaan." : "✓ Opgelost!");
       setShowBug(stillBroken);
     } catch (e) {
-      setRetryMsg("Retry mislukt: " + (e instanceof Error ? e.message : String(e)));
+      setRetryMsg("Retry failed: " + (e instanceof Error ? e.message : String(e)));
       setShowBug(true);
     } finally {
       setRetrying(false);
@@ -786,20 +786,20 @@ function PostPublishChecklist({
       const live = r?.liveCount ?? 0;
       rows.push(
         live >= total && total > 0
-          ? { level: "ok", label: `Product staat live (actief) — ${total}/${total} kleuren` }
-          : { level: "fail", label: `Live zetten (deels) mislukt — ${live}/${total} live; rest staat nog op concept` }
+          ? { level: "ok", label: `Product is live (active) — ${total}/${total} colours` }
+          : { level: "fail", label: `Going live (partly) failed — ${live}/${total} live; the rest is still a draft` }
       );
     } else {
       // Not opting into live-publish is a deliberate, correct outcome — never a warning.
-      rows.push({ level: "ok", label: "Product staat bewust op concept (niet live gezet)" });
+      rows.push({ level: "ok", label: "Product left as a draft on purpose (not set live)" });
     }
 
     // Images + metafields (colour swatch / size chart / siblings).
     const mfErr = r?.metafieldErrors ?? [];
     rows.push(
       mfErr.length === 0
-        ? { level: "ok", label: "Foto's + metafields (kleur, maattabel, siblings) gelukt" }
-        : { level: "warn", label: `${mfErr.length} metafield-waarschuwing(en) — zie de kaart hierboven` }
+        ? { level: "ok", label: "Photos + metafields (colour, size chart, siblings) written" }
+        : { level: "warn", label: `${mfErr.length} metafield warning(s) — see the card above` }
     );
 
     // Post-publish verification (already run at publish time).
@@ -809,8 +809,8 @@ function PostPublishChecklist({
       const fails = ver.some((p) => (p.issues ?? []).some((i) => i.level === "fail"));
       rows.push(
         issues.length === 0
-          ? { level: "ok", label: "Na-controle: foto's, swatch, kanalen & varianten aanwezig" }
-          : { level: fails ? "fail" : "warn", label: `Na-controle: ${issues.length} product(en) om na te kijken` }
+          ? { level: "ok", label: "Post-check: photos, swatch, channels & variants all present" }
+          : { level: fails ? "fail" : "warn", label: `Post-check: ${issues.length} product(s) to look at` }
       );
     }
 
@@ -820,8 +820,8 @@ function PostPublishChecklist({
     if (m) {
       rows.push(
         m.error
-          ? { level: "fail", label: `Meta-ads: mislukt — ${m.error}` }
-          : { level: "ok", label: `Meta-ads: ${m.ad_ids?.length ?? 0} ad(s) klaar — campagne staat op pauze (ad sets & ads staan aan)` }
+          ? { level: "fail", label: `Meta ads: failed — ${m.error}` }
+          : { level: "ok", label: `Meta ads: ${m.ad_ids?.length ?? 0} ad(s) ready — campaign is paused (ad sets & ads are on)` }
       );
     }
 
@@ -834,13 +834,13 @@ function PostPublishChecklist({
   const COLOR: Record<Level, string> = { ok: "text-accent", warn: "text-warning", fail: "text-danger" };
 
   const manualItems: { id: string; label: string }[] = [
-    { id: "page", label: "Productpagina bekeken: foto's, kleur-swatches en maattabel-popup kloppen" },
-    { id: "price", label: "Prijs + kortingsprijs kloppen in elke winkel" },
+    { id: "page", label: "Checked the product page: photos, colour swatches and size-chart popup look right" },
+    { id: "price", label: "Price + compare-at price are right in every store" },
     ...(metaRan
       ? [
-          { id: "adcopy", label: "Ad-preview (beeld + tekst) leest goed per taal" },
-          { id: "budget", label: "Budget €30/dag + targeting-land klopt in Ads Manager" },
-          { id: "setlive", label: "Campagne op LIVE gezet in Ads Manager — één toggle (ad sets & ads staan al aan)" },
+          { id: "adcopy", label: "Ad preview (image + text) reads well in each language" },
+          { id: "budget", label: "Budget €30/day + target country are right in Ads Manager" },
+          { id: "setlive", label: "Campaign switched to LIVE in Ads Manager — one toggle (ad sets & ads are already on)" },
         ]
       : []),
   ];

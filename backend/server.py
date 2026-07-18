@@ -7342,7 +7342,7 @@ Antwoord ALLEEN als geldig JSON:
                              ('description', 'meta_description', 'm_title_specs'))
             out['unverified_length'] = _unverified_length_claims(_blob, _len_src)
             return jsonify(out)
-        return jsonify({'error': 'Kon respons niet parsen', 'raw': text}), 500
+        return jsonify({'error': 'Could not parse the response', 'raw': text}), 500
 
     # ── Full generation (default — all three fields at once) ──
     prompt = f"""Je bent een productschrijver voor een vrouwenmodezaak. Schrijf productcontent in het {language} voor een product genaamd "{product_name}".
@@ -7390,7 +7390,7 @@ Antwoord uitsluitend als geldig JSON zonder extra tekst:
             print(f"[generate] {product_name!r} claims length {out['unverified_length']} "
                   f"not in source")
         return jsonify(out)
-    return jsonify({'error': 'Kon respons niet parsen', 'raw': text}), 500
+    return jsonify({'error': 'Could not parse the response', 'raw': text}), 500
 
 
 @app.route('/api/translate_colors', methods=['POST'])
@@ -9038,7 +9038,7 @@ def api_wtl_stores_add():
     raw = str((request.get_json(silent=True) or {}).get('domain') or '').strip().lower()
     m = re.match(r'(?:https?://)?(?:www\.)?([a-z0-9.-]+\.[a-z]{2,})', raw)
     if not m:
-        return jsonify({'error': 'geen geldig domein'}), 400
+        return jsonify({'error': 'not a valid domain'}), 400
     dom = m.group(1)
     if dom in _load_blocked_sources():
         return jsonify({'error': f'{dom} staat op de blokkadelijst'}), 400
@@ -9100,8 +9100,8 @@ def api_wtl_export():
             if s['domain'].replace('www.', '') == bare:
                 imported = set(s.get('imported_handles') or [])
                 break
-        w.writerow(['Status', 'Positie', 'Titel', 'Type', 'Prijs', 'Prijs EUR', 'Onder EUR 25',
-                    'Ook bestseller bij', 'Sinds', 'Al geimporteerd', 'Product-URL'])
+        w.writerow(['Status', 'Position', 'Title', 'Type', 'Price', 'Price EUR', 'Under EUR 25',
+                    'Also bestseller at', 'Since', 'Already imported', 'Product URL'])
         for pr in payload.get('products') or []:
             w.writerow(['', pr.get('position'), pr.get('title'), pr.get('category'),
                         pr.get('price'),
@@ -9112,7 +9112,7 @@ def api_wtl_export():
                         'JA' if pr.get('handle') in imported else '', pr.get('url')])
         fname = f'wtl_bestsellers_{bare}_{today}.csv'
     elif what == 'stores':
-        w.writerow(['Score', 'Store', 'Verzend-oordeel', f'Bezoekers {cc}/mnd', 'Bezoekers totaal/mnd',
+        w.writerow(['Score', 'Store', 'Shipping verdict', f'Visitors {cc}/mo', 'Visitors total/mo',
                     '% lokaal', 'Trend m/m', 'Eerder geimporteerd', 'Laatste import', 'Bestseller-pagina'])
         for s in stores:
             if only_ok and not s.get('market_ok'):
@@ -9127,7 +9127,7 @@ def api_wtl_export():
                         f"https://{s['domain']}/collections/all?sort_by=best-selling"])
         fname = f'wtl_stores_{store}_{today}.csv'
     else:
-        w.writerow(['Status', 'Store', 'Verzend-oordeel', 'Store-score', f'Bezoekers {cc}/mnd',
+        w.writerow(['Status', 'Store', 'Shipping verdict', 'Store score', f'Visitors {cc}/mo',
                     'Positie', 'Titel', 'Type', 'Prijs', 'Prijs EUR', 'Ook bestseller bij', 'Sinds',
                     'Al geimporteerd', 'Product-URL'])
         picked = [s for s in stores if s.get('market_ok') or not only_ok][:12]
@@ -12532,7 +12532,7 @@ def meta_fix_links():
     parts = [p.strip() for p in cname.split('|') if p.strip()]
     product_name = (data.get('product_name') or (parts[1] if len(parts) >= 3 else (parts[0] if parts else ''))).strip()
     if not (domain and product_name):
-        return jsonify({'error': 'Kon domein of productnaam niet bepalen.'}), 400
+        return jsonify({'error': 'Could not work out the domain or product name.'}), 400
     name_slug = _meta_slug(product_name)
 
     real_handles = _store_variant_handles(store, product_name)
