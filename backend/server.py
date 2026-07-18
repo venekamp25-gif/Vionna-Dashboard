@@ -9732,31 +9732,57 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
         cand[d] = (m, term)
     print(f'[wtl-disc] {len(results)} results -> {len(cand)} unknown candidates')
 
+    # Begrens de pool: met de bredere zoekopdrachten komen er 700+ kandidaten uit,
+    # en die allemaal bevragen kost uren. SERP-volgorde = relevantievolgorde, dus
+    # we nemen de bovenste. De rest komt bij een volgende run — afgewezen
+    # kandidaten worden onthouden, dus je loopt niet dezelfde lijst opnieuw af.
+    _GD_MAX_CANDIDATES = 300
+    if len(cand) > _GD_MAX_CANDIDATES:
+        print(f'[wtl-disc] {len(cand)} kandidaten -> eerste {_GD_MAX_CANDIDATES} deze run')
+        cand = dict(list(cand.items())[:_GD_MAX_CANDIDATES])
+
     scanned, skipped = {}, []
     if jid:
         _job_set(jid, phase='Kandidaten checken (Shopify/lokaal/mode)', total=len(cand), processed=0)
-    for d, (m, term) in cand.items():
-        if jid:
-            _job_inc(jid, processed=1)
-        per_market = sum(1 for v in scanned.values() if v[0] == m)
-        if per_market >= _GD_MAX_NEW * 3:
-            continue
-        if not _gd_is_shopify(d):
-            _gd_remember(seen, d, m, 'geen Shopify')
-            skipped.append({'domain': d, 'market': m, 'reason': 'geen Shopify'})
-            continue
-        if not _gd_is_local(d, m):
-            _gd_remember(seen, d, m, 'niet lokaal')
-            skipped.append({'domain': d, 'market': m, 'reason': f'niet lokaal voor {m.upper()}'})
-            continue
-        # gecachet: een herhaalde run mag dezelfde winkel niet opnieuw scannen
-        payload, blocked = _bs_scan_cached(d)
-        n = len((payload or {}).get('products') or [])
-        if blocked or n < _GD_MIN_WOMENS:
-            _gd_remember(seen, d, m, blocked or 'te weinig bestsellers')
+
+    def _check_one(item):
+        """Eén kandidaat: Shopify -> lokaal -> damesmode. Puur wachten op HTTP,
+        dus veilig parallel. Geeft (domein, markt, term, payload, afwijsreden)."""
+        d, (m, term) = item
+        try:
+            if not _gd_is_shopify(d):
+                return d, m, term, None, 'geen Shopify'
+            if not _gd_is_local(d, m):
+                return d, m, term, None, 'niet lokaal'
+            payload, blocked = _bs_scan_cached(d)
+            n = len((payload or {}).get('products') or [])
+            if blocked or n < _GD_MIN_WOMENS:
+                return d, m, term, None, (blocked or f'maar {n} vrouwenmode-bestsellers')
+            return d, m, term, payload, None
+        except Exception as e:
+            return d, m, term, None, f'check mislukt: {str(e)[:50]}'
+        finally:
+            if jid:
+                _job_inc(jid, processed=1)
+
+    import concurrent.futures as _cf
+    results_c = []
+    with _cf.ThreadPoolExecutor(max_workers=8) as pool:
+        for res in pool.map(_check_one, list(cand.items())):
+            results_c.append(res)
+
+    # Caps PAS NA het verzamelen toepassen, zodat de uitkomst niet afhangt van
+    # welke werker toevallig eerst klaar was.
+    per_market_scanned = {}
+    for d, m, term, payload, reason in results_c:
+        if reason:
+            _gd_remember(seen, d, m, 'te weinig bestsellers' if 'bestsellers' in reason else reason)
             skipped.append({'domain': d, 'market': m,
-                            'reason': blocked or f'maar {n} vrouwenmode-bestsellers'})
+                            'reason': f'niet lokaal voor {m.upper()}' if reason == 'niet lokaal' else reason})
             continue
+        if per_market_scanned.get(m, 0) >= _GD_MAX_NEW * 3:
+            continue          # genoeg voor deze markt; niet onthouden, mag volgende run
+        per_market_scanned[m] = per_market_scanned.get(m, 0) + 1
         scanned[d] = (m, term, payload)
     print(f'[wtl-disc] {len(scanned)} local Shopify womens stores found')
 
