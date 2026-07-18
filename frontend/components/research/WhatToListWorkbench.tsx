@@ -142,6 +142,7 @@ export function WhatToListWorkbench() {
   const [storeSort, setStoreSort] = useState<"score" | "new" | "stale">("score");
   const [hideEmpty, setHideEmpty] = useState(false);
   const [hideMarked, setHideMarked] = useState(false);
+  const [onlyDropshippers, setOnlyDropshippers] = useState(false);
   const [trafficRefreshing, setTrafficRefreshing] = useState(false);
   const [discovering, setDiscovering] = useState(false);
   const [discoverMsg, setDiscoverMsg] = useState<string | null>(null);
@@ -814,6 +815,17 @@ export function WhatToListWorkbench() {
               />
               Hide marked
             </label>
+            <label className="flex items-center gap-1.5 text-text-dim cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={onlyDropshippers}
+                onChange={(e) => setOnlyDropshippers(e.target.checked)}
+                className="h-3.5 w-3.5 accent-[var(--accent)]"
+              />
+              <span title="Hides stores that failed the import-gate's dropship-verdict (own stock / possible real brand) and stores not checked yet. Press “🛡 Verify dropshippers” first to classify more of them.">
+                Only dropshippers
+              </span>
+            </label>
             <label className="flex items-center gap-1.5 text-text-dim">
               Sort
               <select
@@ -890,12 +902,17 @@ export function WhatToListWorkbench() {
             <p className="text-[12px] text-text-faint">No known competitor stores yet — add one below.</p>
           ) : (
             (() => {
+              // A store counts as a confirmed dropshipper once its verdict says so, or an
+              // employee found its products on AliExpress despite a different verdict.
+              const isDropshipper = (s: WtlStore) =>
+                s.verdict?.override === "ali-verified" || s.verdict?.label === "Dropshipper";
               const visible = wtlStores.stores
                 .filter((s) => !onlyEnough || s.market_ok)
                 // Both opt-in. "0 new" only hides stores we ACTUALLY scanned —
                 // never-scanned ones (bs_new_count === null) always stay visible.
                 .filter((s) => !hideEmpty || s.bs_new_count === null || s.bs_new_count > 0)
                 .filter((s) => !hideMarked || !s.mark)
+                .filter((s) => !onlyDropshippers || isDropshipper(s))
                 .slice()
                 .sort((a, b) => {
                   // Marked stores always sink, whatever the sort.
@@ -921,8 +938,13 @@ export function WhatToListWorkbench() {
               if (visible.length === 0)
                 return (
                   <p className="text-[12px] text-text-faint">
-                    No stores clear the local-traffic bar
-                    {wtlStores.traffic_missing > 0 ? " (some have no data yet — press “Update traffic”)" : ""} — untick
+                    {onlyDropshippers
+                      ? "No confirmed dropshippers yet — press “🛡 Verify dropshippers” to classify more stores, or untick "
+                      : "No stores clear the local-traffic bar"}
+                    {!onlyDropshippers && wtlStores.traffic_missing > 0
+                      ? " (some have no data yet — press “Update traffic”)"
+                      : ""}
+                    {!onlyDropshippers && " — untick "}
                     the filter to see all {wtlStores.stores.length}, or press “Discover new stores”.
                   </p>
                 );
