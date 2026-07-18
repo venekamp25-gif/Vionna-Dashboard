@@ -15341,7 +15341,10 @@ def api_lighting_publish():
         content:{ nl:{description, meta_description, m_title_specs}, ... },
         source_text, product_title,          # bron voor de spec-gate
         ack_claims:false,                    # true = publiceer ondanks waarschuwing
-        tags:[], kaching:true, bundle_collection:'handle', activate:false }
+        tags:[],
+        kaching:true,                        # zet het custom producttemplate
+        bundle_collection:'handle',          # DIT is wat de bundel aanstuurt
+        activate:false }
     One Shopify product per store (NOT one per colour — that's the Vionna model).
     Never touches the fashion stores: store keys are resolved from LIGHT_TOKENS.
     """
@@ -15442,8 +15445,14 @@ def api_lighting_publish():
             payload['product']['options'] = [{'name': option_name or 'Kleur',
                                               'values': option_values}]
         if kaching:
-            # Kaching Bundles heeft GEEN API; de bundel hangt aan het producttemplate
-            # + de collectie waarop de deal gericht staat (onderzocht 2026-07-15).
+            # Kaching Bundles heeft GEEN API. LET OP (gemeten 2026-07-16): het
+            # producttemplate stuurt de bundel NIET aan — de app-embed injecteert
+            # het blok op elke productpagina, ongeacht template. Of er een bundel
+            # VERSCHIJNT hangt puur aan de deal-selectie in de Kaching-app
+            # (blockVisibility 'selected-products' -> alleen aangevinkte producten;
+            # zet 'm op een COLLECTIE en alles in die collectie erft de bundel).
+            # Het template zetten is dus alleen zinvol als je bewust een custom
+            # productpagina wilt; het is geen bundel-schakelaar.
             payload['product']['template_suffix'] = data.get('template_suffix') or 'kaching-standaard'
 
         r = req.post(f'{base}products.json', headers=hdrs, json=payload, timeout=45)

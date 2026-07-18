@@ -687,18 +687,21 @@ export function HomeDecorWorkbench() {
                   className="mt-0.5 accent-[var(--accent)]"
                 />
                 <span className="text-[12.5px] text-text">
-                  Put on the Kaching bundle template
+                  Use the custom product template
                   <span className="block text-[11px] text-text-dim mt-0.5">
-                    Kaching has no API, so the bundle follows the product template
-                    (<code className="text-[10.5px]">kaching-standaard</code>) plus the collection its
-                    deal targets. Set your deal to a collection once and every new lamp inherits it.
+                    Puts the product on <code className="text-[10.5px]">kaching-standaard</code>. Note this
+                    does <strong>not</strong> switch the bundle on — measured on the live store, the bundle
+                    block is injected on every product page regardless of template. What decides whether a
+                    bundle actually shows is the collection your Kaching deal targets, below.
                   </span>
                 </span>
               </label>
 
               {draft.kaching && (
                 <label className="block ml-6">
-                  <span className="text-[11px] text-text-dim">Bundle collection handle (optional)</span>
+                  <span className="text-[11px] text-text-dim">
+                    Bundle collection handle — <strong>this is what turns the bundle on</strong>
+                  </span>
                   <input
                     value={draft.bundleCollection}
                     onChange={(e) => patch({ bundleCollection: e.target.value })}
