@@ -9510,7 +9510,7 @@ def _gd_wtl_terms(market):
 
 
 def _gd_domain(url):
-    m = re.match(r'https?://(?:www\.)?([^/]+)', str(url or '').strip().lower())
+    m = re.match(r'https?://(?:www\.)?([^/?#]+)', str(url or '').strip().lower())
     return m.group(1) if m else ''
 
 
