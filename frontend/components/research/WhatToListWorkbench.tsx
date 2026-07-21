@@ -297,20 +297,41 @@ export function WhatToListWorkbench() {
   };
 
   const [classifying, setClassifying] = useState(false);
+  const [classifyMsg, setClassifyMsg] = useState<string | null>(null);
   /** Dropship-check for stores without a fresh verdict (shipping policy + brand signals). */
   const classifyStores = async () => {
     setClassifying(true);
+    setClassifyMsg(null);
     try {
       const start = await api.wtlStoresClassify(10);
       if (!start.job_id) throw new Error(start.error || "could not start");
+      let summary = "";
+      let status = "";
+      let finished = false;
       for (let i = 0; i < 400; i++) {
         await new Promise((r) => setTimeout(r, 3000));
         const j = await api.metaJobStatus(start.job_id).catch(() => null);
-        if (j && j.status !== "running") break;
+        if (j && j.status !== "running") {
+          summary = j.summary || "";
+          status = j.status || "";
+          finished = true;
+          break;
+        }
+      }
+      // Only claim success once the job actually reported completion. The loop
+      // caps at 20 min; a job still running past that must NOT read as "✓ done"
+      // (that would show a green tick for an unfinished run). The backend flags a
+      // round that resolved nothing as "warning" — surface that too.
+      if (!finished) {
+        setClassifyMsg("⏳ Still running — check back in a minute");
+      } else {
+        setClassifyMsg(
+          summary ? `${status === "warning" ? "⚠" : "✓"} ${summary}` : "✓ done",
+        );
       }
       await loadStores(storeMarkets);
-    } catch {
-      /* list stays as-is */
+    } catch (e) {
+      setClassifyMsg(e instanceof Error ? e.message : "failed");
     } finally {
       setClassifying(false);
     }
@@ -981,6 +1002,7 @@ export function WhatToListWorkbench() {
           </div>
 
           {discoverMsg && <p className="text-[11.5px] text-text-dim mb-3">{discoverMsg}</p>}
+          {classifyMsg && <p className="text-[11.5px] text-text-dim mb-3">{classifyMsg}</p>}
 
           {storesLoading ? (
             <p className="text-[12px] text-text-faint">Loading stores…</p>

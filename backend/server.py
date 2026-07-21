@@ -9003,9 +9003,17 @@ def api_wtl_stores():
         s['score_parts'] = parts
     out.sort(key=lambda s: (-s['score'], -s['local_visits'], -s['products']))
     verdicts_missing = sum(1 for s in out if not (s.get('verdict') or {}).get('fresh'))
+    # Apart houden: 'nog nooit gekeken' is een heel ander probleem dan 'gekeken,
+    # niets gevonden'. In een gezamenlijke teller verdwijnt een vastgelopen
+    # wachtrij uit het zicht.
+    never_checked = sum(1 for s in out if not (s.get('verdict') or {}).get('label'))
+    unknown_count = sum(1 for s in out
+                        if (s.get('verdict') or {}).get('label') == 'Onbekend')
     return jsonify({'store': store, 'country': cc, 'min_local': min_local,
                     'stores': out, 'traffic_missing': missing,
                     'verdicts_missing': verdicts_missing,
+                    'never_checked': never_checked,
+                    'unknown_count': unknown_count,
                     'apify_configured': bool(os.getenv('APIFY_TOKEN', '').strip())})
 
 
@@ -9327,6 +9335,44 @@ def _wtl_verdict_fresh(v):
         return False
 
 
+# Backoff voor 'Onbekend'. Zonder rem gijzelt een structureel onvindbare winkel
+# (geen levertijd op de site, Cloudflare-blok) elke ronde opnieuw de wachtrij.
+# Oplopend: 1e mislukking -> 1 dag wachten, dan 2, 4, 8, max 8 dagen.
+_WTL_UNKNOWN_BACKOFF = 86400
+_WTL_UNKNOWN_BACKOFF_MAX = 8 * 86400
+
+
+def _wtl_verdict_age(v):
+    """Leeftijd van de laatste POGING in seconden; None als er niets staat."""
+    try:
+        ts = (v or {}).get('ts') or ''
+        if not ts:
+            return None
+        return (datetime.datetime.utcnow()
+                - datetime.datetime.fromisoformat(ts.rstrip('Z'))).total_seconds()
+    except Exception:
+        return None
+
+
+def _wtl_retry_due(v):
+    """Mag deze winkel NU opnieuw in de wachtrij?
+
+    Losgekoppeld van _wtl_verdict_fresh() met opzet: die voedt de UI-teller
+    verdicts_missing, en 'Onbekend' moet daar zichtbaar blijven meetellen.
+    Hier gaat het puur om wachtrij-planning.
+    """
+    if not v:
+        return True                       # nog nooit geprobeerd
+    age = _wtl_verdict_age(v)
+    if age is None:
+        return True
+    if v.get('label') == 'Onbekend':
+        n = max(0, int(v.get('attempts') or 1) - 1)
+        wait = min(_WTL_UNKNOWN_BACKOFF * (2 ** min(n, 3)), _WTL_UNKNOWN_BACKOFF_MAX)
+        return age >= wait
+    return age >= _WTL_VERDICT_TTL
+
+
 def _wtl_classify_missing(domains, jid=None, cap=10):
     """Classify domains without a fresh verdict, sequentially (slow LLM work), and
     persist. Returns {classified: n, verdicts: {domain: label}}."""
@@ -9334,23 +9380,63 @@ def _wtl_classify_missing(domains, jid=None, cap=10):
         return {'error': 'classification already running'}
     try:
         cache = _wtl_verdicts_load()
-        todo = [d for d in domains if not _wtl_verdict_fresh(cache.get(d.replace('www.', '')))][:cap]
+
+        def _queue_key(d):
+            v = cache.get(d.replace('www.', ''))
+            if not isinstance(v, dict):
+                # None of oud/kapot formaat -> als nooit-geprobeerd behandelen;
+                # (0, ...) sorteert vooraan. Nooit laten crashen: dat zou de
+                # hele job meenemen.
+                return (0, '', d)
+            return (1, v.get('ts') or '', d)
+
+        due = [d for d in domains
+               if _wtl_retry_due(cache.get(d.replace('www.', '')))]
+        todo = sorted(due, key=_queue_key)[:cap]
+        backlog = len(due)
+        never = sum(1 for d in domains if not cache.get(d.replace('www.', '')))
+        # Onbekend maar nog in backoff: telt niet als 'due', maar de UI-teller
+        # verdicts_missing rekent 'm wel mee -> apart benoemen zodat de knop niet
+        # 'niets te doen' lijkt terwijl de teller om werk schreeuwt.
+        snoozed = sum(1 for d in domains
+                      if (lambda vv: isinstance(vv, dict)
+                          and vv.get('label') == 'Onbekend'
+                          and not _wtl_retry_due(vv))(cache.get(d.replace('www.', ''))))
         if jid:
             _job_set(jid, phase='Verzendbeleid + merk-signalen checken', total=len(todo), processed=0)
         out = {}
+        resolved = 0
         for d in todo:
             bare = d.replace('www.', '')
             v = _wtl_classify_store(bare)
-            prev = cache.get(bare) or {}
+            prev = cache.get(bare)
+            if not isinstance(prev, dict):
+                prev = {}               # oud/kapot formaat -> als 'nieuw' behandelen
             if prev.get('override'):
                 v['override'] = prev['override']    # manual judgement survives re-checks
+            # attempts = OPEENVOLGENDE mislukkingen (voedt de backoff). Reset op
+            # een echt oordeel, anders zou een winkel die maanden goed ging na
+            # één hik meteen de maximale backoff krijgen.
+            if v['label'] == 'Onbekend':
+                v['attempts'] = int(prev.get('attempts') or 0) + 1
+            else:
+                v['attempts'] = 0
             cache[bare] = v
             out[bare] = v['label']
             _wtl_verdicts_save(cache)
+            # Vooruitgang = KREEG DE WINKEL EEN BRUIKBAAR OORDEEL, niet 'label
+            # veranderde'. Een herbevestiging is voortgang; 10x 'Onbekend' niet.
+            is_resolved = v['label'] not in (None, '', 'Onbekend')
+            if is_resolved:
+                resolved += 1
             if jid:
                 _job_inc(jid, processed=1)
+                if is_resolved:
+                    _job_inc(jid, changed=1)
             print(f"[wtl] verdict {bare}: {v['label']} ({v['source']})")
-        return {'classified': len(todo), 'verdicts': out}
+        return {'classified': len(todo), 'resolved': resolved, 'verdicts': out,
+                'backlog': backlog, 'never_checked': never, 'snoozed': snoozed,
+                'total': len(domains)}
     finally:
         _WTL_VERDICT_LOCK.release()
 
@@ -9370,9 +9456,33 @@ def api_wtl_stores_classify():
     def _runner():
         try:
             res = _wtl_classify_missing(doms, jid=jid, cap=cap)
-            _job_set(jid, status='done', result=res,
+            if res.get('error'):
+                _job_summary(jid, str(res['error']))
+                _job_set(jid, status='warning', result=res,
+                         finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+                return
+            done_n = int(res.get('classified') or 0)
+            solved = int(res.get('resolved') or 0)
+            left = max(0, int(res.get('backlog') or 0) - done_n)
+            snoozed = int(res.get('snoozed') or 0)
+            tail = f" ({snoozed} in backoff)" if snoozed else ""
+            if done_n == 0:
+                # Niets te doen: of alles klaar, of alles wacht op backoff.
+                msg = (f"Nothing due right now - {snoozed} store(s) waiting in backoff"
+                       if snoozed else "All stores verified - nothing left to check")
+            else:
+                msg = (f"{solved} of {done_n} resolved - {left} of "
+                       f"{res.get('total', '?')} left{tail}")
+            # Vastloper = winkels verwerkt maar GEEN ervan kreeg een bruikbaar
+            # oordeel (allemaal 'Onbekend'). Een herbevestiging telt als opgelost
+            # en is dus GEEN alarm.
+            stalled = done_n > 0 and solved == 0
+            # samenvatting VOOR de status: de UI stopt met pollen zodra
+            # status != running en zou de tekst anders missen.
+            _job_summary(jid, ('Heads up: ' + msg + ' - none resolved, check the sites')
+                         if stalled else msg)
+            _job_set(jid, status='warning' if stalled else 'done', result=res,
                      finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
-            _job_summary(jid, f"{res.get('classified', 0)} store(s) gecheckt")
         except Exception as e:
             _job_error(jid, str(e))
             _job_set(jid, status='error', finished_at=datetime.datetime.utcnow().isoformat() + 'Z')

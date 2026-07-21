@@ -953,6 +953,10 @@ export interface WtlStoresResponse {
   min_local: number;
   traffic_missing: number;
   verdicts_missing: number;
+  /** Split out of verdicts_missing: "never looked at" is a different problem from
+   *  "looked at, found nothing" — merged into one number, a stalled queue hides. */
+  never_checked?: number;
+  unknown_count?: number;
   apify_configured: boolean;
   stores: WtlStore[];
 }

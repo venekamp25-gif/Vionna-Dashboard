@@ -19,11 +19,38 @@ check_shipping() keeps the legacy 'Label (X-Yd)' string API.
 import os
 import re
 import sys
+import time
 import json as _json
 from urllib.parse import urlparse
 import requests
 
 _CACHE: dict = {}
+# Zonder vervaltijd is "nog eens checken" binnen dezelfde serversessie een
+# no-op: hetzelfde antwoord komt uit geheugen zonder fetch. Een uur is ruim
+# genoeg om één scanronde goedkoop te houden en toch echt te herchecken.
+_CACHE_TTL = 3600.0
+_MISS = object()
+
+
+def _cache_get(key, default=None):
+    """Waarde uit de cache, of `default` als hij ontbreekt of verlopen is."""
+    hit = _CACHE.get(key)
+    if hit is None:
+        return default
+    try:
+        ts, val = hit
+    except Exception:
+        _CACHE.pop(key, None)          # oud formaat zonder tijdstempel
+        return default
+    if (time.time() - ts) > _CACHE_TTL:
+        _CACHE.pop(key, None)
+        return default
+    return val
+
+
+def _cache_put(key, val):
+    _CACHE[key] = (time.time(), val)
+    return val
 _UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 POLICY_PATHS = (
@@ -96,7 +123,13 @@ _RETURN_NEG = ("retour", "return", "refund", "garantie", "guarantee", "warranty"
                "tilbagebetaling", "terugbetaling", "remboursement", "rückgabe",
                "widerruf", "ångerrätt", "retur", "money back", "money-back",
                "exchange", "ruilen", "umtausch", "échange",
-               "palautus", "palautusoikeus", "peruutus", "hyvitys")
+               "palautus", "palautusoikeus", "peruutus", "hyvitys",
+               # Juridische herroepingstermijn ("14 dages fortrydelsesret")
+               # is GEEN levertijd - anders vals 'Dropshipper 14d' op een
+               # voorwaarden-/FAQ-pagina.
+               "fortrydelsesret", "fortrydelsesfrist", "fortrydelse",
+               "herroeping", "herroepingsrecht", "retractation", "rétractation",
+               "annullering", "widerrufsrecht", "peruutusoikeus")
 
 # Processing-context words: a duration sitting next to one of these inside a
 # delivery section is the order-processing time, not the transit time — skip it
@@ -200,21 +233,134 @@ def _get_domain(product_url: str) -> str:
     return urlparse(product_url).netloc.lower()
 
 
+# Duurt een levertijd op verzending NAAR HET BUITENLAND? Die hoort niet het
+# oordeel te bepalen als er ook een thuisland-levertijd staat: "Danmark 1-3
+# hverdage / udlandet 14-21" maakte van een gewone Deense winkel een
+# "Dropshipper". Alleen gebruikt als tie-breaker, nooit als filter - zie
+# _split_home_foreign().
+_FOREIGN_CONTEXT_WORDS = (
+    # DK/NO/SE
+    "udlandet", "udland", "uden for danmark", "udenfor danmark", "ovrige lande",
+    "øvrige lande", "resten af verden", "utlandet", "utomlands", "utenfor norge",
+    "ovriga lander", "övriga länder",
+    # NL
+    "buitenland", "rest van de wereld", "buiten nederland", "internationaal",
+    # FR
+    "etranger", "étranger", "reste du monde", "hors france", "hors de france",
+    "outre-mer", "dom-tom",
+    # FI
+    "ulkomaille", "ulkomaat", "ulkomaan", "muut maat", "kansainvalinen",
+    "kansainvälinen",
+    # DE
+    "ausland", "restliche welt", "ausserhalb deutschlands", "außerhalb deutschlands",
+    # EN / NO
+    "international", "internasjonal", "rest of the world", "outside the eu",
+    "worldwide", "other countries", "overseas",
+)
+
+
+# Thuisland-markeringen. Nodig als TEGENwicht: zonder deze kan een genoemd
+# buitenland verderop in de alinea een thuislevertijd nog steeds kapen.
+_HOME_CONTEXT_WORDS = (
+    "danmark", "denmark", "indenlandsk", "indenfor danmark", "indland",
+    "nederland", "netherlands", "binnenland", "in nl",
+    "france", "en france", "metropolitaine", "métropolitaine",
+    "suomi", "suomeen", "suomessa", "kotimaa", "kotimaan", "finland",
+    "deutschland", "germany", "innerhalb deutschlands", "inland",
+    "sverige", "sweden", "inrikes", "norge",
+)
+_SCOPE_LOOKBACK = 160
+
+
+def _ctx_scope(text: str, pos: int) -> str:
+    """'home', 'foreign' of 'unmarked' voor de duur die op `pos` begint.
+
+    Kijkt ACHTERWAARTS naar de DICHTSTBIJZIJNDE land-markering. Bij
+    "danmark : 1-3 / udlandet : 14-21" hoort 1-3 bij danmark en 14-21 bij
+    udlandet.
+
+    Kritiek detail (review-bevinding): de home-woorden zitten LETTERLIJK in de
+    foreign-frases - "danmark" is een suffix van "uden for danmark". We mogen dus
+    niet op START-positie vergelijken (dan wint het korte woord dat verder naar
+    rechts begint), maar op EINDpositie, en bij gelijk einde op LENGTE (de
+    omvattende foreign-frase wint van de losse landnaam erin).
+    """
+    back = text[max(0, pos - _SCOPE_LOOKBACK): pos]
+    best_end, best_len, best_kind = -1, -1, "unmarked"
+    for kind, words in (("foreign", _FOREIGN_CONTEXT_WORDS),
+                        ("home", _HOME_CONTEXT_WORDS)):
+        for w in words:
+            i = back.rfind(w)
+            if i < 0:
+                continue
+            end = i + len(w)
+            # Grootste einde wint; bij gelijk einde de langste match; bij nog
+            # steeds gelijk telt foreign eerst (staat vooraan in de lus) zodat
+            # de omvattende buitenland-frase zijn eigen landnaam-suffix verslaat.
+            if end > best_end or (end == best_end and len(w) > best_len):
+                best_end, best_len, best_kind = end, len(w), kind
+    return best_kind
+
+
+def _pick_scope(home: tuple, unmarked: tuple, foreign: tuple) -> tuple:
+    """Prioriteit: expliciet thuisland > ongemarkeerd > alleen-buitenland.
+
+    - home wint altijd: dat is de levertijd naar het land van de klant.
+    - unmarked (geen land genoemd) verslaat foreign: een kale "levering 3-5" is
+      de standaard/thuis-levering, niet de internationale.
+    - foreign is laatste redmiddel, zodat een winkel die UITSLUITEND
+      internationaal verzendt (typisch dropshipper) niet 'Onbekend' wordt.
+    """
+    if home[1] > 0:
+        return home
+    if unmarked[1] > 0:
+        return unmarked
+    return foreign
+
+
+# Pagina's die nooit een levertijd bevatten maar wel het woord "14 dagen"
+# (herroeping) of dagen (privacy-bewaartermijn) -> buiten de extra-scan houden.
+# NB: 'betingelser'/'conditions' NIET uitsluiten - daar staat vaak juist de
+# echte levertijd (butiksmuksak: tekst-og-betingelsessider).
+_EXTRA_EXCLUDE = ("privacy", "cookie", "terms-of-service", "gdpr", "imprint",
+                  "persondata", "gegevensbescherming")
+
+
 # ── Fetching (kept from the original) ──
 def _discover_shipping_urls(domain: str) -> list:
     """Discover non-standard shipping pages via sitemap + homepage links."""
-    discovered = []
-    for sm in ("/sitemap.xml", "/sitemap_pages_1.xml", "/pages-sitemap.xml"):
+    discovered, extra = [], []
+
+    def _locs(url):
         try:
-            r = requests.get(f"https://{domain}{sm}", headers={"User-Agent": _UA}, timeout=6)
+            r = requests.get(url, headers={"User-Agent": _UA}, timeout=6)
         except Exception:
-            continue
+            return []
         if r.status_code != 200:
-            continue
-        for m in re.finditer(r"<loc>([^<]+)</loc>", r.text):
-            url = m.group(1); low = url.lower()
-            if any(h in low for h in _URL_SHIPPING_HINTS) and ("/pages/" in low or "/policies/" in low):
-                discovered.append(url)
+            return []
+        return [m.group(1).replace("&amp;", "&")
+                for m in re.finditer(r"<loc>([^<]+)</loc>", r.text)]
+
+    for sm in ("/sitemap.xml", "/sitemap_pages_1.xml", "/pages-sitemap.xml"):
+        locs = _locs(f"https://{domain}{sm}")
+        # Shopify geeft op /sitemap.xml een INHOUDSOPGAVE terug: de <loc>'s zijn
+        # zelf sitemaps ("sitemap_pages_1.xml?from=..&to=.."). Alleen de
+        # page/policy-kinderen volgen: een grote winkel heeft eerst
+        # sitemap_agentic_discovery + sitemap_products_1..N (samen megabytes,
+        # nul beleidsurls), dus een blinde [:3] downloadde de producten en
+        # bereikte de pages-sitemap nooit.
+        children = [u for u in locs if ".xml" in u.lower()
+                    and ("pages" in u.lower() or "polic" in u.lower())][:3]
+        for child in children:
+            locs.extend(_locs(child))
+        for url in locs:
+            low = url.lower()
+            if ".xml" in low or not ("/pages/" in low or "/policies/" in low):
+                continue
+            if any(h in low for h in _URL_SHIPPING_HINTS):
+                discovered.append(url)      # herkenbare slug -> voorrang
+            elif not any(x in low for x in _EXTRA_EXCLUDE):
+                extra.append(url)           # gelokaliseerde slug (Deense FAQ etc.)
     try:
         r = requests.get(f"https://{domain}/", headers={"User-Agent": _UA}, timeout=8)
         if r.status_code == 200:
@@ -228,11 +374,14 @@ def _discover_shipping_urls(domain: str) -> list:
                     discovered.append(href)
     except Exception:
         pass
+    # Herkenbare slugs eerst, daarna de gelokaliseerde. Plafond op de staart,
+    # anders haalt een winkel met 40 infopagina's de scan onderuit qua tijd;
+    # de tekst-guard (_SHIPPING_WORDS) zeeft ze daarna alsnog.
     seen, unique = set(), []
-    for u in discovered:
+    for u in discovered + extra[:8]:
         if u not in seen:
             seen.add(u); unique.append(u)
-    return unique[:10]
+    return unique[:12]
 
 
 def _fetch_html(url: str) -> str:
@@ -369,7 +518,7 @@ def _find_delivery_range(text: str, window: int = 350) -> tuple:
     durations, skip any sitting in a processing- or return-context (±80 chars),
     and take the LARGEST remaining range. Fixes section-header policies where the
     first number after "leveranstid" is actually the processing time."""
-    best_lo, best_hi = 0, 0
+    home = unmarked = foreign = (0, 0)
     for trig in DELIVERY_TRIGGER_RE.finditer(text):
         seg = text[trig.start(): trig.end() + window]
         for m in _DUR_RE.finditer(seg):
@@ -384,14 +533,26 @@ def _find_delivery_range(text: str, window: int = 350) -> tuple:
             lo, hi = _dur_days(m)
             if not (1 <= lo <= 90 and 1 <= hi <= 90):
                 continue
-            if hi > best_hi:
-                best_lo, best_hi = lo, hi
-    return best_lo, best_hi
+            # Absolute positie in de VOLLEDIGE tekst: een land-markering die
+            # VOOR de trigger staat ("Danmark: leveringstid 1-3") is in het
+            # segment onzichtbaar omdat dat op de trigger begint.
+            scope = _ctx_scope(text, trig.start() + m.start())
+            # Binnen elke emmer blijft 'grootste wint' gelden - dat vangt de
+            # sectiekop-valstrik (eerste getal = verwerkingstijd) op.
+            if scope == "foreign":
+                if hi > foreign[1]:
+                    foreign = (lo, hi)
+            elif scope == "home":
+                if hi > home[1]:
+                    home = (lo, hi)
+            elif hi > unmarked[1]:
+                unmarked = (lo, hi)
+    return _pick_scope(home, unmarked, foreign)
 
 
 def _scan_all_durations(text: str) -> tuple:
     """Whole-text scan for durations in a shipping context, excluding return windows."""
-    best_lo, best_hi = 0, 0
+    home = unmarked = foreign = (0, 0)
     for m in _DUR_RE.finditer(text):
         s = max(0, m.start() - 220); e = m.end() + 220
         ctx = text[s:e]
@@ -401,12 +562,27 @@ def _scan_all_durations(text: str) -> tuple:
             continue
         if any(n in ctx for n in _NOISE_NEG):
             continue
+        # Verwerkingstijd-guard (stond alleen in _find_delivery_range): zonder
+        # dit telt "verwerkt binnen 24 uur" mee als levertijd en kan een
+        # dropshipper er als 'Eigen voorraad' uit komen. ALLEEN achterwaarts en
+        # kort ("processed within 24h" = proc-woord vlak vóór het getal), anders
+        # zou een proc-woord verderop de ECHTE transittijd ernaast ook wegvegen.
+        behind = text[max(0, m.start() - 32): m.start()]
+        if any(p in behind for p in _PROC_CONTEXT_WORDS):
+            continue
         lo, hi = _dur_days(m)
         if not (1 <= lo <= 90 and 1 <= hi <= 90):
             continue
-        if hi > best_hi:
-            best_lo, best_hi = lo, hi
-    return best_lo, best_hi
+        scope = _ctx_scope(text, m.start())
+        if scope == "foreign":
+            if hi > foreign[1]:
+                foreign = (lo, hi)
+        elif scope == "home":
+            if hi > home[1]:
+                home = (lo, hi)
+        elif hi > unmarked[1]:
+            unmarked = (lo, hi)
+    return _pick_scope(home, unmarked, foreign)
 
 
 def _parse_shipping(text: str) -> dict:
@@ -657,8 +833,9 @@ def brand_signals(domain: str) -> list:
     """Signals that `domain` is a real brand/boutique. Returns labels (possibly
     empty). Cached per domain; homepage-only, best-effort, never raises."""
     key = f"B|{domain}"
-    if key in _CACHE:
-        return _CACHE[key]
+    hit = _cache_get(key, _MISS)
+    if hit is not _MISS:
+        return hit
     sigs = []
     try:
         html = _fetch_html(f"https://{domain}/") or ""
@@ -684,7 +861,7 @@ def brand_signals(domain: str) -> list:
                 sigs.append(label)
     except Exception:
         pass
-    _CACHE[key] = sigs
+    _cache_put(key, sigs)
     return sigs
 
 
@@ -756,8 +933,9 @@ def looks_like_brand(domain: str) -> tuple:
     wholesale hrefs) decide instantly; otherwise Claude judges the store's own
     homepage/about copy. Result cached per domain."""
     key = f"BB|{domain}"
-    if key in _CACHE:
-        return _CACHE[key]
+    hit = _cache_get(key, _MISS)
+    if hit is not _MISS:
+        return hit
     sigs = brand_signals(domain)
     link_labels = {"store locator", "own stores", "stockists page", "wholesale program", "wholesale/B2B"}
     if any(s in link_labels for s in sigs):
@@ -768,7 +946,7 @@ def looks_like_brand(domain: str) -> tuple:
             res = (True, sigs + ([f"AI: {reason}"] if reason else ["AI judged this a real brand"]))
         else:
             res = (False, sigs)
-    _CACHE[key] = res
+    _cache_put(key, res)
     return res
 
 
@@ -778,10 +956,11 @@ def classify_detailed(product_url: str, skip_browser: bool = True) -> dict:
     if not domain:
         return _res("Onbekend", 0, 0, "none", "none")
     cache_key = f"D|{domain}|{int(skip_browser)}"
-    if cache_key in _CACHE:
-        return _CACHE[cache_key]
+    hit = _cache_get(cache_key, _MISS)
+    if hit is not _MISS:
+        return hit
     res = _classify_detailed(domain, product_url, skip_browser)
-    _CACHE[cache_key] = res
+    _cache_put(cache_key, res)
     return res
 
 
