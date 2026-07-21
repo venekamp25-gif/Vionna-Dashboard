@@ -370,9 +370,10 @@ def shopify_url(store_key, path):
 # and the browser sends it as the `X-Droplet-Token` header. We verify it here
 # using only the standard library (hmac/hashlib/base64), so no new pip dependency
 # is introduced and the self-updater (which only pulls server.py + version.txt)
-# keeps working. When DROPLET_TOKEN_SECRET is unset the gate is OPEN, so the first
-# deploy never breaks; set the SAME secret on the droplet AND on Netlify to
-# activate it (set Netlify first, then the droplet — see CLAUDE.md).
+# keeps working. When DROPLET_TOKEN_SECRET is unset the gate is fail-CLOSED for
+# remote calls (a fresh droplet without the env var does NOT silently expose every
+# gated route); only local dev with DEV_LOCAL=1 passes. Set the SAME secret on the
+# droplet AND on Netlify to activate it (set Netlify first, then the droplet — see CLAUDE.md).
 DROPLET_TOKEN_SECRET = os.getenv('DROPLET_TOKEN_SECRET')
 
 def _b64url_decode(seg):
@@ -397,18 +398,19 @@ def _verify_droplet_token(token):
     return payload
 
 def require_droplet_token(f):
-    """Gate a route behind a valid frontend-minted token (no-op until the secret
-    is configured, so deploys are safe before the env var is set everywhere)."""
+    """Gate a route behind a valid frontend-minted token. When the secret is unset
+    the gate is fail-closed for remote calls; local dev passes via DEV_LOCAL=1."""
     @wraps(f)
     def _wrapped(*args, **kwargs):
         if DROPLET_TOKEN_SECRET:
             if not _verify_droplet_token(request.headers.get('X-Droplet-Token', '')):
                 return jsonify({'error': 'Unauthorized — missing, invalid or expired session token'}), 401
             return f(*args, **kwargs)
-        # Secret niet gezet: fail-CLOSED voor REMOTE calls (voorkomt dat een nieuwe
-        # droplet zonder env-var stil ALLE gated routes openzet), maar laat lokale
-        # dev door zodat start.bat blijft werken.
-        if request.remote_addr in ('127.0.0.1', '::1', 'localhost'):
+        # Secret niet gezet: fail-CLOSED. We vertrouwen GEEN remote_addr meer —
+        # achter de Caddy-proxy is dat voor ELKE externe request 127.0.0.1, dus een
+        # IP-bypass zou de hele wereld doorlaten. Lokale dev (start.bat) zet
+        # DEV_LOCAL=1 zodat de gate daar een expliciete no-op is.
+        if os.getenv('DEV_LOCAL') == '1':
             return f(*args, **kwargs)
         return jsonify({'error': 'Server misconfigured: droplet token secret not set'}), 503
     return _wrapped
@@ -433,6 +435,17 @@ def _mint_droplet_token(ttl=600):
 def _self_headers():
     """Headers for backend→backend self-calls to gated endpoints."""
     return {'X-Droplet-Token': _mint_droplet_token()}
+
+
+def _is_genuinely_local():
+    """True only for a DIRECT same-machine call (the droplet's own systemd updater
+    hitting http://127.0.0.1:PORT with no proxy in front), NOT for anything proxied
+    in from the internet. Caddy sets X-Forwarded-* on every proxied request, so
+    their presence means the call came from outside; a genuine localhost call has
+    none. Used to let the local self-updater through while blocking the world."""
+    if request.headers.get('X-Forwarded-For') or request.headers.get('X-Forwarded-Proto'):
+        return False
+    return request.remote_addr in ('127.0.0.1', '::1', 'localhost')
 
 
 # --- Static files ---
@@ -11829,6 +11842,12 @@ def api_version():
 
 @app.route('/api/update', methods=['POST'])
 def api_update():
+    # Only the droplet's own local self-updater (systemd → http://127.0.0.1:PORT,
+    # no proxy) may trigger a pull tokenless; a proxied/internet call must carry a
+    # valid token. Without this, anyone with the public URL could POST /api/update
+    # to force repeated git-pull+restart cycles (DoS).
+    if not _is_genuinely_local() and not _verify_droplet_token(request.headers.get('X-Droplet-Token', '')):
+        return jsonify({'error': 'Unauthorized — /api/update is local-only or requires a valid token'}), 401
     if not GITHUB_RAW:
         return jsonify({'error': 'GITHUB_RAW not configured'}), 400
     base_dir = os.path.dirname(os.path.abspath(__file__))
