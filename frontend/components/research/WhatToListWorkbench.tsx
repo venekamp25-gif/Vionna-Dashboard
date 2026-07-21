@@ -146,7 +146,10 @@ export function WhatToListWorkbench() {
   // hidden unless the operator asks for it.
   const [storeSort, setStoreSort] = useState<"score" | "new" | "stale">("score");
   const [hideEmpty, setHideEmpty] = useState(false);
-  const [hideMarked, setHideMarked] = useState(false);
+  // AAN by default (venek 2026-07-21): stores je al wegklikte ("Later" /
+  // "Not for us") horen niet steeds terug te komen; untick de checkbox om ze
+  // terug te zien (nooit verwijderd, alleen verborgen).
+  const [hideMarked, setHideMarked] = useState(true);
   const [onlyDropshippers, setOnlyDropshippers] = useState(true);
   const [trafficRefreshing, setTrafficRefreshing] = useState(false);
   const [discovering, setDiscovering] = useState(false);
