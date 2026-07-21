@@ -6839,11 +6839,20 @@ def bug_reports_list():
     """List bug reports. Default: open only. Pass ?status=all to see resolved too."""
     status = request.args.get('status', 'open')
     entries = _load_bug_reports(status_filter=None if status == 'all' else 'open')
+    # This endpoint is unauthenticated (the in-app bug list + the ops curl-flow
+    # both hit it tokenless), so it must NOT leak reporter PII or the
+    # possibly-URL-bearing diagnostics blob. Strip those from the public
+    # response; the full record stays in bug_reports.jsonl for the server-side
+    # Slack ping and the resolve/CLI text. The frontend list never renders these
+    # two fields, so hiding them changes no UI.
+    _PUBLIC_DROP = ('reporter_email', 'diagnostics')
+    safe_entries = [{k: v for k, v in e.items() if k not in _PUBLIC_DROP}
+                    for e in entries]
     # Hide screenshot path from list-level response — the GET-by-ID returns it
     return jsonify({
         'open_count':  sum(1 for e in entries if e.get('status') == 'open'),
         'total_count': len(entries),
-        'entries':     entries,
+        'entries':     safe_entries,
     })
 
 
