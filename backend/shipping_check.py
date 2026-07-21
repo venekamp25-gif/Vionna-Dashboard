@@ -131,6 +131,22 @@ _RETURN_NEG = ("retour", "return", "refund", "garantie", "guarantee", "warranty"
                "herroeping", "herroepingsrecht", "retractation", "rétractation",
                "annullering", "widerrufsrecht", "peruutusoikeus")
 
+# Uitverkocht / backorder / vertraagd: een levertijd hiernaast is de
+# UITZONDERINGS-termijn (badge "artikel uitverkocht -> levering X dage"), niet de
+# standaard transittijd. Vaak een thema-string ('shipping_delayed'). Zonder deze
+# guard maakte "udsolgt, shipping_delayed: levering 5-12 dage" van een echt merk
+# een 'Dropshipper'.
+_BACKORDER_NEG = (
+    "udsolgt", "sold out", "utsolgt", "slutsåld", "slutsald", "ausverkauft",
+    "épuisé", "epuise", "uitverkocht", "loppu", "loppuunmyyty",
+    "restordre", "restorder", "backorder", "back-order", "back order",
+    "shipping_delayed", "delayed", "forsinket", "forsinkelse", "försenad",
+    "forsenad", "viivästy", "verzögert", "retardé", "retarde",
+    "pre-order", "preorder", "pre order", "forudbestilling", "förbeställning",
+    "forhåndsbestilling", "ennakkotilaus", "vorbestellung", "précommande",
+    "udgået", "discontinued",
+)
+
 # Processing-context words: a duration sitting next to one of these inside a
 # delivery section is the order-processing time, not the transit time — skip it
 # when isolating the delivery range (so a "prepare within 3 days ... ships in 5-9
@@ -526,6 +542,8 @@ def _find_delivery_range(text: str, window: int = 350) -> tuple:
             local_ctx = seg[ls:le]
             if any(n in local_ctx for n in _RETURN_NEG):
                 continue
+            if any(n in local_ctx for n in _BACKORDER_NEG):
+                continue
             if any(n in local_ctx for n in _NOISE_NEG):
                 continue
             if any(p in local_ctx for p in _PROC_CONTEXT_WORDS):
@@ -559,6 +577,8 @@ def _scan_all_durations(text: str) -> tuple:
         if not any(w in ctx for w in SHIPPING_CONTEXT_NEAR):
             continue
         if any(n in ctx for n in _RETURN_NEG):
+            continue
+        if any(n in ctx for n in _BACKORDER_NEG):
             continue
         if any(n in ctx for n in _NOISE_NEG):
             continue
@@ -966,6 +986,7 @@ def classify_detailed(product_url: str, skip_browser: bool = True) -> dict:
 
 def _classify_detailed(domain: str, product_url: str, skip_browser: bool) -> dict:
     collected = ""
+    candidates = []   # (prio, parse_dict, plain) over alle pagina's; prio 0 = beleid
     # Policy pages first (authoritative on delivery time); the product page — whose
     # marketing copy can contradict the policy fine print — is the fallback. JSON-LD
     # on any page still wins when present.
@@ -985,7 +1006,9 @@ def _classify_detailed(domain: str, product_url: str, skip_browser: bool) -> dic
             collected = plain
         p = _parse_shipping(plain)
         if p["label"] != "Onbekend":
-            return _maybe_llm_verify(p, plain, domain, "policy")
+            # Productpagina = vangnet (marketingtekst kan de policy tegenspreken).
+            prio = 1 if (product_url and url == product_url) else 0
+            candidates.append((prio, p, plain))
 
     for url in _discover_shipping_urls(domain):
         html = _fetch_html(url)
@@ -1002,7 +1025,19 @@ def _classify_detailed(domain: str, product_url: str, skip_browser: bool) -> dic
             collected = plain
         p = _parse_shipping(plain)
         if p["label"] != "Onbekend":
-            return _maybe_llm_verify(p, plain, domain, "policy")
+            candidates.append((0, p, plain))
+
+    if candidates:
+        # Snelste beloofde binnenlandse levertijd = de standaard; beleidspagina's
+        # (prio 0) gaan vóór de productpagina (prio 1). Zo kan één misread-pagina
+        # een echt merk niet meer als dropshipper bestempelen, terwijl een winkel
+        # die overal traag is dat blijft.
+        _cr = {"high": 0, "medium": 1, "low": 2}
+        _prio, best_p, best_plain = min(
+            candidates,
+            key=lambda c: (c[0], c[1]["lo"], c[1]["hi"], _cr.get(c[1]["confidence"], 3)),
+        )
+        return _maybe_llm_verify(best_p, best_plain, domain, "policy")
 
     if not skip_browser:
         t = _fetch_policy_text_via_browser(domain)
