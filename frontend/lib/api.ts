@@ -405,7 +405,7 @@ export const api = {
     ),
 
   names: (store: "dk" | "fr" | "fi") =>
-    call<NamesResponse>("/api/names", { method: "POST", body: { store } }),
+    call<NamesResponse>("/api/names", { method: "POST", body: { store }, authed: true }),
 
   generate: (params: {
     store: "dk" | "fr" | "fi";
@@ -427,7 +427,7 @@ export const api = {
      *  the backend strips fabric keywords the competitor never mentions — never
      *  claim cashmere when the dress is wool/polyester. */
     source_text?: string;
-  }) => call<GenerateResponse>("/api/generate", { method: "POST", body: params }),
+  }) => call<GenerateResponse>("/api/generate", { method: "POST", body: params, authed: true }),
 
   /** Translate colour-variant names into a store's language. Dedicated (not folded
    *  into /api/generate) so the model returns them reliably. Response `colors` is
@@ -592,7 +592,7 @@ export const api = {
     image_urls: string[];
     count?: number;
     color?: string;
-  }) => call<HiggsfieldResponse>("/api/higgsfield", { method: "POST", body: params }),
+  }) => call<HiggsfieldResponse>("/api/higgsfield", { method: "POST", body: params, authed: true }),
 
   publish: (params: {
     store: "dk" | "fr" | "fi";
@@ -901,7 +901,7 @@ export const api = {
     product_name: string;
     product_url: string;
     template?: string;
-  }) => call<AdCopyResponse>("/api/generate_ad_copy", { method: "POST", body: params }),
+  }) => call<AdCopyResponse>("/api/generate_ad_copy", { method: "POST", body: params, authed: true }),
 
   /** Start the background Meta-draft job (generation + copy + ad creation, paced server-side).
    *  Returns a job_id to poll with metaJobStatus. Gated (session token). */

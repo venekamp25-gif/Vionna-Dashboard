@@ -6951,6 +6951,7 @@ def recent_descriptions():
 
 # --- Get existing product names to avoid duplicates ---
 @app.route('/api/names', methods=['POST'])
+@require_droplet_token
 def get_names():
     store = request.json.get('store', 'dk')
     if store not in tokens:
@@ -7198,6 +7199,7 @@ def _unverified_length_claims(generated_text, source_text):
 
 
 @app.route('/api/generate', methods=['POST'])
+@require_droplet_token
 def generate():
     if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
         return jsonify({'error': 'Anthropic API key missing — set ANTHROPIC_API_KEY in environment variables'}), 400
@@ -11567,6 +11569,7 @@ def theme_probe():
 
 # --- Higgsfield image generation ---
 @app.route('/api/higgsfield', methods=['POST'])
+@require_droplet_token
 def higgsfield_generate():
     data         = request.json
     # Support both legacy single URL and new multi-image list
@@ -11579,6 +11582,10 @@ def higgsfield_generate():
     product_type = data.get('product_type', 'fashion product')
     color        = data.get('color', '')
     count        = data.get('count', 4)          # default 4 (Unlimited mode)
+    try:
+        count = max(1, min(int(count), 12))      # clamp batch size (denial-of-wallet guard)
+    except (TypeError, ValueError):
+        count = 4
 
     # Build prompt from template or use custom
     if prompt_type and prompt_type in NANO_BANANA_PROMPTS:
@@ -12278,6 +12285,7 @@ META_AD_COPY_TEMPLATE_NL = (
 
 
 @app.route('/api/generate_ad_copy', methods=['POST'])
+@require_droplet_token
 def generate_ad_copy():
     """Translate the Dutch ad-copy template into fluent, natural ad copy per store-language.
     Body: {stores:[...], product_name, product_url, template?}. Returns
