@@ -1020,15 +1020,14 @@ export function WhatToListWorkbench() {
               const isConfirmedNotDropshipper = (s: WtlStore) =>
                 !isDropshipper(s) &&
                 (s.verdict?.label === "Eigen voorraad" || s.verdict?.label === "Mogelijk eigen merk");
-              const visible = wtlStores.stores
-                .filter((s) => !onlyEnough || s.market_ok)
+              const passesBase = (s: WtlStore) =>
                 // Both opt-in. "0 new" only hides stores we ACTUALLY scanned —
                 // never-scanned ones (bs_new_count === null) always stay visible.
-                .filter((s) => !hideEmpty || s.bs_new_count === null || s.bs_new_count > 0)
-                .filter((s) => !hideMarked || !s.mark)
-                .filter((s) => !onlyDropshippers || !isConfirmedNotDropshipper(s))
-                .slice()
-                .sort((a, b) => {
+                (!hideEmpty || s.bs_new_count === null || s.bs_new_count > 0) &&
+                (!hideMarked || !s.mark) &&
+                (!onlyDropshippers || !isConfirmedNotDropshipper(s));
+              const sortStores = (arr: WtlStore[]) =>
+                arr.slice().sort((a, b) => {
                   // Marked stores always sink, whatever the sort.
                   const am = a.mark ? 1 : 0;
                   const bm = b.mark ? 1 : 0;
@@ -1049,6 +1048,20 @@ export function WhatToListWorkbench() {
                   }
                   return 0; // 'score' = keep the backend order
                 });
+              // The ≥50k traffic bar is a brand-detector: dropshippers are small
+              // stores that almost never clear it, so "enough traffic" ∩ "hide
+              // proven brands" collapses to the 2-3 big outliers. Never leave the
+              // operator staring at 2 cards — if the traffic gate would gut the
+              // list below this floor, drop it (keep the number as a per-store
+              // badge) and rank everything by score instead.
+              const MIN_VISIBLE = 12;
+              const withTraffic = sortStores(
+                wtlStores.stores.filter((s) => passesBase(s) && (!onlyEnough || s.market_ok)),
+              );
+              const trafficRelaxed = onlyEnough && withTraffic.length < MIN_VISIBLE;
+              const visible = trafficRelaxed
+                ? sortStores(wtlStores.stores.filter(passesBase))
+                : withTraffic;
               if (visible.length === 0)
                 return (
                   <p className="text-[12px] text-text-faint">
@@ -1093,6 +1106,14 @@ export function WhatToListWorkbench() {
                     {storeSort === "new" ? "most new" : storeSort === "stale" ? "longest untouched" : "score"}
                   </span>
                 </div>
+                {trafficRelaxed && (
+                  <p className="text-[11px] text-amber-600 dark:text-amber-400 mb-2 leading-relaxed">
+                    Only {withTraffic.length} store{withTraffic.length === 1 ? "" : "s"} clear the ≥
+                    {((wtlStores?.min_local ?? 50000) / 1000).toFixed(0)}k traffic bar — and dropshippers are
+                    usually small, so that bar hides exactly the ones you want. Showing all candidates ranked by
+                    score instead; each store still shows its traffic number.
+                  </p>
+                )}
                 <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 max-h-[560px] overflow-y-auto pr-1">
                   {visible.map((s) => (
                     <button
@@ -1292,7 +1313,9 @@ export function WhatToListWorkbench() {
                         <span className="flex-1" />
 
                         {/* stopPropagation on BOTH handlers, or marking fires the
-                            card's runScan and yanks the page down to step ③. */}
+                            card's runScan and yanks the page down to step ③.
+                            role=button spans (not <button>) — the card itself is a
+                            <button> and nesting buttons is invalid HTML. */}
                         {s.mark ? (
                           <span
                             role="button"
@@ -1302,10 +1325,10 @@ export function WhatToListWorkbench() {
                               void markStore(s.domain, null);
                             }}
                             onKeyDown={(e) => e.stopPropagation()}
-                            className="text-[10px] text-accent hover:underline cursor-pointer"
-                            title="Bring this store back into the list"
+                            className="text-[11px] font-medium px-2 py-1 rounded-md border border-accent/50 text-accent hover:bg-[var(--accent-soft)] cursor-pointer whitespace-nowrap"
+                            title="Bring this store back into the active list"
                           >
-                            undo
+                            ↩ Undo
                           </span>
                         ) : (
                           <>
@@ -1317,25 +1340,25 @@ export function WhatToListWorkbench() {
                                 void markStore(s.domain, "later");
                               }}
                               onKeyDown={(e) => e.stopPropagation()}
-                              className="text-[10px] text-text-faint hover:text-accent hover:underline cursor-pointer"
-                              title="Nothing here for now — sink it for 2 weeks, then it comes back"
+                              className="text-[11px] font-medium px-2 py-1 rounded-md border border-amber-500/50 text-amber-600 dark:text-amber-400 hover:bg-amber-500/15 cursor-pointer whitespace-nowrap"
+                              title="Nothing here right now — snooze it for 2 weeks, then it comes back automatically"
                             >
-                              later
+                              ⏳ Later
                             </span>
                             <span
                               role="button"
                               tabIndex={0}
                               onClick={(e) => {
                                 e.stopPropagation();
-                                if (!confirm(`Mark ${s.domain.replace(/^www\./, "")} as NOT for us?\n\nIt stays in the list, just dimmed and sorted last. You can undo it any time.`))
+                                if (!confirm(`Mark ${s.domain.replace(/^www\./, "")} as NOT for us?\n\nIt stays in the list, just dimmed and sorted to the bottom. You can undo it any time.`))
                                   return;
                                 void markStore(s.domain, "skip");
                               }}
                               onKeyDown={(e) => e.stopPropagation()}
-                              className="text-[10px] text-text-faint hover:text-danger hover:underline cursor-pointer"
-                              title="Wrong style, wrong prices — keep it out of the way"
+                              className="text-[11px] font-medium px-2 py-1 rounded-md border border-danger/50 text-danger hover:bg-danger/15 cursor-pointer whitespace-nowrap"
+                              title="Wrong style or wrong prices — keep this store out of the way"
                             >
-                              not for us
+                              ✕ Not for us
                             </span>
                           </>
                         )}
