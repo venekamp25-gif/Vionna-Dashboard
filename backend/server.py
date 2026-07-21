@@ -9377,9 +9377,13 @@ def _wtl_retry_due(v):
     return age >= _WTL_VERDICT_TTL
 
 
-def _wtl_classify_missing(domains, jid=None, cap=10):
+def _wtl_classify_missing(domains, jid=None, cap=10, force=False):
     """Classify domains without a fresh verdict, sequentially (slow LLM work), and
-    persist. Returns {classified: n, verdicts: {domain: label}}."""
+    persist. Returns {classified: n, verdicts: {domain: label}}.
+
+    force=True bypasses the freshness/backoff gate: an EXPLICITLY requested domain
+    gets re-checked even if it already has a fresh verdict (so a fixed classifier
+    can correct a stale wrong label on demand, instead of waiting out the TTL)."""
     if not _WTL_VERDICT_LOCK.acquire(blocking=False):
         return {'error': 'classification already running'}
     try:
@@ -9395,7 +9399,7 @@ def _wtl_classify_missing(domains, jid=None, cap=10):
             return (1, v.get('ts') or '', d)
 
         due = [d for d in domains
-               if _wtl_retry_due(cache.get(d.replace('www.', '')))]
+               if force or _wtl_retry_due(cache.get(d.replace('www.', '')))]
         todo = sorted(due, key=_queue_key)[:cap]
         backlog = len(due)
         never = sum(1 for d in domains if not cache.get(d.replace('www.', '')))
@@ -9450,16 +9454,21 @@ def api_wtl_stores_classify():
     """Background job: run the dropship-check (shipping policy + brand signals) for
     stores that don't have a fresh verdict yet. Body: {domains?: [...], max?: n}."""
     body = request.get_json(silent=True) or {}
-    doms = [str(d).lower() for d in (body.get('domains') or [])] or sorted(_wtl_all_domains())
+    explicit = [str(d).lower() for d in (body.get('domains') or [])]
+    doms = explicit or sorted(_wtl_all_domains())
+    # An explicit domain list is a deliberate "re-check these" request -> force,
+    # so a fixed classifier can overwrite a stale wrong verdict without waiting
+    # out the 30-day TTL. The full sweep (no domains) keeps the freshness gate.
+    force = bool(explicit) or bool(body.get('force'))
     try:
-        cap = max(1, min(20, int(body.get('max') or 10)))
+        cap = max(1, min(20, int(body.get('max') or (len(explicit) or 10))))
     except Exception:
         cap = 10
     jid = _job_new('wtl_classify', 'wtl')
 
     def _runner():
         try:
-            res = _wtl_classify_missing(doms, jid=jid, cap=cap)
+            res = _wtl_classify_missing(doms, jid=jid, cap=cap, force=force)
             if res.get('error'):
                 _job_summary(jid, str(res['error']))
                 _job_set(jid, status='warning', result=res,
