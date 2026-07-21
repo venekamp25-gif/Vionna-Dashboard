@@ -390,7 +390,7 @@ export const api = {
     ),
 
   scrape: (url: string) =>
-    call<ScrapedProduct>("/api/scrape", { method: "POST", body: { url } }),
+    call<ScrapedProduct>("/api/scrape", { method: "POST", body: { url }, authed: true }),
 
   /**
    * Manual-paste fallback for shops whose Cloudflare / WAF blocks our scraper.
@@ -401,7 +401,7 @@ export const api = {
   scrapeManual: (rawJson: string) =>
     call<ScrapedProduct & { source?: string }>(
       "/api/scrape_manual",
-      { method: "POST", body: { json: rawJson } }
+      { method: "POST", body: { json: rawJson }, authed: true }
     ),
 
   names: (store: "dk" | "fr" | "fi") =>
@@ -707,6 +707,7 @@ export const api = {
     call<{ job_id?: string; status?: string; error?: string }>("/api/wtl_discover", {
       method: "POST",
       body: { markets },
+      authed: true,
     }),
 
   /** Direct-download URL for the funnel CSV exports (stores / work list / one store's bestsellers). */

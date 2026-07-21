@@ -2396,6 +2396,7 @@ def api_debug_extract_chart():
 
 
 @app.route('/api/scrape', methods=['POST'])
+@require_droplet_token
 def scrape():
     raw_input = (request.json.get('url') or '').strip()
     # Defensive: pluck the FIRST http(s):// URL out of arbitrary user text.
@@ -2693,6 +2694,7 @@ def scrape():
 
 
 @app.route('/api/scrape_manual', methods=['POST'])
+@require_droplet_token
 def scrape_manual():
     """Escape hatch for shops whose Cloudflare / WAF blocks our datacentre IP.
 
@@ -10050,6 +10052,7 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
 
 
 @app.route('/api/wtl_discover', methods=['POST'])
+@require_droplet_token
 def api_wtl_discover():
     """Kick a background discovery run (Google hunt for unknown local stores).
     Body: {markets: ['fi', ...]} — defaults to all three. Poll via catalog_job/status."""
