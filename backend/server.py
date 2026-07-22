@@ -13365,6 +13365,7 @@ def _blog_log(store, topic, article):
                 'levers': article.get('levers'),
                 'qa': article.get('qa'),
                 'products': article.get('products'),
+                'pillar': article.get('pillar'),
             }, ensure_ascii=False) + '\n')
     except Exception as e:
         print(f"[blog] history write failed: {e}")
@@ -13920,7 +13921,8 @@ BLOG_FAQ_HEADING = {'dk': 'Ofte stillede spørgsmål', 'fr': 'Questions fréquen
                     'fi': 'Usein kysytyt kysymykset'}
 
 
-def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns=None):
+def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns=None,
+                serp_brief=None):
     """Claude writes the SEO article in the store's language. Returns a dict:
     {title, handle, meta_description, excerpt, tags[], body_html, faq[]}. None on
     failure. avoid: QA findings from a rejected earlier attempt (rewrite mode).
@@ -13967,6 +13969,31 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns
         faq_block = ("\n\nREAL SEARCH QUESTIONS about this subject (people literally type these into "
                      "Google — build the FAQ from the most relevant ones, rephrased naturally):\n"
                      + '\n'.join(f"- {q}" for q in faq_questions[:6]) + "\n")
+    pillar_block = ''
+    if topic.get('pillar'):
+        spokes = topic.get('spokes') or []
+        spoke_lines = '\n'.join(f"- {s.get('title')} (href: /blogs/{BLOG_HANDLE}/{s.get('handle')})"
+                                for s in spokes if s.get('handle'))
+        pillar_block = (
+            f"\n\nTHIS IS A PILLAR ARTICLE: the COMPLETE guide to \"{kw}\" for our shop — the "
+            "authoritative overview a reader bookmarks. Structure it accordingly: a strong intro, "
+            "then sections covering the main styles/silhouettes, fabrics & season, fit & figure "
+            "advice, care, and occasions. Weave a natural inline link to EACH of these existing "
+            "articles of ours exactly once (anchor = their subject, not the full title):\n"
+            + (spoke_lines or '(none yet)') + "\n"
+            + f"The title MUST be: \"{BLOG_PILLAR_TITLE.get(store, '{term}: guide').format(term=kw.capitalize())}\" "
+              "(adjust capitalization to the language norm only).\n")
+    brief_block = ''
+    wc_target = 1250 if topic.get('pillar') else 950
+    if serp_brief:
+        wc_target = max(wc_target if topic.get('pillar') else 0,
+                        serp_brief.get('target_words') or 950)
+        brief_block = (
+            "\n\nCOMPETITIVE BRIEF (this article must OUTRANK the current top results):\n"
+            "Essentials the ranking pages all cover — cover them at least as well:\n"
+            + '\n'.join(f"- {c}" for c in serp_brief.get('covered') or []) +
+            "\nINFORMATION GAIN — none of them covers these well; make them your edge:\n"
+            + '\n'.join(f"- {g}" for g in serp_brief.get('gaps') or []) + "\n")
     concern_block = ''
     if concerns:
         concern_block = ("\n\nREAL CONSUMER CONCERNS (from fashion forums, in English). Address at "
@@ -13978,17 +14005,18 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns
         f"You are the content writer for Vionna, writing an SEO blog article. {BLOG_BRAND_VOICE}\n\n"
         f"Write the ENTIRE article in {lang}. Native, fluent, elegant {lang} — not translated-sounding.\n\n"
         f"WRITING RULES (hard requirements):\n{BLOG_ANTI_AI_RULES}\n"
-        f"{style_block}{pitfall_block}{avoid_block}\n"
+        f"{style_block}{pitfall_block}{avoid_block}{pillar_block}\n"
         f"PRIMARY SEO KEYWORD (must rank for this): \"{kw}\"\n"
         f"Supporting keywords to weave in naturally: {', '.join(cluster) if cluster else '(none)'}"
         f"{season_hint}{pb_block}\n\n"
         f"Products from our shop to feature (link them inline with <a href> using the given relative links):\n"
-        f"{prod_block}{faq_block}{concern_block}\n\n"
+        f"{prod_block}{brief_block}{faq_block}{concern_block}\n\n"
         "REQUIREMENTS:\n"
         f"1. Title: compelling, contains the primary keyword, max ~60 chars, in {lang}.\n"
-        "2. Body: valid HTML (no <html>/<head>/<body> wrappers). 600-950 words (native fashion "
-        "editorial length), never fewer than 550. Use <h2>/<h3> subheadings and <p>; prose over "
-        "bullet lists. Put the primary keyword in the first paragraph and in at least one <h2>.\n"
+        f"2. Body: valid HTML (no <html>/<head>/<body> wrappers). Aim for ~{wc_target} words "
+        f"({max(600, int(wc_target * 0.85))}-{wc_target}), never fewer than 550. Use <h2>/<h3> "
+        "subheadings and <p>; prose over bullet lists. Put the primary keyword in the first "
+        "paragraph and in at least one <h2>.\n"
         "3. Naturally recommend 3-6 of the products above with inline <a href=\"/products/...\"> links. "
         "The anchor text of a product link is the PRODUCT NAME ONLY (1-3 words) — never wrap a "
         "sentence or phrase in the link. Describe each product ONLY with attributes from its "
@@ -14058,6 +14086,8 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns
         'n_faq': len(faq),
         'gap_hit': bool(topic.get('gap_hit')),
         'n_concerns': len(concerns or []),
+        'serp_brief': bool(serp_brief),
+        'product_cards': True,
     }
     return {
         'title': title,
@@ -14160,11 +14190,28 @@ def _blog_fix_anchors(body, products):
     return re.sub(r'<a href="(/products/[^"]+)">(.*?)</a>', _fix, body, flags=re.S)
 
 
-def _blog_inline_product_images(body, products, max_images=3):
-    """Insert a clickable product photo right after the paragraph where each linked
-    product is first mentioned (up to max_images). Fashion editorial is image-led;
-    a text-only body reads bare on the article template. Deterministic HTML insert,
-    no LLM involved. Skips products whose paragraph is already followed by an image."""
+BLOG_CARD_CTA = {'dk': 'Shop nu', 'fr': 'Découvrir', 'fi': 'Osta nyt'}
+BLOG_PRICE_FMT = {'dk': '{p} kr.', 'fr': '{p} €', 'fi': '{p} €'}
+
+
+def _blog_card_price(store, p):
+    """Caption-style price ('599,95 kr.'), the one place native fashion editorial
+    shows prices. '' when unknown."""
+    raw = p.get('price')
+    if not raw:
+        return ''
+    try:
+        val = ('%.2f' % float(raw)).rstrip('0').rstrip('.').replace('.', ',')
+    except Exception:
+        val = str(raw)
+    return BLOG_PRICE_FMT.get(store, '{p}').format(p=val)
+
+
+def _blog_inline_product_images(body, products, max_images=3, store=None):
+    """Shop-the-look CARD after the paragraph where each linked product is first
+    mentioned (up to max_images): photo + name + caption price + a small CTA
+    button. Deterministic HTML, theme-independent inline styles. Skips products
+    whose paragraph is already followed by an image/card."""
     if not body or not products:
         return body
     done = 0
@@ -14184,10 +14231,21 @@ def _blog_inline_product_images(body, products, max_images=3):
             continue
         sep = '&width=720' if '?' in img else '?width=720'
         alt = (title or '').replace('"', '')
-        fig = ('<p style="text-align:center;margin:1.2em 0"><a href="%s">'
-               '<img src="%s%s" alt="%s" loading="lazy" '
-               'style="max-width:min(420px,100%%);height:auto;border-radius:10px"/></a></p>'
-               % (url, img, sep, alt))
+        price = _blog_card_price(store, p) if store else ''
+        cta = BLOG_CARD_CTA.get(store, 'Shop')
+        caption = alt + (f' · {price}' if price else '')
+        fig = (
+            '<div style="max-width:min(420px,100%%);margin:1.4em auto;text-align:center;'
+            'border:1px solid #ececec;border-radius:12px;overflow:hidden;background:#fff">'
+            '<a href="%s" style="text-decoration:none">'
+            '<img src="%s%s" alt="%s" loading="lazy" style="width:100%%;height:auto;display:block"/></a>'
+            '<div style="padding:12px 14px 14px">'
+            '<p style="margin:0 0 8px;font-weight:600;color:#1a1a1a">%s</p>'
+            '<a href="%s" style="display:inline-block;background:#1a1a1a;color:#ffffff;'
+            'padding:9px 22px;border-radius:6px;text-decoration:none;font-size:0.9em;'
+            'letter-spacing:.3px">%s</a>'
+            '</div></div>'
+            % (url, img, sep, alt, caption, url, cta))
         body = body[:pend + 4] + fig + body[pend + 4:]
         done += 1
     return body
@@ -14473,7 +14531,9 @@ def _blog_related_links(store, category, hdrs, exclude_handle=None, max_links=3)
             latest[h] = r     # file order = chronological; last row per handle wins
     rows = [r for r in latest.values() if r.get('published')]
     rows.sort(key=lambda r: r.get('ts') or '', reverse=True)
-    rows.sort(key=lambda r: 0 if (category and r.get('category') == category) else 1)
+    # pillar of this category first, then same-category spokes, then newest rest
+    rows.sort(key=lambda r: (0 if (r.get('pillar') and r.get('category') == category) else
+                             1 if (category and r.get('category') == category) else 2))
     dom = _blog_primary_domain(store, hdrs)
     picks = []
     for r in rows:
@@ -14491,6 +14551,81 @@ def _blog_related_links(store, category, hdrs, exclude_handle=None, max_links=3)
     items = ''.join(f'<li><a href="/blogs/{BLOG_HANDLE}/{r["article_handle"]}">'
                     f'{(r.get("title") or r["article_handle"])}</a></li>' for r in picks)
     return f'<h2>{BLOG_READALSO.get(store, "Read also")}</h2><ul>{items}</ul>'
+
+
+# --- SERP brief: know what ranks, then beat it (information gain) -------------
+DFS_SERP_ENDPOINT = 'https://api.dataforseo.com/v3/serp/google/organic/live/regular'
+
+
+def _blog_serp_brief(store, topic):
+    """Competitive brief for the writer: what do the pages currently ranking for
+    this keyword cover, and what is missing (information gain)? DataForSEO SERP
+    top-10 → fetch top article pages directly → haiku distills {covered, gaps,
+    target_words}. None on any failure (fail-open)."""
+    kw = (topic or {}).get('keyword') or ''
+    if not kw or not _dfs_configured() or store not in DFS_LOCATION:
+        return None
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        return None
+    try:
+        r = req.post(DFS_SERP_ENDPOINT, headers=_dfs_headers(), json=[{
+            'keyword': kw, 'location_code': DFS_LOCATION[store],
+            'language_code': DFS_LANGUAGE[store], 'depth': 10}], timeout=40)
+        t = (r.json().get('tasks') or [{}])[0]
+        items = (((t.get('result') or [{}])[0]) or {}).get('items') or []
+        organic = [it for it in items if it.get('type') == 'organic' and it.get('url')]
+    except Exception as e:
+        print(f"[blog] serp fetch failed: {e}")
+        return None
+    if not organic:
+        return None
+    serp_lines = [f"{i+1}. {it.get('title')} — {it.get('description') or ''}"
+                  for i, it in enumerate(organic[:10])]
+    # read the top article pages (skip our own stores); extract heading structure
+    page_summaries = []
+    own = ('vionna', '.myshopify.')
+    for it in organic[:6]:
+        if len(page_summaries) >= 3:
+            break
+        url = it.get('url') or ''
+        if any(o in url for o in own):
+            continue
+        try:
+            pr = req.get(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'},
+                         timeout=12)
+            if pr.status_code != 200:
+                continue
+            html = pr.text
+            heads = [re.sub(r'<[^>]+>', '', h).strip()[:90]
+                     for h in re.findall(r'<h[23][^>]*>(.*?)</h[23]>', html, re.S | re.I)][:12]
+            words = len(re.findall(r'\w+', re.sub(r'<script.*?</script>|<style.*?</style>|<[^>]+>',
+                                                  ' ', html, flags=re.S)))
+            page_summaries.append(f"URL: {url}\n  ~{words} woorden | koppen: " + ' / '.join(h for h in heads if h))
+        except Exception:
+            continue
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=600,
+                                      messages=[{'role': 'user', 'content':
+            f'Search keyword: "{kw}". Below: the current Google top-10 (titles+descriptions) and the '
+            'heading structure of the top-ranking articles. Produce a compact competitive brief for a '
+            'writer who must OUTRANK them. Return ONLY JSON: '
+            '{"covered": ["subtopics the ranking pages all cover — the essentials to include"], '
+            '"gaps": ["angles/questions NONE of them covers well — the information gain"], '
+            '"target_words": <int, ~10% above the longest ranking article, between 600 and 1400>}\n\n'
+            'TOP-10:\n' + '\n'.join(serp_lines) + '\n\nTOP PAGES:\n' + ('\n'.join(page_summaries) or '(none readable)')}])
+        txt = (msg.content[0].text if msg.content else '') or ''
+        data = _blog_first_json(txt)
+        if not data:
+            return None
+        return {'covered': [str(x) for x in (data.get('covered') or [])][:8],
+                'gaps': [str(x) for x in (data.get('gaps') or [])][:5],
+                'target_words': max(600, min(int(data.get('target_words') or 900), 1400)),
+                'n_pages_read': len(page_summaries)}
+    except Exception as e:
+        print(f"[blog] serp brief distill failed: {e}")
+        return None
 
 
 # --- Reddit consumer concerns (content ENRICHMENT only; topics stay Google) ---
@@ -14688,6 +14823,119 @@ def _blog_gap_keywords(store, _cache={}):
     return sigs
 
 
+# --- Topical clusters: pillar guides + spokes --------------------------------
+# Search engines reward topical authority: one complete guide per category (the
+# PILLAR) with normal articles (SPOKES) linking up, and the pillar linking down.
+BLOG_PILLAR_TITLE = {'dk': '{term}: den komplette guide', 'fr': '{term} : le guide complet',
+                     'fi': '{term}: täydellinen opas'}
+
+
+def _blog_category_term(store, category):
+    """Natural local head-term for a category (kjole/robe/mekko …) via the seed
+    whose label maps to it. Falls back to the raw category name."""
+    for seed, label in (DFS_SEED_LABELS.get(store) or {}).items():
+        if DFS_TYPE_CATEGORY.get(label) == category:
+            return seed
+    return category
+
+
+def _blog_pillar_state(store):
+    """{category: row} of existing pillar articles for this store. Detects both
+    the explicit pillar flag and (for rows recovered via shopify-sync) the pillar
+    title format."""
+    fmt_marker = BLOG_PILLAR_TITLE.get(store, ': guide').split('{term}')[-1].strip(' :')
+    out = {}
+    for r in _blog_read_jsonl(BLOG_HISTORY_PATH):
+        if r.get('store') != store or not r.get('published'):
+            continue
+        if r.get('pillar') or (fmt_marker and fmt_marker.lower() in (r.get('title') or '').lower()):
+            if r.get('category'):
+                out[r['category']] = r
+    return out
+
+
+def _blog_pillar_candidate(store, hdrs):
+    """The pillar to write next, if any: a category with >= 2 published spokes,
+    no pillar yet, enough stock — max one pillar per store per week."""
+    rows = [r for r in _blog_read_jsonl(BLOG_HISTORY_PATH)
+            if r.get('store') == store and r.get('published')]
+    pillars = _blog_pillar_state(store)
+    # max 1 pillar/week/store
+    last_pillar_ts = max((p.get('ts') or '' for p in pillars.values()), default='')
+    if last_pillar_ts:
+        try:
+            age = (datetime.datetime.utcnow()
+                   - datetime.datetime.fromisoformat(last_pillar_ts.replace('Z', '').replace('+00:00', ''))).days
+            if age < 7:
+                return None
+        except Exception:
+            pass
+    from collections import Counter as _C
+    spokes_per_cat = _C()
+    latest = {}
+    for r in rows:
+        if r.get('article_handle'):
+            latest[r['article_handle']] = r
+    for r in latest.values():
+        cat = r.get('category')
+        if cat and cat not in pillars and not r.get('pillar'):
+            spokes_per_cat[cat] += 1
+    for cat, n in spokes_per_cat.most_common():
+        if n < 2:
+            break
+        stock = _blog_category_stock(store, cat, hdrs)
+        if 0 <= stock < BLOG_MIN_CATEGORY_STOCK:
+            continue
+        term = _blog_category_term(store, cat)
+        spokes = [{'title': r.get('title'), 'handle': r.get('article_handle')}
+                  for r in latest.values() if r.get('category') == cat and not r.get('pillar')][:6]
+        return {'keyword': term, 'category': cat, 'source': 'pillar', 'pillar': True,
+                'intent': 'commercial', 'volume': None, 'seasonality': None,
+                'cluster': [], 'spokes': spokes}
+    return None
+
+
+def _blog_update_pillar_links(store, category, hdrs):
+    """Keep the pillar's 'read also' list fresh: after a new spoke publishes,
+    rewrite the pillar article's related-links block with the latest spokes of
+    its category. Best-effort; never raises."""
+    try:
+        pillar = _blog_pillar_state(store).get(category)
+        if not pillar or not pillar.get('article_id'):
+            return
+        latest = {}
+        for r in _blog_read_jsonl(BLOG_HISTORY_PATH):
+            if (r.get('store') == store and r.get('published') and r.get('article_handle')
+                    and r.get('category') == category
+                    and r.get('article_handle') != pillar.get('article_handle')):
+                latest[r['article_handle']] = r
+        spokes = sorted(latest.values(), key=lambda r: r.get('ts') or '', reverse=True)[:5]
+        if not spokes:
+            return
+        heading = BLOG_READALSO.get(store, 'Read also')
+        items = ''.join(f'<li><a href="/blogs/{BLOG_HANDLE}/{r["article_handle"]}">'
+                        f'{(r.get("title") or r["article_handle"])}</a></li>' for r in spokes)
+        block = f'<h2>{heading}</h2><ul>{items}</ul>'
+        blog_id = _blog_ensure(store, hdrs)
+        r = _shopify_call('get', shopify_url(store, f'blogs/{blog_id}/articles/{pillar["article_id"]}.json'),
+                          hdrs, timeout=20)
+        if r.status_code != 200:
+            return
+        body = r.json()['article']['body_html']
+        pat = re.compile(r'<h2>' + re.escape(heading) + r'</h2>\s*<ul>.*?</ul>', re.S)
+        new_body, n = pat.subn(lambda _m: block, body, count=1)
+        if n == 0:
+            anchor = body.find('<div style="text-align:center;margin:2.2em')
+            new_body = (body[:anchor] + block + body[anchor:]) if anchor != -1 else body + block
+        if new_body != body:
+            _shopify_call('put', shopify_url(store, f'blogs/{blog_id}/articles/{pillar["article_id"]}.json'),
+                          hdrs, json={'article': {'id': pillar['article_id'], 'body_html': new_body}},
+                          timeout=30)
+            print(f"[blog] pillar '{pillar.get('article_handle')}' related-links ververst ({len(spokes)} spokes)")
+    except Exception as e:
+        print(f"[blog] pillar link update failed: {e}")
+
+
 def _blog_recent_product_handles(store, n_articles=2):
     """Product handles linked in this store's most recent articles — excluded from
     the next match so consecutive posts don't showcase the same products."""
@@ -14797,6 +15045,10 @@ def _blog_generate_one(store, topic=None, published=None):
         fb = _blog_fallback_topic(store, hdrs=hdrs)
         if fb:
             candidates.append(fb)
+        # cluster building: a due pillar guide takes precedence over regular topics
+        pc = _blog_pillar_candidate(store, hdrs)
+        if pc:
+            candidates.insert(0, pc)
         if not candidates:
             return {'store': store, 'error': 'no topics available (no DataForSEO + no fallback)'}
     exclude = _blog_recent_product_handles(store)
@@ -14824,7 +15076,9 @@ def _blog_generate_one(store, topic=None, published=None):
                 'error': 'no candidate topic has enough genuinely fitting products'}
     faqs = _blog_faq_questions(store, topic.get('keyword'))
     concerns = _blog_reddit_concerns(store, topic)
-    art = _blog_write(store, topic, products, faq_questions=faqs, concerns=concerns)
+    brief = _blog_serp_brief(store, topic)
+    art = _blog_write(store, topic, products, faq_questions=faqs, concerns=concerns,
+                      serp_brief=brief)
     if not art or not art.get('title') or not art.get('body_html'):
         return {'store': store, 'topic': topic, 'error': 'writer failed'}
     art['primary_keyword'] = topic.get('keyword')
@@ -14848,7 +15102,8 @@ def _blog_generate_one(store, topic=None, published=None):
         if not qa_ok:
             print(f"[blog] {store}: QA keeps failing — full rewrite on the same topic")
             prev = ((qa['critical'] + qa['minor'])[:6] if qa else ['previous attempt failed QA'])
-            art2 = _blog_write(store, topic, products, avoid=prev, faq_questions=faqs, concerns=concerns)
+            art2 = _blog_write(store, topic, products, avoid=prev, faq_questions=faqs,
+                               concerns=concerns, serp_brief=brief)
             if art2 and art2.get('title') and art2.get('body_html'):
                 art2['primary_keyword'] = topic.get('keyword')
                 art2 = _blog_edit(store, art2, products)
@@ -14870,7 +15125,7 @@ def _blog_generate_one(store, topic=None, published=None):
     else:
         publish = bool(published)
     art['body_html'] = _blog_fix_anchors(art['body_html'], products)
-    art['body_html'] = _blog_inline_product_images(art['body_html'], products)
+    art['body_html'] = _blog_inline_product_images(art['body_html'], products, store=store)
     related = _blog_related_links(store, topic.get('category'), hdrs, exclude_handle=art.get('handle'))
     art['body_html'] += related
     art['body_html'] += _blog_cta_buttons(store, topic, products, hdrs)
@@ -14891,8 +15146,11 @@ def _blog_generate_one(store, topic=None, published=None):
     created = _blog_create_article(store, blog_id, art, hdrs, published=publish, featured_img=featured)
     qa_slim = qa and {'score': qa['score'], 'critical': len(qa['critical']), 'minor': len(qa['minor'])}
     _blog_log(store, topic, {**created, 'published': publish, 'levers': art.get('levers'), 'qa': qa_slim,
-                             'products': [p.get('handle') for p in products if p.get('handle')]})
+                             'products': [p.get('handle') for p in products if p.get('handle')],
+                             'pillar': topic.get('pillar')})
     _blog_slack_article(store, created, publish, qa_slim, topic)
+    if publish and not topic.get('pillar') and topic.get('category'):
+        _blog_update_pillar_links(store, topic['category'], hdrs)
     return {'store': store, 'topic': topic, 'products_linked': len(products), 'qa': qa_slim,
             'published': publish, 'article': created, 'preview': {'title': art['title'],
             'meta_description': art['meta_description'], 'excerpt': art['excerpt'],
