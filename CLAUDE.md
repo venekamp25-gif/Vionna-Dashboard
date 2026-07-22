@@ -8,10 +8,45 @@ and sales channels.
 - Frontend: Next.js on Netlify — `frontend/` (auto-deploys on push to `main`)
 - Backend: Python Flask on a DigitalOcean droplet — `backend/server.py`
   - Public base URL: `https://188-166-11-177.nip.io`
-  - Self-updates from `main` (pulls `backend/server.py` + `version.txt`); bump
-    `backend/version.txt` for any backend change so the droplet picks it up.
+  - Self-updates from `main` automatically (see "Deploy & self-update" below);
+    bump `backend/version.txt` for any backend change so the droplet picks it up.
 - Repo is PUBLIC — never commit secrets. `.env`, `tokens.json`, `slack_config.json`
   are gitignored and live only on the droplet.
+
+---
+
+## 🔄 Deploy & self-update (backend, since v1.249.0)
+
+Deploying the backend = push to `main` with a higher `backend/version.txt`.
+Nothing else. The droplet installs it itself within ~10 minutes:
+
+- `_self_update_loop` in `backend/server.py` (daemon thread, right after the
+  backup loop) checks the local `/api/version` every 10 min and, when
+  `update_available`, POSTs `http://127.0.0.1:$PORT/api/update` (PORT default
+  5000). That call is genuinely local (no `X-Forwarded-*` headers), so the
+  security gate on `/api/update` lets it through tokenless. After the pull the
+  process restarts itself.
+- There is deliberately **no systemd unit / cron** for updates: the updater
+  lives inside `server.py` so it deploys with every update and can never be
+  missing from the box. (History: the old `api_update` comment referred to a
+  systemd self-updater that was never actually created; when the security
+  harding gated `/api/update`, the employee-facing "Install update" banner
+  button broke too and the droplet silently sat on v1.244 while `main` was at
+  v1.247 — security fixes included. The banner in the legacy `index.html` is
+  now informational only.)
+- Verify from anywhere: `curl https://188-166-11-177.nip.io/api/version` →
+  `"self_update":"active"` means the updater thread is running; after a push,
+  `local` should equal `remote` within ~10 min.
+- Kill switch: set `SELF_UPDATE=0` in the droplet's `.env` (or environment).
+  Local dev (`start.bat`) and pytest skip the updater automatically
+  (`DEV_LOCAL=1` / pytest import guard) — otherwise it would overwrite your
+  working tree with the GitHub versions.
+- If the droplet ever runs a version older than v1.249.0 (pre-updater), one
+  manual kick in the DigitalOcean console is needed:
+  `curl -X POST http://127.0.0.1:5000/api/update`
+- Known limit (pre-existing): the updater runs inside the Flask process, so if
+  the process is down or a bad release crashes on boot, nothing can self-heal —
+  that needs the DO console.
 
 ---
 

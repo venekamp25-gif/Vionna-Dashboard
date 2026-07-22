@@ -211,6 +211,64 @@ try:
 except Exception as _e:
     print(f"[backup] could not start backup thread: {_e}")
 
+# --- Automatic self-update ---
+# Deploys used to rely on a human: publish-update.bat pushed to GitHub and an
+# employee clicked the "Install update" banner in index.html. The security
+# harding gated /api/update (local-only or X-Droplet-Token), so that browser
+# call now 401s through the Caddy proxy and the droplet silently stopped
+# updating (it sat on v1.244 while main was at v1.247, security fixes included).
+# This loop IS the "droplet's own local self-updater" the api_update comment
+# promises: every 10 minutes it asks the local /api/version whether GitHub has
+# a newer version.txt and, if so, POSTs /api/update on 127.0.0.1 — a genuinely
+# local call (no X-Forwarded headers), so the gate lets it through tokenless.
+# In-process on purpose, same pattern as the backup loop above: it ships with
+# every update, so unlike a systemd unit it cannot be missing from the box.
+# After a successful pull api_update restarts the process, which boots a fresh
+# copy of this loop.
+# Guards: DEV_LOCAL=1 (start.bat) and pytest skip it — a dev machine must never
+# overwrite its own working tree with the GitHub versions; SELF_UPDATE=0
+# disables it on the droplet without a code change. Any error (server not
+# listening yet, GitHub down, timeout) is logged and retried next tick — a
+# transient failure must never stop the loop.
+_SELF_UPDATE_INTERVAL = 600  # seconds between version checks (~10 min)
+_SELF_UPDATE_INITIAL  = 90   # let app.run() bind before the first self-call
+_self_update_state    = 'disabled'
+
+
+def _self_update_loop():
+    base = f"http://127.0.0.1:{os.environ.get('PORT', '5000')}"
+    time.sleep(_SELF_UPDATE_INITIAL)
+    while True:
+        try:
+            v = req.get(f'{base}/api/version', timeout=10).json()
+            if v.get('update_available'):
+                print(f"[self-update] v{v.get('local')} -> v{v.get('remote')}: updating...")
+                r = req.post(f'{base}/api/update', timeout=180)
+                try:
+                    body = r.json()
+                except Exception:
+                    body = {}
+                if r.ok and body.get('success'):
+                    print(f"[self-update] pulled {body.get('updated')} "
+                          f"(sha {str(body.get('sha'))[:9]}); restart pending")
+                else:
+                    print(f"[self-update] update failed ({r.status_code}): "
+                          f"{body.get('errors') or r.text[:200]}")
+        except Exception as e:
+            print(f"[self-update] check failed, retrying in {_SELF_UPDATE_INTERVAL}s: {e}")
+        time.sleep(_SELF_UPDATE_INTERVAL)
+
+
+if os.getenv('DEV_LOCAL') == '1' or os.getenv('SELF_UPDATE') == '0' or 'pytest' in sys.modules:
+    print('[self-update] disabled (DEV_LOCAL/pytest/SELF_UPDATE=0)')
+else:
+    try:
+        _threading.Thread(target=_self_update_loop, daemon=True, name='self-updater').start()
+        _self_update_state = 'active'
+    except Exception as _e:
+        _self_update_state = f'failed to start: {_e}'
+        print(f"[self-update] could not start updater thread: {_e}")
+
 # Slack webhook for bug-report pings. Stored in a gitignored file (the repo is
 # public, so the secret can't live in code/env-in-repo). Set once via
 # POST /api/config/slack_webhook. Falls back to the SLACK_WEBHOOK_URL env var.
@@ -438,7 +496,7 @@ def _self_headers():
 
 
 def _is_genuinely_local():
-    """True only for a DIRECT same-machine call (the droplet's own systemd updater
+    """True only for a DIRECT same-machine call (the in-process self-updater
     hitting http://127.0.0.1:PORT with no proxy in front), NOT for anything proxied
     in from the internet. Caddy sets X-Forwarded-* on every proxied request, so
     their presence means the call came from outside; a genuine localhost call has
@@ -11828,23 +11886,24 @@ def api_version():
     # number alone can advance while stale code lingers (the bug this fixes).
     if not GITHUB_RAW:
         return jsonify({'local': local, 'remote': None, 'update_available': False,
-                        'updater': 'sha-pinned'})
+                        'updater': 'sha-pinned', 'self_update': _self_update_state})
     try:
         # Files moved to backend/ subdirectory after repo restructure
         r = req.get(f'{GITHUB_RAW}/backend/version.txt', timeout=5)
         remote = r.text.strip()
         update_available = _version_tuple(remote) > _version_tuple(local)
         return jsonify({'local': local, 'remote': remote, 'update_available': update_available,
-                        'updater': 'sha-pinned'})
+                        'updater': 'sha-pinned', 'self_update': _self_update_state})
     except Exception as e:
         return jsonify({'local': local, 'remote': None, 'update_available': False,
-                        'error': str(e), 'updater': 'sha-pinned'})
+                        'error': str(e), 'updater': 'sha-pinned', 'self_update': _self_update_state})
 
 @app.route('/api/update', methods=['POST'])
 def api_update():
-    # Only the droplet's own local self-updater (systemd → http://127.0.0.1:PORT,
-    # no proxy) may trigger a pull tokenless; a proxied/internet call must carry a
-    # valid token. Without this, anyone with the public URL could POST /api/update
+    # Only the droplet's own local self-updater (_self_update_loop →
+    # http://127.0.0.1:PORT, no proxy) may trigger a pull tokenless; a proxied/
+    # internet call must carry a valid token. Without this, anyone with the
+    # public URL could POST /api/update
     # to force repeated git-pull+restart cycles (DoS).
     if not _is_genuinely_local() and not _verify_droplet_token(request.headers.get('X-Droplet-Token', '')):
         return jsonify({'error': 'Unauthorized — /api/update is local-only or requires a valid token'}), 401

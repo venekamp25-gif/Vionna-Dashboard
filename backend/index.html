@@ -1404,13 +1404,11 @@
   Loading connection status…
 </div>
 
-<!-- UPDATE BANNER (hidden by default) -->
+<!-- UPDATE BANNER (hidden by default). Informational only: the droplet's
+     in-process self-updater installs updates itself within ~10 min; the old
+     "Install update" button would 401 on the gated /api/update anyway. -->
 <div id="updateBanner" style="display:none;background:#1a1a2e;color:#fff;padding:10px 32px;font-size:13px;display:none;align-items:center;gap:12px;justify-content:space-between">
-  <span>🆕 <strong>Update available</strong> — a new version of the dashboard is ready. <span id="updateVersionLabel" style="opacity:0.7"></span></span>
-  <div style="display:flex;gap:8px;align-items:center">
-    <span id="updateStatus" style="opacity:0.7"></span>
-    <button onclick="installUpdate()" id="updateBtn" style="background:#4f8ef7;color:#fff;border:none;border-radius:6px;padding:6px 16px;font-size:12px;font-weight:600;cursor:pointer">Install update & restart</button>
-  </div>
+  <span>🆕 <strong>Update available</strong> <span id="updateVersionLabel" style="opacity:0.7"></span> — installs itself automatically within ~10 minutes.</span>
 </div>
 
 <!-- MAIN -->
@@ -1903,31 +1901,6 @@ Solène er en kjole, der er nem at tage på, og som føles behagelig fra morgen 
         banner.style.display = 'flex';
       }
     } catch(e) { /* silently ignore — no GITHUB_RAW configured */ }
-  }
-
-  async function installUpdate() {
-    const btn    = document.getElementById('updateBtn');
-    const status = document.getElementById('updateStatus');
-    btn.disabled = true;
-    btn.textContent = 'Installing…';
-    status.textContent = 'Downloading files…';
-    try {
-      const r = await fetch('/api/update', { method: 'POST' });
-      const d = await r.json();
-      if (d.success) {
-        status.textContent = 'Done! Restarting in 3s…';
-        btn.textContent = 'Restarting…';
-        setTimeout(() => location.reload(), 4000);
-      } else {
-        status.textContent = 'Error: ' + (d.errors || []).join(', ');
-        btn.disabled = false;
-        btn.textContent = 'Retry';
-      }
-    } catch(e) {
-      status.textContent = 'Connection error';
-      btn.disabled = false;
-      btn.textContent = 'Retry';
-    }
   }
 
   function buildKeywordChips() {
