@@ -13104,7 +13104,232 @@ def meta_fix_links():
 # ----------------------------------------------------------------------------
 BLOG_TITLE   = {'dk': 'Vionna Journal', 'fr': 'Le Journal Vionna', 'fi': 'Vionna Journal'}
 BLOG_HANDLE  = 'journal'
-BLOG_AUTHOR  = 'Vionna'
+BLOG_AUTHOR  = 'Vionna'   # legacy default; per-store persona below wins
+# E-E-A-T: a consistent, honest BRAND author (no fake humans) with a bio page the
+# Article schema points at. Pages are created idempotently at scheduler start.
+BLOG_AUTHOR_STORE = {'dk': 'Vionna Redaktionen', 'fr': 'La Rédaction Vionna', 'fi': 'Vionnan toimitus'}
+BLOG_AUTHOR_PAGE_HANDLE = 'journal-redaktion'
+BLOG_AUTHOR_PAGE = {
+    'dk': {'title': 'Om Vionna Redaktionen',
+           'body': '<p>Vionna Redaktionen skriver Vionna Journal: styling, pasform og pleje af '
+                   'feminin mode. Vi arbejder ud fra vores egen kollektion og rigtige kunders '
+                   'spørgsmål, så hver guide er praktisk og ærlig.</p>'},
+    'fr': {'title': 'La Rédaction Vionna',
+           'body': '<p>La Rédaction Vionna écrit Le Journal Vionna : conseils de style, de coupe '
+                   "et d'entretien autour de la mode féminine. Nous partons de notre propre "
+                   'collection et des vraies questions de nos clientes.</p>'},
+    'fi': {'title': 'Vionnan toimitus',
+           'body': '<p>Vionnan toimitus kirjoittaa Vionna Journalin: tyyli-, istuvuus- ja '
+                   'hoitovinkkejä naisten muotiin. Pohjana oma mallistomme ja asiakkaidemme '
+                   'todelliset kysymykset.</p>'},
+}
+
+
+def _blog_ensure_author_page(store, hdrs):
+    """Create the author bio page once per store (idempotent by handle)."""
+    try:
+        r = _shopify_call('get', shopify_url(store, f'pages.json?handle={BLOG_AUTHOR_PAGE_HANDLE}'),
+                          hdrs, timeout=20)
+        if r.status_code == 200 and (r.json().get('pages') or []):
+            return
+        cfg = BLOG_AUTHOR_PAGE.get(store)
+        if not cfg:
+            return
+        cr = _shopify_call('post', shopify_url(store, 'pages.json'), hdrs,
+                           json={'page': {'title': cfg['title'], 'handle': BLOG_AUTHOR_PAGE_HANDLE,
+                                          'body_html': cfg['body'], 'published': True}}, timeout=30)
+        print(f"[blog] author page {store}: HTTP {cr.status_code}")
+    except Exception as e:
+        print(f"[blog] author page {store} failed: {e}")
+
+
+BLOG_BESTSELLER_TITLEKW = {'dk': 'mest elskede styles lige nu', 'fr': 'styles préférés du moment',
+                           'fi': 'rakastetuimmat tyylit juuri nyt'}
+
+
+def _blog_bestsellers_topic(store, hdrs, n=5):
+    """Once a month: an own-data piece around the ACTUAL bestsellers of the last
+    30 days (unique per store, impossible for competitors to copy). None when
+    it's not due, sales data is unavailable, or fewer than 4 sellable items."""
+    month = datetime.datetime.utcnow().strftime('%Y-%m')
+    for r in _blog_read_jsonl(BLOG_HISTORY_PATH):
+        if (r.get('store') == store and (r.get('ts') or '').startswith(month)
+                and (r.get('source') == 'bestsellers'
+                     or (r.get('levers') or {}).get('format') == 'bestsellers')):
+            return None
+    since = (datetime.datetime.utcnow() - datetime.timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    counts = {}
+    url = shopify_url(store, f'orders.json?status=any&limit=250&created_at_min={since}'
+                             '&fields=id,line_items')
+    try:
+        while url:
+            r = _shopify_call('get', url, hdrs, timeout=30)
+            if r.status_code != 200:
+                return None
+            for o in r.json().get('orders', []):
+                for li in (o.get('line_items') or []):
+                    pid = li.get('product_id')
+                    if pid:
+                        counts[pid] = counts.get(pid, 0) + (li.get('quantity') or 1)
+            link = r.headers.get('Link') or ''
+            m = re.search(r'<([^>]+)>;\s*rel="next"', link)
+            url = m.group(1) if m else None
+    except Exception as e:
+        print(f"[blog] bestsellers orders failed: {e}")
+        return None
+    top_ids = [pid for pid, _ in sorted(counts.items(), key=lambda x: -x[1])][:n * 3]
+    prods, seen_titles = [], set()
+    for pid in top_ids:
+        if len(prods) >= n:
+            break
+        try:
+            q = ('{ product(id: "gid://shopify/Product/%d") { title handle status productType '
+                 'description(truncateAt: 200) featuredImage { url } '
+                 'priceRangeV2 { minVariantPrice { amount currencyCode } } } }' % pid)
+            r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs, json={'query': q}, timeout=20)
+            nd = ((r.json().get('data') or {}).get('product') or {})
+            t = (nd.get('title') or '').strip()
+            if not nd or nd.get('status') != 'ACTIVE' or not nd.get('featuredImage') or t.lower() in seen_titles:
+                continue
+            seen_titles.add(t.lower())
+            price = ((nd.get('priceRangeV2') or {}).get('minVariantPrice') or {})
+            prods.append({'title': t, 'handle': nd.get('handle'), 'url': '/products/' + (nd.get('handle') or ''),
+                          'image': (nd.get('featuredImage') or {}).get('url'),
+                          'price': price.get('amount'), 'currency': price.get('currencyCode'),
+                          'type': (nd.get('productType') or '').strip(),
+                          'desc': ' '.join((nd.get('description') or '').split())[:200]})
+        except Exception:
+            continue
+    if len(prods) < 4:
+        return None
+    return {'keyword': BLOG_BESTSELLER_TITLEKW.get(store, 'bestsellers'), 'category': None,
+            'source': 'bestsellers', 'intent': 'commercial', 'volume': None, 'seasonality': None,
+            'cluster': [], 'products_override': prods}
+
+
+def _blog_hero_image(store, topic, products):
+    """Editorial hero via the Higgsfield CLI (same plumbing as product photos),
+    using the first product photo as reference so the hero matches real
+    merchandise. Returns an image URL or None (fail-open → product photo).
+    Toggle: BLOG_HERO=0."""
+    if os.getenv('BLOG_HERO', '1') == '0':
+        return None
+    if not HIGGSFIELD_EXE or not os.path.isfile(HIGGSFIELD_EXE):
+        return None
+    ref = next((p.get('image') for p in (products or []) if p.get('image')), None)
+    kw = (topic or {}).get('keyword') or 'women fashion'
+    try:
+        import tempfile as _tf
+        tmp = None
+        if ref:
+            try:
+                rr = req.get(ref, timeout=15)
+                if rr.status_code == 200:
+                    tmp = os.path.join(_tf.mkdtemp(), 'ref.jpg')
+                    with open(tmp, 'wb') as f:
+                        f.write(rr.content)
+            except Exception:
+                tmp = None
+        prompt = (f"Editorial fashion magazine hero photo for an article about {kw}. Elegant feminine "
+                  "European woman 35-50, soft natural light, airy minimal setting, refined styling, "
+                  "muted warm tones, high-end lifestyle photography, no text or logos")
+        cmd = (f'"{HIGGSFIELD_EXE}" generate create nano_banana_2 --prompt "{prompt}" '
+               f'--aspect_ratio 16:9 --wait --json')
+        if tmp:
+            cmd += f' --image "{tmp}"'
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, shell=True)
+        urls = _urls_from_stdout(r.stdout or '')
+        out = [u for u in urls if 'd8j0ntlcm91z4.cloudfront.net' in u]
+        return out[0] if out else None
+    except Exception as e:
+        print(f"[blog] hero image failed: {e}")
+        return None
+
+
+# Format rotation: same subject-quality, different editorial shapes — prevents
+# template smell and lets the weekly learn loop discover what converts.
+BLOG_FORMATS = {
+    'guide': "A practical how-to guide: problem-first intro, then themed advice sections.",
+    'styling_diary': "A styling diary: walk the reader through composing 2-3 real outfits step by "
+                     "step (morning-to-evening narrative), weaving the products in as choices you make.",
+    'trend_report': "A trend report: what is happening with this garment right now (catwalks "
+                    "generically, street style, colours/fabrics), then how to translate it to real life.",
+    'outfit_formulas': "Outfit formulas: 3-4 named, repeatable combinations (e.g. 'blazer + wide "
+                       "trousers + loafers'), each with the why and one product anchoring it.",
+    'qna': "A Q&A piece: structure the whole body as the 5-6 questions readers actually ask about "
+           "this subject, each answered warmly and concretely (distinct from the FAQ section, which "
+           "stays short and snippet-focused).",
+}
+
+
+def _blog_pick_format(store, topic):
+    """Least-recently-used editorial format for this store (pillar/bestseller
+    topics carry their own shape)."""
+    if topic.get('pillar') or topic.get('source') == 'bestsellers':
+        return None
+    used = {}
+    for i, r in enumerate(_blog_read_jsonl(BLOG_HISTORY_PATH)):
+        if r.get('store') == store:
+            f = (r.get('levers') or {}).get('format')
+            if f in BLOG_FORMATS:
+                used[f] = i
+    return min(BLOG_FORMATS, key=lambda f: used.get(f, -1))
+
+
+BLOG_NEWSLETTER = {
+    'dk': {'title': 'Få styling-tips direkte i din indbakke',
+           'text': 'Tilmeld dig og få nye guides fra Vionna Journal først.',
+           'placeholder': 'Din e-mail', 'button': 'Tilmeld'},
+    'fr': {'title': 'Recevez nos conseils de style par e-mail',
+           'text': 'Inscrivez-vous et recevez les nouveaux guides du Journal Vionna en avant-première.',
+           'placeholder': 'Votre e-mail', 'button': "S'inscrire"},
+    'fi': {'title': 'Saa tyylivinkit suoraan sähköpostiisi',
+           'text': 'Tilaa, niin saat Vionna Journalin uudet oppaat ensimmäisenä.',
+           'placeholder': 'Sähköpostisi', 'button': 'Tilaa'},
+}
+
+
+def _blog_newsletter_block(store):
+    """Email-capture block using Shopify's native customer form (works on every
+    storefront without apps; subscribers land in Customers with marketing
+    consent). Owned audience = traffic we never have to earn twice."""
+    c = BLOG_NEWSLETTER.get(store)
+    if not c:
+        return ''
+    return (
+        '<div style="max-width:520px;margin:2.2em auto;padding:22px 24px;border:1px solid #ececec;'
+        'border-radius:12px;text-align:center;background:#faf8f6">'
+        f'<p style="margin:0 0 6px;font-weight:600;font-size:1.05em;color:#1a1a1a">{c["title"]}</p>'
+        f'<p style="margin:0 0 14px;color:#444">{c["text"]}</p>'
+        '<form method="post" action="/contact#contact_form" accept-charset="UTF-8">'
+        '<input type="hidden" name="form_type" value="customer"/>'
+        '<input type="hidden" name="utf8" value="✓"/>'
+        '<input type="hidden" name="contact[tags]" value="newsletter,journal"/>'
+        f'<input type="email" name="contact[email]" required placeholder="{c["placeholder"]}" '
+        'style="padding:11px 14px;border:1px solid #ccc;border-radius:6px;width:60%;max-width:280px;'
+        'margin-right:6px"/>'
+        f'<button type="submit" style="background:#1a1a1a;color:#fff;padding:11px 22px;'
+        f'border:none;border-radius:6px;letter-spacing:.3px;cursor:pointer">{c["button"]}</button>'
+        '</form></div>')
+
+
+def _blog_article_jsonld(store, art):
+    """Article structured data: brand author linked to the bio page."""
+    try:
+        shop = tokens.get(store, {}).get('shop') or STORES.get(store)
+        author = BLOG_AUTHOR_STORE.get(store, BLOG_AUTHOR)
+        data = {
+            '@context': 'https://schema.org', '@type': 'Article',
+            'headline': (art.get('title') or '')[:110],
+            'description': art.get('meta_description') or '',
+            'author': {'@type': 'Organization', 'name': author,
+                       'url': f'https://{shop}/pages/{BLOG_AUTHOR_PAGE_HANDLE}'},
+            'publisher': {'@type': 'Organization', 'name': 'Vionna'},
+            'mainEntityOfPage': f'https://{shop}/blogs/{BLOG_HANDLE}/{art.get("handle") or ""}',
+        }
+        return '<script type="application/ld+json">' + json.dumps(data, ensure_ascii=False) + '</script>'
+    except Exception:
+        return ''
 BLOG_HISTORY_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blog_history.jsonl')
 BLOG_VIEWS_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blog_views.json')
 _BLOG_VIEWS_LOCK    = threading.Lock()
@@ -13922,7 +14147,7 @@ BLOG_FAQ_HEADING = {'dk': 'Ofte stillede spørgsmål', 'fr': 'Questions fréquen
 
 
 def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns=None,
-                serp_brief=None):
+                serp_brief=None, fmt=None):
     """Claude writes the SEO article in the store's language. Returns a dict:
     {title, handle, meta_description, excerpt, tags[], body_html, faq[]}. None on
     failure. avoid: QA findings from a rejected earlier attempt (rewrite mode).
@@ -13969,6 +14194,15 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns
         faq_block = ("\n\nREAL SEARCH QUESTIONS about this subject (people literally type these into "
                      "Google — build the FAQ from the most relevant ones, rephrased naturally):\n"
                      + '\n'.join(f"- {q}" for q in faq_questions[:6]) + "\n")
+    fmt_block = ''
+    if fmt and fmt in BLOG_FORMATS:
+        fmt_block = f"\n\nEDITORIAL FORMAT for this article: {BLOG_FORMATS[fmt]}\n"
+    if topic.get('source') == 'bestsellers':
+        fmt_block = ("\n\nEDITORIAL FORMAT: a warm 'most loved right now' piece — these products are "
+                     "our ACTUAL bestsellers of the past month (real sales data, a genuine signal of "
+                     "what women are choosing). Rank them naturally (no hard numbers in headings "
+                     "needed), tell what makes each one loved, and let the social proof carry the "
+                     "piece. Never invent sales figures.\n")
     pillar_block = ''
     if topic.get('pillar'):
         spokes = topic.get('spokes') or []
@@ -14005,7 +14239,7 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns
         f"You are the content writer for Vionna, writing an SEO blog article. {BLOG_BRAND_VOICE}\n\n"
         f"Write the ENTIRE article in {lang}. Native, fluent, elegant {lang} — not translated-sounding.\n\n"
         f"WRITING RULES (hard requirements):\n{BLOG_ANTI_AI_RULES}\n"
-        f"{style_block}{pitfall_block}{avoid_block}{pillar_block}\n"
+        f"{style_block}{pitfall_block}{avoid_block}{fmt_block}{pillar_block}\n"
         f"PRIMARY SEO KEYWORD (must rank for this): \"{kw}\"\n"
         f"Supporting keywords to weave in naturally: {', '.join(cluster) if cluster else '(none)'}"
         f"{season_hint}{pb_block}\n\n"
@@ -14088,6 +14322,8 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns
         'n_concerns': len(concerns or []),
         'serp_brief': bool(serp_brief),
         'product_cards': True,
+        'format': ('bestsellers' if topic.get('source') == 'bestsellers'
+                   else 'pillar' if topic.get('pillar') else fmt),
     }
     return {
         'title': title,
@@ -14378,7 +14614,7 @@ def _blog_create_article(store, blog_id, art, hdrs, published=False, featured_im
     """Create the Shopify article (DRAFT by default) with SEO metafields + image."""
     article = {
         'title': art['title'],
-        'author': BLOG_AUTHOR,
+        'author': BLOG_AUTHOR_STORE.get(store, BLOG_AUTHOR),
         'body_html': art['body_html'],
         'published': bool(published),
         'metafields': [
@@ -15049,6 +15285,10 @@ def _blog_generate_one(store, topic=None, published=None):
         pc = _blog_pillar_candidate(store, hdrs)
         if pc:
             candidates.insert(0, pc)
+        # own-data piece: monthly bestsellers beat everything (unique content)
+        bt = _blog_bestsellers_topic(store, hdrs)
+        if bt:
+            candidates.insert(0, bt)
         if not candidates:
             return {'store': store, 'error': 'no topics available (no DataForSEO + no fallback)'}
     exclude = _blog_recent_product_handles(store)
@@ -15060,6 +15300,9 @@ def _blog_generate_one(store, topic=None, published=None):
                           (None, BLOG_MIN_CATEGORY_STOCK),
                           (None, 2)):
         for cand in candidates:
+            if cand.get('products_override'):
+                topic, products = cand, cand['products_override']
+                break
             prods = _blog_match_products(store, cand.get('category'), hdrs, n=6,
                                          keyword=cand.get('keyword'), exclude=excl)
             prods = _blog_products_fit_topic(store, cand, prods)
@@ -15077,8 +15320,9 @@ def _blog_generate_one(store, topic=None, published=None):
     faqs = _blog_faq_questions(store, topic.get('keyword'))
     concerns = _blog_reddit_concerns(store, topic)
     brief = _blog_serp_brief(store, topic)
+    fmt = _blog_pick_format(store, topic)
     art = _blog_write(store, topic, products, faq_questions=faqs, concerns=concerns,
-                      serp_brief=brief)
+                      serp_brief=brief, fmt=fmt)
     if not art or not art.get('title') or not art.get('body_html'):
         return {'store': store, 'topic': topic, 'error': 'writer failed'}
     art['primary_keyword'] = topic.get('keyword')
@@ -15103,7 +15347,7 @@ def _blog_generate_one(store, topic=None, published=None):
             print(f"[blog] {store}: QA keeps failing — full rewrite on the same topic")
             prev = ((qa['critical'] + qa['minor'])[:6] if qa else ['previous attempt failed QA'])
             art2 = _blog_write(store, topic, products, avoid=prev, faq_questions=faqs,
-                               concerns=concerns, serp_brief=brief)
+                               concerns=concerns, serp_brief=brief, fmt=fmt)
             if art2 and art2.get('title') and art2.get('body_html'):
                 art2['primary_keyword'] = topic.get('keyword')
                 art2 = _blog_edit(store, art2, products)
@@ -15128,11 +15372,13 @@ def _blog_generate_one(store, topic=None, published=None):
     art['body_html'] = _blog_inline_product_images(art['body_html'], products, store=store)
     related = _blog_related_links(store, topic.get('category'), hdrs, exclude_handle=art.get('handle'))
     art['body_html'] += related
+    art['body_html'] += _blog_newsletter_block(store)
     art['body_html'] += _blog_cta_buttons(store, topic, products, hdrs)
     # JSON-LD from the FINAL body text (post-editor), so the structured data
     # matches what readers see; falls back to the writer's faq array.
     faq_final = _blog_faq_from_body(store, art['body_html']) or art.get('faq') or []
     art['body_html'] += _blog_faq_jsonld(faq_final)
+    art['body_html'] += _blog_article_jsonld(store, art)
     art['body_html'] += _blog_view_beacon(store)
     if isinstance(art.get('levers'), dict):
         art['levers']['n_inline_images'] = art['body_html'].count('loading="lazy"')
@@ -15142,7 +15388,10 @@ def _blog_generate_one(store, topic=None, published=None):
         if qa:
             art['levers']['qa_score'] = qa['score']
     blog_id = _blog_ensure(store, hdrs)
-    featured = next((p.get('image') for p in products if p.get('image')), None)
+    hero = _blog_hero_image(store, topic, products) if publish else None
+    featured = hero or next((p.get('image') for p in products if p.get('image')), None)
+    if isinstance(art.get('levers'), dict):
+        art['levers']['hero_image'] = bool(hero)
     created = _blog_create_article(store, blog_id, art, hdrs, published=publish, featured_img=featured)
     qa_slim = qa and {'score': qa['score'], 'critical': len(qa['critical']), 'minor': len(qa['minor'])}
     _blog_log(store, topic, {**created, 'published': publish, 'levers': art.get('levers'), 'qa': qa_slim,
@@ -15335,6 +15584,93 @@ def _blog_store_posted_on(store, date_str):
     return False
 
 
+def _blog_refresh_one(store):
+    """Content refresh (highest-ROI SEO move): take one article stuck at position
+    5-20, add one section targeting the queries it ALMOST ranks for (from our own
+    DataForSEO measurements — no Search Console needed), re-QA, update in place
+    (same URL). Max one per store per weekly cycle; article >= 28 days old; not
+    refreshed in the last 21 days. Never raises."""
+    try:
+        now = datetime.datetime.utcnow()
+        refreshed_recent = set()
+        for r in _blog_read_jsonl(BLOG_HISTORY_PATH):
+            if r.get('refresh') and r.get('store') == store:
+                try:
+                    if (now - datetime.datetime.fromisoformat((r.get('ts') or '').replace('Z', ''))).days < 21:
+                        refreshed_recent.add(r.get('article_id'))
+                except Exception:
+                    pass
+        cands = []
+        for p in _blog_perf_latest():
+            if p.get('store') != store or p.get('article_id') in refreshed_recent:
+                continue
+            bp = p.get('best_position')
+            if not bp or not (5 <= bp <= 20):
+                continue
+            if (p.get('age_days') or 0) < 28:
+                continue
+            cands.append(p)
+        if not cands:
+            return
+        # page-2 rankings first (biggest jump), then the 6-10 refinements
+        cands.sort(key=lambda p: (0 if p['best_position'] >= 11 else 1, p['best_position']))
+        target = cands[0]
+        near = [k for k in (target.get('top_keywords') or [])
+                if k.get('position') and 6 <= k['position'] <= 30][:3]
+        if not near:
+            return
+        hdrs = shopify_headers(store)
+        blog_id = _blog_ensure(store, hdrs)
+        aid = target['article_id']
+        r = _shopify_call('get', shopify_url(store, f'blogs/{blog_id}/articles/{aid}.json'), hdrs, timeout=20)
+        if r.status_code != 200:
+            return
+        art_now = r.json()['article']
+        body = re.sub(r'<script[^>]*>.*?</script>', '', art_now.get('body_html') or '', flags=re.S)
+        lang = DFS_LANG_NAME.get(store, 'Danish')
+        kws = ', '.join(f"\"{k.get('keyword')}\" (pos {k.get('position')})" for k in near)
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=16000,
+            messages=[{'role': 'user', 'content':
+            f"You are updating an existing {lang} fashion-blog article that ranks positions 5-20 "
+            f"for these searches: {kws}. Strengthen it so it can reach the top: add ONE new <h2> "
+            "section (120-220 words) that directly and naturally serves those searches, and where "
+            "an existing sentence can weave one of those phrasings in naturally, do so. Do NOT "
+            "change the title, links, structure or tone otherwise; keep every <a href> exactly. "
+            f"Same writing rules as always:\n{BLOG_ANTI_AI_RULES}\n\nBODY_HTML:\n{body}\n\n"
+            'Return ONLY compact JSON: {"body_html": "..."}'}])
+        data = _blog_first_json((msg.content[0].text if msg.content else '') or '')
+        new_body = (data or {}).get('body_html') or ''
+        if not new_body or new_body.count('/products/') < body.count('/products/'):
+            print(f"[blog] refresh {store}: update unusable, skipped")
+            return
+        qa = _blog_qa_gate(store, {'title': art_now.get('title'), 'meta_description': '',
+                                   'excerpt': '', 'body_html': new_body})
+        if not qa or qa['score'] < BLOG_QA_MIN_SCORE or qa['critical']:
+            print(f"[blog] refresh {store}: QA rejected ({qa and qa['score']}), skipped")
+            return
+        # re-append the stripped machine blocks
+        faq_final = _blog_faq_from_body(store, new_body)
+        new_body += _blog_faq_jsonld(faq_final)
+        new_body += _blog_article_jsonld(store, {'title': art_now.get('title'),
+                                                 'meta_description': '', 'handle': art_now.get('handle')})
+        new_body += _blog_view_beacon(store)
+        u = _shopify_call('put', shopify_url(store, f'blogs/{blog_id}/articles/{aid}.json'), hdrs,
+                          json={'article': {'id': aid, 'body_html': new_body}}, timeout=30)
+        if u.status_code == 200:
+            with open(BLOG_HISTORY_PATH, 'a', encoding='utf-8') as f:
+                f.write(json.dumps({'ts': now.isoformat() + 'Z', 'store': store, 'refresh': True,
+                                    'article_id': aid, 'article_handle': None,
+                                    'targets': [k.get('keyword') for k in near]},
+                                   ensure_ascii=False) + '\n')
+            _blog_slack(f"🔄 Blog-refresh [{store.upper()}]: '{(art_now.get('title') or '')[:60]}' "
+                        f"versterkt voor: {', '.join(k.get('keyword') or '' for k in near)} (QA {qa['score']})")
+            print(f"[blog] refresh {store}: {art_now.get('handle')} updated (QA {qa['score']})")
+    except Exception as e:
+        print(f"[blog] refresh {store} failed: {e}")
+
+
 def _blog_run_learn_cycle():
     """Weekly: measure published articles, then rebuild the writer playbook."""
     try:
@@ -15352,6 +15688,8 @@ def _blog_run_learn_cycle():
     except Exception as e:
         print(f"[blog] learn failed: {e}")
         _blog_slack(f"🚨 Blog-leerronde (playbook) mislukt: {str(e)[:180]}")
+    for st in BLOG_SCHED_STORES:
+        _blog_refresh_one(st)
 
 
 # Bookkeeping seeds: two articles were (re)generated from the laptop on 2026-07-07
@@ -15464,6 +15802,7 @@ def _blog_scheduler_loop():
     _blog_seed_history()
     for _st in BLOG_SCHED_STORES:
         _blog_sync_history_from_shopify(_st)
+        _blog_ensure_author_page(_st, shopify_headers(_st))
     # One-shot bootstrap: a first real draft for every store that has never posted,
     # shortly after each (re)start. Idempotent — stores with history are skipped, so
     # a restart after fixing a store's token immediately produces its first draft.
