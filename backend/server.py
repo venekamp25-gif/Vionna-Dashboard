@@ -11567,6 +11567,196 @@ NANO_BANANA_PROMPTS = {
          "fabric texture and details."),
 }
 
+# Schoenen: zelfde stap-semantiek (1 hero / 2 detail / 3 alt-aanzicht / 4 materiaal),
+# maar de schoen is de held van het beeld en stap 3 is een ZIJPROFIEL — het
+# silhouet + de hakvorm is wat een koper wil zien, niet de rug van het model.
+NANO_BANANA_PROMPTS_SHOES = {
+    1: ("I've added a photo of a woman wearing a dress. I only want to use the background "
+        "from this photo. Then, I want you to put the {product_type} on the feet of a realistic "
+        "woman model in that background. The shoes are the HERO of the shot: both shoes fully "
+        "visible and sharply in focus, natural standing pose, full-body or knee-down framing "
+        "that draws the eye to the shoes. It should be completely unnoticeable that it's an "
+        "AI-generated model — it must look fully natural and real."),
+    2: ("I've uploaded a photo of OUR model wearing the {product_type}. Keep the SAME model — "
+        "same skin tone, legs and body — and the SAME background, lighting and styling. Keep "
+        "every detail of the {product_type} (shape, colour, materials, sole, heel and design "
+        "elements) identical to the reference. Generate a closer three-quarter shot from the "
+        "knee down where BOTH shoes are sharply in focus and the design details are prominent. "
+        "CRITICAL: use a clearly DIFFERENT leg and foot pose than the reference — change the "
+        "stance and angle so it is visibly a new photo, NOT a copy. Same shoes, same setting — "
+        "new pose."),
+    3: ("I've added a photo of a woman wearing the {product_type}. This is our model, and we do "
+        "not want the background, model, or product to be changed. Now show the same shoes on "
+        "the same model from a true SIDE PROFILE, so the full silhouette, heel shape and sole "
+        "line are clearly visible. Keep the current setup exactly as it is and make it look "
+        "completely real."),
+    4: ("I've added a photo of a woman wearing the {product_type}. We don't want any changes to "
+        "the background, model, or the product. Now generate a close-up of the {product_type} "
+        "itself: the upper material, stitching, sole edge and heel details. Match the original "
+        "style and lighting; the texture must look crisp and realistic."),
+    5: ("I've uploaded multiple reference images. The FIRST image is our model wearing the "
+        "{product_type} — keep this model, the background, the lighting, the styling and the "
+        "framing EXACTLY identical. The remaining images are colour references from the "
+        "competitor showing the same {product_type} in {color}; use them only to match the "
+        "exact {color} colour, material and finish. Generate the same model in a slightly "
+        "different pose, wearing the {product_type} in {color}. Do not copy the competitor's "
+        "model, feet, body, or background — only mirror the colour onto the shoes."),
+    11: ("I've uploaded reference images with TWO different roles:\n"
+         "- IMAGE 1: our existing model wearing the {product_type} — use her body, the framing, "
+         "background, lighting and styling. A slightly different pose is allowed.\n"
+         "- IMAGES 2+: competitor colour references. These define the EXACT shade, hue, "
+         "saturation, material and finish for the new variant. Use them ONLY for colour "
+         "information.\n\n"
+         "Task: generate a shot of OUR model (from IMAGE 1) wearing the {product_type} in the "
+         "EXACT colour shown in IMAGES 2+, framed so both shoes are fully visible and in focus. "
+         "Critical: do NOT guess the colour from the label '{color}' — match precisely what you "
+         "see in the reference images, including subtle tints. Ignore the competitor's model "
+         "and background entirely — only mirror the shoe colour."),
+    12: ("I've uploaded reference images with TWO different roles:\n"
+         "- IMAGE 1: our existing model wearing the {product_type}.\n"
+         "- IMAGES 2+: competitor colour references — EXACT colour ground truth.\n\n"
+         "Task: generate a knee-down detail shot of OUR model with BOTH shoes sharply in focus, "
+         "wearing the {product_type} in the EXACT colour shown in IMAGES 2+. Critical: match "
+         "the precise shade from the reference photos, not your prior idea of '{color}'. Keep "
+         "our model, background and styling identical to IMAGE 1, but use a different leg pose "
+         "than in IMAGE 1."),
+    13: ("I've uploaded reference images with TWO different roles:\n"
+         "- IMAGE 1: our existing model wearing the {product_type} (same setup, model, "
+         "background).\n"
+         "- IMAGES 2+: competitor colour references — EXACT colour ground truth.\n\n"
+         "Task: generate a true SIDE-PROFILE view of the {product_type} on OUR model in the "
+         "EXACT colour shown in IMAGES 2+, with the silhouette, heel shape and sole line "
+         "clearly visible. Critical: copy the precise shade, saturation and finish you see in "
+         "the references. Same model, same background as IMAGE 1."),
+    14: ("I've uploaded reference images with TWO different roles:\n"
+         "- IMAGE 1: our model wearing the {product_type} (for style + lighting reference).\n"
+         "- IMAGES 2+: competitor colour references — EXACT colour ground truth.\n\n"
+         "Task: generate a close-up of the {product_type} in the EXACT colour shown in "
+         "IMAGES 2+: upper material, stitching, sole edge and heel details. Critical: match "
+         "the precise shade, not your idea of '{color}'. Reproduce the lighting style from "
+         "IMAGE 1."),
+}
+
+# Tassen: een tas wordt GEDRAGEN (schouder/crossbody/hand), niet aangetrokken.
+# Stap 3 is een styled product shot zonder model — een rugaanzicht van het
+# model zegt niets over een tas; silhouet + hengsels + proporties wel.
+NANO_BANANA_PROMPTS_BAGS = {
+    1: ("I've added a photo of a woman wearing a dress. I only want to use the background "
+        "from this photo. Then, I want you to show a realistic woman model in that background "
+        "CARRYING the {product_type} — on the shoulder, crossbody or in hand, whichever suits "
+        "the design. The bag is the HERO of the shot: fully visible, correct proportions, "
+        "straps hanging naturally. It should be completely unnoticeable that it's an "
+        "AI-generated model — it must look fully natural and real."),
+    2: ("I've uploaded a photo of OUR model carrying the {product_type}. Keep the SAME model — "
+        "same face, hair, skin tone and body — and the SAME background, lighting and styling. "
+        "Keep every detail of the {product_type} (shape, colour, material, hardware, straps "
+        "and stitching) identical to the reference. Generate a closer shot where the bag is "
+        "sharply in focus at chest or hip height and its design details are prominent — the "
+        "bag leads the frame. CRITICAL: use a clearly DIFFERENT pose and carry angle than the "
+        "reference so it is visibly a new photo, NOT a copy. Same bag, same setting — new pose."),
+    3: ("I've added a photo of our model with the {product_type}. Do not change the product or "
+        "the style of the setting. Now generate a styled PRODUCT SHOT of the same "
+        "{product_type} standing alone on an elegant surface in the same setting and lighting "
+        "— three-quarter front angle, with the silhouette, straps and proportions clearly "
+        "visible, no model in frame. Keep it photorealistic."),
+    4: ("I've added a photo of our model with the {product_type}. We don't want any changes to "
+        "the background, model, or the product. Now generate a close-up of the {product_type} "
+        "itself: the material grain, stitching, zips, clasps and metal hardware. Match the "
+        "original style and lighting; the texture must look crisp and realistic."),
+    5: ("I've uploaded multiple reference images. The FIRST image is our model with the "
+        "{product_type} — keep this model, the background, the lighting, the styling and the "
+        "framing EXACTLY identical. The remaining images are colour references from the "
+        "competitor showing the same {product_type} in {color}; use them only to match the "
+        "exact {color} colour, material and finish. Generate the same model in a slightly "
+        "different pose, carrying the {product_type} in {color}. Do not copy the competitor's "
+        "model or background — only mirror the colour onto the bag."),
+    11: ("I've uploaded reference images with TWO different roles:\n"
+         "- IMAGE 1: our existing model carrying the {product_type} — use her face, body, the "
+         "framing, background, lighting and styling. A slightly different pose is allowed.\n"
+         "- IMAGES 2+: competitor colour references. These define the EXACT shade, hue, "
+         "saturation, material and finish for the new variant. Use them ONLY for colour "
+         "information.\n\n"
+         "Task: generate a shot of OUR model (from IMAGE 1) carrying the {product_type} in the "
+         "EXACT colour shown in IMAGES 2+, with the bag fully visible and in focus. Critical: "
+         "do NOT guess the colour from the label '{color}' — match precisely what you see in "
+         "the reference images, including subtle tints. Ignore the competitor's model and "
+         "background entirely — only mirror the bag colour."),
+    12: ("I've uploaded reference images with TWO different roles:\n"
+         "- IMAGE 1: our existing model carrying the {product_type}.\n"
+         "- IMAGES 2+: competitor colour references — EXACT colour ground truth.\n\n"
+         "Task: generate a closer shot of OUR model with the {product_type} sharply in focus "
+         "at chest or hip height, in the EXACT colour shown in IMAGES 2+. Critical: match the "
+         "precise shade from the reference photos, not your prior idea of '{color}'. Keep our "
+         "model, background and styling identical to IMAGE 1, but use a different pose and "
+         "carry angle than in IMAGE 1."),
+    13: ("I've uploaded reference images with TWO different roles:\n"
+         "- IMAGE 1: our model with the {product_type} (same setting and lighting).\n"
+         "- IMAGES 2+: competitor colour references — EXACT colour ground truth.\n\n"
+         "Task: generate a styled PRODUCT SHOT of the {product_type} standing alone on an "
+         "elegant surface in the same setting — three-quarter front angle, silhouette, straps "
+         "and proportions clearly visible, no model in frame — in the EXACT colour shown in "
+         "IMAGES 2+. Critical: copy the precise shade, saturation and finish you see in the "
+         "references."),
+    14: ("I've uploaded reference images with TWO different roles:\n"
+         "- IMAGE 1: our model with the {product_type} (for style + lighting reference).\n"
+         "- IMAGES 2+: competitor colour references — EXACT colour ground truth.\n\n"
+         "Task: generate a close-up of the {product_type} in the EXACT colour shown in "
+         "IMAGES 2+: material grain, stitching, zips, clasps and hardware. Critical: match "
+         "the precise shade, not your idea of '{color}'. Reproduce the lighting style from "
+         "IMAGE 1."),
+}
+
+
+def _nb_category(product_type):
+    """'bag' | 'shoes' | 'garment' voor een vrije product_type-string (EN/DK/FR/FI).
+
+    Substring-matching met opzet: Deens/Fins plakken samenstellingen
+    ("skuldertaske", "käsilaukku"), dus woordgrenzen zouden die missen.
+    Tassen EERST: "skoletaske" bevat zowel 'sko' als 'taske' en is een tas.
+    """
+    pt = (product_type or '').lower()
+    pt = pt.replace('bootcut', '')          # bootcut jeans zijn een broek, geen laars
+    bag_words = (
+        'bag', 'handbag', 'tote', 'shopper', 'crossbody', 'cross-body', 'clutch',
+        'satchel', 'purse', 'backpack', 'rucksack', 'weekender', 'duffel', 'pouch',
+        'wallet',
+        # DK
+        'taske', 'håndtaske', 'haandtaske', 'skuldertaske', 'rygsæk', 'rygsaek', 'pung',
+        # FR ('sac' los via woordgrens hieronder: 'sac' zit in te veel andere woorden)
+        'bandoulière', 'bandouliere', 'pochette', 'cabas', 'sacoche', 'portefeuille',
+        # FI
+        'laukku', 'käsilaukku', 'kasilaukku', 'olkalaukku', 'reppu', 'lompakko',
+    )
+    if any(w in pt for w in bag_words) or re.search(r'\bsacs?\b', pt):
+        return 'bag'
+    shoe_words = (
+        'shoe', 'sneaker', 'trainer', 'boot', 'loafer', 'sandal', 'heel', 'pump',
+        'stiletto', 'espadrille', 'slipper', 'flip-flop', 'flip flop', 'ballet flat',
+        'oxford', 'brogue', 'clog', 'mule',
+        # DK
+        'sko', 'støvle', 'stovle', 'hjemmesko', 'træsko', 'traesko', 'hæl', 'hael',
+        # FR (géén 'talon': zit letterlijk in 'pantalon(s)')
+        'chaussure', 'basket', 'botte', 'bottine', 'escarpin', 'mocassin', 'ballerine',
+        'sabot', 'chausson',
+        # FI
+        'kengät', 'kengat', 'kenkä', 'kenka', 'lenkkarit', 'tennarit', 'saappaat',
+        'saapas', 'nilkkurit', 'nilkkuri', 'sandaalit', 'korkokengät', 'korkokengat',
+        'mokkasiini', 'tossut', 'ballerinat',
+    )
+    if any(w in pt for w in shoe_words):
+        return 'shoes'
+    return 'garment'
+
+
+def _nb_prompts_for(product_type):
+    """De juiste template-set voor dit producttype. Zelfde sleutels in alle sets."""
+    cat = _nb_category(product_type)
+    if cat == 'bag':
+        return NANO_BANANA_PROMPTS_BAGS
+    if cat == 'shoes':
+        return NANO_BANANA_PROMPTS_SHOES
+    return NANO_BANANA_PROMPTS
+
 
 @app.route('/api/theme_export')
 @require_droplet_token
@@ -11681,7 +11871,9 @@ def higgsfield_generate():
 
     # Build prompt from template or use custom
     if prompt_type and prompt_type in NANO_BANANA_PROMPTS:
-        prompt = NANO_BANANA_PROMPTS[prompt_type].format(
+        # Template-set per categorie (kleding/schoenen/tassen) — zelfde sleutels,
+        # passende shots. Frontend blijft gewoon 1-5/11-14 sturen.
+        prompt = _nb_prompts_for(product_type)[prompt_type].format(
             product_type=product_type,
             color=color,
         )
@@ -12708,27 +12900,49 @@ def _season_now():
 
 def _lifestyle_prompt(product_type, season=None):
     """Build the Nano Banana prompt for a lifestyle ad shot, picking the scene from the season +
-    the product type. The reference image is our existing model shot — we keep the garment and
-    just re-stage the model in a seasonal lifestyle setting. Returns (prompt, season_used)."""
+    the product type. The reference image is our existing model shot — we keep the product and
+    just re-stage the model in a seasonal lifestyle setting. Category-aware: a bag is CARRIED
+    (not worn) and shoes need the feet in frame. Returns (prompt, season_used)."""
     season = (season or _season_now()).lower()
     pt = (product_type or 'fashion product').strip() or 'fashion product'
-    ptl = pt.lower()
+    ptl = pt.lower().replace('bootcut', '')     # bootcut jeans zijn geen laarzen
+    cat = _nb_category(ptl)
     # A few product types imply their own setting regardless of the calendar season.
-    if any(w in ptl for w in ('swim', 'bikini', 'beach')):
+    if any(w in ptl for w in ('swim', 'bikini', 'beach', 'sandal', 'sandaal', 'espadrille',
+                              'flip-flop', 'flip flop')):
         setting = "a sunny beach or seaside promenade with bright summer sunlight, relaxed and holiday-like"
-    elif any(w in ptl for w in ('coat', 'jacket', 'puffer', 'knit', 'sweater', 'wool', 'cardigan', 'trench')):
+    elif any(w in ptl for w in ('coat', 'jacket', 'puffer', 'knit', 'sweater', 'wool', 'cardigan',
+                                'trench', 'boot', 'støvle', 'stovle', 'botte', 'bottine',
+                                'saappaat', 'nilkkuri')):
         setting = ("a crisp cool-weather outdoor scene — a European city street or park with soft "
                    "daylight and cosy, layered styling")
     else:
         setting = _LIFESTYLE_SETTINGS.get(season, _LIFESTYLE_SETTINGS['summer'])
+    if cat == 'bag':
+        subject = f"our model carrying a {pt}"
+        keep = (f"Keep the EXACT same {pt} — same shape, colour, material, hardware and design "
+                f"details —")
+        framing = (f"a natural, relaxed candid pose with three-quarter or full-body framing in "
+                   f"which the {pt} stays fully visible and prominent (on the shoulder, crossbody "
+                   f"or in hand, whichever suits the design)")
+        noun = "product"
+    elif cat == 'shoes':
+        subject = f"our model wearing {pt}"
+        keep = (f"Keep the EXACT same {pt} — same shape, colour, materials, sole and heel —")
+        framing = ("a natural, relaxed candid pose with full-body or knee-down framing in which "
+                   "BOTH shoes are clearly visible and in focus")
+        noun = "shoes"
+    else:
+        subject = f"our model wearing a {pt}"
+        keep = f"Keep the EXACT same {pt} — same cut, colour, fabric and design details —"
+        framing = "a natural, relaxed candid pose with three-quarter or full-body framing"
+        noun = "garment"
     prompt = (
-        f"I've uploaded a photo of our model wearing a {pt}. Keep the EXACT same {pt} — same cut, "
-        f"colour, fabric and design details — and keep a realistic woman model whose face and body "
-        f"look completely natural (it must be unnoticeable that she is AI-generated). Re-stage her "
-        f"in {setting}. Use a natural, relaxed candid pose with three-quarter or full-body framing, "
-        f"an authentic editorial fashion-campaign feel, and photorealistic lighting that matches the "
-        f"scene. Do NOT change the garment in any way — only change the environment, lighting and "
-        f"pose to this lifestyle setting."
+        f"I've uploaded a photo of {subject}. {keep} and keep a realistic woman model whose face "
+        f"and body look completely natural (it must be unnoticeable that she is AI-generated). "
+        f"Re-stage her in {setting}. Use {framing}, an authentic editorial fashion-campaign feel, "
+        f"and photorealistic lighting that matches the scene. Do NOT change the {noun} in any way "
+        f"— only change the environment, lighting and pose to this lifestyle setting."
     )
     return prompt, season
 

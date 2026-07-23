@@ -10,12 +10,41 @@ import { higgsfieldQueue } from "@/lib/concurrency";
 import { MAX_IMAGES_PER_COLOR } from "@/lib/scrape-utils";
 import { notify, requestNotificationPermission } from "@/lib/notifications";
 
-const STEPS = [
-  { n: 1, title: "First model shot",      desc: "Product on model with reference background (4 variants)" },
-  { n: 2, title: "Detailed model shot",   desc: "Full face + product details visible" },
-  { n: 3, title: "Back view",             desc: "Same model, same background, back view" },
-  { n: 4, title: "Close-up material",     desc: "Texture and detail shot of the material" },
-];
+/** UI labels only — the backend picks the matching prompt set from the same
+ *  product-type string (see _nb_category in server.py), so these just have to
+ *  DESCRIBE what each step will produce per category. */
+const nbCategory = (productType: string): "garment" | "shoes" | "bag" => {
+  const pt = (productType || "").toLowerCase().replace("bootcut", "");
+  const bag = ["bag", "handbag", "tote", "shopper", "crossbody", "clutch", "purse", "backpack",
+    "taske", "rygsæk", "pung", "pochette", "cabas", "sacoche", "portefeuille", "laukku", "reppu", "lompakko"];
+  if (bag.some((w) => pt.includes(w)) || /\bsacs?\b/.test(pt)) return "bag";
+  const shoes = ["shoe", "sneaker", "trainer", "boot", "loafer", "sandal", "heel", "pump", "stiletto",
+    "espadrille", "slipper", "mule", "sko", "støvle", "hæl", "chaussure", "basket", "botte", "bottine",
+    "escarpin", "mocassin", "ballerine", "keng", "kenk", "lenkkarit", "tennarit", "saappaat", "nilkkuri", "tossut"];
+  if (shoes.some((w) => pt.includes(w))) return "shoes";
+  return "garment";
+};
+
+const STEPS_BY_CATEGORY = {
+  garment: [
+    { n: 1, title: "First model shot",      desc: "Product on model with reference background (4 variants)" },
+    { n: 2, title: "Detailed model shot",   desc: "Full face + product details visible" },
+    { n: 3, title: "Back view",             desc: "Same model, same background, back view" },
+    { n: 4, title: "Close-up material",     desc: "Texture and detail shot of the material" },
+  ],
+  shoes: [
+    { n: 1, title: "First model shot",      desc: "Shoes on model, reference background — shoes are the hero (4 variants)" },
+    { n: 2, title: "On-foot detail",        desc: "Knee-down shot, both shoes sharp and prominent" },
+    { n: 3, title: "Side profile",          desc: "Silhouette, heel shape and sole line, same model & background" },
+    { n: 4, title: "Close-up material",     desc: "Upper material, stitching, sole edge and heel details" },
+  ],
+  bag: [
+    { n: 1, title: "First model shot",      desc: "Model carrying the bag, reference background (4 variants)" },
+    { n: 2, title: "Carry detail",          desc: "Bag sharp at chest/hip height, hardware visible" },
+    { n: 3, title: "Product shot",          desc: "Bag alone on a styled surface, same setting — no model" },
+    { n: 4, title: "Close-up material",     desc: "Material grain, stitching, zips and hardware" },
+  ],
+} as const;
 
 const TOTAL_VARIANTS = 4;
 
@@ -456,7 +485,7 @@ export function NanoBananaSteps() {
         </div>
       )}
 
-      {STEPS.map(({ n, title, desc }) => {
+      {STEPS_BY_CATEGORY[nbCategory(data.productType || "")].map(({ n, title, desc }) => {
         const results = data.nbResults[n] ?? [];
         const isRunning = !!running[n];
         const done = results.length > 0 && results.some((r) => r.url);
