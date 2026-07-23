@@ -11849,6 +11849,64 @@ def theme_probe():
     return jsonify(out)
 
 
+# --- Higgsfield CLI stdout parsing (shared by /api/higgsfield and _blog_hero_image) ---
+def _extract_urls_from_text(text):
+    """Find all image URLs in a string (plain text or JSON)."""
+    return re.findall(
+        r'https?://[^\s\'"<>\]]+\.(?:jpg|jpeg|png|webp)(?:\?[^\s\'"<>\]]*)?',
+        text, re.IGNORECASE
+    )
+
+
+def _extract_urls_from_obj(obj, found=None):
+    """Recursively find image URLs in a parsed JSON object."""
+    if found is None:
+        found = []
+    if isinstance(obj, str):
+        if obj.startswith('http') and any(obj.lower().endswith(e) for e in ['.jpg','.jpeg','.png','.webp']):
+            found.append(obj)
+        elif obj.startswith('http') and any(k in obj for k in ('cdn','storage','higgsfield','output')):
+            found.append(obj)
+    elif isinstance(obj, list):
+        for item in obj:
+            _extract_urls_from_obj(item, found)
+    elif isinstance(obj, dict):
+        # Only look in clearly output-specific keys (avoids picking up input_images / images)
+        for key in ('output_url', 'download_url', 'signed_url', 'result_url'):
+            if key in obj and isinstance(obj[key], str) and obj[key].startswith('http'):
+                found.append(obj[key])
+        for key in ('output_images', 'output_urls', 'outputs', 'results'):
+            if key in obj:
+                _extract_urls_from_obj(obj[key], found)
+        # Also check 'url'/'src' only if NOT inside an input-related parent
+        for key in ('url', 'src', 'uri', 'image_url'):
+            if key in obj and isinstance(obj[key], str) and obj[key].startswith('http'):
+                found.append(obj[key])
+        # Recurse into jobs/items but skip known input keys
+        for key in ('jobs', 'items'):
+            if key in obj:
+                _extract_urls_from_obj(obj[key], found)
+    return found
+
+
+def _urls_from_stdout(text):
+    """Extract image URLs from hf.exe stdout — JSON first (structured), regex as fallback."""
+    # Try JSON parsing from last line backwards (avoids picking up log/progress URLs)
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+            urls = _extract_urls_from_obj(parsed)
+            if urls:
+                return urls
+        except Exception:
+            continue
+    # Fallback: regex (may catch log messages, but better than nothing)
+    return _extract_urls_from_text(text)
+
+
 # --- Higgsfield image generation ---
 @app.route('/api/higgsfield', methods=['POST'])
 @require_droplet_token
@@ -11880,70 +11938,7 @@ def higgsfield_generate():
     else:
         prompt = data.get('prompt', 'fashion product photo, realistic woman model, professional lighting')
 
-    import re as _re, concurrent.futures as _cf
-
-    def _extract_urls_from_text(text):
-        """Find all image URLs in a string (plain text or JSON)."""
-        return _re.findall(
-            r'https?://[^\s\'"<>\]]+\.(?:jpg|jpeg|png|webp)(?:\?[^\s\'"<>\]]*)?',
-            text, _re.IGNORECASE
-        )
-
-    def _extract_urls_from_obj(obj, found=None):
-        """Recursively find image URLs in a parsed JSON object."""
-        if found is None:
-            found = []
-        if isinstance(obj, str):
-            if obj.startswith('http') and any(obj.lower().endswith(e) for e in ['.jpg','.jpeg','.png','.webp']):
-                found.append(obj)
-            elif obj.startswith('http') and any(k in obj for k in ('cdn','storage','higgsfield','output')):
-                found.append(obj)
-        elif isinstance(obj, list):
-            for item in obj:
-                _extract_urls_from_obj(item, found)
-        elif isinstance(obj, dict):
-            # Only look in clearly output-specific keys (avoids picking up input_images / images)
-            for key in ('output_url', 'download_url', 'signed_url', 'result_url'):
-                if key in obj and isinstance(obj[key], str) and obj[key].startswith('http'):
-                    found.append(obj[key])
-            for key in ('output_images', 'output_urls', 'outputs', 'results'):
-                if key in obj:
-                    _extract_urls_from_obj(obj[key], found)
-            # Also check 'url'/'src' only if NOT inside an input-related parent
-            for key in ('url', 'src', 'uri', 'image_url'):
-                if key in obj and isinstance(obj[key], str) and obj[key].startswith('http'):
-                    found.append(obj[key])
-            # Recurse into jobs/items but skip known input keys
-            for key in ('jobs', 'items'):
-                if key in obj:
-                    _extract_urls_from_obj(obj[key], found)
-        return found
-
-    def _urls_from_stdout(text):
-        """Extract image URLs from hf.exe stdout — JSON first (structured), regex as fallback."""
-        # Try JSON parsing from last line backwards (avoids picking up log/progress URLs)
-        for line in reversed(text.splitlines()):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                parsed = json.loads(line)
-                urls = _extract_urls_from_obj(parsed)
-                if urls:
-                    return urls
-            except Exception:
-                continue
-        # Fallback: regex (may catch log messages, but better than nothing)
-        return _extract_urls_from_text(text)
-        for line in reversed(text.splitlines()):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                return _extract_urls_from_obj(json.loads(line))
-            except Exception:
-                continue
-        return []
+    import concurrent.futures as _cf
 
     tmp_dir = None
     try:
