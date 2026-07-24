@@ -2620,6 +2620,16 @@ def scrape():
                     }), 400
             else:
                 base = base_data.get('product') or {}
+    except (req.exceptions.ConnectionError, req.exceptions.Timeout) as e:
+        # Network-level failure (DNS, TLS, refused connection, timeout) — give
+        # the same friendly "could not reach the store" message used elsewhere
+        # (_bs_scan etc.) instead of dumping the raw urllib3 exception, which
+        # reads as a wall of text like "HTTPSConnectionPool(...) Max retries
+        # exceeded ..." to non-technical reporters (bug #27).
+        return jsonify({
+            'error': f'Could not reach the store ({str(e)[:120]}). It may be down or blocking us — try again in a bit.',
+            'url_tried': json_url,
+        }), 502
     except Exception as e:
         return jsonify({'error': str(e), 'url_tried': json_url}), 500
     if base is None:
