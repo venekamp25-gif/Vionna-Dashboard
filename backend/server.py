@@ -2541,6 +2541,25 @@ def scrape():
                 'error': f'Upstream returned {r.status_code}. The shop may be private, geo-restricted, or temporarily blocking us.',
                 'url_tried': json_url,
             }), 400
+        # Rate-limited — either a real 429 from the shop, or the synthetic one
+        # _scrape_get returns while that host is in cooldown (bug #16). Both used
+        # to fall through to r.raise_for_status(), which raised a raw
+        # "429 Client Error: Too Many Requests for url: ..." — read by a
+        # non-technical reporter as "the dashboard can't read this store" with no
+        # hint that it's temporary or that retrying later (or manual paste, which
+        # runs from their own browser/IP) would work (bug #28).
+        if r.status_code == 429:
+            try:
+                wait_s = int(r.headers.get('Retry-After', '') or 0)
+            except (TypeError, ValueError):
+                wait_s = 0
+            wait_msg = f' Try again in about {wait_s}s.' if wait_s > 0 else ' Try again in a few minutes.'
+            return jsonify({
+                'error': f"This shop is rate-limiting our scraper (HTTP 429 — too many requests).{wait_msg} "
+                         "It usually clears on its own; you can also use the manual-paste workaround below, "
+                         "which comes from your own browser instead of ours.",
+                'url_tried': json_url,
+            }), 429
         if r.status_code == 200 and _detect_private_shop(r.text or ''):
             return jsonify({
                 'error': 'This shop is password-protected or in development mode (Shopify "coming soon" / "enter password" gate). Ask the shop owner for storefront access.',
