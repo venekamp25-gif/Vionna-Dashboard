@@ -13738,13 +13738,13 @@ BLOG_STYLE = {
 # regardless. Local-language keyword + the catalogue category to link products from.
 BLOG_FALLBACK_TOPICS = {
     'dk': [
-        {'keyword': 'sommerkjole', 'category': 'dress', 'months': [4, 5, 6, 7, 8],
+        {'keyword': 'sommerkjole', 'category': 'dress', 'months': [2, 3, 4, 5, 6],
          'cluster': ['blomstret kjole', 'lang kjole', 'maxikjole']},
-        {'keyword': 'strik til efteråret', 'category': 'knitwear', 'months': [8, 9, 10, 11],
+        {'keyword': 'strik til efteråret', 'category': 'knitwear', 'months': [6, 7, 8, 9],
          'cluster': ['cardigan', 'sweater', 'strikbluse']},
         {'keyword': 'den perfekte blazer', 'category': 'outerwear',
          'cluster': ['oversized blazer', 'blazer til kvinder']},
-        {'keyword': 'nederdel styling', 'category': 'skirt', 'months': [3, 4, 5, 6, 7, 8, 9],
+        {'keyword': 'nederdel styling', 'category': 'skirt', 'months': [1, 2, 3, 4, 5, 6, 7],
          'cluster': ['lang nederdel', 'plisseret nederdel']},
         {'keyword': 'bukser til kontoret', 'category': 'pants',
          'cluster': ['habitbukser', 'vide bukser']},
@@ -13752,13 +13752,13 @@ BLOG_FALLBACK_TOPICS = {
          'cluster': ['bluse outfit', 'skjorte til kvinder', 'elegant top']},
     ],
     'fr': [
-        {'keyword': "robe d'été", 'category': 'dress', 'months': [4, 5, 6, 7, 8],
+        {'keyword': "robe d'été", 'category': 'dress', 'months': [2, 3, 4, 5, 6],
          'cluster': ['robe fleurie', 'robe longue', 'robe légère']},
-        {'keyword': "la maille pour l'automne", 'category': 'knitwear', 'months': [8, 9, 10, 11],
+        {'keyword': "la maille pour l'automne", 'category': 'knitwear', 'months': [6, 7, 8, 9],
          'cluster': ['cardigan', 'pull', 'gilet']},
         {'keyword': 'le blazer parfait', 'category': 'outerwear',
          'cluster': ['blazer oversize', 'veste femme']},
-        {'keyword': 'comment porter la jupe longue', 'category': 'skirt', 'months': [3, 4, 5, 6, 7, 8, 9],
+        {'keyword': 'comment porter la jupe longue', 'category': 'skirt', 'months': [1, 2, 3, 4, 5, 6, 7],
          'cluster': ['jupe plissée', 'jupe midi']},
         {'keyword': 'le pantalon de bureau', 'category': 'pants',
          'cluster': ['pantalon large', 'pantalon tailleur']},
@@ -13766,13 +13766,13 @@ BLOG_FALLBACK_TOPICS = {
          'cluster': ['blouse blanche', 'chemise femme']},
     ],
     'fi': [
-        {'keyword': 'kesämekko', 'category': 'dress', 'months': [4, 5, 6, 7, 8],
+        {'keyword': 'kesämekko', 'category': 'dress', 'months': [2, 3, 4, 5, 6],
          'cluster': ['kukkamekko', 'pitkä mekko', 'maksimekko']},
-        {'keyword': 'neuleet syksyyn', 'category': 'knitwear', 'months': [8, 9, 10, 11],
+        {'keyword': 'neuleet syksyyn', 'category': 'knitwear', 'months': [6, 7, 8, 9],
          'cluster': ['neuletakki', 'villapaita', 'neulepusero']},
         {'keyword': 'täydellinen bleiseri', 'category': 'outerwear',
          'cluster': ['oversize bleiseri', 'naisten jakku']},
-        {'keyword': 'hameen tyylivinkit', 'category': 'skirt', 'months': [4, 5, 6, 7, 8, 9],
+        {'keyword': 'hameen tyylivinkit', 'category': 'skirt', 'months': [2, 3, 4, 5, 6, 7],
          'cluster': ['pitkä hame', 'pliseehame']},
         {'keyword': 'housut töihin', 'category': 'pants',
          'cluster': ['leveälahkeiset housut', 'puvunhousut']},
@@ -14263,6 +14263,28 @@ def _blog_ensure(store, hdrs):
     return cr.json()['blog']['id']
 
 
+def _blog_lead_time_bonus(seasonality):
+    """A blog article needs ~3-8 weeks to be indexed and climb, so the IDEAL
+    subject peaks 2-3 months from now — not today. (Product listing wants the
+    opposite: sell what peaks now. That is why blogs score seasonality
+    themselves instead of reusing _recommend_keywords' in-season bonus.)
+    Returns (bonus, months_to_peak|None); evergreen gets a neutral-positive
+    bonus because it is publishable all year."""
+    s = seasonality or {}
+    if not s.get('seasonal') or not s.get('peak_month'):
+        return 0.20, None
+    try:
+        peak = _SEASON_MONTHS.index(s.get('peak_month'))
+    except (ValueError, TypeError):
+        return 0.20, None
+    if not peak:
+        return 0.20, None
+    months = (peak - datetime.datetime.now().month) % 12
+    #        peaks now  +1mo  SWEET SPOT  +4mo  +5mo  +6mo
+    curve = {0: 0.10, 1: 0.40, 2: 0.75, 3: 0.75, 4: 0.50, 5: 0.30, 6: 0.15}
+    return curve.get(months, 0.0), months
+
+
 def _blog_category_stock(store, cat, hdrs, _cache={}):
     """How many active products this store carries in `cat:<cat>` (0-10, capped).
     Guards topic choice against subjects the store doesn't actually sell — the FI
@@ -14339,6 +14361,7 @@ def _blog_hot_topics(store, k=3, hdrs=None):
     recent = _blog_recent_sigs(store)
     recent_cats = _blog_recent_categories(store)
     gap_sigs = _blog_gap_keywords(store)   # secondary signal: bonus only, never a gate
+    max_vol = max((x.get('volume') or 0) for x in cands) or 1
 
     def _collect(respect_cooldown):
         out = []
@@ -14361,14 +14384,20 @@ def _blog_hot_topics(store, k=3, hdrs=None):
                        key=lambda r: -(r.get('volume') or 0))
                        if r.get('keyword') and r.get('keyword') != x.get('keyword')
                        and (r.get('keyword') or '').strip().lower() in clean_kws][:6]
-            # blogs profit most from 'soon' (peak in 1-2 months = indexed right on time)
-            score = (x.get('score') or 0) + (0.35 if bucket == 'soon' else 0)
+            # Blog-specific score. Deliberately NOT _recommend_keywords' score:
+            # that one rewards "peaks NOW" (+0.6), which for a blog means arriving
+            # after the peak. Here the lead-time curve rewards publishing ahead.
+            lead, months_to_peak = _blog_lead_time_bonus(x.get('seasonality'))
+            score = (x.get('volume') or 0) / max_vol + lead
+            if (x.get('intent') or '').lower() in ('transactional', 'commercial'):
+                score += 0.3
             gap_hit = sig in gap_sigs
             if gap_hit:
                 score += BLOG_GAP_BONUS       # competitor blogs already rank for this
             out.append({
                 'keyword': x.get('keyword'), 'volume': x.get('volume'), 'intent': x.get('intent'),
                 'seasonality': x.get('seasonality'), 'season_bucket': bucket, 'gap_hit': gap_hit,
+                'months_to_peak': months_to_peak,
                 'score': round(score, 3), 'seed': seed, 'label': label, 'category': cat,
                 'cluster': cluster,
             })
@@ -14468,9 +14497,22 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns
     seas = topic.get('seasonality') or {}
     season_hint = ''
     if seas.get('seasonal'):
+        mtp = topic.get('months_to_peak')
+        if isinstance(mtp, int) and mtp >= 2:
+            # published deliberately ahead of the peak (indexing lead time), so the
+            # article must read forward-looking instead of "that season is here now"
+            timing = (f"\nTIMING — IMPORTANT: this publishes NOW, but the subject peaks in about "
+                      f"{mtp} months (month {seas.get('peak_month')}). Write it forward-looking: "
+                      "as preparing for / heading towards that season, never as if it is already "
+                      "here, and never describe today's weather as that season.")
+        elif isinstance(mtp, int) and mtp <= 1:
+            timing = (f"\nTiming: the subject peaks in month {seas.get('peak_month')}, i.e. right "
+                      "about now — write it fully in-season.")
+        else:
+            timing = ''
         season_hint = (f"\nSeasonality: this subject peaks around month {seas.get('peak_month')}; "
-                       f"trend is {seas.get('trend')}. Write for the current/upcoming season, "
-                       "reference it naturally, do NOT hard-code a specific year in the URL handle.")
+                       f"trend is {seas.get('trend')}.{timing} Reference the season naturally, and "
+                       "do NOT hard-code a specific year in the title or URL handle.")
     # Evolving playbook — concrete guidance learned from what actually ranks/sells.
     pb = _blog_playbook_text()
     pb_block = (f"\n\nLEARNED PLAYBOOK (apply these — derived from our best-performing past articles):\n{pb}\n"
