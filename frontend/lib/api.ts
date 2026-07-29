@@ -520,6 +520,10 @@ export const api = {
           seasonal?: boolean;
         } | null;
       }[];
+      /** DataForSEO call failures (auth, rate-limit, bad response…), up to 3.
+       *  When `found` is 0 BECAUSE of these, the UI must say so instead of
+       *  showing the generic "no keywords above the threshold" message. */
+      errors?: { error?: string; code?: number }[];
     }>("/api/keyword_research_niche", { method: "POST", body: params, authed: true }),
 
   /** "What to list": product-TYPE view for a market — each type has an English

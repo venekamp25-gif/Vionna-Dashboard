@@ -15,6 +15,9 @@ type StoreResult = {
   keywords?: Kw[];
   error?: string;
   notConfigured?: boolean;
+  /** DataForSEO call failures returned alongside `found: 0` — surfaced so a
+   *  real API failure isn't mistaken for "genuinely no keywords". */
+  apiErrors?: { error?: string; code?: number }[];
 };
 
 const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
@@ -98,6 +101,7 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
                 found: r.found ?? 0,
                 minVolume: r.min_volume ?? 0,
                 keywords: r.keywords ?? [],
+                apiErrors: r.errors ?? [],
               },
             ];
           } catch (e) {
@@ -296,9 +300,16 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
                   </div>
 
                   {(active.keywords?.length ?? 0) === 0 ? (
-                    <p className="text-[13px] text-text-faint">
-                      No keywords above the threshold for this type in this market. Try a broader type.
-                    </p>
+                    active.apiErrors && active.apiErrors.length > 0 ? (
+                      <p className="text-[13px] text-danger">
+                        Keyword lookup failed: {active.apiErrors.map((e) => e.error).filter(Boolean).join("; ") || "unknown error"}.
+                        Try again in a moment.
+                      </p>
+                    ) : (
+                      <p className="text-[13px] text-text-faint">
+                        No keywords above the threshold for this type in this market. Try a broader type.
+                      </p>
+                    )
                   ) : (
                     <>
                       {(() => {
