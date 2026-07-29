@@ -14,6 +14,8 @@ type StoreResult = {
   minVolume?: number;
   keywords?: Kw[];
   error?: string;
+  /** Upstream DataForSEO failures for this market, if any. */
+  apiErrors?: { error?: string; code?: number | string | null }[];
   notConfigured?: boolean;
 };
 
@@ -98,6 +100,7 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
                 found: r.found ?? 0,
                 minVolume: r.min_volume ?? 0,
                 keywords: r.keywords ?? [],
+                apiErrors: r.errors ?? [],
               },
             ];
           } catch (e) {
@@ -295,10 +298,29 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
                     </button>
                   </div>
 
+                  {/* An upstream failure must never read as "nothing found" — that
+                      sent a reporter hunting for a broader search term while the
+                      keyword API was actually rejecting every call (bug #31). */}
+                  {(active.apiErrors?.length ?? 0) > 0 && (
+                    <div className="text-[12px] rounded-md border border-danger/40 bg-danger/10 text-danger px-3 py-2 mb-2">
+                      <strong>The keyword service returned an error</strong> — these results are
+                      incomplete or empty for that reason, not because there are no keywords.
+                      <br />
+                      {active.apiErrors?.[0]?.error}
+                      {active.apiErrors?.[0]?.code ? ` (code ${active.apiErrors[0].code})` : ""}
+                      <br />
+                      <span className="text-text-dim">
+                        Check the DataForSEO credentials and account balance in Settings.
+                      </span>
+                    </div>
+                  )}
+
                   {(active.keywords?.length ?? 0) === 0 ? (
-                    <p className="text-[13px] text-text-faint">
-                      No keywords above the threshold for this type in this market. Try a broader type.
-                    </p>
+                    (active.apiErrors?.length ?? 0) > 0 ? null : (
+                      <p className="text-[13px] text-text-faint">
+                        No keywords above the threshold for this type in this market. Try a broader type.
+                      </p>
+                    )
                   ) : (
                     <>
                       {(() => {
