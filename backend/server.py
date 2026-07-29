@@ -5153,13 +5153,61 @@ def api_research_keywords():
     return jsonify({'configured': True, 'results': results})
 
 
+_DFS_PROBE_CACHE = {'at': 0.0, 'result': None}
+_DFS_PROBE_TTL = 120  # seconds — a probe costs credits, so don't let it be spammed
+
+
+def _dfs_probe():
+    """One cheap live DataForSEO call, reduced to 'does the account work'.
+
+    `configured` only ever meant "the env vars are non-empty" — it stays true
+    when the credentials are stale or the balance is gone. That gap is why a dead
+    account looked like an empty search result for a whole afternoon (bug #31).
+    Cached briefly so a refreshing dashboard can't burn credits."""
+    now = time.time()
+    if _DFS_PROBE_CACHE['result'] is not None and (now - _DFS_PROBE_CACHE['at']) < _DFS_PROBE_TTL:
+        return _DFS_PROBE_CACHE['result']
+    task = {'keyword': 'dress', 'location_code': DFS_LOCATION['com'],
+            'language_code': DFS_LANGUAGE['com'], 'limit': 1}
+    out = {'ok': False, 'code': None, 'message': None, 'items': 0}
+    try:
+        r = req.post(DFS_SUGGEST_ENDPOINT, headers=_dfs_headers(), json=[task], timeout=20)
+        d = r.json() if r.content else {}
+        t, err = _dfs_task_or_error(r, d)
+        if err:
+            out.update(ok=False, code=err.get('code'), message=str(err.get('error'))[:200])
+        else:
+            items = (((t.get('result') or [{}])[0]) or {}).get('items') or []
+            out.update(ok=True, code=20000, items=len(items),
+                       message='DataForSEO answered normally')
+    except Exception as e:
+        out.update(ok=False, code='network', message=str(e)[:200])
+    _DFS_PROBE_CACHE.update(at=now, result=out)
+    return out
+
+
 @app.route('/api/keyword_research_status')
 def api_keyword_research_status():
-    """Whether DataForSEO keyword research is live (creds present). Non-secret."""
+    """Whether DataForSEO keyword research is live. Non-secret.
+
+    Pass ?probe=1 to actually call DataForSEO and report whether the ACCOUNT
+    works (credentials valid, balance left) rather than only whether credentials
+    are present. Deliberately ungated: when keyword research goes dark this is
+    the one thing anyone needs to be able to check without a session token."""
     lo, _pw = _dfs_creds()
-    return jsonify({'configured': _dfs_configured(),
-                    'login_hint': (lo[:2] + '…' + lo[-6:]) if len(lo) > 8 else ('set' if lo else ''),
-                    'locations': DFS_LOCATION, 'languages': DFS_LANGUAGE})
+    body = {'configured': _dfs_configured(),
+            'login_hint': (lo[:2] + '…' + lo[-6:]) if len(lo) > 8 else ('set' if lo else ''),
+            'locations': DFS_LOCATION, 'languages': DFS_LANGUAGE}
+    if request.args.get('probe') and _dfs_configured():
+        p = _dfs_probe()
+        body['probe'] = p
+        body['account_ok'] = p['ok']
+        if not p['ok']:
+            body['diagnosis'] = (
+                'Credentials rejected — re-enter them in Settings.' if p['code'] == 40100 else
+                'Out of DataForSEO credits — top up the account.' if p['code'] == 40200 else
+                f"DataForSEO is not answering normally (code {p['code']}).")
+    return jsonify(body)
 
 
 @app.route('/api/debug_dfs')
