@@ -520,6 +520,10 @@ export const api = {
           seasonal?: boolean;
         } | null;
       }[];
+      /** Per-seed upstream failures (bad credentials, no balance, rate limit).
+       *  The backend has always returned these; showing them is what stops a
+       *  dead DataForSEO account from reading as "no keywords found". */
+      errors?: { error?: string; code?: number | string | null }[];
     }>("/api/keyword_research_niche", { method: "POST", body: params, authed: true }),
 
   /** "What to list": product-TYPE view for a market — each type has an English

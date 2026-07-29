@@ -901,7 +901,7 @@ def _brand_llm_verdict(domain: str, evidence: list) -> tuple:
     full = _html_to_text(html)
     tm = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
     md = re.search(r'<meta[^>]+name="description"[^>]+content="([^"]{1,300})"', html, re.I)
-    text = f"[TITLE] {tm.group(1).strip()[:150] if tm else ""}\n[META] {md.group(1) if md else ""}\n"
+    text = f"[TITLE] {tm.group(1).strip()[:150] if tm else ''}\n[META] {md.group(1) if md else ''}\n"
     # head (hero copy) + tail (footer: about/stores/wholesale links live there)
     text += full[:3500] + "\n[FOOTER]\n" + full[-2500:]
     for path in _BRAND_ABOUT_PATHS:

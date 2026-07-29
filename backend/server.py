@@ -4302,6 +4302,37 @@ def _dfs_headers():
     return {'Authorization': 'Basic ' + tok, 'Content-Type': 'application/json'}
 
 
+def _dfs_task_or_error(resp, data):
+    """Unwrap a DataForSEO envelope into (task, error) — exactly one is set.
+
+    DataForSEO reports ACCOUNT-level failures — invalid/rotated credentials
+    (40100), exhausted balance (40200), account rate limiting — at the TOP level
+    of the envelope, with `tasks` empty or absent. Every caller here used to read
+    only the PER-TASK status and default a missing task to `{}` — whose
+    status_code is None, which the guard explicitly whitelisted. So a dead
+    DataForSEO account produced a clean empty list with no error recorded,
+    indistinguishable from "no keywords matched". That is bug #31: keyword
+    research went silently empty in all three markets while the UI kept saying
+    "no keywords above the threshold — try a broader type".
+
+    Check the envelope before the task, and never invent a task that isn't there.
+    """
+    d = data if isinstance(data, dict) else {}
+    http = getattr(resp, 'status_code', None)
+    top = d.get('status_code')
+    if top is not None and top != 20000:
+        return None, {'error': (d.get('status_message') or f'DataForSEO error {top}')[:150], 'code': top}
+    tasks = d.get('tasks') or []
+    if not tasks:
+        return None, {'error': (d.get('status_message')
+                                or f'DataForSEO returned no tasks (HTTP {http})')[:150],
+                      'code': top or http}
+    t = tasks[0] or {}
+    if t.get('status_code') not in (20000, None) and not t.get('result'):
+        return None, {'error': (t.get('status_message') or 'dfs error')[:150], 'code': t.get('status_code')}
+    return t, None
+
+
 def _derive_seeds_llm(competitor_title, product_name, category, description, stores=None):
     """Claude → 2-3 local-language search seed phrases per market.
 
@@ -4386,9 +4417,9 @@ def _dfs_keyword_ideas(seeds, store, min_volume=30, limit=12):
         d = r.json()
     except Exception as e:
         return [{'error': str(e)[:100]}]
-    task = (d.get('tasks') or [{}])[0]
-    if task.get('status_code') not in (20000, None) and not task.get('result'):
-        return [{'error': task.get('status_message', 'dfs error'), 'code': task.get('status_code')}]
+    task, err = _dfs_task_or_error(r, d)
+    if err:
+        return [err]
     res = (task.get('result') or [{}])[0] or {}
     items = res.get('items') or []
     out = []
@@ -4766,18 +4797,21 @@ def _dfs_keyword_suggestions(seed, store, min_volume=0, limit=25):
     Never raises."""
     if not seed or store not in DFS_LOCATION:
         return []
+    # NOTE: no server-side `filters` on search_volume. The results are already
+    # ordered by volume desc, so the top `limit` rows are the same set the filter
+    # would return, and the caller re-applies the threshold anyway. Sending the
+    # filter only added a way for the whole call to come back empty (this was the
+    # single call site in this file that used one) for no gain.
     task = {'keyword': seed, 'location_code': DFS_LOCATION[store], 'language_code': DFS_LANGUAGE[store],
             'limit': max(limit, 20), 'order_by': ['keyword_info.search_volume,desc']}
-    if min_volume:
-        task['filters'] = [['keyword_info.search_volume', '>', int(min_volume)]]
     try:
         r = req.post(DFS_SUGGEST_ENDPOINT, headers=_dfs_headers(), json=[task], timeout=30)
         d = r.json()
     except Exception as e:
         return [{'error': str(e)[:100]}]
-    t = (d.get('tasks') or [{}])[0]
-    if t.get('status_code') not in (20000, None) and not t.get('result'):
-        return [{'error': t.get('status_message', 'dfs error'), 'code': t.get('status_code')}]
+    t, err = _dfs_task_or_error(r, d)
+    if err:
+        return [err]
     items = (((t.get('result') or [{}])[0]) or {}).get('items') or []
     out = []
     for it in items:
@@ -6954,6 +6988,150 @@ def bug_reports_list():
         'total_count': len(entries),
         'entries':     safe_entries,
     })
+
+
+@app.route('/api/bug_reports/<int:bug_id>/pr', methods=['POST'])
+def bug_reports_attach_pr(bug_id):
+    """Register the PR that carries the fix for a bug. Body: {pr_number, pr_url?}.
+
+    Without this the pipeline has no idea a fix exists: the bug sits 'open' while
+    a finished, green PR waits for a merge click nobody knows about (bug #31 sat
+    that way). Once registered, _fix_pr_watch_loop below chases it until it is
+    merged, so a fix can no longer be lost because the routine's session ended
+    before CI went green."""
+    body = request.get_json(silent=True) or {}
+    try:
+        pr_number = int(body.get('pr_number'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'pr_number (int) is required'}), 400
+    entries = _load_bug_reports()
+    entry = next((e for e in entries if e.get('id') == bug_id), None)
+    if not entry:
+        return jsonify({'error': f'bug #{bug_id} not found'}), 404
+    entry['pr_number'] = pr_number
+    entry['pr_url'] = (body.get('pr_url') or f'{GITHUB_REPO_URL}/pull/{pr_number}')[:300]
+    entry['pr_opened_at'] = datetime.datetime.utcnow().isoformat() + 'Z'
+    entry['pr_nagged_at'] = None
+    try:
+        _rewrite_bug_reports(entries)
+    except Exception as ex:
+        return jsonify({'error': f'Could not update: {ex}'}), 500
+    print(f"[bugs] #{bug_id} fix PR #{pr_number} registered")
+    return jsonify({'success': True, 'id': bug_id, 'pr_number': pr_number})
+
+
+GITHUB_REPO_URL = 'https://github.com/venekamp25-gif/Vionna-Dashboard'
+_FIX_PR_WATCH_INTERVAL = 600          # seconds between sweeps
+_FIX_PR_GRACE = 15 * 60               # how long a PR may sit before the first ping
+_FIX_PR_RENAG = 6 * 3600              # re-ping this often while it stays unmerged
+
+
+def _fix_pr_sweep():
+    """One pass: check every open bug's registered fix-PR and escalate if it is
+    just sitting there. Returns the number of Slack pings sent (for tests)."""
+    entries = _load_bug_reports()
+    changed = False
+    pings = 0
+    now = datetime.datetime.utcnow()
+    for e in entries:
+        if e.get('status') != 'open' or not e.get('pr_number'):
+            continue
+        try:
+            r = req.get(f'https://api.github.com/repos/venekamp25-gif/Vionna-Dashboard'
+                        f"/pulls/{e['pr_number']}",
+                        headers={'Accept': 'application/vnd.github+json'}, timeout=15)
+            if r.status_code != 200:
+                continue
+            pr = r.json()
+        except Exception:
+            continue
+        if pr.get('merged'):
+            # Landed. Whether the bug is really fixed is a separate question, so
+            # don't resolve it here — just stop chasing the PR.
+            e['pr_merged_at'] = pr.get('merged_at')
+            e['pr_number'] = None
+            changed = True
+            continue
+        if pr.get('state') == 'closed':
+            e['pr_number'] = None
+            changed = True
+            continue
+        opened = _parse_iso(e.get('pr_opened_at'))
+        nagged = _parse_iso(e.get('pr_nagged_at'))
+        if opened and (now - opened).total_seconds() < _FIX_PR_GRACE:
+            continue
+        if nagged and (now - nagged).total_seconds() < _FIX_PR_RENAG:
+            continue
+        mins = int((now - opened).total_seconds() // 60) if opened else 0
+        _post_stalled_fix_to_slack(e, pr, mins)
+        pings += 1
+        e['pr_nagged_at'] = now.isoformat() + 'Z'
+        changed = True
+    if changed:
+        _rewrite_bug_reports(entries)
+    return pings
+
+
+def _fix_pr_watch_loop():
+    """Chase fix-PRs that are done but never landed.
+
+    The auto-fix routine merges its own PR at the end of its run, once CI turns
+    green. When CI is slower than usual the run ends first and the PR — green,
+    mergeable, finished — silently sits there: the reporter keeps seeing the bug,
+    and nothing anywhere says a fix is one click away. This loop is the backstop:
+    it polls the (public, so unauthenticated) GitHub API and pings Slack until the
+    PR is merged or closed. Best-effort; never raises out of the thread."""
+    time.sleep(120)
+    while True:
+        try:
+            _fix_pr_sweep()
+        except Exception as ex:
+            print(f"[fix-watch] sweep failed: {ex}")
+        time.sleep(_FIX_PR_WATCH_INTERVAL)
+
+
+def _parse_iso(s):
+    if not s:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(str(s).replace('Z', ''))
+    except Exception:
+        return None
+
+
+def _post_stalled_fix_to_slack(entry, pr, minutes):
+    """Tell the CEO a finished fix is waiting on a merge click."""
+    url = _slack_webhook_url()
+    if not url:
+        return
+    pr_url = entry.get('pr_url') or pr.get('html_url') or GITHUB_REPO_URL
+    draft = pr.get('draft')
+    why = ('it is still a draft — it was opened for a human decision'
+           if draft else 'CI is done and it is mergeable — it just needs the Merge click')
+    try:
+        req.post(url, json={
+            'text': f"⏳ Fix for bug #{entry.get('id')} has been waiting {minutes} min: {pr_url}",
+            'blocks': [
+                {'type': 'header', 'text': {'type': 'plain_text',
+                                            'text': f"⏳ Fix waiting for bug #{entry.get('id')}",
+                                            'emoji': True}},
+                {'type': 'section', 'text': {'type': 'mrkdwn',
+                                             'text': f"*{entry.get('title') or '(no title)'}*\n{why}."}},
+                {'type': 'section', 'text': {'type': 'mrkdwn',
+                                             'text': f"<{pr_url}|Open PR #{pr.get('number')}> "
+                                                     f"· open for {minutes} min"}},
+            ]}, timeout=10)
+    except Exception as ex:
+        print(f"[fix-watch] slack ping failed: {ex}")
+
+
+if os.getenv('DEV_LOCAL') == '1' or 'pytest' in sys.modules:
+    pass
+else:
+    try:
+        threading.Thread(target=_fix_pr_watch_loop, daemon=True, name='fix-pr-watch').start()
+    except Exception as _e:
+        print(f"[fix-watch] could not start: {_e}")
 
 
 @app.route('/api/bug_reports/<int:bug_id>/resolve', methods=['POST'])
@@ -13958,7 +14136,13 @@ def _dfs_url_performance(domain, url_path, store):
     except Exception as e:
         print(f"[blog] ranked_keywords failed: {e}")
         return None
-    t = (d.get('tasks') or [{}])[0]
+    t, err = _dfs_task_or_error(r, d)
+    if err:
+        # Returning a zeroed dict here would record "0 keywords ranked" as if it
+        # were a measurement; None keeps it as "not measured" so the article is
+        # retried instead of being written off as failing.
+        print(f"[blog] ranked_keywords error: {err.get('code')} {err.get('error')}")
+        return None
     items = (((t.get('result') or [{}])[0]) or {}).get('items') or []
     kws, best, etv = [], None, 0.0
     for it in items:
