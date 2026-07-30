@@ -4333,6 +4333,91 @@ def _dfs_task_or_error(resp, data):
     return t, None
 
 
+# Schijf-cache voor de BETAALDE Labs-calls. Zoekvolumes zijn maandcijfers en de
+# seeds zijn statisch, dus 7 dagen cache verandert niets aan de uitkomst — maar
+# scheelt élke herhaalde call. De oude in-memory aanpak verdampte bij iedere
+# deploy-herstart, waardoor dezelfde seeds keer op keer opnieuw werden afgerekend
+# (zo raakte het tegoed leeg, 2026-07-29).
+DFS_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dfs_cache.json')
+_DFS_DISK_TTL = 7 * 86400
+_DFS_DISK_MAX = 1500          # entries; oudste eruit bij overschrijding
+_DFS_DISK: dict = {}
+_DFS_DISK_STATE = {'loaded': False}
+_DFS_DISK_LOCK = threading.Lock()
+
+
+def _dfs_cache_ensure():
+    if _DFS_DISK_STATE['loaded']:
+        return
+    with _DFS_DISK_LOCK:
+        if _DFS_DISK_STATE['loaded']:
+            return
+        try:
+            with open(DFS_CACHE_PATH, encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                _DFS_DISK.update(data)
+        except Exception:
+            pass
+        _DFS_DISK_STATE['loaded'] = True
+
+
+def _dfs_cache_fresh(key):
+    """Cache-items (kopie) als de entry bestaat en < TTL oud is, anders None."""
+    _dfs_cache_ensure()
+    with _DFS_DISK_LOCK:
+        e = _DFS_DISK.get(key)
+    if not isinstance(e, dict):
+        return None
+    try:
+        if (time.time() - float(e.get('ts') or 0)) > _DFS_DISK_TTL:
+            return None
+        items = e.get('items')
+        return [dict(x) for x in items] if isinstance(items, list) else None
+    except Exception:
+        return None
+
+
+def _dfs_cache_put(key, items):
+    _dfs_cache_ensure()
+    with _DFS_DISK_LOCK:
+        _DFS_DISK[key] = {'ts': time.time(), 'items': items}
+        if len(_DFS_DISK) > _DFS_DISK_MAX:
+            for k in sorted(_DFS_DISK, key=lambda k: (_DFS_DISK[k] or {}).get('ts') or 0)[
+                    :len(_DFS_DISK) - _DFS_DISK_MAX]:
+                _DFS_DISK.pop(k, None)
+        try:
+            tmp = DFS_CACHE_PATH + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(_DFS_DISK, f, ensure_ascii=False)
+            os.replace(tmp, DFS_CACHE_PATH)
+        except Exception as e:
+            print(f'[dfs-cache] save failed: {e}')
+
+
+def _dfs_cache_stale_or(key, err):
+    """Bij een API-fout: liever oude data MET de fout erbij dan niets.
+
+    Het error-item blijft in de lijst staan zodat de bug#31-banner gewoon
+    afgaat; `stale_cache` erbij zodat de UI kan melden dat dit oudere
+    resultaten zijn. Zonder oude data: alleen de fout (bestaand gedrag).
+    """
+    _dfs_cache_ensure()
+    with _DFS_DISK_LOCK:
+        e = _DFS_DISK.get(key)
+    items = (e or {}).get('items') if isinstance(e, dict) else None
+    if isinstance(items, list) and items:
+        marked = dict(err)
+        marked['stale_cache'] = True
+        try:
+            marked['cached_at'] = datetime.datetime.utcfromtimestamp(
+                float(e.get('ts') or 0)).isoformat() + 'Z'
+        except Exception:
+            pass
+        return [dict(x) for x in items] + [marked]
+    return [err]
+
+
 def _derive_seeds_llm(competitor_title, product_name, category, description, stores=None):
     """Claude → 2-3 local-language search seed phrases per market.
 
@@ -4404,6 +4489,11 @@ def _dfs_keyword_ideas(seeds, store, min_volume=30, limit=12):
     cpc, competition, intent}] sorted by volume desc, ≥min_volume. Never raises."""
     if not seeds or store not in DFS_LOCATION:
         return []
+    ckey = 'ideas|%s|%s|%s|%s' % (store, '+'.join(sorted(str(s).lower().strip() for s in seeds[:20])),
+                                  int(min_volume), int(limit))
+    hit = _dfs_cache_fresh(ckey)
+    if hit is not None:
+        return hit
     payload = [{
         'keywords': seeds[:20],
         'location_code': DFS_LOCATION[store],
@@ -4416,10 +4506,10 @@ def _dfs_keyword_ideas(seeds, store, min_volume=30, limit=12):
         r = req.post(DFS_ENDPOINT, headers=_dfs_headers(), json=payload, timeout=30)
         d = r.json()
     except Exception as e:
-        return [{'error': str(e)[:100]}]
+        return _dfs_cache_stale_or(ckey, {'error': str(e)[:100]})
     task, err = _dfs_task_or_error(r, d)
     if err:
-        return [err]
+        return _dfs_cache_stale_or(ckey, err)
     res = (task.get('result') or [{}])[0] or {}
     items = res.get('items') or []
     out = []
@@ -4432,7 +4522,9 @@ def _dfs_keyword_ideas(seeds, store, min_volume=30, limit=12):
             'competition': ki.get('competition_level'),
             'intent': ((it.get('search_intent_info') or {}) or {}).get('main_intent'),
         })
-    return out[:limit]
+    out = out[:limit]
+    _dfs_cache_put(ckey, out)
+    return out
 
 
 # scaled per-market minimum monthly search volume (DK/FI are small markets;
@@ -4802,16 +4894,20 @@ def _dfs_keyword_suggestions(seed, store, min_volume=0, limit=25):
     # would return, and the caller re-applies the threshold anyway. Sending the
     # filter only added a way for the whole call to come back empty (this was the
     # single call site in this file that used one) for no gain.
+    ckey = 'sug|%s|%s|%s|%s' % (store, str(seed).lower().strip(), int(min_volume), int(limit))
+    hit = _dfs_cache_fresh(ckey)
+    if hit is not None:
+        return hit
     task = {'keyword': seed, 'location_code': DFS_LOCATION[store], 'language_code': DFS_LANGUAGE[store],
             'limit': max(limit, 20), 'order_by': ['keyword_info.search_volume,desc']}
     try:
         r = req.post(DFS_SUGGEST_ENDPOINT, headers=_dfs_headers(), json=[task], timeout=30)
         d = r.json()
     except Exception as e:
-        return [{'error': str(e)[:100]}]
+        return _dfs_cache_stale_or(ckey, {'error': str(e)[:100]})
     t, err = _dfs_task_or_error(r, d)
     if err:
-        return [err]
+        return _dfs_cache_stale_or(ckey, err)
     items = (((t.get('result') or [{}])[0]) or {}).get('items') or []
     out = []
     for it in items:
@@ -4822,7 +4918,9 @@ def _dfs_keyword_suggestions(seed, store, min_volume=0, limit=25):
             'intent': ((it.get('search_intent_info') or {}) or {}).get('main_intent'),
             'seasonality': _seasonality(ki.get('monthly_searches')),
         })
-    return out[:limit]
+    out = out[:limit]
+    _dfs_cache_put(ckey, out)
+    return out
 
 
 def _niche_seeds_for_type(product_type, store):
@@ -5182,6 +5280,19 @@ def _dfs_probe():
                        message='DataForSEO answered normally')
     except Exception as e:
         out.update(ok=False, code='network', message=str(e)[:200])
+    # Saldo erbij — /v3/appendix/user_data is GRATIS bij DataForSEO, dus dit
+    # kost geen credits. Zo kan "check het saldo" ook echt een getal tonen en
+    # zie je 'm leeglopen vóór alles op 40200 stukloopt.
+    try:
+        rb = req.get('https://api.dataforseo.com/v3/appendix/user_data',
+                     headers=_dfs_headers(), timeout=15)
+        db = rb.json() if rb.content else {}
+        money = ((((db.get('tasks') or [{}])[0] or {}).get('result') or [{}])[0] or {}).get('money') or {}
+        bal = money.get('balance')
+        if bal is not None:
+            out['balance'] = round(float(bal), 2)
+    except Exception:
+        pass
     _DFS_PROBE_CACHE.update(at=now, result=out)
     return out
 

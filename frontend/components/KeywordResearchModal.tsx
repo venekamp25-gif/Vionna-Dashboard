@@ -15,7 +15,7 @@ type StoreResult = {
   keywords?: Kw[];
   error?: string;
   /** Upstream DataForSEO failures for this market, if any. */
-  apiErrors?: { error?: string; code?: number | string | null }[];
+  apiErrors?: { error?: string; code?: number | string | null; stale_cache?: boolean; cached_at?: string }[];
   notConfigured?: boolean;
 };
 
@@ -303,14 +303,29 @@ export function KeywordResearchModal({ open, onClose }: { open: boolean; onClose
                       keyword API was actually rejecting every call (bug #31). */}
                   {(active.apiErrors?.length ?? 0) > 0 && (
                     <div className="text-[12px] rounded-md border border-danger/40 bg-danger/10 text-danger px-3 py-2 mb-2">
-                      <strong>The keyword service returned an error</strong> — these results are
-                      incomplete or empty for that reason, not because there are no keywords.
+                      <strong>The keyword service returned an error</strong>
+                      {active.apiErrors?.[0]?.stale_cache ? (
+                        <>
+                          {" "}— showing the last successful results
+                          {active.apiErrors?.[0]?.cached_at
+                            ? ` (from ${active.apiErrors[0].cached_at.slice(0, 10)})`
+                            : ""}{" "}
+                          instead. They may be slightly outdated.
+                        </>
+                      ) : (
+                        <>
+                          {" "}— these results are incomplete or empty for that reason, not
+                          because there are no keywords.
+                        </>
+                      )}
                       <br />
                       {active.apiErrors?.[0]?.error}
                       {active.apiErrors?.[0]?.code ? ` (code ${active.apiErrors[0].code})` : ""}
                       <br />
                       <span className="text-text-dim">
-                        Check the DataForSEO credentials and account balance in Settings.
+                        {String(active.apiErrors?.[0]?.code) === "40200"
+                          ? "The DataForSEO balance is empty — top up at app.dataforseo.com, then run the research again."
+                          : "Check the DataForSEO credentials and account balance in Settings."}
                       </span>
                     </div>
                   )}
