@@ -1296,10 +1296,55 @@ _SCRAPE_UA_FALLBACK = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537
 # that store" (bug #16: boheme-infinity.com kept 429ing every subsequent
 # attempt). Remember the host for a cooldown window and fail fast without
 # hitting the network again, so we stop hammering it and it can clear sooner.
+#
+# The cooldown must never outlive the block it protects against, though: a shop
+# that answers us again is not rate-limiting us. Until bug #32 the flag was
+# write-only — one transient 429 mid-import armed it, the immediate retry got a
+# 200 back, and the flag STILL blocked every further request to that host for
+# 30-300s. Listing product after product from one store (each import fires
+# 5-30 requests) reliably trips one such blip, after which the dashboard refused
+# the whole store while the store was serving us fine — reported as "can't read
+# the competitor store", with the shrinking synthetic "try again in about 18s".
+# So: clear the flag on any non-429 answer, and while it is set let a single
+# probe through every _SCRAPE_429_PROBE_EVERY seconds to notice recovery.
 _SCRAPE_429_LOCK       = threading.Lock()
 _scrape_429_until      = {}    # host -> monotonic() time the cooldown ends
+_scrape_429_probe_at   = {}    # host -> monotonic() time the next probe may run
 _SCRAPE_429_COOLDOWN_MIN = 30   # seconds — floor, even if Retry-After is tiny/absent
 _SCRAPE_429_COOLDOWN_MAX = 300  # seconds — cap, so one huge Retry-After doesn't wedge a host
+_SCRAPE_429_PROBE_EVERY  = 15   # seconds between half-open probes while cooling down
+
+
+def _scrape_429_arm(host, cooldown):
+    """Remember `host` as rate-limiting us for `cooldown` seconds."""
+    now = time.monotonic()
+    with _SCRAPE_429_LOCK:
+        _scrape_429_until[host] = now + cooldown
+        _scrape_429_probe_at[host] = now + _SCRAPE_429_PROBE_EVERY
+
+
+def _scrape_429_forget(host):
+    """Host answered us with something other than 429 — it is not rate-limiting
+    us (any more), so drop the cooldown instead of blocking ourselves out of a
+    store that works."""
+    with _SCRAPE_429_LOCK:
+        if _scrape_429_until.pop(host, None) is not None:
+            print(f"[scrape] {host} answered again — 429 cooldown cleared")
+        _scrape_429_probe_at.pop(host, None)
+
+
+def _scrape_429_state(host):
+    """(remaining_seconds, may_probe) for `host`. Claims the probe slot when it
+    hands one out, so parallel imports don't all probe at once."""
+    now = time.monotonic()
+    with _SCRAPE_429_LOCK:
+        remaining = _scrape_429_until.get(host, 0) - now
+        if remaining <= 0:
+            return 0, False
+        if now >= _scrape_429_probe_at.get(host, 0):
+            _scrape_429_probe_at[host] = now + _SCRAPE_429_PROBE_EVERY
+            return remaining, True
+        return remaining, False
 
 
 def _scrape_429_cooldown_response(url, host, remaining):
@@ -1331,17 +1376,20 @@ def _scrape_get(url, timeout=10, _retries_remaining=2):
 
     A host that 429s us is remembered for a cooldown window (see
     _scrape_429_cooldown_response) — further calls to ANY path fail fast
-    instead of retrying against a host that's already rate-limiting us.
+    instead of retrying against a host that's already rate-limiting us. The
+    cooldown ends the moment the host answers us with anything but a 429, and
+    every _SCRAPE_429_PROBE_EVERY seconds one request is let through to find
+    that out (bug #32).
     """
     host = urllib.parse.urlparse(url).netloc.lower()
-    with _SCRAPE_429_LOCK:
-        until = _scrape_429_until.get(host, 0)
-    remaining = until - time.monotonic()
-    if remaining > 0:
+    remaining, probing = _scrape_429_state(host)
+    if remaining > 0 and not probing:
         print(f"[scrape] {host} in 429 cooldown for {int(remaining)}s more — skipping request")
         return _scrape_429_cooldown_response(url, host, remaining)
+    if probing:
+        print(f"[scrape] {host} in 429 cooldown — probing once to see if it recovered")
 
-    delays_left = [1, 3]  # seconds before each retry; popped front-first
+    delays_left = [] if probing else [1, 3]  # seconds before each retry; popped front-first
     headers_primary  = {'User-Agent': _SCRAPE_UA_PRIMARY,
                         'Accept': 'application/json, text/html;q=0.9, */*;q=0.5'}
     headers_fallback = {'User-Agent': _SCRAPE_UA_FALLBACK,
@@ -1354,6 +1402,10 @@ def _scrape_get(url, timeout=10, _retries_remaining=2):
             if r.status_code == 403:
                 # Upstream actively rejected our identifier — try a browser UA.
                 r = req.get(url, timeout=timeout, headers=headers_fallback)
+            if r.status_code != 429:
+                # It's answering us — whatever it says, it is not rate-limiting
+                # us, so a leftover cooldown must not keep blocking the store.
+                _scrape_429_forget(host)
             # Transient: retry
             if r.status_code == 429:
                 wait_s = 5
@@ -1362,8 +1414,7 @@ def _scrape_get(url, timeout=10, _retries_remaining=2):
                 except Exception:
                     pass
                 cooldown = min(max(wait_s, _SCRAPE_429_COOLDOWN_MIN), _SCRAPE_429_COOLDOWN_MAX)
-                with _SCRAPE_429_LOCK:
-                    _scrape_429_until[host] = time.monotonic() + cooldown
+                _scrape_429_arm(host, cooldown)
                 if delays_left:
                     print(f"[scrape] 429 rate-limit on {url}, sleeping {wait_s}s then retrying")
                     time.sleep(min(wait_s, 30))
