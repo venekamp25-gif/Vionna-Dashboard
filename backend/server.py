@@ -639,6 +639,9 @@ def health():
         'anthropic': bool(ANTHROPIC_KEY and ANTHROPIC_KEY != 'VOELINJEYHIER'),
         'higgsfield_cli': bool(HIGGSFIELD_EXE),
         'backups': {'count': n_backups, 'last': last_backup},
+        # Whether competitor scraping leaves the droplet through the residential
+        # proxy (bug #34). Boolean only — the proxy URL holds credentials.
+        'scraper_proxy': bool(_scraper_proxies('https://example.com/products/x.json')),
     })
 
 
@@ -1290,6 +1293,57 @@ def _ensure_color_option(product):
 _SCRAPE_UA_PRIMARY  = 'FashionListingDashboard/1.0 (+https://fashion-listing-dashboard.netlify.app)'
 _SCRAPE_UA_FALLBACK = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
+# ── Scraper egress proxy (bug #34, plan #2 optie 1) ─────────────────────────
+# Competitor shops rate-limit the droplet's DATACENTRE IP, not our code: while
+# bug #34 was open murci.co.uk answered 429 to the droplet and 200 to the same
+# requests from another IP, and identical bestseller scans took 123s on the
+# droplet against ~5s elsewhere (cettesaison.fr, miakee.com) — several
+# independent shops at once, so the shared cause is the IP. Routing scraper
+# traffic through a proxy with residential IPs makes shops see an ordinary
+# visitor instead of a server.
+#
+# Droplet-only config (.env, gitignored — the credentials are a secret and must
+# never be committed):
+#   SCRAPER_PROXY_URL=http://user:pass@gateway.provider.net:port
+#   SCRAPER_PROXY=0     kill switch: back to direct traffic (restart to apply)
+# Unset = direct traffic, byte-for-byte the behaviour we had before.
+_SCRAPER_PROXY_LOCAL_HOSTS = {'localhost', '127.0.0.1', '::1'}
+
+
+def _scraper_proxies(url):
+    """requests-style `proxies` dict for `url`, or None when it should go direct.
+
+    Direct regardless of config for our own host and for asset CDNs: image and
+    CDN bytes are the bulk of the traffic, they are not what gets rate-limited,
+    and residential proxies bill per GB — sending them through would multiply
+    the cost for no benefit."""
+    if (os.getenv('SCRAPER_PROXY') or '').strip() == '0':
+        return None
+    proxy = (os.getenv('SCRAPER_PROXY_URL') or '').strip()
+    if not proxy:
+        return None
+    host = (urllib.parse.urlparse(url).hostname or '').lower()
+    if host in _SCRAPER_PROXY_LOCAL_HOSTS or host.startswith('cdn.'):
+        return None
+    return {'http': proxy, 'https': proxy}
+
+
+def _scrape_request(url, timeout, headers):
+    """One GET through the scraper proxy when configured, else direct.
+
+    A proxy that is down must never take the whole scraper with it: if we can't
+    reach the proxy itself we log it and repeat the request directly, which is
+    exactly what we did before there was a proxy."""
+    proxies = _scraper_proxies(url)
+    if not proxies:
+        return req.get(url, timeout=timeout, headers=headers)
+    try:
+        return req.get(url, timeout=timeout, headers=headers, proxies=proxies)
+    except (req.exceptions.ProxyError, req.exceptions.InvalidProxyURL) as e:
+        print(f"[scrape] proxy unusable ({str(e)[:100]}) — falling back to a direct request for {url}")
+        return req.get(url, timeout=timeout, headers=headers)
+
+
 # Once a host 429s us, every retry (ours AND the next user's import from that
 # same store) just adds to the pressure keeping the block up — that's what
 # turned "one slow import" into "won't let me list ANY more products from
@@ -1374,6 +1428,9 @@ def _scrape_get(url, timeout=10, _retries_remaining=2):
     try Mozilla. We don't retry 403 — that's an auth/scope decision by the
     upstream, not a transient flake.
 
+    Every request goes out through the scraper proxy when one is configured
+    (see _scraper_proxies) so shops don't see the droplet's datacentre IP.
+
     A host that 429s us is remembered for a cooldown window (see
     _scrape_429_cooldown_response) — further calls to ANY path fail fast
     instead of retrying against a host that's already rate-limiting us. The
@@ -1398,10 +1455,10 @@ def _scrape_get(url, timeout=10, _retries_remaining=2):
     last_exc = None
     while True:
         try:
-            r = req.get(url, timeout=timeout, headers=headers_primary)
+            r = _scrape_request(url, timeout, headers_primary)
             if r.status_code == 403:
                 # Upstream actively rejected our identifier — try a browser UA.
-                r = req.get(url, timeout=timeout, headers=headers_fallback)
+                r = _scrape_request(url, timeout, headers_fallback)
             if r.status_code != 429:
                 # It's answering us — whatever it says, it is not rate-limiting
                 # us, so a leftover cooldown must not keep blocking the store.
