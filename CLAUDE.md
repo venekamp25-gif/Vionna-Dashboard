@@ -50,6 +50,36 @@ Nothing else. The droplet installs it itself within ~10 minutes:
 
 ---
 
+## 🌐 Scraper egress proxy (since v1.257.0)
+
+Competitor shops rate-limit the droplet's **datacentre IP**, not our code — the
+recurring "the dashboard can't read the competitor" reports (#28, #32, #34) are
+all this. Measured while #34 was open: murci.co.uk answered 429 to the droplet
+and 200 to the same requests from another IP; identical bestseller scans took
+123s on the droplet vs ~5s elsewhere.
+
+`_scrape_get` therefore sends every competitor request through a proxy with
+residential IPs when one is configured. Droplet-only `.env` keys (gitignored —
+the URL holds credentials, never commit it):
+
+```
+SCRAPER_PROXY_URL=http://user:pass@gateway.provider.net:port
+SCRAPER_PROXY=0        # kill switch — direct traffic again (restart to apply)
+```
+
+- Unset = direct traffic, exactly as before. The code ships inert until the key
+  is set, so deploying it changes nothing on its own.
+- Asset CDNs (`cdn.*`) and localhost always go direct: images are most of the
+  bytes, aren't what gets rate-limited, and residential proxies bill per GB.
+- A proxy that is down falls back to a direct request (logged) rather than
+  taking the scraper with it.
+- Verify from anywhere: `curl https://188-166-11-177.nip.io/api/health` →
+  `"scraper_proxy":true`. Then
+  `curl "https://188-166-11-177.nip.io/api/bestseller_scan?domain=murci.co.uk"`
+  should return `ok:true` instead of the 429 "blocked" message.
+
+---
+
 ## 🐛 Codeword: "bug"
 
 When the user says **"bug"** (also accept "bugs", "/bug", "fix bugs", "work the
