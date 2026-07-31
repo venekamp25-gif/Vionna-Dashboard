@@ -11259,6 +11259,92 @@ def _attach_images_one_by_one(store, prod_id, img_payload, hdrs):
     return created
 
 
+SEO_TITLE_LIMIT = 60
+
+# Loshangende functiewoorden aan het eind van een afgekapte titel lezen als een
+# afgebroken zin ("...med fleeceforing til"). Talen: DK/FR/FI + NL/DE/EN.
+_SEO_TAIL_STOP = {
+    'til', 'og', 'med', 'i', 'paa', 'af', 'uden',
+    'de', 'du', 'des', 'la', 'le', 'les', 'pour', 'et', 'en', 'avec', 'sans',
+    'ja', 'kanssa',
+    'van', 'met', 'voor', 'zonder', 'op',
+    'mit', 'und', 'von', 'ohne',
+    'the', 'and', 'with', 'of', 'without', 'for', 'in',
+}
+
+
+def _seo_trim_tail(s):
+    """Trailing leestekens + loshangende functiewoorden weghalen."""
+    s = s.rstrip(' ,.-')
+    parts = s.split(' ')
+    while len(parts) > 2 and parts[-1].lower().strip(',.') in _SEO_TAIL_STOP:
+        parts.pop()
+    return ' '.join(parts).rstrip(' ,.-')
+
+
+def _seo_cut_words(s, limit):
+    """Afkappen op `limit`, ALTIJD op een woordgrens - nooit midden in een woord."""
+    if len(s) <= limit:
+        return _seo_trim_tail(s)
+    cut = s[:limit]
+    i = cut.rfind(' ')
+    if i > 0:
+        cut = cut[:i]
+    return _seo_trim_tail(cut)
+
+
+
+def _seo_page_title(name, colour, specs, limit=SEO_TITLE_LIMIT):
+    """Page title (global.title_tag) voor een productpagina.
+
+    "{producttype-zin} - {naam} {kleur}", max `limit` tekens.
+
+    KEYWORD-FIRST met opzet: 'Sasha'/'Aglae' zijn verzonnen voornamen met nul
+    zoekvolume, terwijl zowel Google's zoekresultaat als Shopping het BEGIN van
+    de titel het zwaarst wegen. Het echte zoekwoord staat in m_title_specs, dat
+    per prompt al met het producttype begint.
+
+    Naam + kleur staan achteraan maar krijgen hun ruimte GERESERVEERD: zonder
+    dat zou een afkapping de kleur opeten, en dan delen tot 27 losse URL's weer
+    dezelfde titel (gemeten 2026-07-29: 462/556 DK, 500/605 FR, 443/579 FI).
+
+    Taal volgt vanzelf de store: specs en kleur staan al in de winkeltaal.
+    """
+    name = re.sub(r'\s+', ' ', str(name or '')).strip()
+    colour = re.sub(r'\s+', ' ', str(colour or '')).strip()
+    specs = re.sub(r'\s+', ' ', str(specs or '')).strip()
+    # De copy hangt er soms een tweede zin achter een en-dash/pipe; die duwt de
+    # titel ver voorbij wat Google toont. Alleen de eerste clausule is de titel.
+    specs = re.split(r'\s*[\u2013\u2014|;]\s*', specs)[0].strip(' .,-')
+    # Naam niet dubbel als de beschrijving er toevallig mee begint.
+    if name and specs.lower().startswith(name.lower() + ' '):
+        specs = specs[len(name):].strip(' -,')
+
+    tail = ' '.join(p for p in (name, colour) if p)
+    if not specs:
+        return _seo_cut_words(tail, limit)
+    if not tail:
+        return _seo_cut_words(specs, limit)
+
+    # De staart mag de kop niet opeten. Zonder deze rem hield een 39 tekens
+    # lange kleur ("Sininen/Merensininen Pilkullinen") maar 18 tekens over voor
+    # de beschrijving, en bleef daar alleen "Elegantti" van over - het
+    # producttype-keyword, juist waar het om gaat, viel eruit.
+    max_tail = int(limit * 0.45)
+    if len(tail) > max_tail and '/' in colour:
+        colour = colour.split('/')[0].strip()      # eerste kleurcomponent
+        tail = ' '.join(p for p in (name, colour) if p)
+    if len(tail) > max_tail:
+        tail = _seo_cut_words(tail, max_tail) or tail[:max_tail].strip()
+
+    sep = ' - '
+    room = limit - len(tail) - len(sep)
+    if room < 12:
+        return _seo_cut_words(tail, limit)
+    body = specs if len(specs) <= room else _seo_cut_words(specs, room)
+    return f'{body}{sep}{tail}'
+
+
 def _publish_one_variant(
     *,
     store, product_name, color, sizes,
@@ -11367,11 +11453,16 @@ def _publish_one_variant(
     uploaded_images = _attach_images_one_by_one(store, prod_id, img_payload, hdrs)
 
     # --- Metafields ---
+    # Page title stond NOOIT gezet -> Shopify viel terug op de kale producttitel
+    # ("Aglaé"), een verzonnen voornaam met nul zoekvolume. Bureau meldde dit
+    # 2026-07-29; toen: 0 van 1.740 producten had er een.
+    page_title = _seo_page_title(product_name, color, m_title_specs)
     metafields = [
         {'namespace': 'theme',  'key': 'cutline',                       'value': color,            'type': 'single_line_text_field'},
         {'namespace': 'theme',  'key': 'siblings',                      'value': actual_handle,    'type': 'single_line_text_field'},
         {'namespace': 'custom', 'key': 'm_title_specs_multi_line_text_','value': m_title_specs,    'type': 'multi_line_text_field'},
         {'namespace': 'custom', 'key': 'size_chart',                    'value': size_chart_html,  'type': 'multi_line_text_field'},
+        {'namespace': 'global', 'key': 'title_tag',                     'value': page_title,       'type': 'single_line_text_field'},
         {'namespace': 'global', 'key': 'description_tag',               'value': meta_description, 'type': 'single_line_text_field'},
     ]
     mf_errors = []
