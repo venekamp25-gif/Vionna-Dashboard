@@ -11316,39 +11316,89 @@ def _attach_images_one_by_one(store, prod_id, img_payload, hdrs):
     return created
 
 
-SEO_TITLE_LIMIT = 60
+# Het THEMA plakt er "- VIONNA DK" achter (live geverifieerd op alle drie de
+# winkels: onze 56 tekens werden 68 in de <title>). Google toont ~60, dus zonder
+# die reservering kapt hij precies naam+kleur weg - het enige verschil tussen
+# zusterproducten die elk een eigen URL hebben.
+SEO_BRAND_SUFFIX = 12          # len(" - VIONNA DK")
+SEO_TITLE_LIMIT = 60 - SEO_BRAND_SUFFIX
 
 # Loshangende functiewoorden aan het eind van een afgekapte titel lezen als een
 # afgebroken zin ("...med fleeceforing til"). Talen: DK/FR/FI + NL/DE/EN.
 _SEO_TAIL_STOP = {
-    'til', 'og', 'med', 'i', 'paa', 'af', 'uden',
+    'til', 'og', 'med', 'i', 'paa', 'på', 'af', 'uden', 'som',
     'de', 'du', 'des', 'la', 'le', 'les', 'pour', 'et', 'en', 'avec', 'sans',
+    'à', 'a', 'aux', 'au',
     'ja', 'kanssa',
     'van', 'met', 'voor', 'zonder', 'op',
     'mit', 'und', 'von', 'ohne',
     'the', 'and', 'with', 'of', 'without', 'for', 'in',
 }
 
+# Finse naamvals-uitgangen. Fins heeft geen losse voorzetsels: "met een klassieke
+# pasvorm" = "klassisella istuvuudella", waarbij BEIDE woorden de naamval dragen.
+# Knip je het zelfstandig naamwoord weg, dan blijft "klassisella" achter - een
+# bepaling zonder kern, precies even stuk als het Deense "og elegant".
+_FI_CASE_TAILS = ('lla', 'llä', 'lle', 'ssa', 'ssä', 'sta', 'stä',
+                  'iin', 'een', 'ksi', 'itä', 'ita', 'illa', 'illä',
+                  'ille', 'issa', 'issä', 'ista', 'istä')
 
-def _seo_trim_tail(s):
-    """Trailing leestekens + loshangende functiewoorden weghalen."""
-    s = s.rstrip(' ,.-')
-    parts = s.split(' ')
-    while len(parts) > 2 and parts[-1].lower().strip(',.') in _SEO_TAIL_STOP:
-        parts.pop()
+
+def _seo_trim_tail(s, truncated=False, removed_first=None):
+    """Trailing leestekens weg + terug tot een grammaticaal complete zinsgrens.
+
+    `truncated`/`removed_first` beschrijven de afkapping. Op VOLLEDIGE copy
+    grijpen de zinsgrens-regels niet in - daar is de tekst per definitie af.
+    """
+    def _strip_func(parts, first_rm):
+        # Het weggehaalde functiewoord WORDT het nieuwe 'eerst weggehaalde
+        # woord': valt "til" eraf, dan is "...med los pasform" gewoon af en mag
+        # de zinsgrens-regel hieronder niet meer ingrijpen.
+        while len(parts) > 1 and parts[-1].lower().strip(',.') in _SEO_TAIL_STOP:
+            first_rm = parts.pop()
+        return parts, first_rm
+
+    s = (s or '').rstrip(' ,.-')
+    if not s:
+        return ''
+    parts, removed_first = _strip_func(s.split(' '), removed_first)
+
+    if truncated:
+        # Fins draagt "met/voor" IN de naamval; adjectief en zelfstandig
+        # naamwoord dragen dezelfde uitgang, dus lussen tot er een kern staat.
+        while (len(parts) > 1 and len(parts[-1]) > 5
+               and parts[-1].lower().strip(',.').endswith(_FI_CASE_TAILS)):
+            parts.pop()
+        # Is de KERN weggeknipt (eerst weggehaalde woord was een inhoudswoord),
+        # val dan in EEN stap terug tot het laatste functiewoord en gooi dat mee.
+        # Geen functiewoord aanwezig = losse zelfstandige naamwoorden, die lezen
+        # prima; dan niets doen (anders bleef er van "Pantalon femme taille
+        # haute palazzo" alleen "Pantalon" over).
+        first_rm = (removed_first or '').lower().strip(',.')
+        if first_rm and first_rm not in _SEO_TAIL_STOP:
+            idx = next((i for i in range(len(parts) - 1, -1, -1)
+                        if parts[i].lower().strip(',.') in _SEO_TAIL_STOP), None)
+            if idx is not None and idx > 0:
+                parts = parts[:idx]
+        parts, removed_first = _strip_func(parts, removed_first)
+
+    if len(parts) == 1 and parts[0].lower().strip(',.') in _SEO_TAIL_STOP:
+        return ''
     return ' '.join(parts).rstrip(' ,.-')
 
 
 def _seo_cut_words(s, limit):
     """Afkappen op `limit`, ALTIJD op een woordgrens - nooit midden in een woord."""
     if len(s) <= limit:
-        return _seo_trim_tail(s)
+        return _seo_trim_tail(s, truncated=False)
     cut = s[:limit]
     i = cut.rfind(' ')
+    removed_first = None
     if i > 0:
+        rest = s[i:].strip()
+        removed_first = rest.split(' ')[0] if rest else None
         cut = cut[:i]
-    return _seo_trim_tail(cut)
-
+    return _seo_trim_tail(cut, truncated=True, removed_first=removed_first)
 
 
 def _seo_page_title(name, colour, specs, limit=SEO_TITLE_LIMIT):
@@ -11383,22 +11433,35 @@ def _seo_page_title(name, colour, specs, limit=SEO_TITLE_LIMIT):
     if not tail:
         return _seo_cut_words(specs, limit)
 
-    # De staart mag de kop niet opeten. Zonder deze rem hield een 39 tekens
-    # lange kleur ("Sininen/Merensininen Pilkullinen") maar 18 tekens over voor
-    # de beschrijving, en bleef daar alleen "Elegantti" van over - het
-    # producttype-keyword, juist waar het om gaat, viel eruit.
-    max_tail = int(limit * 0.45)
-    if len(tail) > max_tail and '/' in colour:
+    # VOLGORDE VAN OPOFFEREN (gemeten, niet gegokt):
+    # 1. naam + kleur blijven heel - zij zijn het ENIGE verschil tussen
+    #    zusterproducten die elk een eigen URL hebben;
+    # 2. de beschrijving wijkt tot een ondergrens die het producttype-keyword
+    #    nog kan dragen;
+    # 3. pas daaronder wordt de kleur zelf ingekort.
+    # Een vaste cap op de staart (45%) deed het omgekeerde: "Agathe
+    # Vaaleanpunainen" (22) paste niet in 21 en werd "Agathe" - kleur weg.
+    sep = ' - '
+    min_body = 16                       # ~ genoeg voor "Elegant midi-kjole"
+    if len(tail) + len(sep) + min_body > limit and '/' in colour:
         colour = colour.split('/')[0].strip()      # eerste kleurcomponent
         tail = ' '.join(p for p in (name, colour) if p)
-    if len(tail) > max_tail:
-        tail = _seo_cut_words(tail, max_tail) or tail[:max_tail].strip()
+    if len(tail) + len(sep) + min_body > limit:
+        # kleur woord voor woord inkorten, naam blijft altijd staan
+        cwords = colour.split(' ')
+        while len(cwords) > 1 and len(f'{name} {" ".join(cwords)}') + len(sep) + min_body > limit:
+            cwords.pop()
+        colour = ' '.join(cwords)
+        tail = ' '.join(p for p in (name, colour) if p)
+    if len(tail) + len(sep) + min_body > limit:
+        tail = _seo_cut_words(tail, limit - len(sep) - min_body) or tail[:limit].strip()
 
-    sep = ' - '
     room = limit - len(tail) - len(sep)
-    if room < 12:
+    if room < 8:
         return _seo_cut_words(tail, limit)
     body = specs if len(specs) <= room else _seo_cut_words(specs, room)
+    if not body:
+        return _seo_cut_words(tail, limit)
     return f'{body}{sep}{tail}'
 
 
