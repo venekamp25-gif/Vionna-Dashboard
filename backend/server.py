@@ -11442,7 +11442,11 @@ def _seo_page_title(name, colour, specs, limit=SEO_TITLE_LIMIT):
     # Een vaste cap op de staart (45%) deed het omgekeerde: "Agathe
     # Vaaleanpunainen" (22) paste niet in 21 en werd "Agathe" - kleur weg.
     sep = ' - '
-    min_body = 16                       # ~ genoeg voor "Elegant midi-kjole"
+    # 20 tekens: net genoeg voor "Klassinen juhlamekko" / "Elegant midi-kjole".
+    # Bij 16 viel het producttype-zelfstandig naamwoord weg zodra de kleur lang
+    # was ("Klassinen - Agathe Sininen Kukkakuvioinen"); liever een kleurwoord
+    # minder dan het zoekwoord kwijt.
+    min_body = 20
     if len(tail) + len(sep) + min_body > limit and '/' in colour:
         colour = colour.split('/')[0].strip()      # eerste kleurcomponent
         tail = ' '.join(p for p in (name, colour) if p)
