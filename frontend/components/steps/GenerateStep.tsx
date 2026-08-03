@@ -18,6 +18,7 @@ import {
   normalizeImageUrl,
   safeHostname,
 } from "@/lib/scrape-utils";
+import { classifyScrapeError } from "@/lib/scrapeError";
 import { translateColor } from "@/lib/colors";
 import { randomName } from "@/lib/names";
 import { autoSiblingsHandle } from "@/lib/slug";
@@ -396,6 +397,12 @@ export function GenerateStep() {
         const msg = e instanceof Error ? e.message : String(e);
         setError(msg);
         started.current = false;
+        // The shop is rate-limiting our datacentre IP (bug #34), not refusing
+        // the product. Retrying from here hits the same IP and fails the same
+        // way, so don't park the worker on an error screen: open the manual
+        // paste straight away — that fetch runs from their own browser, which
+        // the shop does answer, and gets them through the import in ~30s.
+        if (classifyScrapeError(msg) === "rate-limit") setManualPasteOpen(true);
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -406,16 +413,25 @@ export function GenerateStep() {
   if (error) {
     // Detect errors that are "the scraper got blocked" rather than "the
     // user did something wrong" so we can offer the manual-paste escape hatch.
-    const looksLikeBlock =
-      /cloudflare|anti-bot|blocking|cdn|geo-restrict|authentication|private|preventing|forbidden/i.test(error) ||
-      error.startsWith("API /api/scrape");
+    const failure = classifyScrapeError(error);
+    const looksLikeBlock = failure !== "other";
+    // A rate-limit is the shop refusing our IP for a while, not a broken
+    // import: the paste modal is already open on top of this screen, so the
+    // panel behind it is a waiting room, not a red failure.
+    const rateLimited = failure === "rate-limit";
 
     return (
       <>
         <div className="max-w-2xl mx-auto">
-          <div className="bg-bg-elev border border-danger/40 rounded-2xl px-8 py-10 flex flex-col items-center gap-4 text-center">
-            <div className="w-12 h-12 rounded-full bg-danger/20 text-danger text-2xl flex items-center justify-center">!</div>
-            <h2 className="text-[15px] font-semibold text-text">Could not generate product</h2>
+          <div className={`bg-bg-elev border rounded-2xl px-8 py-10 flex flex-col items-center gap-4 text-center ${rateLimited ? "border-warning/40" : "border-danger/40"}`}>
+            <div className={`w-12 h-12 rounded-full text-2xl flex items-center justify-center ${rateLimited ? "bg-warning/20 text-warning" : "bg-danger/20 text-danger"}`}>
+              {rateLimited ? "⏳" : "!"}
+            </div>
+            <h2 className="text-[15px] font-semibold text-text">
+              {rateLimited
+                ? "This shop is busy — paste the product to continue"
+                : "Could not generate product"}
+            </h2>
             <p className="text-[13px] text-text-dim">{error}</p>
 
             {/* When the failure looks like an anti-bot block, walk the user
@@ -427,15 +443,27 @@ export function GenerateStep() {
                   💡 Workaround: paste the product JSON manually (about 30 seconds)
                 </div>
                 <p className="text-[12px] text-text-dim mb-3 leading-relaxed">
-                  This shop is blocking our scraper, but it works fine from your
-                  own browser. Open the product&apos;s JSON URL in a new tab, copy the
+                  {rateLimited
+                    ? "This shop is rate-limiting our server, but it answers your own browser normally — waiting or retrying here hits the same limit."
+                    : "This shop is blocking our scraper, but it works fine from your own browser."}{" "}
+                  Open the product&apos;s JSON URL in a new tab, copy the
                   whole page, paste it back here, and the dashboard will continue
                   as if it had scraped automatically.
                 </p>
                 <ol className="text-[12px] text-text-dim leading-relaxed list-decimal list-inside space-y-1 mb-4">
                   <li>
-                    Click <strong className="text-text">&ldquo;Paste JSON manually&rdquo;</strong> below.
-                    A modal opens with the right URL pre-filled.
+                    {rateLimited ? (
+                      <>
+                        The paste window is already open (reopen it with{" "}
+                        <strong className="text-text">&ldquo;Paste JSON manually&rdquo;</strong> below).
+                        It has the right URL pre-filled.
+                      </>
+                    ) : (
+                      <>
+                        Click <strong className="text-text">&ldquo;Paste JSON manually&rdquo;</strong> below.
+                        A modal opens with the right URL pre-filled.
+                      </>
+                    )}
                   </li>
                   <li>
                     In that modal click <strong className="text-text">&ldquo;Open ↗&rdquo;</strong> — a new
@@ -479,6 +507,7 @@ export function GenerateStep() {
         <ManualPasteModal
           open={manualPasteOpen}
           originalUrl={data.competitorUrl}
+          reason={rateLimited ? "rate-limit" : "block"}
           onClose={() => setManualPasteOpen(false)}
           onSuccess={(product) => {
             setManualPasteOpen(false);

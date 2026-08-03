@@ -8,6 +8,10 @@ interface Props {
   open: boolean;
   /** The original URL the user pasted in Input — we suggest its `.json` variant. */
   originalUrl: string;
+  /** Why we ended up here, so the intro line says something true: an anti-bot
+   *  wall ("block", the default) or the shop rate-limiting our IP ("rate-limit",
+   *  bug #34 — that one opens this modal by itself). */
+  reason?: "block" | "rate-limit";
   onClose: () => void;
   /** Fires with the validated product. Parent should then continue the
    *  Generate flow as if `/api/scrape` had returned this. */
@@ -23,7 +27,7 @@ interface Props {
  * Posts to /api/scrape_manual which validates the JSON and returns it in
  * the same shape /api/scrape would have.
  */
-export function ManualPasteModal({ open, originalUrl, onClose, onSuccess }: Props) {
+export function ManualPasteModal({ open, originalUrl, reason = "block", onClose, onSuccess }: Props) {
   const [pasted, setPasted] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -88,8 +92,9 @@ export function ManualPasteModal({ open, originalUrl, onClose, onSuccess }: Prop
               Paste the product JSON manually
             </h2>
             <p className="text-[12px] text-text-faint mt-0.5 max-w-md">
-              This shop's anti-bot protection is blocking our scraper, but you
-              can still fetch the data from your own browser and paste it back.
+              {reason === "rate-limit"
+                ? "This shop is rate-limiting our server right now, but you can still fetch the data from your own browser and paste it back."
+                : "This shop's anti-bot protection is blocking our scraper, but you can still fetch the data from your own browser and paste it back."}{" "}
               Takes about 30 seconds.
             </p>
           </div>
