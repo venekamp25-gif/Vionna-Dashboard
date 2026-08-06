@@ -590,6 +590,31 @@ export const api = {
       { method: "POST", body: params, authed: true }
     ),
 
+  /** Scraper-proxy config as the server sees it. Never includes the URL itself —
+   *  it carries credentials. Unlike /api/health this tells "no URL set" apart
+   *  from "kill switch on". */
+  scraperProxyStatus: () =>
+    call<{
+      configured: boolean;
+      enabled: boolean;
+      kill_switch: boolean;
+      host_hint?: string;
+      active: boolean;
+    }>("/api/scraper_proxy_status", { method: "GET" }),
+
+  /** Save (or clear, with an empty proxy_url) the scraper proxy. Written to the
+   *  server .env and applied live — no restart. The URL is never returned. */
+  saveScraperProxy: (params: { proxy_url: string; enabled?: boolean }) =>
+    call<{
+      ok?: boolean;
+      configured?: boolean;
+      enabled?: boolean;
+      host_hint?: string;
+      verified?: boolean;
+      message?: string;
+      error?: string;
+    }>("/api/save_scraper_proxy", { method: "POST", body: params, authed: true }),
+
   higgsfield: (params: {
     prompt_type: number;
     product_type: string;

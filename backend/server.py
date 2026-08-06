@@ -13,7 +13,8 @@ if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
     except Exception:
         pass
 
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'), override=True)
+ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+load_dotenv(ENV_PATH, override=True)
 
 app = Flask(__name__, static_folder='.')
 app.secret_key = os.environ.get('SECRET_KEY') or os.urandom(24)
@@ -5504,6 +5505,161 @@ def api_save_dataforseo_credentials():
     return jsonify({'ok': True, 'configured': True})
 
 
+# ── Scraper proxy settings (plan #3 / bug #35) ──────────────────────────────
+# The proxy is the fix for competitor shops blocking the droplet's datacentre IP,
+# but until now the only way to configure it was SSH into the droplet and edit
+# .env by hand. That made a two-minute change a CEO-only task. These two routes
+# move it into the dashboard, following exactly the shape of
+# /api/save_dataforseo_credentials above: gated, applied live, never echoed back.
+_ENV_ALLOWED_KEYS = ('SCRAPER_PROXY_URL', 'SCRAPER_PROXY')
+
+
+def _env_write(values):
+    """Persist {KEY: value} to backend/.env, replacing existing lines. A value of
+    None deletes the key. Only keys in _ENV_ALLOWED_KEYS are ever touched — a
+    settings form must never be able to rewrite arbitrary server config."""
+    bad = [k for k in values if k not in _ENV_ALLOWED_KEYS]
+    if bad:
+        raise ValueError(f'refusing to write non-allowlisted key(s): {bad}')
+    env_path = ENV_PATH
+    lines = []
+    if os.path.exists(env_path):
+        with open(env_path, 'r', encoding='utf-8') as f:
+            lines = [ln.rstrip('\n') for ln in f]
+    lines = [ln for ln in lines
+             if not any(ln.startswith(k + '=') for k in values)]
+    for key, val in values.items():
+        if val is not None:
+            lines.append(f'{key}={val}')
+    tmp = env_path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
+    os.replace(tmp, env_path)
+
+
+def _proxy_host_hint(url):
+    """host:port of a proxy URL — safe to show. Credentials are stripped."""
+    try:
+        u = urllib.parse.urlparse(url)
+        if not u.hostname:
+            return ''
+        return u.hostname + (f':{u.port}' if u.port else '')
+    except Exception:
+        return ''
+
+
+def _egress_ip(through_proxy, timeout=8):
+    """Our public IP as the outside world sees it, optionally via the proxy.
+
+    This is what turns 'saved' into 'proven': if the proxied IP equals the direct
+    IP the proxy is not actually carrying our traffic. Best-effort — any failure
+    returns None and is reported as 'could not check', never as success."""
+    try:
+        url = 'https://api.ipify.org?format=json'
+        proxies = _scraper_proxies(url) if through_proxy else None
+        if through_proxy and not proxies:
+            return None
+        r = req.get(url, timeout=timeout, proxies=proxies)
+        return ((r.json() or {}).get('ip') or '').strip() or None
+    except Exception:
+        return None
+
+
+@app.route('/api/scraper_proxy_status')
+def api_scraper_proxy_status():
+    """Non-secret view of the scraper-proxy config for the Settings form.
+
+    Deliberately never returns the URL: it carries credentials. Note this
+    distinguishes 'no URL set' from 'kill switch on', which /api/health cannot —
+    that ambiguity cost real debugging time on bug #35."""
+    raw = (os.getenv('SCRAPER_PROXY_URL') or '').strip()
+    killed = (os.getenv('SCRAPER_PROXY') or '').strip() == '0'
+    return jsonify({
+        'configured': bool(raw),
+        'enabled': bool(raw) and not killed,
+        'kill_switch': killed,
+        'host_hint': _proxy_host_hint(raw),
+        'active': bool(_scraper_proxies('https://example.com/products/x.json')),
+    })
+
+
+@app.route('/api/save_scraper_proxy', methods=['POST'])
+@require_droplet_token
+def api_save_scraper_proxy():
+    """Save/clear the scraper proxy from the dashboard. Gated. Writes .env AND
+    applies to the live process, so it takes effect without a restart —
+    _scraper_proxies reads os.getenv on every request. Never logs or returns the
+    URL itself."""
+    body = request.get_json(silent=True) or {}
+    raw = body.get('proxy_url')
+    raw = '' if raw is None else str(raw)
+    url = raw.strip()
+    # REJECT embedded whitespace rather than stripping it out. Silently removing
+    # a newline glues the rest of the payload onto the URL
+    # ("...:8080ANTHROPIC_API_KEY=stolen"), which lands in .env as one line and
+    # corrupts the value instead of injecting a key — still wrong, and it hides
+    # the mistake from whoever pasted it. A caller with a newline in their proxy
+    # URL has a broken URL; say so.
+    if re.search(r'\s', url):
+        return jsonify({'error': 'Proxy URL must not contain spaces or line breaks.'}), 400
+    enabled = body.get('enabled')
+    enabled = True if enabled is None else bool(enabled)
+
+    if not url:
+        try:
+            _env_write({'SCRAPER_PROXY_URL': None, 'SCRAPER_PROXY': None})
+        except Exception as e:
+            return jsonify({'error': 'Could not write .env: ' + str(e)[:80]}), 500
+        os.environ.pop('SCRAPER_PROXY_URL', None)
+        os.environ.pop('SCRAPER_PROXY', None)
+        print('[scrape] proxy cleared via dashboard')
+        return jsonify({'ok': True, 'configured': False, 'enabled': False,
+                        'message': 'Proxy removed — scraper traffic goes direct again.'})
+
+    if len(url) > 500:
+        return jsonify({'error': 'Proxy URL too long.'}), 400
+    try:
+        parsed = urllib.parse.urlparse(url)
+        parsed.port          # raises ValueError on a malformed port
+    except Exception:
+        parsed = None
+    # http/https only: a socks5:// URL needs the PySocks extra, which is not in
+    # requirements.txt — requests would raise InvalidSchema on every scrape and
+    # _scrape_request only catches ProxyError/InvalidProxyURL. All the residential
+    # providers offer an HTTP gateway, so this costs nothing.
+    if not parsed or parsed.scheme not in ('http', 'https') or not parsed.hostname:
+        return jsonify({'error': 'Enter a full proxy URL like '
+                                 'http://user:pass@gateway.provider.net:8080'}), 400
+
+    try:
+        _env_write({'SCRAPER_PROXY_URL': url, 'SCRAPER_PROXY': '1' if enabled else '0'})
+    except Exception as e:
+        return jsonify({'error': 'Could not write .env: ' + str(e)[:80]}), 500
+    os.environ['SCRAPER_PROXY_URL'] = url
+    os.environ['SCRAPER_PROXY'] = '1' if enabled else '0'
+    print(f'[scrape] proxy saved via dashboard: {_proxy_host_hint(url)} '
+          f'(enabled={enabled})')  # host only — never the credentials
+
+    direct_ip = _egress_ip(False)
+    proxy_ip = _egress_ip(True) if enabled else None
+    if not enabled:
+        verdict = 'Saved, but the kill switch is on — traffic still goes direct.'
+    elif proxy_ip and direct_ip and proxy_ip != direct_ip:
+        verdict = f'Working — competitor traffic now leaves from {proxy_ip} instead of {direct_ip}.'
+    elif proxy_ip and direct_ip and proxy_ip == direct_ip:
+        verdict = ('Saved, but the proxy did NOT change our IP — check the credentials. '
+                   'Requests silently fall back to a direct connection.')
+    elif proxy_ip:
+        verdict = f'Working — competitor traffic now leaves from {proxy_ip}.'
+    else:
+        verdict = ('Saved, but the test request through the proxy failed. '
+                   'Scraping will fall back to direct traffic until this works.')
+    return jsonify({'ok': True, 'configured': True, 'enabled': enabled,
+                    'host_hint': _proxy_host_hint(url),
+                    'verified': bool(proxy_ip and direct_ip and proxy_ip != direct_ip),
+                    'message': verdict})
+
+
 @app.route('/api/debug_classify')
 @require_droplet_token
 def api_debug_classify():
@@ -8853,6 +9009,22 @@ def api_fill_missing_size_charts():
 _BS_CACHE = {}          # domain -> {'ts', 'at', 'payload'}
 _BS_TTL = 12 * 3600
 
+# Per-product cache, shared across scans (plan #3 step 4, bug #35). Every scan
+# used to re-fetch all ~20 products, so one store cost ~21 requests per scan and
+# a re-scan 12h later paid the same bill again — that volume is what tips a
+# competitor's rate limiter over (meshki refused 18 of our 19 per-product
+# fetches). _BS_PROD_TTL is how long an entry is reused as-is; entries are kept
+# on disk far longer (_BS_PROD_KEEP) because a STALE entry is still the best
+# answer we have when a fetch is refused.
+_BS_PROD_CACHE = {}     # "host/handle" -> {'ts', 'p'}
+_BS_PROD_TTL = 72 * 3600
+_BS_PROD_KEEP = 30 * 24 * 3600
+_BS_PROD_MAX = 4000
+# Burst concurrency per store. Was 6; halved so a scan knocks more gently and
+# stays under rate limiters longer. Cold scans get slower, but the cache above
+# means a cold scan is now the exception rather than every 12h.
+_BS_WORKERS = 3
+
 _BS_CATEGORY_KEYWORDS = [
     ('dress',     ['dress', 'kjole', 'robe', 'mekko', 'gown', 'jurk']),
     ('jumpsuit',  ['jumpsuit', 'playsuit', 'romper', 'combinaison', 'overall']),
@@ -8955,6 +9127,85 @@ def _bs_cache_save():
         print(f'[bestsellers] cache save failed: {e}')
 
 
+BS_PROD_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bs_product_cache.json')
+
+
+def _bs_prod_slim(p):
+    """Keep only the fields _bs_scan reads, in the raw response's shape.
+
+    The full Shopify product JSON carries every variant, every image and
+    body_html — orders of magnitude more than we use, and this cache is written
+    to disk. Keeping the shape means the caller's `p.get(...)` lines work
+    unchanged whether the dict came from the network or from here."""
+    imgs = p.get('images') or []
+    var = (p.get('variants') or [{}])[0] or {}
+    return {'title': p.get('title'),
+            'images': ([{'src': imgs[0].get('src')}] if imgs else []),
+            'variants': [{'price': var.get('price')}],
+            'product_type': p.get('product_type'),
+            'published_at': p.get('published_at')}
+
+
+def _bs_prod_json(host, handle):
+    """One product's .json, cached across scans. Returns (product_dict, was_cached).
+
+    Three outcomes, in order: a fresh cache entry is returned without touching
+    the network; otherwise we fetch and store; and if that fetch fails (429,
+    timeout, blocked IP) we fall back to a stale entry rather than the empty
+    dict the caller would otherwise turn into null title/image/price. Only
+    successful fetches are ever cached — never the empty failure shape."""
+    key = f'{host}/{handle}'
+    hit = _BS_PROD_CACHE.get(key)
+    now_ts = time.time()
+    if hit and (now_ts - hit['ts']) < _BS_PROD_TTL:
+        return hit['p'], True
+    try:
+        pr = _scrape_get(f'https://{host}/products/{handle}.json', timeout=12)
+        p = (pr.json() or {}).get('product') or {}
+    except Exception:
+        p = {}
+    if p:
+        slim = _bs_prod_slim(p)
+        _BS_PROD_CACHE[key] = {'ts': now_ts, 'p': slim}
+        return slim, False
+    return (hit['p'] if hit else {}), bool(hit)
+
+
+def _bs_prod_cache_load():
+    try:
+        with open(BS_PROD_CACHE_PATH, encoding='utf-8') as f:
+            data = json.load(f) or {}
+        _BS_PROD_CACHE.update(data)
+        print(f'[bestsellers] product cache warmed from disk: {len(data)} products')
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f'[bestsellers] product cache load failed: {e}')
+
+
+def _bs_prod_cache_save():
+    """Persist, dropping entries past _BS_PROD_KEEP and capping the total.
+
+    Prunes the live dict too, not just the file — otherwise a long-running
+    process would grow it forever while the on-disk copy stayed bounded."""
+    try:
+        now_ts = time.time()
+        keep = {k: v for k, v in _BS_PROD_CACHE.items()
+                if (now_ts - v.get('ts', 0)) < _BS_PROD_KEEP}
+        if len(keep) > _BS_PROD_MAX:
+            keep = dict(sorted(keep.items(), key=lambda kv: kv[1].get('ts', 0),
+                               reverse=True)[:_BS_PROD_MAX])
+        if len(keep) != len(_BS_PROD_CACHE):
+            _BS_PROD_CACHE.clear()
+            _BS_PROD_CACHE.update(keep)
+        tmp = BS_PROD_CACHE_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(keep, f, ensure_ascii=False)
+        os.replace(tmp, BS_PROD_CACHE_PATH)
+    except Exception as e:
+        print(f'[bestsellers] product cache save failed: {e}')
+
+
 def _bs_scan(host, limit=20):
     """Scan one competitor's best-selling page. Returns (payload, None) or
     (None, blocked_reason). Retries once on 429 (we're being rate-limited,
@@ -9000,13 +9251,13 @@ def _bs_scan(host, limit=20):
     if not handles:
         return None, 'no products found on the bestseller page (maybe not a Shopify store)'
 
+    cached_hits = []
+
     def _one(pos_handle):
         pos, handle = pos_handle
-        try:
-            pr = _scrape_get(f'https://{host}/products/{handle}.json', timeout=12)
-            p = (pr.json() or {}).get('product') or {}
-        except Exception:
-            p = {}
+        p, was_cached = _bs_prod_json(host, handle)
+        if was_cached:
+            cached_hits.append(handle)
         title = p.get('title') or handle.replace('-', ' ').title()
         imgs = p.get('images') or []
         return {'position': pos, 'handle': handle, 'title': title,
@@ -9017,8 +9268,12 @@ def _bs_scan(host, limit=20):
                 'published_at': (p.get('published_at') or '')[:10],
                 'category': _bs_category(title, p.get('product_type'))}
     import concurrent.futures as _cf
-    with _cf.ThreadPoolExecutor(max_workers=6) as pool:
+    with _cf.ThreadPoolExecutor(max_workers=_BS_WORKERS) as pool:
         products = list(pool.map(_one, enumerate(handles, start=1)))
+    if cached_hits:
+        print(f'[bestsellers] {host}: {len(cached_hits)}/{len(handles)} products '
+              f'served from cache ({len(handles) - len(cached_hits)} fetched)')
+    _bs_prod_cache_save()
     # drop non-products (gift cards, parcel protection etc.) — never suggestions
     products = [p for p in products if not _BS_JUNK_RE.search(p['title'] or '')]
     products.sort(key=lambda x: x['position'])
@@ -9129,6 +9384,7 @@ def _bs_enrich(payload, host):
 
 
 _bs_cache_load()
+_bs_prod_cache_load()
 
 
 @app.route('/api/bestseller_scan')

@@ -74,3 +74,5 @@ backend/dfs_cache.json
 
 wtl_discover_seen.json
 backend/wtl_discover_seen.json
+bs_product_cache.json
+backend/bs_product_cache.json

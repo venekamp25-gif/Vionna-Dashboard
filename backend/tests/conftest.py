@@ -21,3 +21,17 @@ def _isolate_dfs_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(server, 'DFS_CACHE_PATH', str(tmp_path / 'dfs_cache.json'))
     monkeypatch.setattr(server, '_DFS_DISK', {})
     monkeypatch.setitem(server._DFS_DISK_STATE, 'loaded', False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_bs_product_cache(tmp_path, monkeypatch):
+    """Same treatment for the per-product bestseller cache (plan #3, bug #35).
+
+    _bs_scan persists it after every scan, so without this a test run would drop
+    backend/bs_product_cache.json into the repo and the NEXT run would serve
+    products from that file instead of from the mocked fetch.
+    """
+    import server
+
+    monkeypatch.setattr(server, 'BS_PROD_CACHE_PATH', str(tmp_path / 'bs_product_cache.json'))
+    monkeypatch.setattr(server, '_BS_PROD_CACHE', {})

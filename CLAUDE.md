@@ -59,13 +59,29 @@ and 200 to the same requests from another IP; identical bestseller scans took
 123s on the droplet vs ~5s elsewhere.
 
 `_scrape_get` therefore sends every competitor request through a proxy with
-residential IPs when one is configured. Droplet-only `.env` keys (gitignored —
-the URL holds credentials, never commit it):
+residential IPs when one is configured.
+
+**Configure it in the dashboard** (since v1.259.0): Settings → *Scraper proxy —
+competitor access*. Paste the provider's gateway URL, press **Save and test**.
+The backend writes it to `.env`, applies it to the running process (no restart —
+`_scraper_proxies` reads `os.getenv` per request) and then proves it works by
+comparing our egress IP with and without the proxy. If the IP does *not* change
+it says so: `_scrape_request` falls back to a direct connection on proxy
+failure, so a wrong password otherwise looks exactly like success.
+
+Behind the form, the same two `.env` keys as before (gitignored — the URL holds
+credentials, never commit it). Editing them by hand still works:
 
 ```
 SCRAPER_PROXY_URL=http://user:pass@gateway.provider.net:port
 SCRAPER_PROXY=0        # kill switch — direct traffic again (restart to apply)
 ```
+
+`POST /api/save_scraper_proxy` is token-gated and only ever writes those two
+keys (`_ENV_ALLOWED_KEYS`); it rejects a URL containing whitespace, a malformed
+port, or a non-http(s) scheme, and never logs or returns the value.
+`GET /api/scraper_proxy_status` is the non-secret view — unlike `/api/health` it
+tells "no URL set" apart from "kill switch on".
 
 - Unset = direct traffic, exactly as before. The code ships inert until the key
   is set, so deploying it changes nothing on its own.
