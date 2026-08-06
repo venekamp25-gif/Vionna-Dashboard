@@ -5548,21 +5548,75 @@ def _proxy_host_hint(url):
         return ''
 
 
+def _proxy_failure_hint(exc):
+    """Turn a requests proxy exception into something the CEO can act on.
+
+    "the test request failed" is useless when the fix differs per cause: no
+    traffic balance, wrong credentials and an unreachable gateway all look
+    identical otherwise."""
+    text = str(exc)
+    low = text.lower()
+    if '407' in text or 'proxy authentication' in low:
+        return ('the provider rejected our credentials (HTTP 407) — check the proxy '
+                'username/password, and that the account actually has traffic left')
+    if 'name or service not known' in low or 'nodename nor servname' in low \
+            or 'failed to resolve' in low or 'getaddrinfo' in low:
+        return 'the gateway hostname could not be resolved — check the host part of the URL'
+    if 'connection refused' in low:
+        return 'the gateway refused the connection — check the port'
+    if 'timed out' in low or 'timeout' in low:
+        return 'the gateway did not answer in time — check the host and port'
+    return text[:160]
+
+
 def _egress_ip(through_proxy, timeout=8):
     """Our public IP as the outside world sees it, optionally via the proxy.
 
-    This is what turns 'saved' into 'proven': if the proxied IP equals the direct
-    IP the proxy is not actually carrying our traffic. Best-effort — any failure
-    returns None and is reported as 'could not check', never as success."""
+    Returns (ip, error). This is what turns 'saved' into 'proven': if the proxied
+    IP equals the direct IP the proxy is not actually carrying our traffic. The
+    error half matters as much as the IP — without it a failed check can only say
+    "it didn't work", which is where bug #35 debugging stalled."""
+    url = 'https://api.ipify.org?format=json'
     try:
-        url = 'https://api.ipify.org?format=json'
         proxies = _scraper_proxies(url) if through_proxy else None
         if through_proxy and not proxies:
-            return None
+            return None, 'no proxy is configured, or the kill switch is on'
         r = req.get(url, timeout=timeout, proxies=proxies)
-        return ((r.json() or {}).get('ip') or '').strip() or None
-    except Exception:
-        return None
+        if r.status_code != 200:
+            return None, f'the IP check answered HTTP {r.status_code}'
+        ip = ((r.json() or {}).get('ip') or '').strip()
+        return (ip or None), (None if ip else 'the IP check returned no address')
+    except Exception as e:
+        return None, _proxy_failure_hint(e)
+
+
+def _scraper_proxy_probe():
+    """Compare our egress IP with and without the proxy and say what we found.
+
+    Shared by save and re-test so both report identically. `verified` is true
+    ONLY when the proxy demonstrably changed our IP — everything else, including
+    a save that worked, is a warning, because _scrape_request falls back to a
+    direct connection and a broken proxy otherwise looks exactly like success."""
+    killed = (os.getenv('SCRAPER_PROXY') or '').strip() == '0'
+    direct_ip, _direct_err = _egress_ip(False)
+    if killed:
+        return {'verified': False, 'direct_ip': direct_ip,
+                'message': 'Saved, but the kill switch is on — traffic still goes direct.'}
+    proxy_ip, proxy_err = _egress_ip(True)
+    if proxy_ip and direct_ip and proxy_ip != direct_ip:
+        return {'verified': True, 'proxy_ip': proxy_ip, 'direct_ip': direct_ip,
+                'message': f'Working — competitor traffic now leaves from {proxy_ip} '
+                           f'instead of {direct_ip}.'}
+    if proxy_ip and direct_ip and proxy_ip == direct_ip:
+        return {'verified': False, 'proxy_ip': proxy_ip, 'direct_ip': direct_ip,
+                'message': 'The proxy did NOT change our IP — check the credentials. '
+                           'Requests silently fall back to a direct connection.'}
+    if proxy_ip:
+        return {'verified': True, 'proxy_ip': proxy_ip,
+                'message': f'Working — competitor traffic now leaves from {proxy_ip}.'}
+    return {'verified': False, 'direct_ip': direct_ip, 'error_detail': proxy_err,
+            'message': f'The test request through the proxy failed: {proxy_err}. '
+                       f'Scraping falls back to direct traffic until this works.'}
 
 
 @app.route('/api/scraper_proxy_status')
@@ -5640,24 +5694,22 @@ def api_save_scraper_proxy():
     print(f'[scrape] proxy saved via dashboard: {_proxy_host_hint(url)} '
           f'(enabled={enabled})')  # host only — never the credentials
 
-    direct_ip = _egress_ip(False)
-    proxy_ip = _egress_ip(True) if enabled else None
-    if not enabled:
-        verdict = 'Saved, but the kill switch is on — traffic still goes direct.'
-    elif proxy_ip and direct_ip and proxy_ip != direct_ip:
-        verdict = f'Working — competitor traffic now leaves from {proxy_ip} instead of {direct_ip}.'
-    elif proxy_ip and direct_ip and proxy_ip == direct_ip:
-        verdict = ('Saved, but the proxy did NOT change our IP — check the credentials. '
-                   'Requests silently fall back to a direct connection.')
-    elif proxy_ip:
-        verdict = f'Working — competitor traffic now leaves from {proxy_ip}.'
-    else:
-        verdict = ('Saved, but the test request through the proxy failed. '
-                   'Scraping will fall back to direct traffic until this works.')
+    probe = _scraper_proxy_probe()
     return jsonify({'ok': True, 'configured': True, 'enabled': enabled,
-                    'host_hint': _proxy_host_hint(url),
-                    'verified': bool(proxy_ip and direct_ip and proxy_ip != direct_ip),
-                    'message': verdict})
+                    'host_hint': _proxy_host_hint(url), **probe})
+
+
+@app.route('/api/test_scraper_proxy', methods=['POST'])
+@require_droplet_token
+def api_test_scraper_proxy():
+    """Re-run the egress check against the STORED proxy, without re-pasting it.
+
+    Needed because the usual failures are fixed at the provider (top up traffic,
+    whitelist our IP, reset the password) and then you just want to ask "does it
+    work now?" — the URL never changed."""
+    if not (os.getenv('SCRAPER_PROXY_URL') or '').strip():
+        return jsonify({'error': 'No proxy is configured yet.'}), 400
+    return jsonify({'ok': True, **_scraper_proxy_probe()})
 
 
 @app.route('/api/debug_classify')

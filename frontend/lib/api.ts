@@ -612,8 +612,22 @@ export const api = {
       host_hint?: string;
       verified?: boolean;
       message?: string;
+      error_detail?: string;
       error?: string;
     }>("/api/save_scraper_proxy", { method: "POST", body: params, authed: true }),
+
+  /** Re-run the egress check against the stored proxy. The usual failures are
+   *  fixed at the provider, so you want to re-test without re-pasting. */
+  testScraperProxy: () =>
+    call<{
+      ok?: boolean;
+      verified?: boolean;
+      proxy_ip?: string;
+      direct_ip?: string;
+      message?: string;
+      error_detail?: string;
+      error?: string;
+    }>("/api/test_scraper_proxy", { method: "POST", authed: true }),
 
   higgsfield: (params: {
     prompt_type: number;
