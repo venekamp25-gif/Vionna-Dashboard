@@ -13,7 +13,8 @@ if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
     except Exception:
         pass
 
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'), override=True)
+ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+load_dotenv(ENV_PATH, override=True)
 
 app = Flask(__name__, static_folder='.')
 app.secret_key = os.environ.get('SECRET_KEY') or os.urandom(24)
@@ -5502,6 +5503,161 @@ def api_save_dataforseo_credentials():
     os.environ['DATAFORSEO_PASSWORD'] = password
     print('[dataforseo] credentials saved (login length %d)' % len(login))  # never log the value
     return jsonify({'ok': True, 'configured': True})
+
+
+# ── Scraper proxy settings (plan #3 / bug #35) ──────────────────────────────
+# The proxy is the fix for competitor shops blocking the droplet's datacentre IP,
+# but until now the only way to configure it was SSH into the droplet and edit
+# .env by hand. That made a two-minute change a CEO-only task. These two routes
+# move it into the dashboard, following exactly the shape of
+# /api/save_dataforseo_credentials above: gated, applied live, never echoed back.
+_ENV_ALLOWED_KEYS = ('SCRAPER_PROXY_URL', 'SCRAPER_PROXY')
+
+
+def _env_write(values):
+    """Persist {KEY: value} to backend/.env, replacing existing lines. A value of
+    None deletes the key. Only keys in _ENV_ALLOWED_KEYS are ever touched — a
+    settings form must never be able to rewrite arbitrary server config."""
+    bad = [k for k in values if k not in _ENV_ALLOWED_KEYS]
+    if bad:
+        raise ValueError(f'refusing to write non-allowlisted key(s): {bad}')
+    env_path = ENV_PATH
+    lines = []
+    if os.path.exists(env_path):
+        with open(env_path, 'r', encoding='utf-8') as f:
+            lines = [ln.rstrip('\n') for ln in f]
+    lines = [ln for ln in lines
+             if not any(ln.startswith(k + '=') for k in values)]
+    for key, val in values.items():
+        if val is not None:
+            lines.append(f'{key}={val}')
+    tmp = env_path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
+    os.replace(tmp, env_path)
+
+
+def _proxy_host_hint(url):
+    """host:port of a proxy URL — safe to show. Credentials are stripped."""
+    try:
+        u = urllib.parse.urlparse(url)
+        if not u.hostname:
+            return ''
+        return u.hostname + (f':{u.port}' if u.port else '')
+    except Exception:
+        return ''
+
+
+def _egress_ip(through_proxy, timeout=8):
+    """Our public IP as the outside world sees it, optionally via the proxy.
+
+    This is what turns 'saved' into 'proven': if the proxied IP equals the direct
+    IP the proxy is not actually carrying our traffic. Best-effort — any failure
+    returns None and is reported as 'could not check', never as success."""
+    try:
+        url = 'https://api.ipify.org?format=json'
+        proxies = _scraper_proxies(url) if through_proxy else None
+        if through_proxy and not proxies:
+            return None
+        r = req.get(url, timeout=timeout, proxies=proxies)
+        return ((r.json() or {}).get('ip') or '').strip() or None
+    except Exception:
+        return None
+
+
+@app.route('/api/scraper_proxy_status')
+def api_scraper_proxy_status():
+    """Non-secret view of the scraper-proxy config for the Settings form.
+
+    Deliberately never returns the URL: it carries credentials. Note this
+    distinguishes 'no URL set' from 'kill switch on', which /api/health cannot —
+    that ambiguity cost real debugging time on bug #35."""
+    raw = (os.getenv('SCRAPER_PROXY_URL') or '').strip()
+    killed = (os.getenv('SCRAPER_PROXY') or '').strip() == '0'
+    return jsonify({
+        'configured': bool(raw),
+        'enabled': bool(raw) and not killed,
+        'kill_switch': killed,
+        'host_hint': _proxy_host_hint(raw),
+        'active': bool(_scraper_proxies('https://example.com/products/x.json')),
+    })
+
+
+@app.route('/api/save_scraper_proxy', methods=['POST'])
+@require_droplet_token
+def api_save_scraper_proxy():
+    """Save/clear the scraper proxy from the dashboard. Gated. Writes .env AND
+    applies to the live process, so it takes effect without a restart —
+    _scraper_proxies reads os.getenv on every request. Never logs or returns the
+    URL itself."""
+    body = request.get_json(silent=True) or {}
+    raw = body.get('proxy_url')
+    raw = '' if raw is None else str(raw)
+    url = raw.strip()
+    # REJECT embedded whitespace rather than stripping it out. Silently removing
+    # a newline glues the rest of the payload onto the URL
+    # ("...:8080ANTHROPIC_API_KEY=stolen"), which lands in .env as one line and
+    # corrupts the value instead of injecting a key — still wrong, and it hides
+    # the mistake from whoever pasted it. A caller with a newline in their proxy
+    # URL has a broken URL; say so.
+    if re.search(r'\s', url):
+        return jsonify({'error': 'Proxy URL must not contain spaces or line breaks.'}), 400
+    enabled = body.get('enabled')
+    enabled = True if enabled is None else bool(enabled)
+
+    if not url:
+        try:
+            _env_write({'SCRAPER_PROXY_URL': None, 'SCRAPER_PROXY': None})
+        except Exception as e:
+            return jsonify({'error': 'Could not write .env: ' + str(e)[:80]}), 500
+        os.environ.pop('SCRAPER_PROXY_URL', None)
+        os.environ.pop('SCRAPER_PROXY', None)
+        print('[scrape] proxy cleared via dashboard')
+        return jsonify({'ok': True, 'configured': False, 'enabled': False,
+                        'message': 'Proxy removed — scraper traffic goes direct again.'})
+
+    if len(url) > 500:
+        return jsonify({'error': 'Proxy URL too long.'}), 400
+    try:
+        parsed = urllib.parse.urlparse(url)
+        parsed.port          # raises ValueError on a malformed port
+    except Exception:
+        parsed = None
+    # http/https only: a socks5:// URL needs the PySocks extra, which is not in
+    # requirements.txt — requests would raise InvalidSchema on every scrape and
+    # _scrape_request only catches ProxyError/InvalidProxyURL. All the residential
+    # providers offer an HTTP gateway, so this costs nothing.
+    if not parsed or parsed.scheme not in ('http', 'https') or not parsed.hostname:
+        return jsonify({'error': 'Enter a full proxy URL like '
+                                 'http://user:pass@gateway.provider.net:8080'}), 400
+
+    try:
+        _env_write({'SCRAPER_PROXY_URL': url, 'SCRAPER_PROXY': '1' if enabled else '0'})
+    except Exception as e:
+        return jsonify({'error': 'Could not write .env: ' + str(e)[:80]}), 500
+    os.environ['SCRAPER_PROXY_URL'] = url
+    os.environ['SCRAPER_PROXY'] = '1' if enabled else '0'
+    print(f'[scrape] proxy saved via dashboard: {_proxy_host_hint(url)} '
+          f'(enabled={enabled})')  # host only — never the credentials
+
+    direct_ip = _egress_ip(False)
+    proxy_ip = _egress_ip(True) if enabled else None
+    if not enabled:
+        verdict = 'Saved, but the kill switch is on — traffic still goes direct.'
+    elif proxy_ip and direct_ip and proxy_ip != direct_ip:
+        verdict = f'Working — competitor traffic now leaves from {proxy_ip} instead of {direct_ip}.'
+    elif proxy_ip and direct_ip and proxy_ip == direct_ip:
+        verdict = ('Saved, but the proxy did NOT change our IP — check the credentials. '
+                   'Requests silently fall back to a direct connection.')
+    elif proxy_ip:
+        verdict = f'Working — competitor traffic now leaves from {proxy_ip}.'
+    else:
+        verdict = ('Saved, but the test request through the proxy failed. '
+                   'Scraping will fall back to direct traffic until this works.')
+    return jsonify({'ok': True, 'configured': True, 'enabled': enabled,
+                    'host_hint': _proxy_host_hint(url),
+                    'verified': bool(proxy_ip and direct_ip and proxy_ip != direct_ip),
+                    'message': verdict})
 
 
 @app.route('/api/debug_classify')

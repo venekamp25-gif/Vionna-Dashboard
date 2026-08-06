@@ -36,6 +36,54 @@ export function SettingsModal({ open, onClose }: Props) {
     if (!open) return;
     void api.keywordResearchStatus().then(setDfsStatus).catch(() => {});
   }, [open]);
+  // Scraper egress proxy — competitor shops rate-limit the droplet's IP (bug #35).
+  // Configuring this used to require SSH into the droplet; now it lives here.
+  const [proxyUrl, setProxyUrl] = useState("");
+  const [proxyBusy, setProxyBusy] = useState(false);
+  const [proxyStatus, setProxyStatus] = useState<{
+    configured: boolean;
+    enabled: boolean;
+    kill_switch: boolean;
+    host_hint?: string;
+  } | null>(null);
+  const [proxyMsg, setProxyMsg] = useState<string | null>(null);
+  const [proxyOk, setProxyOk] = useState(false);
+  useEffect(() => {
+    if (!open) return;
+    void api.scraperProxyStatus().then(setProxyStatus).catch(() => {});
+  }, [open]);
+  const saveProxy = async (clear = false) => {
+    if (!clear && !proxyUrl.trim()) {
+      setProxyMsg("Paste the proxy URL first.");
+      setProxyOk(false);
+      return;
+    }
+    setProxyBusy(true);
+    setProxyMsg(null);
+    try {
+      const r = await api.saveScraperProxy({
+        proxy_url: clear ? "" : proxyUrl.trim(),
+        enabled: true,
+      });
+      if (r.error) {
+        setProxyMsg(r.error);
+        setProxyOk(false);
+      } else {
+        // `verified` means the egress IP actually changed. Without it the save
+        // succeeded but scraping silently falls back to a direct connection.
+        setProxyOk(Boolean(r.verified) || clear);
+        setProxyMsg((r.verified || clear ? "✓ " : "⚠ ") + (r.message ?? "Saved."));
+        if (clear) setProxyUrl("");
+        void api.scraperProxyStatus().then(setProxyStatus).catch(() => {});
+      }
+    } catch (e) {
+      setProxyMsg(e instanceof Error ? e.message : "Could not save.");
+      setProxyOk(false);
+    } finally {
+      setProxyBusy(false);
+    }
+  };
+
   const saveDfs = async () => {
     if (!dfsLogin.trim() || !dfsPassword.trim()) {
       setDfsMsg("Enter both login and password.");
@@ -654,6 +702,68 @@ export function SettingsModal({ open, onClose }: Props) {
                   </span>
                 )}
               </div>
+            </div>
+          </div>
+
+          {/* ── Scraper egress proxy ───────────────────────────────── */}
+          <div className="mt-8 pt-6 border-t border-border">
+            <div className="text-[14px] font-semibold text-text mb-1">
+              Scraper proxy — competitor access
+              {proxyStatus?.enabled && (
+                <span className="ml-2 text-[11px] text-accent align-middle">● active</span>
+              )}
+              {proxyStatus?.kill_switch && (
+                <span className="ml-2 text-[11px] text-danger align-middle">● switched off</span>
+              )}
+            </div>
+            <p className="text-[12px] text-text-faint mb-3 leading-relaxed">
+              Competitor shops rate-limit our server&apos;s IP, not our code — that&apos;s why a store
+              suddenly &quot;can&apos;t be read&quot;. Paste the gateway URL from your residential-proxy
+              provider (IPRoyal, Smartproxy, Bright Data, Oxylabs) and competitor requests go out over
+              their IPs instead. Applied immediately, no restart. Written to the server only and never
+              shown back. Product images bypass the proxy, so you don&apos;t pay per-GB for them.
+            </p>
+            {proxyStatus?.configured && (
+              <p className={`text-[12px] mb-3 ${proxyStatus.enabled ? "text-accent" : "text-danger"}`}>
+                {proxyStatus.enabled ? "✓ Active" : "⚠ Configured but switched off"}
+                {proxyStatus.host_hint ? ` (${proxyStatus.host_hint})` : ""}. Enter a new URL to replace.
+              </p>
+            )}
+            <div className="flex flex-col gap-2 max-w-[440px]">
+              <input
+                type="password"
+                value={proxyUrl}
+                onChange={(e) => setProxyUrl(e.target.value)}
+                placeholder="http://user:pass@gateway.provider.net:8080"
+                autoComplete="new-password"
+                spellCheck={false}
+                className="w-full px-3 h-10 rounded-[10px] bg-bg-elev-2 border border-border text-[13px] focus:outline-none focus:border-accent focus:ring-3 focus:ring-[var(--accent-soft)]"
+              />
+              <div className="flex items-center gap-2 flex-wrap">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={proxyBusy || !proxyUrl.trim()}
+                  onClick={() => void saveProxy()}
+                >
+                  {proxyBusy ? "Saving & testing…" : "Save and test"}
+                </Button>
+                {proxyStatus?.configured && (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={proxyBusy}
+                    onClick={() => void saveProxy(true)}
+                  >
+                    Remove
+                  </Button>
+                )}
+              </div>
+              {proxyMsg && (
+                <span className={`text-[11px] ${proxyOk ? "text-accent" : "text-danger"}`}>
+                  {proxyMsg}
+                </span>
+              )}
             </div>
           </div>
 
