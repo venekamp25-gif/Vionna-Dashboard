@@ -176,3 +176,65 @@ def test_an_unknown_check_is_rejected(client):
     r = client.get('/api/selftest?what=everything')
 
     assert r.status_code == 400
+
+
+# ── A failed measurement is not a failed proxy ──────────────────────────────
+# On its first real run this endpoint reported "the proxy is NOT carrying our
+# traffic" while meshki scanned 19/19 through that very proxy: the ipify check
+# timed out because residential proxies are slow, and the two failure modes had
+# been collapsed into one verdict.
+
+def test_an_unreachable_ip_check_is_inconclusive_not_a_dead_proxy(client, monkeypatch):
+    monkeypatch.setenv('SCRAPER_PROXY_URL', 'http://user:secret@gateway.example.net:8080')
+    monkeypatch.setattr(server, '_egress_ip', lambda through_proxy, timeout=None:
+                        (None, 'the gateway did not answer in time')
+                        if through_proxy else ('1.2.3.4', None))
+
+    body = client.get('/api/selftest?what=scraper_proxy').get_json()
+
+    assert body['ok'] is False
+    assert body['inconclusive'] is True
+    assert 'does NOT prove the proxy is down' in body['message']
+
+
+def test_an_unchanged_ip_is_a_definite_failure(client, monkeypatch):
+    """Distinct from the case above: we DID measure, and the answer is bad."""
+    monkeypatch.setenv('SCRAPER_PROXY_URL', 'http://user:secret@gateway.example.net:8080')
+    monkeypatch.setattr(server, '_egress_ip',
+                        lambda through_proxy, timeout=None: ('1.2.3.4', None))
+
+    body = client.get('/api/selftest?what=scraper_proxy').get_json()
+
+    assert body['ok'] is False
+    assert body['inconclusive'] is False
+    assert 'unchanged' in body['message']
+
+
+def test_a_working_proxy_is_neither_failed_nor_inconclusive(client, monkeypatch):
+    monkeypatch.setenv('SCRAPER_PROXY_URL', 'http://user:secret@gateway.example.net:8080')
+    monkeypatch.setattr(server, '_egress_ip', lambda through_proxy, timeout=None:
+                        ('5.5.5.5', None) if through_proxy else ('1.2.3.4', None))
+
+    body = client.get('/api/selftest?what=scraper_proxy').get_json()
+
+    assert body['ok'] is True
+    assert body['inconclusive'] is False
+
+
+def test_the_proxied_ip_check_gets_a_longer_timeout(monkeypatch):
+    """8s was too short for a residential proxy — that is what caused the false
+    alarm. Assert the asymmetry directly."""
+    seen = {}
+
+    def fake_get(url, timeout=None, **kw):
+        seen[bool(kw.get('proxies'))] = timeout
+        raise Exception('stop here')
+
+    monkeypatch.setenv('SCRAPER_PROXY_URL', 'http://user:p@gateway.example.net:8080')
+    monkeypatch.setattr(server.req, 'get', fake_get)
+
+    server._egress_ip(True)
+    server._egress_ip(False)
+
+    assert seen[True] > seen[False]
+    assert seen[True] >= 20

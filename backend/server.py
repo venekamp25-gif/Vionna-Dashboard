@@ -5501,11 +5501,23 @@ def api_selftest():
         # egress IPs, and error_detail falls back to raw exception text, which
         # from requests can contain the proxy URL — credentials included. The
         # Settings form is gated and shows the detail there.
-        verified = bool(probe.get('verified'))
-        result = {'ok': verified,
-                  'message': ('The proxy is carrying our competitor traffic.' if verified else
-                              'The proxy is NOT carrying our traffic — requests fall back to a '
-                              'direct connection. Open Settings → Scraper proxy for the reason.')}
+        #
+        # THREE outcomes, not two. Collapsing the last two into "not working" is
+        # what this endpoint did on its first real run: the IP check timed out
+        # while the proxy was demonstrably carrying scraper traffic, and it
+        # reported the proxy as dead. A failed measurement is not a failed proxy.
+        if probe.get('verified'):
+            result = {'ok': True, 'inconclusive': False,
+                      'message': 'The proxy is carrying our competitor traffic.'}
+        elif probe.get('proxy_ip'):
+            result = {'ok': False, 'inconclusive': False,
+                      'message': 'The proxy is NOT carrying our traffic — our egress IP is '
+                                 'unchanged. Requests fall back to a direct connection.'}
+        else:
+            result = {'ok': False, 'inconclusive': True,
+                      'message': 'Could not verify: the IP check through the proxy did not '
+                                 'answer. This does NOT prove the proxy is down — confirm with '
+                                 'a real scan (/api/bestseller_scan?domain=…) before acting.'}
     _SELFTEST_CACHE[what] = {'ts': now, 'result': result}
     out = dict(result)
     out['from_cache'] = False
@@ -5651,14 +5663,22 @@ def _proxy_failure_hint(exc):
     return text[:160]
 
 
-def _egress_ip(through_proxy, timeout=8):
+def _egress_ip(through_proxy, timeout=None):
     """Our public IP as the outside world sees it, optionally via the proxy.
+
+    The proxied call gets a far longer timeout than the direct one: residential
+    proxies route through consumer connections and are simply slow. At the
+    original 8s the check timed out against a proxy that was demonstrably
+    carrying our scraper traffic (meshki scanned 19/19 at the same moment), and
+    reported it as dead.
 
     Returns (ip, error). This is what turns 'saved' into 'proven': if the proxied
     IP equals the direct IP the proxy is not actually carrying our traffic. The
     error half matters as much as the IP — without it a failed check can only say
     "it didn't work", which is where bug #35 debugging stalled."""
     url = 'https://api.ipify.org?format=json'
+    if timeout is None:
+        timeout = 25 if through_proxy else 8
     try:
         proxies = _scraper_proxies(url) if through_proxy else None
         if through_proxy and not proxies:
