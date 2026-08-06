@@ -5514,10 +5514,20 @@ def api_selftest():
                       'message': 'The proxy is NOT carrying our traffic — our egress IP is '
                                  'unchanged. Requests fall back to a direct connection.'}
         else:
-            result = {'ok': False, 'inconclusive': True,
-                      'message': 'Could not verify: the IP check through the proxy did not '
-                                 'answer. This does NOT prove the proxy is down — confirm with '
-                                 'a real scan (/api/bestseller_scan?domain=…) before acting.'}
+            # Pass the reason through ONLY when it is one of our own curated
+            # messages. Those contain no part of the exception; the raw fallback
+            # can carry the proxy URL, credentials included, and must never reach
+            # an ungated endpoint. Without a reason here the caller is blind:
+            # this exact case failed in 0.6s across three hosts, which rules out
+            # a timeout, and that distinction is not visible from ok:false alone.
+            detail = probe.get('error_detail')
+            msg = ('Could not verify: the IP check through the proxy did not answer. '
+                   'This does NOT prove the proxy is down — confirm with a real scan '
+                   '(/api/bestseller_scan?domain=…) before acting.')
+            if detail in _PROXY_HINTS_SAFE:
+                msg = f'Could not verify — {detail}. This does NOT prove the proxy is ' \
+                      f'down for scraping; confirm with a real scan.'
+            result = {'ok': False, 'inconclusive': True, 'message': msg}
     _SELFTEST_CACHE[what] = {'ts': now, 'result': result}
     out = dict(result)
     out['from_cache'] = False
@@ -5642,25 +5652,42 @@ def _proxy_host_hint(url):
         return ''
 
 
+# (needle-or-needles, message). The messages are written by us and contain no
+# part of the exception, so they are safe to show on an UNGATED endpoint —
+# unlike str(exception), which from requests can carry the proxy URL with its
+# credentials. _PROXY_HINTS_SAFE is the membership test for exactly that.
+_PROXY_FAILURE_HINTS = (
+    (('407', 'proxy authentication'),
+     'the provider rejected our credentials (HTTP 407) — check the proxy '
+     'username/password, and that the account actually has traffic left'),
+    (('name or service not known', 'nodename nor servname', 'failed to resolve', 'getaddrinfo'),
+     'the gateway hostname could not be resolved — check the host part of the URL'),
+    (('connection refused',),
+     'the gateway refused the connection — check the port'),
+    (('connection reset', 'connectionreseterror', 'remotedisconnected',
+      'connection aborted', 'badstatusline'),
+     'the gateway accepted the connection and then dropped it — typical when the '
+     'provider blocks the destination host, or the traffic balance is gone'),
+    (('tunnel connection failed', 'cannot connect to proxy'),
+     'the proxy refused to open a tunnel to that host — the provider is likely '
+     'blocking the destination'),
+    (('timed out', 'timeout'),
+     'the gateway did not answer in time — check the host and port'),
+)
+_PROXY_HINTS_SAFE = frozenset(msg for _needles, msg in _PROXY_FAILURE_HINTS)
+
+
 def _proxy_failure_hint(exc):
     """Turn a requests proxy exception into something the CEO can act on.
 
     "the test request failed" is useless when the fix differs per cause: no
     traffic balance, wrong credentials and an unreachable gateway all look
     identical otherwise."""
-    text = str(exc)
-    low = text.lower()
-    if '407' in text or 'proxy authentication' in low:
-        return ('the provider rejected our credentials (HTTP 407) — check the proxy '
-                'username/password, and that the account actually has traffic left')
-    if 'name or service not known' in low or 'nodename nor servname' in low \
-            or 'failed to resolve' in low or 'getaddrinfo' in low:
-        return 'the gateway hostname could not be resolved — check the host part of the URL'
-    if 'connection refused' in low:
-        return 'the gateway refused the connection — check the port'
-    if 'timed out' in low or 'timeout' in low:
-        return 'the gateway did not answer in time — check the host and port'
-    return text[:160]
+    low = str(exc).lower()
+    for needles, msg in _PROXY_FAILURE_HINTS:
+        if any(n in low for n in needles):
+            return msg
+    return str(exc)[:160]
 
 
 # Tried in order until one answers. icanhazip is FIRST because it is the host
