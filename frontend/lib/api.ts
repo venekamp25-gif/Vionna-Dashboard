@@ -600,6 +600,12 @@ export const api = {
       kill_switch: boolean;
       host_hint?: string;
       active: boolean;
+      /** Verdict of the LAST real competitor request that used the proxy. True
+       *  means traffic is silently going direct right now. */
+      proxy_failing?: boolean;
+      proxy_failures?: number;
+      proxy_requests?: number;
+      proxy_last_reason?: string | null;
     }>("/api/scraper_proxy_status", { method: "GET" }),
 
   /** Save (or clear, with an empty proxy_url) the scraper proxy. Written to the

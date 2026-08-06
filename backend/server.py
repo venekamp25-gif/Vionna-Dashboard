@@ -643,6 +643,7 @@ def health():
         # Whether competitor scraping leaves the droplet through the residential
         # proxy (bug #34). Boolean only — the proxy URL holds credentials.
         'scraper_proxy': bool(_scraper_proxies('https://example.com/products/x.json')),
+        'scraper_proxy_failing': _proxy_health_snapshot()['proxy_failing'],
     })
 
 
@@ -1329,18 +1330,45 @@ def _scraper_proxies(url):
     return {'http': proxy, 'https': proxy}
 
 
+# Live record of what the proxy is actually doing. The fallback below is
+# deliberately silent to the caller — that is what keeps a broken proxy from
+# taking the scraper down — but it also meant a proxy rejected with HTTP 407 kept
+# quietly routing competitor traffic over our own IP for hours, and nothing
+# short of running a probe by hand could tell. `failing` is the last proxied
+# attempt's verdict, so the dashboard can say so without any live test.
+_PROXY_HEALTH = {'ok': 0, 'failed': 0, 'last_ok_ts': 0.0, 'last_fail_ts': 0.0,
+                 'last_reason': None}
+
+
+def _proxy_health_snapshot():
+    h = _PROXY_HEALTH
+    used = h['ok'] + h['failed']
+    return {'proxy_requests': used,
+            'proxy_failures': h['failed'],
+            'proxy_failing': bool(h['failed'] and h['last_fail_ts'] > h['last_ok_ts']),
+            'proxy_last_reason': (h['last_reason']
+                                  if h['last_reason'] in _PROXY_HINTS_SAFE else None)}
+
+
 def _scrape_request(url, timeout, headers):
     """One GET through the scraper proxy when configured, else direct.
 
     A proxy that is down must never take the whole scraper with it: if we can't
     reach the proxy itself we log it and repeat the request directly, which is
-    exactly what we did before there was a proxy."""
+    exactly what we did before there was a proxy. Every outcome is recorded in
+    _PROXY_HEALTH so that silent fallback is still *visible* afterwards."""
     proxies = _scraper_proxies(url)
     if not proxies:
         return req.get(url, timeout=timeout, headers=headers)
     try:
-        return req.get(url, timeout=timeout, headers=headers, proxies=proxies)
+        r = req.get(url, timeout=timeout, headers=headers, proxies=proxies)
+        _PROXY_HEALTH['ok'] += 1
+        _PROXY_HEALTH['last_ok_ts'] = time.time()
+        return r
     except (req.exceptions.ProxyError, req.exceptions.InvalidProxyURL) as e:
+        _PROXY_HEALTH['failed'] += 1
+        _PROXY_HEALTH['last_fail_ts'] = time.time()
+        _PROXY_HEALTH['last_reason'] = _proxy_failure_hint(e)
         print(f"[scrape] proxy unusable ({str(e)[:100]}) — falling back to a direct request for {url}")
         return req.get(url, timeout=timeout, headers=headers)
 
@@ -5527,7 +5555,8 @@ def api_selftest():
             if detail in _PROXY_HINTS_SAFE:
                 msg = f'Could not verify — {detail}. This does NOT prove the proxy is ' \
                       f'down for scraping; confirm with a real scan.'
-            result = {'ok': False, 'inconclusive': True, 'message': msg}
+            result = {'ok': False, 'inconclusive': True, 'message': msg,
+                  **_proxy_health_snapshot()}
     _SELFTEST_CACHE[what] = {'ts': now, 'result': result}
     out = dict(result)
     out['from_cache'] = False
@@ -5794,6 +5823,7 @@ def api_scraper_proxy_status():
         'kill_switch': killed,
         'host_hint': _proxy_host_hint(raw),
         'active': bool(_scraper_proxies('https://example.com/products/x.json')),
+        **_proxy_health_snapshot(),
     })
 
 

@@ -115,3 +115,76 @@ def test_health_reports_whether_the_proxy_is_on(monkeypatch):
 
     monkeypatch.setenv('SCRAPER_PROXY_URL', PROXY)
     assert client.get('/api/health').get_json()['scraper_proxy'] is True
+
+
+# ── A silent fallback must still be visible afterwards ──────────────────────
+# The fallback is what keeps a broken proxy from taking the scraper down, but on
+# 2026-08-06 it also meant a proxy rejected with HTTP 407 quietly routed
+# competitor traffic over our own IP for hours. Nothing short of running a probe
+# by hand could tell. _PROXY_HEALTH records every outcome so the dashboard can.
+
+@pytest.fixture(autouse=True)
+def _reset_proxy_health():
+    server._PROXY_HEALTH.update(ok=0, failed=0, last_ok_ts=0.0, last_fail_ts=0.0,
+                                last_reason=None)
+
+
+def test_a_fallback_is_recorded_not_just_logged(monkeypatch):
+    monkeypatch.setenv('SCRAPER_PROXY_URL', PROXY)
+    calls = []
+
+    def fake_get(url, timeout=None, headers=None, **kwargs):
+        calls.append(bool(kwargs.get('proxies')))
+        if kwargs.get('proxies'):
+            raise server.req.exceptions.ProxyError('407 Proxy Authentication Required')
+        return _FakeResponse(200, 'ok')
+
+    monkeypatch.setattr(server.req, 'get', fake_get)
+
+    server._scrape_get('https://shop.example/products/x.json')
+    snap = server._proxy_health_snapshot()
+
+    assert calls == [True, False], 'should try the proxy, then fall back'
+    assert snap['proxy_failing'] is True
+    assert snap['proxy_failures'] == 1
+    assert 'traffic left' in snap['proxy_last_reason']
+
+
+def test_a_working_proxy_is_not_reported_as_failing(monkeypatch):
+    monkeypatch.setenv('SCRAPER_PROXY_URL', PROXY)
+    monkeypatch.setattr(server.req, 'get',
+                        lambda url, timeout=None, headers=None, **kw: _FakeResponse(200, 'ok'))
+
+    server._scrape_get('https://shop.example/products/x.json')
+
+    assert server._proxy_health_snapshot()['proxy_failing'] is False
+
+
+def test_recovery_clears_the_failing_flag(monkeypatch):
+    """A single old failure must not mark the proxy broken forever — the flag is
+    the LAST attempt's verdict, not a sticky bit."""
+    monkeypatch.setenv('SCRAPER_PROXY_URL', PROXY)
+    server._PROXY_HEALTH.update(failed=1, last_fail_ts=1.0)
+    monkeypatch.setattr(server.req, 'get',
+                        lambda url, timeout=None, headers=None, **kw: _FakeResponse(200, 'ok'))
+
+    server._scrape_get('https://shop.example/products/x.json')
+
+    assert server._proxy_health_snapshot()['proxy_failing'] is False
+
+
+def test_the_recorded_reason_is_never_raw_exception_text(monkeypatch):
+    """proxy_last_reason is surfaced on UNGATED endpoints, so it must pass the
+    curated safe-list — a requests ProxyError can carry the proxy URL."""
+    monkeypatch.setenv('SCRAPER_PROXY_URL', PROXY)
+
+    def fake_get(url, timeout=None, headers=None, **kwargs):
+        if kwargs.get('proxies'):
+            raise server.req.exceptions.ProxyError(f'something odd {PROXY}')
+        return _FakeResponse(200, 'ok')
+
+    monkeypatch.setattr(server.req, 'get', fake_get)
+
+    server._scrape_get('https://shop.example/products/x.json')
+
+    assert server._proxy_health_snapshot()['proxy_last_reason'] is None
