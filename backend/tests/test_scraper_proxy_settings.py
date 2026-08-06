@@ -13,6 +13,10 @@ import pytest
 
 import server
 
+# Captured before the autouse fixture replaces it, so the one test that exercises
+# the REAL probe can still reach it.
+_REAL_EGRESS_IP = server._egress_ip
+
 
 @pytest.fixture(autouse=True)
 def _env_sandbox(tmp_path, monkeypatch):
@@ -24,7 +28,7 @@ def _env_sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(server, 'DROPLET_TOKEN_SECRET', '')
     # Never let the tests reach the real ipify endpoint.
     monkeypatch.setattr(server, '_egress_ip', lambda through_proxy, timeout=8:
-                        '5.5.5.5' if through_proxy else '1.2.3.4')
+                        ('5.5.5.5', None) if through_proxy else ('1.2.3.4', None))
     return tmp_path
 
 
@@ -149,7 +153,8 @@ def test_kill_switch_can_be_set_from_the_form(client, _env_sandbox):
 def test_a_proxy_that_does_not_change_our_ip_is_reported_as_broken(client, monkeypatch):
     """The dangerous silent failure: _scrape_request falls back to a direct
     request, so a wrong password looks like success unless we check the IP."""
-    monkeypatch.setattr(server, '_egress_ip', lambda through_proxy, timeout=8: '1.2.3.4')
+    monkeypatch.setattr(server, '_egress_ip',
+                        lambda through_proxy, timeout=8: ('1.2.3.4', None))
 
     body = client.post('/api/save_scraper_proxy', json={'proxy_url': PROXY}).get_json()
 
@@ -173,3 +178,62 @@ def test_saving_requires_the_token_when_a_secret_is_set(client, monkeypatch):
     r = client.post('/api/save_scraper_proxy', json={'proxy_url': PROXY})
 
     assert r.status_code == 401
+
+
+# ── Diagnostics: "the test failed" is useless without the reason ────────────
+
+def test_a_failed_probe_reports_the_actual_reason(client, monkeypatch):
+    """The first version said only "the test request failed", which is exactly
+    where diagnosis stalls — 407, an unreachable gateway and an empty balance
+    all need different fixes."""
+    monkeypatch.setattr(server, '_egress_ip', lambda through_proxy, timeout=8:
+                        (None, 'the provider rejected our credentials (HTTP 407)')
+                        if through_proxy else ('1.2.3.4', None))
+
+    body = client.post('/api/save_scraper_proxy', json={'proxy_url': PROXY}).get_json()
+
+    assert body['verified'] is False
+    assert '407' in body['message']
+    assert body['error_detail'] == 'the provider rejected our credentials (HTTP 407)'
+
+
+@pytest.mark.parametrize('raw, expected', [
+    ('407 Proxy Authentication Required', 'traffic left'),
+    ('Failed to resolve geo.example.net', 'hostname could not be resolved'),
+    ('[Errno 111] Connection refused', 'refused the connection'),
+    ('Read timed out.', 'did not answer in time'),
+])
+def test_proxy_failures_map_to_actionable_hints(raw, expected):
+    assert expected in server._proxy_failure_hint(Exception(raw))
+
+
+def test_retest_uses_the_stored_url(client, _env_sandbox):
+    """After fixing something at the provider you want to re-check without
+    pasting the credentials again."""
+    client.post('/api/save_scraper_proxy', json={'proxy_url': PROXY})
+
+    r = client.post('/api/test_scraper_proxy')
+
+    assert r.status_code == 200
+    assert r.get_json()['verified'] is True
+
+
+def test_retest_without_a_configured_proxy_is_a_clear_error(client):
+    r = client.post('/api/test_scraper_proxy')
+
+    assert r.status_code == 400
+    assert 'No proxy is configured' in r.get_json()['error']
+
+
+def test_egress_ip_returns_the_reason_it_failed(monkeypatch):
+    """_egress_ip must never swallow the exception — that detail is the whole
+    point of the probe."""
+    def boom(*a, **kw):
+        raise Exception('407 Proxy Authentication Required')
+    monkeypatch.setenv('SCRAPER_PROXY_URL', PROXY)
+    monkeypatch.setattr(server.req, 'get', boom)
+
+    ip, err = _REAL_EGRESS_IP(True)
+
+    assert ip is None
+    assert 'traffic left' in err

@@ -84,6 +84,26 @@ export function SettingsModal({ open, onClose }: Props) {
     }
   };
 
+  const retestProxy = async () => {
+    setProxyBusy(true);
+    setProxyMsg(null);
+    try {
+      const r = await api.testScraperProxy();
+      if (r.error) {
+        setProxyMsg(r.error);
+        setProxyOk(false);
+      } else {
+        setProxyOk(Boolean(r.verified));
+        setProxyMsg((r.verified ? "✓ " : "⚠ ") + (r.message ?? ""));
+      }
+    } catch (e) {
+      setProxyMsg(e instanceof Error ? e.message : "Could not test.");
+      setProxyOk(false);
+    } finally {
+      setProxyBusy(false);
+    }
+  };
+
   const saveDfs = async () => {
     if (!dfsLogin.trim() || !dfsPassword.trim()) {
       setDfsMsg("Enter both login and password.");
@@ -749,14 +769,24 @@ export function SettingsModal({ open, onClose }: Props) {
                   {proxyBusy ? "Saving & testing…" : "Save and test"}
                 </Button>
                 {proxyStatus?.configured && (
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    disabled={proxyBusy}
-                    onClick={() => void saveProxy(true)}
-                  >
-                    Remove
-                  </Button>
+                  <>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      disabled={proxyBusy}
+                      onClick={() => void retestProxy()}
+                    >
+                      {proxyBusy ? "Testing…" : "Test again"}
+                    </Button>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      disabled={proxyBusy}
+                      onClick={() => void saveProxy(true)}
+                    >
+                      Remove
+                    </Button>
+                  </>
                 )}
               </div>
               {proxyMsg && (
