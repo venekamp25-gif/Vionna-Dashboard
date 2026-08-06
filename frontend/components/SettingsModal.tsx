@@ -45,6 +45,9 @@ export function SettingsModal({ open, onClose }: Props) {
     enabled: boolean;
     kill_switch: boolean;
     host_hint?: string;
+    proxy_failing?: boolean;
+    proxy_failures?: number;
+    proxy_last_reason?: string | null;
   } | null>(null);
   const [proxyMsg, setProxyMsg] = useState<string | null>(null);
   const [proxyOk, setProxyOk] = useState(false);
@@ -749,6 +752,26 @@ export function SettingsModal({ open, onClose }: Props) {
               their IPs instead. Applied immediately, no restart. Written to the server only and never
               shown back. Product images bypass the proxy, so you don&apos;t pay per-GB for them.
             </p>
+            {/* The fallback to a direct connection is deliberately silent to the
+                scraper, so without this banner a rejected proxy keeps routing
+                competitor traffic over our own IP with nothing to show for it. */}
+            {proxyStatus?.proxy_failing && (
+              <div className="text-[12px] rounded-md border border-danger/40 bg-danger/10 text-danger px-3 py-2 mb-3">
+                <strong>Traffic is going direct right now.</strong> The last request that used
+                the proxy was rejected, so competitor requests fall back to our own IP — which
+                is what gets a store to block us.
+                {proxyStatus.proxy_last_reason ? (
+                  <>
+                    <br />
+                    Reason: {proxyStatus.proxy_last_reason}.
+                  </>
+                ) : null}
+                <br />
+                <span className="text-text-dim">
+                  Paste a currently valid gateway URL below and press Save and test.
+                </span>
+              </div>
+            )}
             {proxyStatus?.configured && (
               <p className={`text-[12px] mb-3 ${proxyStatus.enabled ? "text-accent" : "text-danger"}`}>
                 {proxyStatus.enabled ? "✓ Active" : "⚠ Configured but switched off"}
