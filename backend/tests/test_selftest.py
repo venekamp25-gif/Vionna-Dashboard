@@ -238,3 +238,70 @@ def test_the_proxied_ip_check_gets_a_longer_timeout(monkeypatch):
 
     assert seen[True] > seen[False]
     assert seen[True] >= 20
+
+
+# ── The IP check must not depend on one echo host ───────────────────────────
+# api.ipify.org never answered through IPRoyal's residential network, even at
+# 25s, while the same proxy was carrying scraper traffic fine. One provider
+# blocking one host must not make verification impossible.
+
+class _Resp:
+    def __init__(self, status_code=200, text=''):
+        self.status_code = status_code
+        self.text = text
+
+    def json(self):
+        import json as _j
+        return _j.loads(self.text)
+
+
+def test_it_falls_through_to_the_next_echo_host(monkeypatch):
+    tried = []
+
+    def fake_get(url, timeout=None, **kw):
+        tried.append(url)
+        if 'icanhazip' in url:
+            raise Exception('Read timed out.')
+        return _Resp(200, '{"ip": "5.5.5.5"}')
+
+    monkeypatch.setattr(server.req, 'get', fake_get)
+
+    ip, err = server._egress_ip(False)
+
+    assert ip == '5.5.5.5'
+    assert err is None
+    assert len(tried) == 2, 'should have moved on after the first host failed'
+
+
+def test_a_bare_text_ip_is_understood(monkeypatch):
+    """icanhazip answers with the address and nothing else — no JSON."""
+    monkeypatch.setattr(server.req, 'get',
+                        lambda url, timeout=None, **kw: _Resp(200, '203.0.113.9\n'))
+
+    ip, err = server._egress_ip(False)
+
+    assert ip == '203.0.113.9'
+    assert err is None
+
+
+def test_html_or_junk_is_not_mistaken_for_an_ip(monkeypatch):
+    """A captive portal or error page must not be parsed as our egress IP —
+    that would make two different failures compare 'equal' and read as a
+    working proxy."""
+    monkeypatch.setattr(server.req, 'get',
+                        lambda url, timeout=None, **kw: _Resp(200, '<html>blocked</html>'))
+
+    ip, err = server._egress_ip(False)
+
+    assert ip is None
+    assert err
+
+
+def test_all_hosts_failing_reports_the_last_reason(monkeypatch):
+    monkeypatch.setattr(server.req, 'get', lambda url, timeout=None, **kw:
+                        (_ for _ in ()).throw(Exception('407 Proxy Authentication Required')))
+
+    ip, err = server._egress_ip(False)
+
+    assert ip is None
+    assert 'traffic left' in err
