@@ -8853,6 +8853,22 @@ def api_fill_missing_size_charts():
 _BS_CACHE = {}          # domain -> {'ts', 'at', 'payload'}
 _BS_TTL = 12 * 3600
 
+# Per-product cache, shared across scans (plan #3 step 4, bug #35). Every scan
+# used to re-fetch all ~20 products, so one store cost ~21 requests per scan and
+# a re-scan 12h later paid the same bill again — that volume is what tips a
+# competitor's rate limiter over (meshki refused 18 of our 19 per-product
+# fetches). _BS_PROD_TTL is how long an entry is reused as-is; entries are kept
+# on disk far longer (_BS_PROD_KEEP) because a STALE entry is still the best
+# answer we have when a fetch is refused.
+_BS_PROD_CACHE = {}     # "host/handle" -> {'ts', 'p'}
+_BS_PROD_TTL = 72 * 3600
+_BS_PROD_KEEP = 30 * 24 * 3600
+_BS_PROD_MAX = 4000
+# Burst concurrency per store. Was 6; halved so a scan knocks more gently and
+# stays under rate limiters longer. Cold scans get slower, but the cache above
+# means a cold scan is now the exception rather than every 12h.
+_BS_WORKERS = 3
+
 _BS_CATEGORY_KEYWORDS = [
     ('dress',     ['dress', 'kjole', 'robe', 'mekko', 'gown', 'jurk']),
     ('jumpsuit',  ['jumpsuit', 'playsuit', 'romper', 'combinaison', 'overall']),
@@ -8955,6 +8971,85 @@ def _bs_cache_save():
         print(f'[bestsellers] cache save failed: {e}')
 
 
+BS_PROD_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bs_product_cache.json')
+
+
+def _bs_prod_slim(p):
+    """Keep only the fields _bs_scan reads, in the raw response's shape.
+
+    The full Shopify product JSON carries every variant, every image and
+    body_html — orders of magnitude more than we use, and this cache is written
+    to disk. Keeping the shape means the caller's `p.get(...)` lines work
+    unchanged whether the dict came from the network or from here."""
+    imgs = p.get('images') or []
+    var = (p.get('variants') or [{}])[0] or {}
+    return {'title': p.get('title'),
+            'images': ([{'src': imgs[0].get('src')}] if imgs else []),
+            'variants': [{'price': var.get('price')}],
+            'product_type': p.get('product_type'),
+            'published_at': p.get('published_at')}
+
+
+def _bs_prod_json(host, handle):
+    """One product's .json, cached across scans. Returns (product_dict, was_cached).
+
+    Three outcomes, in order: a fresh cache entry is returned without touching
+    the network; otherwise we fetch and store; and if that fetch fails (429,
+    timeout, blocked IP) we fall back to a stale entry rather than the empty
+    dict the caller would otherwise turn into null title/image/price. Only
+    successful fetches are ever cached — never the empty failure shape."""
+    key = f'{host}/{handle}'
+    hit = _BS_PROD_CACHE.get(key)
+    now_ts = time.time()
+    if hit and (now_ts - hit['ts']) < _BS_PROD_TTL:
+        return hit['p'], True
+    try:
+        pr = _scrape_get(f'https://{host}/products/{handle}.json', timeout=12)
+        p = (pr.json() or {}).get('product') or {}
+    except Exception:
+        p = {}
+    if p:
+        slim = _bs_prod_slim(p)
+        _BS_PROD_CACHE[key] = {'ts': now_ts, 'p': slim}
+        return slim, False
+    return (hit['p'] if hit else {}), bool(hit)
+
+
+def _bs_prod_cache_load():
+    try:
+        with open(BS_PROD_CACHE_PATH, encoding='utf-8') as f:
+            data = json.load(f) or {}
+        _BS_PROD_CACHE.update(data)
+        print(f'[bestsellers] product cache warmed from disk: {len(data)} products')
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f'[bestsellers] product cache load failed: {e}')
+
+
+def _bs_prod_cache_save():
+    """Persist, dropping entries past _BS_PROD_KEEP and capping the total.
+
+    Prunes the live dict too, not just the file — otherwise a long-running
+    process would grow it forever while the on-disk copy stayed bounded."""
+    try:
+        now_ts = time.time()
+        keep = {k: v for k, v in _BS_PROD_CACHE.items()
+                if (now_ts - v.get('ts', 0)) < _BS_PROD_KEEP}
+        if len(keep) > _BS_PROD_MAX:
+            keep = dict(sorted(keep.items(), key=lambda kv: kv[1].get('ts', 0),
+                               reverse=True)[:_BS_PROD_MAX])
+        if len(keep) != len(_BS_PROD_CACHE):
+            _BS_PROD_CACHE.clear()
+            _BS_PROD_CACHE.update(keep)
+        tmp = BS_PROD_CACHE_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(keep, f, ensure_ascii=False)
+        os.replace(tmp, BS_PROD_CACHE_PATH)
+    except Exception as e:
+        print(f'[bestsellers] product cache save failed: {e}')
+
+
 def _bs_scan(host, limit=20):
     """Scan one competitor's best-selling page. Returns (payload, None) or
     (None, blocked_reason). Retries once on 429 (we're being rate-limited,
@@ -9000,13 +9095,13 @@ def _bs_scan(host, limit=20):
     if not handles:
         return None, 'no products found on the bestseller page (maybe not a Shopify store)'
 
+    cached_hits = []
+
     def _one(pos_handle):
         pos, handle = pos_handle
-        try:
-            pr = _scrape_get(f'https://{host}/products/{handle}.json', timeout=12)
-            p = (pr.json() or {}).get('product') or {}
-        except Exception:
-            p = {}
+        p, was_cached = _bs_prod_json(host, handle)
+        if was_cached:
+            cached_hits.append(handle)
         title = p.get('title') or handle.replace('-', ' ').title()
         imgs = p.get('images') or []
         return {'position': pos, 'handle': handle, 'title': title,
@@ -9017,8 +9112,12 @@ def _bs_scan(host, limit=20):
                 'published_at': (p.get('published_at') or '')[:10],
                 'category': _bs_category(title, p.get('product_type'))}
     import concurrent.futures as _cf
-    with _cf.ThreadPoolExecutor(max_workers=6) as pool:
+    with _cf.ThreadPoolExecutor(max_workers=_BS_WORKERS) as pool:
         products = list(pool.map(_one, enumerate(handles, start=1)))
+    if cached_hits:
+        print(f'[bestsellers] {host}: {len(cached_hits)}/{len(handles)} products '
+              f'served from cache ({len(handles) - len(cached_hits)} fetched)')
+    _bs_prod_cache_save()
     # drop non-products (gift cards, parcel protection etc.) — never suggestions
     products = [p for p in products if not _BS_JUNK_RE.search(p['title'] or '')]
     products.sort(key=lambda x: x['position'])
@@ -9129,6 +9228,7 @@ def _bs_enrich(payload, host):
 
 
 _bs_cache_load()
+_bs_prod_cache_load()
 
 
 @app.route('/api/bestseller_scan')
