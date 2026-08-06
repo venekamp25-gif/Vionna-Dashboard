@@ -5663,6 +5663,32 @@ def _proxy_failure_hint(exc):
     return text[:160]
 
 
+# Tried in order until one answers. icanhazip is FIRST because it is the host
+# IPRoyal's own integration example uses, so it is known to work through their
+# residential network — api.ipify.org, the original single choice, never answered
+# through it even at a 25s timeout while the same proxy was carrying our scraper
+# traffic fine. One provider blocking one echo host must not make the whole
+# verification impossible.
+_IP_ECHO_URLS = (
+    'https://ipv4.icanhazip.com',
+    'https://api.ipify.org?format=json',
+    'https://ifconfig.me/ip',
+)
+_IP_RE = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
+
+
+def _parse_ip_echo(resp):
+    """An IPv4 address out of either a bare-text or JSON echo response."""
+    body = (resp.text or '').strip()
+    if _IP_RE.match(body):
+        return body
+    try:
+        val = ((resp.json() or {}).get('ip') or '').strip()
+        return val if _IP_RE.match(val) else None
+    except Exception:
+        return None
+
+
 def _egress_ip(through_proxy, timeout=None):
     """Our public IP as the outside world sees it, optionally via the proxy.
 
@@ -5676,20 +5702,25 @@ def _egress_ip(through_proxy, timeout=None):
     IP equals the direct IP the proxy is not actually carrying our traffic. The
     error half matters as much as the IP — without it a failed check can only say
     "it didn't work", which is where bug #35 debugging stalled."""
-    url = 'https://api.ipify.org?format=json'
     if timeout is None:
         timeout = 25 if through_proxy else 8
-    try:
-        proxies = _scraper_proxies(url) if through_proxy else None
-        if through_proxy and not proxies:
-            return None, 'no proxy is configured, or the kill switch is on'
-        r = req.get(url, timeout=timeout, proxies=proxies)
-        if r.status_code != 200:
-            return None, f'the IP check answered HTTP {r.status_code}'
-        ip = ((r.json() or {}).get('ip') or '').strip()
-        return (ip or None), (None if ip else 'the IP check returned no address')
-    except Exception as e:
-        return None, _proxy_failure_hint(e)
+    if through_proxy and not _scraper_proxies(_IP_ECHO_URLS[0]):
+        return None, 'no proxy is configured, or the kill switch is on'
+    last_err = 'the IP check did not answer'
+    for url in _IP_ECHO_URLS:
+        try:
+            proxies = _scraper_proxies(url) if through_proxy else None
+            r = req.get(url, timeout=timeout, proxies=proxies)
+            if r.status_code != 200:
+                last_err = f'the IP check answered HTTP {r.status_code}'
+                continue
+            ip = _parse_ip_echo(r)
+            if ip:
+                return ip, None
+            last_err = 'the IP check returned no usable address'
+        except Exception as e:
+            last_err = _proxy_failure_hint(e)
+    return None, last_err
 
 
 def _scraper_proxy_probe():
