@@ -50,6 +50,12 @@ export function SettingsModal({ open, onClose }: Props) {
   const [proxyOk, setProxyOk] = useState(false);
   useEffect(() => {
     if (!open) return;
+    // Clear the previous run's verdict. It is a point-in-time result, but it
+    // used to survive until the next button press, so a 407 from before the
+    // account was topped up kept reading as the CURRENT state long after the
+    // proxy started working.
+    setProxyMsg(null);
+    setProxyOk(false);
     void api.scraperProxyStatus().then(setProxyStatus).catch(() => {});
   }, [open]);
   const saveProxy = async (clear = false) => {
