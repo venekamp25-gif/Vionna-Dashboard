@@ -119,17 +119,66 @@ bug queue"), run this flow without asking for clarification first:
      ```bash
      curl -sS -X POST "https://188-166-11-177.nip.io/api/bug_reports/<id>/resolve"
      ```
-   - **Cloud / web session:** make the change on a branch and open a PR; tell the
-     user to tap **Merge** to go live. (Marking resolved can wait for the next
-     laptop session, or do it if the droplet API is reachable.)
-5. Always show what changed before it goes live; never merge/deploy on the user's
-   behalf without the change being visible to them.
+   - **Cloud / web session:** open a PR (ready for review, **not** a draft — a
+     draft cannot auto-merge), turn on **auto-merge (squash)**, and let CI be the
+     gate. Read back whether auto-merge actually got enabled; if it didn't, wait
+     for CI and merge yourself once green. Then mark the bug resolved if the
+     droplet API is reachable.
+5. CI is the gate that makes this safe, not a human read-through: `.github/
+   workflows/ci.yml` runs the backend tests + an import smoke test on the file the
+   droplet executes, plus the same `next build` Netlify publishes. Never merge
+   red, and never disable a check to get to green.
+6. Still require a human for: anything that spends money, anything that writes to
+   Shopify with live tokens, and any change whose *cause* lies outside the code
+   (empty API balance, expired key, shop down) — those go through
+   **Plans** (see below), not a PR.
 
 Notes:
 - The bug queue + Slack ping are handled entirely by the droplet; Claude does NOT
   need any Slack access — only the GitHub repo + (when reachable) the public API.
 - Data-mutation tasks that need live Shopify tokens (`tokens.json`) only work from
   the laptop, not cloud sessions.
+
+---
+
+## 🔎 Self-test endpoints — how the routine verifies its own fix
+
+Everything behind `@require_droplet_token` is unreachable from a cloud session,
+so the routine could fix a bug and then not be able to measure whether the fix
+worked. Bug #31 stayed open for exactly that reason while the code was already
+correct and the DataForSEO account healthy.
+
+`GET /api/selftest?what=keywords|scraper_proxy` — ungated, read-only, returns an
+**outcome only**:
+
+```
+curl "https://188-166-11-177.nip.io/api/selftest?what=keywords"
+# {"ok":true,"found":12,"min_volume":1800,"store":"dk","product_type":"dress"}
+curl "https://188-166-11-177.nip.io/api/selftest?what=scraper_proxy"
+# {"ok":true,"message":"The proxy is carrying our competitor traffic."}
+```
+
+- Never returns keyword text, the proxy URL, our egress IPs, or raw exception
+  text (a `requests` ProxyError can carry the proxy URL, credentials included).
+  That is why it builds its own message instead of echoing the probe's.
+- Cached 120s (`_SELFTEST_TTL`) so a retry loop can't burn DataForSEO credits.
+- `?what=keywords` stops **before** the LLM cleaning step that
+  `/api/keyword_research_niche` runs. That's deliberate: `found > 0` here but
+  nothing in the UI means the cleaner is eating the results, not the API.
+- `ok:false` **with** `error` = upstream failure; `ok:false` **without** = the
+  market genuinely has nothing above the threshold. Conflating those two is what
+  bug #31 was reported for.
+
+Other ungated checks worth knowing: `/api/health`, `/api/version`,
+`/api/scraper_proxy_status`, `/api/keyword_research_status?probe=1` (calls
+DataForSEO and reports account + balance), and `/api/bestseller_scan?domain=X`
+(the real end-to-end proof that competitor access works).
+
+Deliberately **not** done: handing the routine a session token. It reads
+untrusted input — scraped competitor HTML and bug reports typed by others — so a
+credential it holds is something a prompt injection can try to aim. These
+endpoints have nothing worth stealing. `/api/plans/<id>/approve` must never
+become reachable to the routine either; it would let it approve its own plans.
 
 ---
 

@@ -5430,6 +5430,88 @@ def api_keyword_research_status():
     return jsonify(body)
 
 
+# ── Self-test: can the hands-off routine verify its own fixes? ──────────────
+# Everything behind @require_droplet_token is unreachable from a cloud session,
+# so the routine could fix a bug and then not measure whether the fix worked —
+# bug #31 stayed open for exactly that reason while the code was already correct
+# and the account healthy. These endpoints answer the verification question and
+# nothing else: an outcome, never the data. Deliberately UNGATED, because the
+# alternative (handing the routine a credential) creates something a prompt
+# injection in scraped competitor HTML could try to abuse — and there is nothing
+# here worth stealing.
+_SELFTEST_CACHE = {}
+_SELFTEST_TTL = 120     # same guard as _DFS_PROBE_CACHE: a live call costs credits
+
+
+def _selftest_keywords():
+    """Does a keyword search still return anything above the market threshold?
+
+    Mirrors the real path up to the volume filter: translate the type to local
+    seeds, pull suggestions, count what clears the threshold. It deliberately
+    stops BEFORE the LLM cleaning step that api_keyword_research_niche runs, so
+    the two together bisect the pipeline: found > 0 here but nothing in the UI
+    means the cleaner is eating the results, not the API."""
+    store, product_type = 'dk', 'dress'
+    if not _dfs_configured():
+        return {'ok': False, 'error': 'DataForSEO is not configured', 'found': 0}
+    min_vol = DFS_MIN_VOLUME.get(store, 2000)
+    seeds = _niche_seeds_for_type(product_type, store)
+    if not seeds:
+        return {'ok': False, 'error': 'no seeds derived for the test type', 'found': 0,
+                'store': store, 'product_type': product_type}
+    found, errors = 0, []
+    for seed in seeds:
+        for kw in _dfs_keyword_suggestions(seed, store, min_volume=min_vol, limit=25):
+            if 'error' in kw:
+                errors.append(str(kw.get('error'))[:120])
+                continue
+            if (kw.get('volume') or 0) >= min_vol:
+                found += 1
+    if errors and not found:
+        # An upstream failure must never read as "nothing found" — that is the
+        # exact confusion bug #31 was reported for.
+        return {'ok': False, 'error': errors[0], 'found': 0, 'store': store,
+                'product_type': product_type, 'min_volume': min_vol, 'seed_count': len(seeds)}
+    return {'ok': found > 0, 'found': found, 'store': store, 'product_type': product_type,
+            'min_volume': min_vol, 'seed_count': len(seeds),
+            'note': 'counts keywords above the threshold, before LLM cleaning'}
+
+
+@app.route('/api/selftest')
+def api_selftest():
+    """Read-only "did it work?" checks, no session token needed. ?what=keywords|scraper_proxy
+
+    Returns an OUTCOME only — never keyword text, never the proxy URL, never
+    credentials. Cached briefly so a retry loop cannot burn DataForSEO credits."""
+    what = (request.args.get('what') or '').strip().lower()
+    if what not in ('keywords', 'scraper_proxy'):
+        return jsonify({'error': 'pass ?what=keywords or ?what=scraper_proxy'}), 400
+    now = time.time()
+    hit = _SELFTEST_CACHE.get(what)
+    if hit and (now - hit['ts']) < _SELFTEST_TTL:
+        out = dict(hit['result'])
+        out['from_cache'] = True
+        out['cache_age_seconds'] = int(now - hit['ts'])
+        return jsonify(out)
+    if what == 'keywords':
+        result = _selftest_keywords()
+    else:
+        probe = _scraper_proxy_probe()
+        # Outcome ONLY. Nothing from the probe is echoed: its message embeds both
+        # egress IPs, and error_detail falls back to raw exception text, which
+        # from requests can contain the proxy URL — credentials included. The
+        # Settings form is gated and shows the detail there.
+        verified = bool(probe.get('verified'))
+        result = {'ok': verified,
+                  'message': ('The proxy is carrying our competitor traffic.' if verified else
+                              'The proxy is NOT carrying our traffic — requests fall back to a '
+                              'direct connection. Open Settings → Scraper proxy for the reason.')}
+    _SELFTEST_CACHE[what] = {'ts': now, 'result': result}
+    out = dict(result)
+    out['from_cache'] = False
+    return jsonify(out)
+
+
 @app.route('/api/debug_dfs')
 @require_droplet_token
 def api_debug_dfs():
