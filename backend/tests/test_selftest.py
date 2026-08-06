@@ -305,3 +305,44 @@ def test_all_hosts_failing_reports_the_last_reason(monkeypatch):
 
     assert ip is None
     assert 'traffic left' in err
+
+
+# ── The reason may pass through, but only ours ──────────────────────────────
+
+def test_a_curated_reason_reaches_the_ungated_endpoint(client, monkeypatch):
+    """Without a reason, ok:false is blind: a 0.6s failure across three hosts
+    rules out a timeout, and that distinction is invisible otherwise."""
+    hint = server._proxy_failure_hint(Exception('Tunnel connection failed: 502'))
+    monkeypatch.setenv('SCRAPER_PROXY_URL', 'http://user:secret@gateway.example.net:8080')
+    monkeypatch.setattr(server, '_egress_ip', lambda through_proxy, timeout=None:
+                        (None, hint) if through_proxy else ('1.2.3.4', None))
+
+    body = client.get('/api/selftest?what=scraper_proxy').get_json()
+
+    assert body['inconclusive'] is True
+    assert 'blocking the destination' in body['message']
+
+
+def test_a_raw_exception_reason_is_still_suppressed(client, monkeypatch):
+    """The fallback branch of _proxy_failure_hint returns str(exception), which
+    can carry the proxy URL. It must not pass the safe-list."""
+    raw = server._proxy_failure_hint(Exception('boom http://user:secret@gw.example.net:8080'))
+    assert raw not in server._PROXY_HINTS_SAFE
+
+    monkeypatch.setenv('SCRAPER_PROXY_URL', 'http://user:secret@gateway.example.net:8080')
+    monkeypatch.setattr(server, '_egress_ip', lambda through_proxy, timeout=None:
+                        (None, raw) if through_proxy else ('1.2.3.4', None))
+
+    r = client.get('/api/selftest?what=scraper_proxy')
+
+    assert 'secret' not in r.get_data(as_text=True)
+    assert 'did not answer' in r.get_json()['message']
+
+
+def test_a_dropped_connection_gets_its_own_hint():
+    """A reset mid-connection is not a timeout and not a 407 — it is what a
+    provider blocking the destination looks like."""
+    msg = server._proxy_failure_hint(Exception("('Connection aborted.', RemoteDisconnected())"))
+
+    assert 'blocks the destination' in msg
+    assert msg in server._PROXY_HINTS_SAFE
