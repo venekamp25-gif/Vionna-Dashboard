@@ -124,11 +124,16 @@ bug queue"), run this flow without asking for clarification first:
      gate. Read back whether auto-merge actually got enabled; if it didn't, wait
      for CI and merge yourself once green. Then mark the bug resolved if the
      droplet API is reachable.
-5. CI is the gate that makes this safe, not a human read-through: `.github/
+5. **If GitHub Actions gives no verdict** (it stopped assigning runners entirely
+   on 2026-08-06 — `runner_id: 0`, jobs cancelled after ~15 min queued), run
+   `bash scripts/ci-local.sh`. It runs exactly what `ci.yml` runs and prints a
+   pass/fail verdict. Say in the PR that the verdict is local, and why. Never
+   present a local run as if CI had passed.
+6. CI is the gate that makes this safe, not a human read-through: `.github/
    workflows/ci.yml` runs the backend tests + an import smoke test on the file the
    droplet executes, plus the same `next build` Netlify publishes. Never merge
    red, and never disable a check to get to green.
-6. Still require a human for: anything that spends money, anything that writes to
+7. Still require a human for: anything that spends money, anything that writes to
    Shopify with live tokens, and any change whose *cause* lies outside the code
    (empty API balance, expired key, shop down) — those go through
    **Plans** (see below), not a PR.
