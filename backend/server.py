@@ -8953,6 +8953,233 @@ def _size_chart_fill_loop():
 threading.Thread(target=_size_chart_fill_loop, daemon=True, name='size-chart-fill').start()
 
 
+# ── Siblings-zelfherstel ──────────────────────────────────────────────────
+# theme.siblings wijst naar een COLLECTIE; het thema toont de producten daaruit
+# als kleurstalen. Staat het metafield goed maar zit het product niet IN die
+# collectie, dan blijven de stalen leeg zonder dat er iets 'kapot' lijkt.
+SIB_HEAL_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   'siblings_heal.json')
+
+_SIB_Q_COLS = ('{ collections(first:250%s){ pageInfo{hasNextPage endCursor} '
+               'edges{ node{ id handle productsCount{count} '
+               'ruleSet{ rules{ column relation condition } } } } } }')
+_SIB_Q_PRODS = ('{ products(first:250%s, query:"status:active"){ '
+                'pageInfo{hasNextPage endCursor} edges{ node{ id handle title '
+                'sib: metafield(namespace:"theme",key:"siblings"){value} } } } }')
+_SIB_M_ADD = ('mutation($id:ID!, $ids:[ID!]!){ collectionAddProducts(id:$id, productIds:$ids)'
+              '{ collection{ id } userErrors{ field message } } }')
+_SIB_M_RULE = ('mutation($input:CollectionInput!){ collectionUpdate(input:$input)'
+               '{ collection{ id } userErrors{ field message } } }')
+_SIB_M_MF = ('mutation($metafields:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$metafields)'
+             '{ metafields{ key } userErrors{ field message } } }')
+
+
+def _sib_gql(store, query, variables=None):
+    """Shopify GraphQL op MODULEniveau (met variabelen).
+
+    De bestaande `_gql` is een GENESTE functie binnen een andere route; van
+    buitenaf aanroepen geeft een NameError die pas in productie opvalt.
+    """
+    body = {'query': query}
+    if variables:
+        body['variables'] = variables
+    r = req.post(shopify_url(store, 'graphql.json'),
+                 headers=shopify_headers(store), json=body, timeout=45)
+    d = r.json() if r.content else {}
+    if d.get('errors'):
+        raise RuntimeError(str(d['errors'])[:200])
+    return d.get('data') or {}
+
+
+def _sib_page(store, query, key):
+    """Alle pagina's van een GraphQL-connectie ophalen."""
+    out, cursor = [], None
+    while True:
+        after = f', after:"{cursor}"' if cursor else ''
+        d = _sib_gql(store, query % after) or {}
+        conn = (d.get(key)) or {}
+        if not conn:
+            break
+        out += [e['node'] for e in conn.get('edges', [])]
+        pg = conn.get('pageInfo') or {}
+        if not pg.get('hasNextPage'):
+            break
+        cursor = pg.get('endCursor')
+    return out
+
+
+def _siblings_audit(store):
+    """Welke siblings-collecties zijn leeg terwijl er producten naar verwijzen?
+
+    Read-only. -> {checked, broken_manual, broken_smart, missing, products_affected,
+                   plan_add:[...], plan_rule:[...]}
+    """
+    cols = _sib_page(store, _SIB_Q_COLS, 'collections')
+    prods = _sib_page(store, _SIB_Q_PRODS, 'products')
+    by_h = {c['handle']: c for c in cols}
+    refs = {}
+    for p in prods:
+        h = (((p.get('sib') or {}) or {}).get('value') or '').strip()
+        if h:
+            refs.setdefault(h, []).append(p)
+
+    plan_add, plan_rule, plan_case, missing = [], [], [], []
+    for h, plist in refs.items():
+        c = by_h.get(h)
+        if not c:
+            # Shopify-handles zijn ALTIJD kleine letters. Wijst het metafield met
+            # hoofdletters ('Vartia-siblings') naar een collectie die als
+            # 'vartia-siblings' bestaat, dan mislukt de opzoeking in het thema
+            # terwijl er niets leeg of ontbrekend lijkt (FR, 2026-07-31).
+            low = h.lower()
+            if low != h and low in by_h:
+                plan_case += [{'pid': p['id'], 'handle': p['handle'],
+                               'from': h, 'to': low} for p in plist]
+                continue
+            missing.append(h)
+            continue
+        if (c.get('productsCount') or {}).get('count', 0) > 0:
+            continue
+        if c.get('ruleSet'):
+            titles = {p['title'] for p in plist}
+            if len(titles) == 1:
+                plan_rule.append({'id': c['id'], 'handle': h, 'title': titles.pop()})
+        else:
+            plan_add.append({'id': c['id'], 'handle': h,
+                             'pids': [p['id'] for p in plist]})
+    return {'checked': len(refs), 'broken_manual': len(plan_add),
+            'broken_smart': len(plan_rule), 'broken_case': len(plan_case),
+            'missing': len(missing), 'missing_handles': missing[:10],
+            'products_affected': sum(len(x['pids']) for x in plan_add) + len(plan_case),
+            'plan_add': plan_add, 'plan_rule': plan_rule, 'plan_case': plan_case}
+
+
+def _siblings_heal(store, apply_changes=True):
+    """Lege siblings-collecties vullen + accentloze titelregels herstellen."""
+    rep = _siblings_audit(store)
+    if not apply_changes:
+        for k in ('plan_add', 'plan_rule', 'plan_case'):
+            rep.pop(k, None)
+        return rep
+    fixed = errs = 0
+    for x in rep['plan_add']:
+        try:
+            d = _sib_gql(store, _SIB_M_ADD, {'id': x['id'], 'ids': x['pids']}) or {}
+            ue = ((d.get('collectionAddProducts') or {}).get('userErrors')) or []
+            if ue:
+                errs += 1
+                print(f"[siblings] {store} {x['handle']}: {str(ue)[:120]}")
+            else:
+                fixed += 1
+        except Exception as e:
+            errs += 1
+            print(f"[siblings] {store} {x['handle']}: {e}")
+    for x in rep['plan_rule']:
+        try:
+            inp = {'id': x['id'],
+                   'ruleSet': {'appliedDisjunctively': False,
+                               'rules': [{'column': 'TITLE', 'relation': 'EQUALS',
+                                          'condition': x['title']}]}}
+            d = _sib_gql(store, _SIB_M_RULE, {'input': inp}) or {}
+            ue = ((d.get('collectionUpdate') or {}).get('userErrors')) or []
+            if ue:
+                errs += 1
+            else:
+                fixed += 1
+        except Exception as e:
+            errs += 1
+            print(f"[siblings] {store} rule {x['handle']}: {e}")
+    for x in rep['plan_case']:
+        try:
+            inp = {'metafields': [{'ownerId': x['pid'], 'namespace': 'theme',
+                                   'key': 'siblings', 'type': 'single_line_text_field',
+                                   'value': x['to']}]}
+            d = _sib_gql(store, _SIB_M_MF, inp) or {}
+            ue = ((d.get('metafieldsSet') or {}).get('userErrors')) or []
+            if ue:
+                errs += 1
+                print(f"[siblings] {store} case {x['handle']}: {str(ue)[:120]}")
+            else:
+                fixed += 1
+        except Exception as e:
+            errs += 1
+            print(f"[siblings] {store} case {x['handle']}: {e}")
+    for k in ('plan_add', 'plan_rule', 'plan_case'):
+        rep.pop(k, None)
+    rep.update(fixed=fixed, errors=errs)
+    return rep
+
+
+@app.route('/api/siblings_audit')
+def api_siblings_audit():
+    """Read-only: hoeveel kleurgroepen tonen GEEN stalen omdat hun collectie leeg
+    is? Bewust ongegate - dit is puur een telling, en als de stalen wegvallen wil
+    je dat zonder sessie kunnen controleren. ?store=dk|fr|fi (default: alle)."""
+    want = request.args.get('store')
+    out = {}
+    for st in ([want] if want else ['dk', 'fr', 'fi']):
+        if st not in tokens:
+            continue
+        try:
+            out[st] = _siblings_heal(st, apply_changes=False)
+        except Exception as e:
+            out[st] = {'error': str(e)[:200]}
+    return jsonify(out)
+
+
+@app.route('/api/siblings_heal', methods=['POST'])
+@require_droplet_token
+def api_siblings_heal():
+    """Lege siblings-collecties alsnog vullen. Body: {store?}."""
+    body = request.get_json(silent=True) or {}
+    want = body.get('store')
+    out = {}
+    for st in ([want] if want else ['dk', 'fr', 'fi']):
+        if st not in tokens:
+            continue
+        try:
+            out[st] = _siblings_heal(st, apply_changes=True)
+        except Exception as e:
+            out[st] = {'error': str(e)[:200]}
+    return jsonify(out)
+
+
+def _siblings_heal_loop():
+    """Dagelijks: kleurstalen die stilletjes zijn weggevallen weer aanzetten.
+
+    De publish-flow maakt de collectie EN voegt het product toe, dus die is niet
+    de dader; de gaten kwamen van duplicatie/herstel-paden eromheen (FI, 90
+    collecties, 2026-07-31). Een controle op de UITKOMST dekt elk pad.
+    """
+    time.sleep(300)
+    while True:
+        state = {}
+        for store in ('dk', 'fr', 'fi'):
+            if store not in tokens:
+                continue
+            try:
+                rep = _siblings_heal(store, apply_changes=True)
+                rep['at'] = datetime.datetime.utcnow().isoformat() + 'Z'
+                state[store] = rep
+                if rep.get('fixed'):
+                    print(f'[siblings] {store}: {rep["fixed"]} kleurgroep(en) hersteld')
+            except Exception as e:
+                state[store] = {'error': str(e)[:150],
+                                'at': datetime.datetime.utcnow().isoformat() + 'Z'}
+                print(f'[siblings] {store} heal failed: {e}')
+        try:
+            tmp = SIB_HEAL_STATE_PATH + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(state, f, ensure_ascii=False)
+            os.replace(tmp, SIB_HEAL_STATE_PATH)
+        except Exception as e:
+            print(f'[siblings] state save failed: {e}')
+        time.sleep(24 * 3600)
+
+
+threading.Thread(target=_siblings_heal_loop, daemon=True, name='siblings-heal').start()
+
+
 @app.route('/api/size_chart_fill_status')
 def api_size_chart_fill_status():
     """Laatste self-heal run per store (read-only). written = charts toegevoegd;
