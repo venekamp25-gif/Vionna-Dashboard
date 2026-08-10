@@ -640,10 +640,16 @@ def health():
         'anthropic': bool(ANTHROPIC_KEY and ANTHROPIC_KEY != 'VOELINJEYHIER'),
         'higgsfield_cli': bool(HIGGSFIELD_EXE),
         'backups': {'count': n_backups, 'last': last_backup},
-        # Whether competitor scraping leaves the droplet through the residential
+        # Whether competitor scraping CAN leave the droplet through the residential
         # proxy (bug #34). Boolean only — the proxy URL holds credentials.
+        # The proxy is a LAST RESORT: `proxy_hosts` lists the shops that actually
+        # refused us directly and are therefore on the paid route right now. An
+        # empty list means everything is going out over the free direct route.
         'scraper_proxy': bool(_scraper_proxies('https://example.com/products/x.json')),
         'scraper_proxy_failing': _proxy_health_snapshot()['proxy_failing'],
+        'proxy_hosts': _proxy_health_snapshot()['proxy_hosts'],
+        'proxy_hosts_count': _proxy_health_snapshot()['proxy_hosts_count'],
+        'proxy_requests': _proxy_health_snapshot()['proxy_requests'],
     })
 
 
