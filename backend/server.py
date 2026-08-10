@@ -1343,21 +1343,94 @@ _PROXY_HEALTH = {'ok': 0, 'failed': 0, 'last_ok_ts': 0.0, 'last_fail_ts': 0.0,
 def _proxy_health_snapshot():
     h = _PROXY_HEALTH
     used = h['ok'] + h['failed']
+    with _PROXY_HOSTS_LOCK:
+        now = time.monotonic()
+        hosts = sorted(k for k, v in _proxy_hosts.items() if v > now)
     return {'proxy_requests': used,
             'proxy_failures': h['failed'],
             'proxy_failing': bool(h['failed'] and h['last_fail_ts'] > h['last_ok_ts']),
             'proxy_last_reason': (h['last_reason']
-                                  if h['last_reason'] in _PROXY_HINTS_SAFE else None)}
+                                  if h['last_reason'] in _PROXY_HINTS_SAFE else None),
+            # Proxy = laatste redmiddel: alleen deze hosts weigerden ons direct.
+            'proxy_hosts': hosts,
+            'proxy_hosts_count': len(hosts)}
 
 
-def _scrape_request(url, timeout, headers):
-    """One GET through the scraper proxy when configured, else direct.
+# Welke hosts hebben de proxy echt nodig? Residentieel verkeer wordt per GB
+# afgerekend, dus de proxy is een LAATSTE redmiddel: pas als een winkel ons
+# rechtstreeks blokkeert EN de proxy dat aantoonbaar oplost, onthouden we die
+# host. De TTL zorgt dat we daarna weer direct proberen — een blokkade is vaak
+# tijdelijk, en zonder vervaldatum zou één slechte dag die host voor altijd
+# door de betaalde route sturen.
+_PROXY_HOST_TTL = 6 * 3600
+_PROXY_NOHELP_TTL = 3600   # korter: een blokkade die de proxy niet oplost kan wel wijzigen
+_PROXY_HOSTS_LOCK = threading.Lock()
+_proxy_hosts = {}          # host -> monotonic() tot wanneer proxy-first geldt
+# Hosts waar de proxy AANTOONBAAR niets oploste. Zonder dit geheugen betaal je
+# bij elk volgend verzoek opnieuw een proxy-poging voor een route die toch faalt
+# - precies het verbruik dat we willen vermijden.
+_proxy_nohelp = {}         # host -> monotonic() tot wanneer we niet meer escaleren
 
-    A proxy that is down must never take the whole scraper with it: if we can't
-    reach the proxy itself we log it and repeat the request directly, which is
-    exactly what we did before there was a proxy. Every outcome is recorded in
-    _PROXY_HEALTH so that silent fallback is still *visible* afterwards."""
-    proxies = _scraper_proxies(url)
+# Statussen die zeggen "deze winkel wil de droplet niet": 429 = expliciet
+# rate-limit (het bewijs uit bug #34), 403 = geweigerd ook na een browser-UA.
+_PROXY_ESCALATE_STATUS = (429, 403)
+
+
+def _proxy_host_due(host):
+    """Moet dit verzoek meteen via de proxy (host blokkeerde ons eerder)?"""
+    if not host:
+        return False
+    with _PROXY_HOSTS_LOCK:
+        until = _proxy_hosts.get(host)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            _proxy_hosts.pop(host, None)      # verlopen: weer direct proberen
+            return False
+        return True
+
+
+def _proxy_host_mark(host, why):
+    with _PROXY_HOSTS_LOCK:
+        first = host not in _proxy_hosts
+        _proxy_hosts[host] = time.monotonic() + _PROXY_HOST_TTL
+    if first:
+        print(f"[scrape] {host} blocks us directly ({why}) — routing it via the proxy for "
+              f"{_PROXY_HOST_TTL // 3600}h")
+
+
+def _proxy_host_clear(host, nohelp=False):
+    """Host niet (meer) via de proxy. `nohelp` onthoudt bovendien dat de proxy
+    hier niets oploste, zodat we niet elk verzoek opnieuw een betaalde poging doen."""
+    with _PROXY_HOSTS_LOCK:
+        _proxy_hosts.pop(host, None)
+        if nohelp:
+            _proxy_nohelp[host] = time.monotonic() + _PROXY_NOHELP_TTL
+
+
+def _proxy_escalation_allowed(host):
+    """Mag deze host nog een proxy-poging krijgen, of bewees die al niets te helpen?"""
+    if not host:
+        return True
+    with _PROXY_HOSTS_LOCK:
+        until = _proxy_nohelp.get(host)
+        if until is None:
+            return True
+        if time.monotonic() >= until:
+            _proxy_nohelp.pop(host, None)
+            return True
+        return False
+
+
+def _scrape_request(url, timeout, headers, use_proxy=False):
+    """One GET, direct by default and through the proxy only when asked.
+
+    `use_proxy` komt van _scrape_get: die probeert eerst direct en schakelt de
+    proxy pas in als de winkel ons weigert. Een proxy die zelf plat ligt mag de
+    scraper nooit meenemen — dan doen we het verzoek alsnog direct, precies zoals
+    vóór er een proxy was. Elke uitkomst landt in _PROXY_HEALTH, zodat die
+    stille terugval achteraf zichtbaar is."""
+    proxies = _scraper_proxies(url) if use_proxy else None
     if not proxies:
         return req.get(url, timeout=timeout, headers=headers)
     try:
@@ -1457,8 +1530,11 @@ def _scrape_get(url, timeout=10, _retries_remaining=2):
     try Mozilla. We don't retry 403 — that's an auth/scope decision by the
     upstream, not a transient flake.
 
-    Every request goes out through the scraper proxy when one is configured
-    (see _scraper_proxies) so shops don't see the droplet's datacentre IP.
+    Requests go out DIRECT by default. Only when a shop refuses the droplet
+    (429, or a 403 that survives the browser-UA retry) do we repeat that one
+    request through the residential proxy, and we remember the host for
+    _PROXY_HOST_TTL only if the proxy actually fixed it — residential traffic
+    is billed per GB, so it stays a last resort instead of the default route.
 
     A host that 429s us is remembered for a cooldown window (see
     _scrape_429_cooldown_response) — further calls to ANY path fail fast
@@ -1484,10 +1560,25 @@ def _scrape_get(url, timeout=10, _retries_remaining=2):
     last_exc = None
     while True:
         try:
-            r = _scrape_request(url, timeout, headers_primary)
+            use_proxy = _proxy_host_due(host)
+            r = _scrape_request(url, timeout, headers_primary, use_proxy)
             if r.status_code == 403:
                 # Upstream actively rejected our identifier — try a browser UA.
-                r = _scrape_request(url, timeout, headers_fallback)
+                r = _scrape_request(url, timeout, headers_fallback, use_proxy)
+            # Winkel weigert de droplet en we gingen nog direct? Eén keer via de
+            # proxy proberen. Werkt dat, dan onthouden we de host; werkt het NIET,
+            # dan is de proxy hier geen oplossing en blijven we direct gaan -
+            # anders betaal je per GB voor een route die niets oplost.
+            if (not use_proxy and r.status_code in _PROXY_ESCALATE_STATUS
+                    and _proxy_escalation_allowed(host) and _scraper_proxies(url)):
+                rp = _scrape_request(url, timeout, headers_fallback, use_proxy=True)
+                if rp.status_code < 400:
+                    _proxy_host_mark(host, f'HTTP {r.status_code}')
+                    r = rp
+                else:
+                    _proxy_host_clear(host, nohelp=True)
+                    print(f"[scrape] proxy didn't help {host} (HTTP {rp.status_code}) — "
+                          f"staying direct for {_PROXY_NOHELP_TTL // 60}min")
             if r.status_code != 429:
                 # It's answering us — whatever it says, it is not rate-limiting
                 # us, so a leftover cooldown must not keep blocking the store.
