@@ -1381,6 +1381,11 @@ _proxy_nohelp = {}         # host -> monotonic() tot wanneer we niet meer escale
 # rate-limit (het bewijs uit bug #34), 403 = geweigerd ook na een browser-UA.
 _PROXY_ESCALATE_STATUS = (429, 403)
 
+# Statussen die van de PROXY zelf komen, niet van de winkel: 407 = proxy wil
+# (andere) inloggegevens, 402 = tegoed op. Nooit als winkelantwoord behandelen.
+_PROXY_LAYER_STATUS = (402, 407)
+_PROXY_HINT_QUOTA = 'proxy out of data or credentials rejected'
+
 
 def _proxy_host_due(host):
     """Moet dit verzoek meteen via de proxy (host blokkeerde ons eerder)?"""
@@ -1441,6 +1446,18 @@ def _scrape_request(url, timeout, headers, use_proxy=False):
         return req.get(url, timeout=timeout, headers=headers)
     try:
         r = req.get(url, timeout=timeout, headers=headers, proxies=proxies)
+        # Een leeg tegoed of verlopen inlog komt niet altijd als exception terug:
+        # bij plain HTTP antwoordt de proxy gewoon met 402/407. Dat is GEEN
+        # antwoord van de winkel - doorgeven zou de shop onterecht als
+        # 'weigert ons' bestempelen, en het als 'ok' tellen zou de
+        # gezondheidsmeter laten liegen. (IPRoyal-saldo raakte op 2026-08-09.)
+        if r.status_code in _PROXY_LAYER_STATUS:
+            _PROXY_HEALTH['failed'] += 1
+            _PROXY_HEALTH['last_fail_ts'] = time.time()
+            _PROXY_HEALTH['last_reason'] = _PROXY_HINT_QUOTA
+            print(f"[scrape] proxy answered HTTP {r.status_code} (out of data or bad "
+                  f"credentials) — falling back to a direct request for {url}")
+            return req.get(url, timeout=timeout, headers=headers)
         _PROXY_HEALTH['ok'] += 1
         _PROXY_HEALTH['last_ok_ts'] = time.time()
         return r
@@ -5800,7 +5817,7 @@ _PROXY_FAILURE_HINTS = (
     (('timed out', 'timeout'),
      'the gateway did not answer in time — check the host and port'),
 )
-_PROXY_HINTS_SAFE = frozenset(msg for _needles, msg in _PROXY_FAILURE_HINTS)
+_PROXY_HINTS_SAFE = frozenset(msg for _needles, msg in _PROXY_FAILURE_HINTS) | {_PROXY_HINT_QUOTA}
 
 
 def _proxy_failure_hint(exc):
