@@ -119,6 +119,48 @@ async function call<T>(
 }
 
 // ── Types matching server.py responses ──
+
+/** One variant judged on cost-of-goods versus its CURRENT selling price. */
+export interface CogsRow {
+  store: string;
+  variant_id: string;
+  product_id?: string;
+  title?: string;
+  shopify_title?: string;
+  variant_title?: string;
+  handle?: string;
+  currency?: string | null;
+  cost: number;
+  price: number;
+  /** Basis the ratio was computed on. Equals `price` on gross basis (venek does
+   *  not remit VAT), lower when a VAT correction is switched on. */
+  net_price: number;
+  vat: number;
+  ratio: number;
+  pct: number;
+  over: boolean;
+  suggested_price?: number | null;
+  suggested_pct?: number | null;
+  suggested_compare_at?: number | null;
+  compare_at?: number | null;
+  seen?: number;
+  last_order?: string;
+}
+
+export interface CogsOverview {
+  configured?: boolean;
+  error?: string;
+  detail?: string;
+  scope?: string;
+  days?: number;
+  counted?: number;
+  rows?: CogsRow[];
+  alerts?: CogsRow[];
+  unknown_count?: number;
+  price_errors?: Record<string, string>;
+  stats?: Record<string, number>;
+}
+
 export interface BackendStatus {
   dk: boolean;
   fr: boolean;
@@ -703,6 +745,29 @@ export const api = {
 
   /** What-to-list funnel step 2: competitor stores with LOCAL SimilarWeb traffic
    *  for a market (cached droplet-side, refreshed weekly / via wtlStoresRefresh). */
+  // ── Margin watch (COGS) ──
+  // The maths runs on master-dashboard (that is where the ServicePoints key
+  // lives); the droplet fetches it server-side so the shared secret never
+  // reaches the browser. `configured:false` means the link is not set up yet —
+  // show that, never an empty table, or "nothing over the threshold" would be
+  // indistinguishable from "we could not look".
+  cogsOverview: (scope: "daily" | "weekly" = "weekly") =>
+    call<CogsOverview>(`/api/cogs/overview?scope=${scope}`, { authed: true }),
+
+  /** Write new prices. Always send compare_at_price when the product carries a
+   *  struck-through price, otherwise the discount badge breaks. */
+  pricingApply: (
+    store: string,
+    updates: { variant_id: string; price: number; compare_at_price?: number }[]
+  ) =>
+    call<{
+      store: string;
+      updated: number;
+      failed: number;
+      results?: { variant_id: string; price?: string; compare_at_price?: string }[];
+      errors?: { variant_id: string; error: string }[];
+    }>("/api/pricing/apply", { method: "POST", body: { store, updates }, authed: true }),
+
   wtlStores: (store: "dk" | "fr" | "fi") =>
     call<WtlStoresResponse>(`/api/wtl_stores?store=${store}`),
 

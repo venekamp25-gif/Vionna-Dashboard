@@ -70,6 +70,7 @@ export function Header() {
     divider?: boolean;
   }[] = [
     { label: "What to list", desc: "Full research flow: types → stores → products (opens in a new tab)", action: () => window.open("/research", "_blank") },
+    { label: "Margin watch", desc: "Products where the supplier cost eats too much of the price (opens in a new tab)", action: () => window.open("/cogs", "_blank") },
     { label: "Keyword research", desc: "Best keywords for a type you already picked", action: () => setResearchOpen(true) },
     { label: "Keyword backfill", desc: "Regenerate copy for already-listed products", action: () => setBackfillOpen(true) },
     { label: "Catalogue maintenance", desc: "Bulk fixes (bold, channels, cutlines, duplicates)", action: () => setMaintenanceOpen(true), running: maintenanceRunning },

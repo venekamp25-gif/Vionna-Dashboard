@@ -9224,6 +9224,117 @@ def _siblings_heal(store, apply_changes=True):
     return rep
 
 
+# ── COGS-overzicht + prijzen doorvoeren ───────────────────────────────────
+# Het rekenwerk gebeurt in master-dashboard (daar staat de ServicePoints-sleutel);
+# hier tonen we het en voeren we de prijs door. De fetch is SERVER-SIDE zodat het
+# gedeelde geheim niet in de browser komt.
+COGS_SOURCE_URL = os.getenv('MASTER_DASHBOARD_URL', '').rstrip('/')
+
+
+@app.route('/api/cogs/overview')
+@require_droplet_token
+def api_cogs_overview():
+    """Haalt het COGS-overzicht op bij master-dashboard en geeft het door.
+
+    Faalt de bron, dan zeggen we DAT -- een leeg overzicht mag nooit lezen als
+    'geen enkel product zit boven de drempel'.
+    """
+    if not COGS_SOURCE_URL:
+        return jsonify({'error': 'MASTER_DASHBOARD_URL niet ingesteld op de droplet',
+                        'configured': False}), 200
+    secret = os.getenv('NOTIFY_SECRET', '')
+    if not secret:
+        return jsonify({'error': 'NOTIFY_SECRET niet ingesteld op de droplet',
+                        'configured': False}), 200
+    scope = request.args.get('scope', 'weekly')
+    try:
+        r = req.get(f'{COGS_SOURCE_URL}/api/cogs/report',
+                    headers={'X-Notify-Token': secret},
+                    params={'scope': scope}, timeout=120)
+        if r.status_code != 200:
+            return jsonify({'error': f'bron gaf HTTP {r.status_code}',
+                            'detail': r.text[:200], 'configured': True}), 200
+        data = r.json() or {}
+        data['configured'] = True
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': f'bron onbereikbaar: {str(e)[:160]}',
+                        'configured': True}), 200
+
+
+@app.route('/api/pricing/apply', methods=['POST'])
+@require_droplet_token
+def api_pricing_apply():
+    """Zet een nieuwe prijs (en van-prijs) op varianten.
+
+    Body: {store, updates:[{variant_id, price, compare_at_price?}]}
+    Werkt voor BEIDE portalen: shopify_url/shopify_headers lopen via _shop_entry.
+    """
+    body = request.get_json(silent=True) or {}
+    store = str(body.get('store') or '').strip()
+    updates = body.get('updates') or []
+    if not _shop_entry(store).get('token'):
+        return jsonify({'error': f'Not authenticated for {store.upper()}.'}), 401
+    if not isinstance(updates, list) or not updates:
+        return jsonify({'error': 'geen updates meegestuurd'}), 400
+    if len(updates) > 100:
+        return jsonify({'error': 'maximaal 100 varianten per keer'}), 400
+
+    hdrs = shopify_headers(store)
+    done, errors = [], []
+    for u in updates:
+        vid = str((u or {}).get('variant_id') or '').strip()
+        try:
+            new_price = float(str((u or {}).get('price')).replace(',', '.'))
+        except (TypeError, ValueError):
+            errors.append({'variant_id': vid, 'error': 'prijs is geen getal'})
+            continue
+        if not vid or new_price <= 0:
+            errors.append({'variant_id': vid, 'error': 'variant of prijs ontbreekt'})
+            continue
+
+        payload = {'id': vid, 'price': f'{new_price:.2f}'}
+        cmp_in = (u or {}).get('compare_at_price')
+        if cmp_in not in (None, ''):
+            try:
+                payload['compare_at_price'] = f"{float(str(cmp_in).replace(',', '.')):.2f}"
+            except (TypeError, ValueError):
+                errors.append({'variant_id': vid, 'error': 'van-prijs is geen getal'})
+                continue
+
+        try:
+            # Huidige van-prijs ophalen als er geen is meegestuurd: een prijs die
+            # de van-prijs passeert laat de kortingsbadge verdwijnen of toont een
+            # onzinnige korting. Liever weigeren dan stilletjes de etalage slopen.
+            if 'compare_at_price' not in payload:
+                cur = _shopify_call('get', shopify_url(store, f'variants/{vid}.json'),
+                                    hdrs, timeout=20)
+                old_cmp = ((cur.json() or {}).get('variant') or {}).get('compare_at_price') \
+                    if cur.status_code == 200 else None
+                if old_cmp and float(old_cmp) <= new_price:
+                    errors.append({'variant_id': vid,
+                                   'error': f'nieuwe prijs {new_price:.2f} ligt op of boven de '
+                                            f'van-prijs {float(old_cmp):.2f} - stuur een nieuwe '
+                                            f'van-prijs mee of verlaag de prijs'})
+                    continue
+
+            r = _shopify_call('put', shopify_url(store, f'variants/{vid}.json'), hdrs,
+                              json={'variant': payload}, timeout=25)
+            if r.status_code in (200, 201):
+                v = (r.json() or {}).get('variant') or {}
+                done.append({'variant_id': vid, 'price': v.get('price'),
+                             'compare_at_price': v.get('compare_at_price')})
+            else:
+                errors.append({'variant_id': vid,
+                               'error': f'HTTP {r.status_code}: {r.text[:120]}'})
+        except Exception as e:
+            errors.append({'variant_id': vid, 'error': str(e)[:140]})
+
+    print(f'[pricing] {store}: {len(done)} prijzen gezet, {len(errors)} mislukt')
+    return jsonify({'store': store, 'updated': len(done), 'failed': len(errors),
+                    'results': done, 'errors': errors})
+
+
 @app.route('/api/siblings_audit')
 def api_siblings_audit():
     """Read-only: hoeveel kleurgroepen tonen GEEN stalen omdat hun collectie leeg
