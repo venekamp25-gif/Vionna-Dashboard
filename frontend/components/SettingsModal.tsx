@@ -625,6 +625,25 @@ export function SettingsModal({ open, onClose }: Props) {
                   <span className={health.higgsfield_cli ? "text-accent" : "text-warning"}>
                     {health.higgsfield_cli ? "✓" : "✕"}
                   </span>
+                  {health.higgsfield_cli_version ? (
+                    <span className="text-text-dim"> ({health.higgsfield_cli_version})</span>
+                  ) : null}
+                </div>
+                {/* "The binary exists" is not "generation works" — during bug #42 the
+                    tick above stayed green through a total outage. This line shows the
+                    last measured generate; it is filled by /api/selftest?what=higgsfield,
+                    which costs a credit, so health itself never triggers one. */}
+                <div>
+                  Image generation{" "}
+                  {health.higgsfield_generate?.status === "ok" ? (
+                    <span className="text-accent">✓ working</span>
+                  ) : health.higgsfield_generate?.status === "failing" ? (
+                    <span className="text-danger">
+                      ✕ failing{health.higgsfield_generate.reason ? ` (${health.higgsfield_generate.reason})` : ""}
+                    </span>
+                  ) : (
+                    <span className="text-text-dim">not measured yet</span>
+                  )}
                 </div>
                 <div className="flex flex-wrap gap-1.5">
                   {STORE_KEYS.map((s) => (
