@@ -106,6 +106,8 @@ print(f'Higgsfield EXE: {HIGGSFIELD_EXE or "(not found — install with: npm ins
 # flagged exactly that risk for the model name after a major CLI bump.
 HIGGSFIELD_MODEL = os.getenv('HIGGSFIELD_MODEL', 'nano_banana_2')
 HIGGSFIELD_OUTPUT_CDN = 'd8j0ntlcm91z4.cloudfront.net'
+# The CDN that serves our REFERENCE uploads. Never a result, whatever else changes.
+HIGGSFIELD_INPUT_CDN = 'd2ol7oe51mr4n9.cloudfront.net'
 
 _HF_VERSION_CACHE = {'ts': 0.0, 'value': ''}
 _HF_VERSION_TTL = 600
@@ -5766,7 +5768,9 @@ def _selftest_higgsfield():
         return {'ok': False, 'reason': 'unknown', 'cli_version': ver,
                 'message': _HF_SELFTEST_MESSAGE['unknown']}
     stdout, stderr = (r.stdout or '').strip(), (r.stderr or '').strip()
-    if [u for u in _urls_from_stdout(stdout) if HIGGSFIELD_OUTPUT_CDN in u]:
+    # No reference images are sent, so anything that is not the input CDN is a
+    # result — including one from a moved output host.
+    if _higgsfield_outputs(_urls_from_stdout(stdout)):
         return {'ok': True, 'reason': 'generated', 'cli_version': ver,
                 'message': 'Higgsfield generated a test image.'}
     if stdout and not stderr and r.returncode == 0:
@@ -13652,6 +13656,34 @@ def _extract_urls_from_obj(obj, found=None):
     return found
 
 
+def _higgsfield_outputs(urls, input_urls=()):
+    """The generated images out of everything the CLI printed.
+
+    Preferred rule: the known output CDN. But that host is OURS to guess — it
+    is not in the CLI binary, it comes back from the API — so pinning it means a
+    Higgsfield-side rename silently throws away every result and reads as "no
+    images generated", which is indistinguishable from the outage in bug #42.
+
+    So when the known host matches nothing, fall back to whatever is left after
+    removing the reference-upload CDN and the images we sent in. Loud on
+    purpose: the fallback firing is a signal that HIGGSFIELD_OUTPUT_CDN needs
+    updating, not a state to sit in."""
+    def _base(u):
+        return u.split('?')[0].split('#')[0].rstrip('/')
+
+    known = [u for u in urls if HIGGSFIELD_OUTPUT_CDN in u]
+    if known:
+        return known
+    sent = {_base(u) for u in (input_urls or ())}
+    other = [u for u in urls
+             if HIGGSFIELD_INPUT_CDN not in u and _base(u) not in sent]
+    if other:
+        print(f'[hf] WARNING: no URL on the known output CDN '
+              f'({HIGGSFIELD_OUTPUT_CDN}); accepting {len(other)} result(s) from '
+              f'another host — the output CDN may have moved.')
+    return other
+
+
 def _urls_from_stdout(text):
     """Extract image URLs from hf.exe stdout — JSON first (structured), regex as fallback."""
     # Try JSON parsing from last line backwards (avoids picking up log/progress URLs)
@@ -13742,9 +13774,9 @@ def higgsfield_generate():
             for stdout_i, stderr_i in pool.map(_run, range(num_jobs)):
                 if stdout_i:
                     urls_i = _urls_from_stdout(stdout_i)
-                    # Higgsfield output-CDN: d8j0ntlcm91z4.cloudfront.net met hf_ prefix
-                    # Input-CDN: d2ol7oe51mr4n9.cloudfront.net (altijd weggooien)
-                    filtered = [u for u in urls_i if HIGGSFIELD_OUTPUT_CDN in u]
+                    # Output-CDN eerst; valt die weg (hostwijziging bij Higgsfield),
+                    # dan alles behalve de input-CDN en onze eigen referenties.
+                    filtered = _higgsfield_outputs(urls_i, image_urls)
                     print(f'[hf] URLs found: {urls_i}')
                     print(f'[hf] After CDN filter (output only): {filtered}')
                     if filtered:
@@ -15269,7 +15301,7 @@ def _blog_hero_image(store, topic, products):
             cmd += f' --image "{tmp}"'
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, shell=True)
         urls = _urls_from_stdout(r.stdout or '')
-        out = [u for u in urls if HIGGSFIELD_OUTPUT_CDN in u]
+        out = _higgsfield_outputs(urls, [ref] if ref else [])
         return out[0] if out else None
     except Exception as e:
         print(f"[blog] hero image failed: {e}")
