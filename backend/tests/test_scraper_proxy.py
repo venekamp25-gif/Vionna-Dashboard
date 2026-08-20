@@ -24,9 +24,18 @@ class _FakeResponse:
 @pytest.fixture(autouse=True)
 def _clean_proxy_env(monkeypatch):
     """Neither var is set on a dev laptop; make that explicit so a stray
-    environment can't decide the outcome of these tests."""
+    environment can't decide the outcome of these tests.
+
+    The routing memories are process-global and outlive a test: a host marked
+    proxy-first by one test would make the next one's first request go out
+    proxied, and a 429 cooldown armed here would make a later test skip the
+    network entirely. Reset both."""
     monkeypatch.delenv('SCRAPER_PROXY_URL', raising=False)
     monkeypatch.delenv('SCRAPER_PROXY', raising=False)
+    monkeypatch.setattr(server, '_proxy_hosts', {})
+    monkeypatch.setattr(server, '_proxy_nohelp', {})
+    monkeypatch.setattr(server, '_scrape_429_until', {})
+    monkeypatch.setattr(server, '_scrape_429_probe_at', {})
 
 
 def _record_gets(monkeypatch, responses=None):
@@ -49,14 +58,32 @@ def _record_gets(monkeypatch, responses=None):
 PROXY = 'http://user:pass@gateway.example.net:8080'
 
 
-def test_scrape_goes_through_the_proxy_when_configured(monkeypatch):
+PROXIES = {'http': PROXY, 'https': PROXY}
+
+
+def test_a_shop_that_refuses_us_is_retried_through_the_proxy(monkeypatch):
+    """Bug #34's fix, as it works since the proxy became a LAST resort: traffic
+    goes out direct, and only a shop that refuses the droplet (429, or a 403 that
+    survives the browser-UA retry) is repeated over the residential IP."""
     monkeypatch.setenv('SCRAPER_PROXY_URL', PROXY)
-    calls = _record_gets(monkeypatch)
+    calls = _record_gets(monkeypatch, [_FakeResponse(429, 'slow down'),
+                                       _FakeResponse(200, '{"product": {}}')])
 
-    server._scrape_get('https://shop-proxy-on.example/products/dress.json')
+    res = server._scrape_get('https://shop-proxy-on.example/products/dress.json')
 
-    assert len(calls) == 1
-    assert calls[0]['proxies'] == {'http': PROXY, 'https': PROXY}
+    assert res.status_code == 200
+    assert [c['proxies'] for c in calls] == [None, PROXIES]
+
+
+def test_a_shop_that_answers_us_never_costs_a_proxy_request(monkeypatch):
+    """Residential traffic bills per GB. A store that serves us fine must stay on
+    the free route even with the proxy configured."""
+    monkeypatch.setenv('SCRAPER_PROXY_URL', PROXY)
+    calls = _record_gets(monkeypatch, [_FakeResponse(200, '{"product": {}}')])
+
+    server._scrape_get('https://shop-friendly.example/products/dress.json')
+
+    assert [c['proxies'] for c in calls] == [None]
 
 
 def test_scrape_goes_direct_when_no_proxy_configured(monkeypatch):
@@ -97,12 +124,13 @@ def test_unreachable_proxy_falls_back_to_a_direct_request(monkeypatch):
     def _boom():
         raise server.req.exceptions.ProxyError('Unable to connect to proxy')
 
-    calls = _record_gets(monkeypatch, [_boom, _FakeResponse(200, '{"product": {}}')])
+    calls = _record_gets(monkeypatch, [_FakeResponse(429, 'slow down'), _boom,
+                                       _FakeResponse(200, '{"product": {}}')])
 
     res = server._scrape_get('https://shop-deadproxy.example/products/dress.json')
 
     assert res.status_code == 200
-    assert [c['proxies'] for c in calls] == [{'http': PROXY, 'https': PROXY}, None]
+    assert [c['proxies'] for c in calls] == [None, PROXIES, None]
 
 
 def test_health_reports_whether_the_proxy_is_on(monkeypatch):
@@ -134,17 +162,20 @@ def test_a_fallback_is_recorded_not_just_logged(monkeypatch):
     calls = []
 
     def fake_get(url, timeout=None, headers=None, **kwargs):
-        calls.append(bool(kwargs.get('proxies')))
-        if kwargs.get('proxies'):
+        proxied = bool(kwargs.get('proxies'))
+        calls.append(proxied)
+        if proxied:
             raise server.req.exceptions.ProxyError('407 Proxy Authentication Required')
-        return _FakeResponse(200, 'ok')
+        # First (direct) attempt: the shop refuses us — that is what escalates
+        # to the proxy at all. The fallback after the proxy dies then succeeds.
+        return _FakeResponse(429 if len(calls) == 1 else 200, 'ok')
 
     monkeypatch.setattr(server.req, 'get', fake_get)
 
     server._scrape_get('https://shop.example/products/x.json')
     snap = server._proxy_health_snapshot()
 
-    assert calls == [True, False], 'should try the proxy, then fall back'
+    assert calls == [False, True, False], 'direct, escalate to the proxy, then fall back'
     assert snap['proxy_failing'] is True
     assert snap['proxy_failures'] == 1
     assert 'traffic left' in snap['proxy_last_reason']
@@ -152,12 +183,16 @@ def test_a_fallback_is_recorded_not_just_logged(monkeypatch):
 
 def test_a_working_proxy_is_not_reported_as_failing(monkeypatch):
     monkeypatch.setenv('SCRAPER_PROXY_URL', PROXY)
-    monkeypatch.setattr(server.req, 'get',
-                        lambda url, timeout=None, headers=None, **kw: _FakeResponse(200, 'ok'))
+    _record_gets(monkeypatch, [_FakeResponse(429, 'slow down'), _FakeResponse(200, 'ok')])
 
     server._scrape_get('https://shop.example/products/x.json')
+    snap = server._proxy_health_snapshot()
 
-    assert server._proxy_health_snapshot()['proxy_failing'] is False
+    assert snap['proxy_failing'] is False
+    assert snap['proxy_requests'] == 1
+    # The host that needed it is remembered, so the dashboard can show which
+    # shops are actually on the paid route.
+    assert snap['proxy_hosts'] == ['shop.example']
 
 
 def test_recovery_clears_the_failing_flag(monkeypatch):
@@ -165,8 +200,7 @@ def test_recovery_clears_the_failing_flag(monkeypatch):
     the LAST attempt's verdict, not a sticky bit."""
     monkeypatch.setenv('SCRAPER_PROXY_URL', PROXY)
     server._PROXY_HEALTH.update(failed=1, last_fail_ts=1.0)
-    monkeypatch.setattr(server.req, 'get',
-                        lambda url, timeout=None, headers=None, **kw: _FakeResponse(200, 'ok'))
+    _record_gets(monkeypatch, [_FakeResponse(429, 'slow down'), _FakeResponse(200, 'ok')])
 
     server._scrape_get('https://shop.example/products/x.json')
 

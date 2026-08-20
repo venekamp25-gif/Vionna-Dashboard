@@ -143,7 +143,17 @@ export function NanoBananaSteps() {
 
     const successCount = finalResults.filter((r) => r.url).length;
     if (successCount === 0) {
-      setStepErrors((e) => ({ ...e, [stepNum]: "All variants failed. Check Higgsfield + try again." }));
+      // Say WHY. "Check Higgsfield + try again" is the same sentence whether the
+      // account is out of credits, the server session expired, or a ref image was
+      // rejected — during bug #42 it was the only thing anyone could see, and the
+      // real reason (in every variant's error) never reached the screen.
+      const reason = slotErrors.find((m) => m && m.trim());
+      setStepErrors((e) => ({
+        ...e,
+        [stepNum]: reason
+          ? `All variants failed — ${reason}`
+          : "All variants failed. Check Higgsfield + try again.",
+      }));
     } else {
       notify(
         `Step ${stepNum} ready`,

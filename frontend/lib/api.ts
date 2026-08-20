@@ -54,6 +54,17 @@ async function getDropletToken(force = false): Promise<string | null> {
 const TRANSIENT_READ_RETRIES = 2; // extra attempts on top of the first, GET only
 const isTransientStatus = (s: number) => s === 502 || s === 503 || s === 504;
 
+/** The backend's own `{"error": "..."}` message, if the body carries one. */
+function serverErrorMessage(body: string): string | null {
+  try {
+    const parsed = JSON.parse(body) as { error?: unknown };
+    const msg = typeof parsed?.error === "string" ? parsed.error.trim() : "";
+    return msg ? msg.slice(0, 300) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function call<T>(
   path: string,
   init?: { method?: "GET" | "POST"; body?: unknown; signal?: AbortSignal; authed?: boolean }
@@ -113,7 +124,11 @@ async function call<T>(
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`API ${path} → ${res.status}: ${text.slice(0, 200)}`);
+    // The backend already translates what it can into a sentence a colleague can
+    // act on ("Higgsfield account is out of credits…"). Show THAT, not the JSON
+    // envelope around it — during bug #42 the real reason was in the response
+    // body the whole time and nobody could read it past the `{"error":"…` blob.
+    throw new Error(serverErrorMessage(text) ?? `API ${path} → ${res.status}: ${text.slice(0, 200)}`);
   }
   return res.json() as Promise<T>;
 }
@@ -417,6 +432,14 @@ export const api = {
       stores: Record<"dk" | "fr" | "fi", boolean>;
       anthropic: boolean;
       higgsfield_cli: boolean;
+      /** Installed CLI version — "" when the binary is missing or silent. */
+      higgsfield_cli_version?: string;
+      /** Last MEASURED generate (/api/selftest?what=higgsfield); health never starts one. */
+      higgsfield_generate?: {
+        status: "ok" | "failing" | "unknown";
+        reason: string;
+        checked_seconds_ago: number | null;
+      };
       backups: { count: number; last: string };
     }>("/api/health"),
 

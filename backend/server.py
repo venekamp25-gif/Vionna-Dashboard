@@ -99,6 +99,39 @@ def _find_higgsfield_exe():
 HIGGSFIELD_EXE = _find_higgsfield_exe()
 print(f'Higgsfield EXE: {HIGGSFIELD_EXE or "(not found — install with: npm install -g @higgsfield/cli)"}')
 
+# The model every generate call asks for, and the CDN host that serves the
+# RESULT (the input CDN d2ol7oe51mr4n9.cloudfront.net must never be mistaken
+# for output). Both were hard-coded in three places; a Higgsfield-side rename
+# then means three edits and one of them gets forgotten. Plan #5 (bug #42)
+# flagged exactly that risk for the model name after a major CLI bump.
+HIGGSFIELD_MODEL = os.getenv('HIGGSFIELD_MODEL', 'nano_banana_2')
+HIGGSFIELD_OUTPUT_CDN = 'd8j0ntlcm91z4.cloudfront.net'
+
+_HF_VERSION_CACHE = {'ts': 0.0, 'value': ''}
+_HF_VERSION_TTL = 600
+
+
+def _higgsfield_version(force=False):
+    """The installed CLI's version string, cached.
+
+    /api/health reports it so "our client is three months behind" is visible
+    BEFORE it breaks: bug #42 was a total generation outage on a 0.1.40 client
+    while the service had moved on to 1.x, and nothing in the dashboard showed
+    the version. Cached because health is polled and this shells out."""
+    now = time.time()
+    if not force and (now - _HF_VERSION_CACHE['ts']) < _HF_VERSION_TTL:
+        return _HF_VERSION_CACHE['value']
+    value = ''
+    if HIGGSFIELD_EXE and os.path.isfile(HIGGSFIELD_EXE):
+        try:
+            r = subprocess.run(f'"{HIGGSFIELD_EXE}" --version',
+                               capture_output=True, text=True, timeout=10, shell=True)
+            value = (r.stdout or '').strip().splitlines()[0].strip() if (r.stdout or '').strip() else ''
+        except Exception:
+            value = ''
+    _HF_VERSION_CACHE.update({'ts': now, 'value': value})
+    return value
+
 APP_CREDENTIALS = {
     'dk': {
         'client_id':     os.getenv('SHOPIFY_DK_CLIENT_ID'),
@@ -638,7 +671,15 @@ def health():
         'version': ver,
         'stores': {k: (k in tokens) for k in ('dk', 'fr', 'fi')},
         'anthropic': bool(ANTHROPIC_KEY and ANTHROPIC_KEY != 'VOELINJEYHIER'),
+        # "The binary is on disk" was the only thing this said, and during the
+        # bug #42 outage it kept saying ✓ while every generate failed. The
+        # version makes "our client is months behind the service" visible, and
+        # higgsfield_generate reports the last MEASURED generate
+        # (/api/selftest?what=higgsfield) — health never starts one itself, it
+        # is polled and a generate costs a credit.
         'higgsfield_cli': bool(HIGGSFIELD_EXE),
+        'higgsfield_cli_version': _higgsfield_version(),
+        'higgsfield_generate': _higgsfield_generate_status(),
         'backups': {'count': n_backups, 'last': last_backup},
         # Whether competitor scraping CAN leave the droplet through the residential
         # proxy (bug #34). Boolean only — the proxy URL holds credentials.
@@ -1761,29 +1802,63 @@ def _strip_color_from_title(title, color):
     return re.sub(r'\s+', ' ', t).strip().lower()
 
 
+# How the CLI says "there is no valid session". `unauthor…` alone was not
+# enough: the wording it actually prints when the login is gone is
+# "Not authenticated", which matched nothing and therefore reached the
+# employee as raw CLI text (bug #42, plan #5 step 3c).
+_HF_AUTH_MARKERS = ('not authenticated', 'unauthenticated', 'not logged in',
+                    'auth login', 'authentication failed', 'authentication required',
+                    'login required', 'no active session', 'sign in', ' 401', '401 ')
+
+_HF_ERROR_MESSAGE = {
+    'empty':          'Higgsfield returned no output.',
+    'credits':        'Higgsfield account is out of credits. Top up at higgsfield.ai or wait for the daily quota to reset.',
+    'quota':          'Higgsfield quota exceeded for this plan. Top up or wait for the reset.',
+    'rate_limit':     'Higgsfield rate limit reached — wait a few seconds and click Retry.',
+    'auth':           'Higgsfield session expired — run `hf auth login` on the server.',
+    'timeout':        'Higgsfield timed out (took too long). Try with fewer reference images or click Retry.',
+    'image_rejected': 'A reference image was rejected (probably too large or unsupported format). Try a different ref.',
+    'network':        'Higgsfield network error — server-side connectivity issue. Click Retry.',
+}
+
+
+def _higgsfield_error_kind(raw):
+    """Classify Higgsfield's raw error output into one of _HF_ERROR_MESSAGE's
+    keys, or 'unknown'. The CLI / API has no stable error-code scheme, so we
+    string-match on the failure modes we have actually seen.
+
+    Split out from _map_higgsfield_error so the UNGATED self-test can report the
+    kind of failure without echoing the raw text — the CLI prints account and
+    session detail in there."""
+    low = (raw or '').lower()
+    if not low:
+        return 'empty'
+    if 'insufficient' in low and ('credit' in low or 'balance' in low):
+        return 'credits'
+    if 'quota' in low and ('exceed' in low or 'exhaust' in low or 'limit' in low):
+        return 'quota'
+    if 'rate limit' in low or 'too many request' in low or '429' in low:
+        return 'rate_limit'
+    if ('unauthor' in low or 'invalid token' in low or ('expired' in low and 'session' in low)
+            or any(m in low for m in _HF_AUTH_MARKERS)):
+        return 'auth'
+    if 'timeout' in low or 'timed out' in low:
+        return 'timeout'
+    if 'image' in low and ('too large' in low or 'invalid' in low or 'unsupported' in low):
+        return 'image_rejected'
+    if 'network' in low or 'connection' in low:
+        return 'network'
+    return 'unknown'
+
+
 def _map_higgsfield_error(raw):
     """Translate Higgsfield's raw error output into a user-actionable message.
-    The CLI / API doesn't have a stable error-code scheme, so we string-match
-    on the most common failure modes we've seen. Falls back to a trimmed raw
-    string when nothing matches."""
-    if not raw:
-        return 'Higgsfield returned no output.'
-    low = raw.lower()
-    if 'insufficient' in low and ('credit' in low or 'balance' in low):
-        return 'Higgsfield account is out of credits. Top up at higgsfield.ai or wait for the daily quota to reset.'
-    if 'quota' in low and ('exceed' in low or 'exhaust' in low or 'limit' in low):
-        return 'Higgsfield quota exceeded for this plan. Top up or wait for the reset.'
-    if 'rate limit' in low or 'too many request' in low or '429' in low:
-        return 'Higgsfield rate limit reached — wait a few seconds and click Retry.'
-    if 'unauthor' in low or 'invalid token' in low or 'expired' in low and 'session' in low:
-        return 'Higgsfield session expired — run `hf auth login` on the server.'
-    if 'timeout' in low or 'timed out' in low:
-        return 'Higgsfield timed out (took too long). Try with fewer reference images or click Retry.'
-    if 'image' in low and ('too large' in low or 'invalid' in low or 'unsupported' in low):
-        return 'A reference image was rejected (probably too large or unsupported format). Try a different ref.'
-    if 'network' in low or 'connection' in low:
-        return 'Higgsfield network error — server-side connectivity issue. Click Retry.'
-    return raw[:200]
+    Falls back to a trimmed raw string when nothing matches — that fallback is
+    for the TOKEN-GATED generate endpoint only; the self-test must not echo it."""
+    kind = _higgsfield_error_kind(raw)
+    if kind == 'unknown':
+        return str(raw)[:200]
+    return _HF_ERROR_MESSAGE[kind]
 
 
 def _sane_image_url(u):
@@ -5583,6 +5658,31 @@ def api_keyword_research_status():
 # here worth stealing.
 _SELFTEST_CACHE = {}
 _SELFTEST_TTL = 120     # same guard as _DFS_PROBE_CACHE: a live call costs credits
+# Per-check override. A keyword probe costs a fraction of a DataForSEO credit;
+# ?what=higgsfield renders a real image and costs a real one, so it is cached an
+# hour and serialised (below) — an ungated endpoint that spends money on every
+# hit is a denial-of-wallet hole, not a health check.
+_SELFTEST_TTL_BY_CHECK = {'higgsfield': 3600}
+_SELFTEST_LOCK = threading.Lock()
+_SELFTEST_CHECKS = ('keywords', 'scraper_proxy', 'higgsfield')
+
+
+def _selftest_ttl(what):
+    return _SELFTEST_TTL_BY_CHECK.get(what, _SELFTEST_TTL)
+
+
+def _higgsfield_generate_status():
+    """What the LAST ?what=higgsfield run found — reads the cache, never spends.
+
+    /api/health is polled by the admin panel, so it must not trigger a real
+    generate itself; it reports the most recent measured outcome instead."""
+    hit = _SELFTEST_CACHE.get('higgsfield')
+    if not hit:
+        return {'status': 'unknown', 'reason': '', 'checked_seconds_ago': None}
+    res = hit['result']
+    return {'status': 'ok' if res.get('ok') else 'failing',
+            'reason': res.get('reason') or '',
+            'checked_seconds_ago': int(time.time() - hit['ts'])}
 
 
 def _selftest_keywords():
@@ -5619,21 +5719,102 @@ def _selftest_keywords():
             'note': 'counts keywords above the threshold, before LLM cleaning'}
 
 
+# What the self-test says per failure kind. Curated sentences, never the CLI's
+# own text: on a failed generate the CLI prints session and account detail, and
+# this endpoint is ungated.
+_HF_SELFTEST_MESSAGE = {
+    'credits':        'Higgsfield refused the job — the account is out of credits. Top up at higgsfield.ai.',
+    'quota':          'Higgsfield refused the job — the plan quota is used up. Top up or wait for the reset.',
+    'auth':           'The CLI has no valid Higgsfield session — run `hf auth login` on the droplet.',
+    'rate_limit':     'Higgsfield rate-limited the test generation. Try again in a few minutes.',
+    'timeout':        'The test generation did not finish in time.',
+    'network':        'The droplet could not reach Higgsfield.',
+    'image_rejected': 'Higgsfield rejected the test prompt image.',
+    'empty':          'The CLI produced no output at all.',
+    'unknown':        'The CLI refused the test generation for a reason we do not recognise — '
+                      'read its own output on the droplet.',
+}
+
+
+def _selftest_higgsfield():
+    """Does ONE real generate still come back with an image?
+
+    Bug #42 was a total generation outage whose cause sat outside our code (the
+    session, the credit balance, or a three-month-old client the service stopped
+    accepting), and nothing reachable from a cloud session could tell those
+    apart — the routine had to file a plan just to ask someone to read a stderr
+    line. This answers that question, and only that question.
+
+    Costs one Higgsfield credit per real run, hence the hour-long cache and the
+    lock in api_selftest. Returns an outcome: never a URL, never CLI text."""
+    ver = _higgsfield_version()
+    if not HIGGSFIELD_EXE or not os.path.isfile(HIGGSFIELD_EXE):
+        return {'ok': False, 'reason': 'cli_missing', 'cli_version': ver,
+                'message': 'The Higgsfield CLI is not installed on the server '
+                           '(npm install -g @higgsfield/cli).'}
+    cmd = (f'"{HIGGSFIELD_EXE}" generate create {HIGGSFIELD_MODEL}'
+           f' --prompt "plain empty studio backdrop, soft grey, no people, no text"'
+           f' --aspect_ratio 3:4 --wait --json')
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, shell=True)
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'reason': 'timeout', 'cli_version': ver,
+                'message': _HF_SELFTEST_MESSAGE['timeout']}
+    except Exception:
+        # str(e) can carry the command line; the command line is ours, but this
+        # is the one place where echoing anything is a habit worth not having.
+        return {'ok': False, 'reason': 'unknown', 'cli_version': ver,
+                'message': _HF_SELFTEST_MESSAGE['unknown']}
+    stdout, stderr = (r.stdout or '').strip(), (r.stderr or '').strip()
+    if [u for u in _urls_from_stdout(stdout) if HIGGSFIELD_OUTPUT_CDN in u]:
+        return {'ok': True, 'reason': 'generated', 'cli_version': ver,
+                'message': 'Higgsfield generated a test image.'}
+    if stdout and not stderr and r.returncode == 0:
+        # It ran and claims success, but nothing landed on the output CDN. That
+        # is what a renamed model or a moved output host looks like — a code
+        # change on our side, unlike every other branch here.
+        return {'ok': False, 'reason': 'no_output_url', 'cli_version': ver,
+                'message': 'The CLI reported success but returned no image on the expected '
+                           'output CDN — the model name or the output host may have changed.'}
+    kind = _higgsfield_error_kind(stderr or stdout)
+    return {'ok': False, 'reason': kind, 'cli_version': ver,
+            'message': _HF_SELFTEST_MESSAGE.get(kind, _HF_SELFTEST_MESSAGE['unknown'])}
+
+
 @app.route('/api/selftest')
 def api_selftest():
-    """Read-only "did it work?" checks, no session token needed. ?what=keywords|scraper_proxy
+    """Read-only "did it work?" checks, no session token needed.
+    ?what=keywords|scraper_proxy|higgsfield
 
     Returns an OUTCOME only — never keyword text, never the proxy URL, never
-    credentials. Cached briefly so a retry loop cannot burn DataForSEO credits."""
+    credentials, never raw CLI output. Cached briefly so a retry loop cannot
+    burn DataForSEO credits (and, for higgsfield, an hour: it renders a real
+    image)."""
     what = (request.args.get('what') or '').strip().lower()
-    if what not in ('keywords', 'scraper_proxy'):
-        return jsonify({'error': 'pass ?what=keywords or ?what=scraper_proxy'}), 400
+    if what not in _SELFTEST_CHECKS:
+        return jsonify({'error': 'pass ?what=' + '|'.join(_SELFTEST_CHECKS)}), 400
     now = time.time()
     hit = _SELFTEST_CACHE.get(what)
-    if hit and (now - hit['ts']) < _SELFTEST_TTL:
+    if hit and (now - hit['ts']) < _selftest_ttl(what):
         out = dict(hit['result'])
         out['from_cache'] = True
         out['cache_age_seconds'] = int(now - hit['ts'])
+        return jsonify(out)
+    if what == 'higgsfield':
+        # Serialised: without this, N parallel requests each start a generate
+        # before the first one writes the cache — N credits for one answer.
+        with _SELFTEST_LOCK:
+            hit = _SELFTEST_CACHE.get(what)
+            now = time.time()
+            if hit and (now - hit['ts']) < _selftest_ttl(what):
+                out = dict(hit['result'])
+                out['from_cache'] = True
+                out['cache_age_seconds'] = int(now - hit['ts'])
+                return jsonify(out)
+            result = _selftest_higgsfield()
+            _SELFTEST_CACHE[what] = {'ts': now, 'result': result}
+        out = dict(result)
+        out['from_cache'] = False
         return jsonify(out)
     if what == 'keywords':
         result = _selftest_keywords()
@@ -13544,7 +13725,7 @@ def higgsfield_generate():
                                      'Install with: npm install -g @higgsfield/cli'}), 500
 
         safe_prompt = prompt.replace('"', "'")
-        base_cmd = (f'"{HIGGSFIELD_EXE}" generate create nano_banana_2'
+        base_cmd = (f'"{HIGGSFIELD_EXE}" generate create {HIGGSFIELD_MODEL}'
                     f' --prompt "{safe_prompt}" --aspect_ratio 3:4 --wait --json')
         for path in local_paths:
             base_cmd += f' --image "{path}"'
@@ -13563,8 +13744,7 @@ def higgsfield_generate():
                     urls_i = _urls_from_stdout(stdout_i)
                     # Higgsfield output-CDN: d8j0ntlcm91z4.cloudfront.net met hf_ prefix
                     # Input-CDN: d2ol7oe51mr4n9.cloudfront.net (altijd weggooien)
-                    OUTPUT_CDN = 'd8j0ntlcm91z4.cloudfront.net'
-                    filtered = [u for u in urls_i if OUTPUT_CDN in u]
+                    filtered = [u for u in urls_i if HIGGSFIELD_OUTPUT_CDN in u]
                     print(f'[hf] URLs found: {urls_i}')
                     print(f'[hf] After CDN filter (output only): {filtered}')
                     if filtered:
@@ -15083,13 +15263,13 @@ def _blog_hero_image(store, topic, products):
         prompt = (f"Editorial fashion magazine hero photo for an article about {kw}. Elegant feminine "
                   "European woman 35-50, soft natural light, airy minimal setting, refined styling, "
                   "muted warm tones, high-end lifestyle photography, no text or logos")
-        cmd = (f'"{HIGGSFIELD_EXE}" generate create nano_banana_2 --prompt "{prompt}" '
+        cmd = (f'"{HIGGSFIELD_EXE}" generate create {HIGGSFIELD_MODEL} --prompt "{prompt}" '
                f'--aspect_ratio 16:9 --wait --json')
         if tmp:
             cmd += f' --image "{tmp}"'
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, shell=True)
         urls = _urls_from_stdout(r.stdout or '')
-        out = [u for u in urls if 'd8j0ntlcm91z4.cloudfront.net' in u]
+        out = [u for u in urls if HIGGSFIELD_OUTPUT_CDN in u]
         return out[0] if out else None
     except Exception as e:
         print(f"[blog] hero image failed: {e}")
