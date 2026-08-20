@@ -285,6 +285,52 @@ def test_an_unrecognised_failure_still_shows_the_raw_text_on_the_gated_path():
     assert 'unicorn exploded' in server._map_higgsfield_error('unicorn exploded')
 
 
+# ── Picking the result out of what the CLI printed ─────────────────────────
+# Verified against the real 1.1.23 binary: the output CDN host is NOT in it, so
+# that host is our guess about an API response. Pinning it means a Higgsfield-
+# side rename throws away every image and reads as "generation is broken" —
+# the same symptom as bug #42, from a different cause.
+
+MOVED = 'https://cdn-new.higgsfield.ai/hf_result.jpg'
+
+
+def test_a_result_on_the_known_output_cdn_is_used():
+    assert server._higgsfield_outputs([INPUT_URL, OUT_URL]) == [OUT_URL]
+
+
+def test_the_reference_upload_cdn_is_never_a_result():
+    assert server._higgsfield_outputs([INPUT_URL]) == []
+
+
+def test_our_own_reference_images_are_never_a_result():
+    ref = 'https://shop.example/cdn/products/dress.jpg'
+    assert server._higgsfield_outputs([ref], input_urls=[ref]) == []
+    # …not even when the CLI echoes it back with a cache-buster.
+    assert server._higgsfield_outputs([ref + '?v=99'], input_urls=[ref]) == []
+
+
+def test_a_moved_output_host_is_still_accepted():
+    """The regression this guards: with the host pinned, this returned [] and
+    the employee saw 'no images generated' while generation worked fine."""
+    assert server._higgsfield_outputs([MOVED], input_urls=['https://shop.example/a.jpg']) == [MOVED]
+
+
+def test_the_known_host_still_wins_when_both_are_present():
+    """The fallback must not widen what we accept on a normal run."""
+    assert server._higgsfield_outputs([MOVED, OUT_URL]) == [OUT_URL]
+
+
+def test_a_moved_host_does_not_drag_the_inputs_in_with_it():
+    ref = 'https://shop.example/dress.jpg'
+    assert server._higgsfield_outputs([INPUT_URL, ref, MOVED], input_urls=[ref]) == [MOVED]
+
+
+def test_the_selftest_passes_on_a_moved_output_host(client, monkeypatch):
+    _stub(monkeypatch, stdout='{"jobs":[{"output_url":"%s"}]}' % MOVED)
+
+    assert client.get('/api/selftest?what=higgsfield').get_json()['ok'] is True
+
+
 def test_the_reference_image_rule_still_beats_the_token_rule():
     """'invalid token' and 'invalid image' both contain 'invalid'; order matters."""
     assert 'reference image' in server._map_higgsfield_error('image rejected: unsupported format')
