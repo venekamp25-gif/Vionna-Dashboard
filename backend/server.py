@@ -9472,14 +9472,32 @@ def api_pricing_lookup():
     items = (request.get_json(silent=True) or {}).get('items') or []
     if not isinstance(items, list):
         return jsonify({'error': 'items ontbreekt'}), 400
+
+    # Domein -> winkelsleutel, opgebouwd uit de winkels die we ECHT hebben.
+    # De aanroeper hoeft dus geen tabel bij te houden die veroudert: hij stuurt
+    # het myshopify-domein mee dat in zijn eigen data staat en wij zoeken op
+    # welke van onze winkels dat is. (Een handmatige tabel miste Vionna FI
+    # maandenlang zonder dat iemand het zag - 2026-08-23.)
+    by_domain = {}
+    for _k in list(tokens.keys()) + list(LIGHT_TOKENS.keys()):
+        _shop = str(_shop_entry(_k).get('shop') or '').lower()
+        if _shop:
+            by_domain[_shop] = _k
+            by_domain[_shop.split('.myshopify.com')[0]] = _k
+
     out, errors = {}, {}
     for it in items[:500]:
         store = str((it or {}).get('store') or '').strip()
         vid = str((it or {}).get('variant_id') or '').strip()
+        dom = str((it or {}).get('shop_domain') or '').strip().lower()
+        if dom and not _shop_entry(store).get('token'):
+            store = (by_domain.get(dom)
+                     or by_domain.get(dom.split('.myshopify.com')[0]) or store)
         if not store or not vid:
             continue
         if not _shop_entry(store).get('token'):
-            errors[store] = 'geen token voor deze winkel op de droplet'
+            errors[store or dom or '?'] = ('geen token voor deze winkel op de droplet'
+                                           + (f' (domein {dom})' if dom else ''))
             continue
         try:
             r = _shopify_call('get', shopify_url(store, f'variants/{vid}.json'),
@@ -9488,7 +9506,7 @@ def api_pricing_lookup():
                 errors[f'{store}:{vid}'] = f'HTTP {r.status_code}'
                 continue
             v = (r.json() or {}).get('variant') or {}
-            out[f'{store}:{vid}'] = {
+            out[f'{(it or {}).get("store") or store}:{vid}'] = {
                 'price': v.get('price'),
                 'compare_at': v.get('compare_at_price'),
                 'product_id': str(v.get('product_id') or ''),
