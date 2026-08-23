@@ -9452,6 +9452,53 @@ def api_cogs_overview():
                         'configured': True}), 200
 
 
+@app.route('/api/pricing/lookup', methods=['POST'])
+def api_pricing_lookup():
+    """Actuele prijs per variant opzoeken. Body: {items:[{store, variant_id}]}.
+
+    Bestaat omdat de WINKELTOKENS hier staan en niet op master-dashboard: die
+    heeft de ServicePoints-sleutel (de inkoopprijs), wij hebben de verkoopprijs.
+    Elk de helft die hij al bezit, i.p.v. tokens dupliceren.
+
+    Gate: het normale sessietoken OF het gedeelde cron-geheim, zodat
+    master-dashboard er server-to-server bij kan voor het Slack-bericht.
+    """
+    secret = os.getenv('NOTIFY_SECRET', '')
+    supplied = request.headers.get('X-Notify-Token', '')
+    if not (secret and supplied == secret):
+        if not _verify_droplet_token(request.headers.get('X-Droplet-Token', '')):
+            return jsonify({'error': 'Unauthorized'}), 401
+
+    items = (request.get_json(silent=True) or {}).get('items') or []
+    if not isinstance(items, list):
+        return jsonify({'error': 'items ontbreekt'}), 400
+    out, errors = {}, {}
+    for it in items[:500]:
+        store = str((it or {}).get('store') or '').strip()
+        vid = str((it or {}).get('variant_id') or '').strip()
+        if not store or not vid:
+            continue
+        if not _shop_entry(store).get('token'):
+            errors[store] = 'geen token voor deze winkel op de droplet'
+            continue
+        try:
+            r = _shopify_call('get', shopify_url(store, f'variants/{vid}.json'),
+                              shopify_headers(store), timeout=20)
+            if r.status_code != 200:
+                errors[f'{store}:{vid}'] = f'HTTP {r.status_code}'
+                continue
+            v = (r.json() or {}).get('variant') or {}
+            out[f'{store}:{vid}'] = {
+                'price': v.get('price'),
+                'compare_at': v.get('compare_at_price'),
+                'product_id': str(v.get('product_id') or ''),
+                'title': v.get('title'),
+            }
+        except Exception as e:
+            errors[f'{store}:{vid}'] = str(e)[:120]
+    return jsonify({'prices': out, 'errors': errors, 'found': len(out)})
+
+
 @app.route('/api/pricing/apply', methods=['POST'])
 @require_droplet_token
 def api_pricing_apply():
