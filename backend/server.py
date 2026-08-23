@@ -9413,7 +9413,11 @@ def _siblings_heal(store, apply_changes=True):
 # Het rekenwerk gebeurt in master-dashboard (daar staat de ServicePoints-sleutel);
 # hier tonen we het en voeren we de prijs door. De fetch is SERVER-SIDE zodat het
 # gedeelde geheim niet in de browser komt.
-COGS_SOURCE_URL = os.getenv('MASTER_DASHBOARD_URL', '').rstrip('/')
+# Standaard ingevuld: dit is een PUBLIEK adres, geen geheim, dus het hoort niet
+# in de .env te hoeven. Zo blijft er nog maar EEN waarde over die de eigenaar
+# zelf moet zetten (NOTIFY_SECRET), i.p.v. drie.
+COGS_SOURCE_URL = (os.getenv('MASTER_DASHBOARD_URL')
+                   or 'https://master-dashboard-mw2d.onrender.com').rstrip('/')
 
 
 @app.route('/api/cogs/overview')
@@ -9424,13 +9428,14 @@ def api_cogs_overview():
     Faalt de bron, dan zeggen we DAT -- een leeg overzicht mag nooit lezen als
     'geen enkel product zit boven de drempel'.
     """
-    if not COGS_SOURCE_URL:
-        return jsonify({'error': 'MASTER_DASHBOARD_URL niet ingesteld op de droplet',
-                        'configured': False}), 200
     secret = os.getenv('NOTIFY_SECRET', '')
     if not secret:
-        return jsonify({'error': 'NOTIFY_SECRET niet ingesteld op de droplet',
-                        'configured': False}), 200
+        return jsonify({
+            'error': 'NOTIFY_SECRET staat nog niet op de droplet. Kopieer de waarde '
+                     'uit Render (master-dashboard > Environment) naar '
+                     '/opt/listing-dashboard/backend/.env en draai '
+                     '"systemctl restart listing-backend".',
+            'configured': False}), 200
     scope = request.args.get('scope', 'weekly')
     try:
         r = req.get(f'{COGS_SOURCE_URL}/api/cogs/report',
