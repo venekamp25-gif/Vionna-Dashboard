@@ -680,6 +680,10 @@ def health():
         # (/api/selftest?what=higgsfield) — health never starts one itself, it
         # is polled and a generate costs a credit.
         'higgsfield_cli': bool(HIGGSFIELD_EXE),
+        # Niet alleen "staat de CLI er" maar "zou genereren nu lukken". Een
+        # aanwezige CLI zonder inlog of workspace faalde eerder stil.
+        'higgsfield_ready': _higgsfield_ready().get('ok'),
+        'higgsfield_reason': _higgsfield_ready().get('detail'),
         'higgsfield_cli_version': _higgsfield_version(),
         'higgsfield_generate': _higgsfield_generate_status(),
         'backups': {'count': n_backups, 'last': last_backup},
@@ -1818,6 +1822,9 @@ _HF_ERROR_MESSAGE = {
     'quota':          'Higgsfield quota exceeded for this plan. Top up or wait for the reset.',
     'rate_limit':     'Higgsfield rate limit reached — wait a few seconds and click Retry.',
     'auth':           'Higgsfield session expired — run `hf auth login` on the server.',
+    'workspace':      ('Higgsfield has no workspace selected on the server. The server tries to '
+                       'fix this itself; if you see this repeatedly, run `hf workspace list` and '
+                       '`hf workspace set <id>` there.'),
     'timeout':        'Higgsfield timed out (took too long). Try with fewer reference images or click Retry.',
     'image_rejected': 'A reference image was rejected (probably too large or unsupported format). Try a different ref.',
     'network':        'Higgsfield network error — server-side connectivity issue. Click Retry.',
@@ -1841,6 +1848,11 @@ def _higgsfield_error_kind(raw):
         return 'quota'
     if 'rate limit' in low or 'too many request' in low or '429' in low:
         return 'rate_limit'
+    # VOOR de auth-check: "no workspace selected" bevat geen auth-woorden, maar
+    # de hint eronder ("Run: hf workspace set") mag niet als iets anders landen.
+    if 'workspace' in low and ('no workspace' in low or 'not selected' in low
+                               or 'workspace set' in low):
+        return 'workspace'
     if ('unauthor' in low or 'invalid token' in low or ('expired' in low and 'session' in low)
             or any(m in low for m in _HF_AUTH_MARKERS)):
         return 'auth'
@@ -1861,6 +1873,115 @@ def _map_higgsfield_error(raw):
     if kind == 'unknown':
         return str(raw)[:200]
     return _HF_ERROR_MESSAGE[kind]
+
+
+# ── Higgsfield-gereedheid ─────────────────────────────────────────────────
+# Een generatie kost tijd en credits; falen is duur en frustrerend. Deze
+# controle is GRATIS (`hf account status` verbruikt niets) en zegt vooraf of het
+# zou lukken. Kort gecached zodat een verversend dashboard hem niet plat legt.
+_HF_READY = {'at': 0.0, 'ok': None, 'kind': None, 'detail': None, 'account': None}
+_HF_READY_TTL = 300          # seconden
+_HF_READY_LOCK = threading.Lock()
+
+
+def _hf_run(args, timeout=45):
+    """Draai de Higgsfield-CLI. -> (rc, stdout+stderr)."""
+    if not HIGGSFIELD_EXE:
+        return 127, 'higgsfield CLI not installed on the server'
+    try:
+        r = subprocess.run([HIGGSFIELD_EXE] + list(args), capture_output=True,
+                           text=True, timeout=timeout)
+        return r.returncode, ((r.stdout or '') + (r.stderr or '')).strip()
+    except subprocess.TimeoutExpired:
+        return 124, 'timed out'
+    except Exception as e:
+        return 1, str(e)[:200]
+
+
+def _hf_try_pick_workspace():
+    """Kies zelf een workspace als er geen gekozen is.
+
+    Alleen bij precies EEN workspace: dan weigert de CLI niet omdat de keuze
+    onduidelijk is maar omdat er geen keuze is vastgelegd, en dat kan de server
+    net zo goed zelf. Bij meerdere raden we niet -- dan is het een beslissing.
+    """
+    rc, out = _hf_run(['workspace', 'list'], timeout=45)
+    if rc != 0:
+        return False, f'workspace list mislukte: {out[:120]}'
+    ids = re.findall(r'^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})',
+                     out, re.M)
+    if len(ids) != 1:
+        return False, (f'{len(ids)} workspaces gevonden — kies er zelf een met '
+                       f'`hf workspace set <id>`')
+    rc2, out2 = _hf_run(['workspace', 'set', ids[0]], timeout=45)
+    if rc2 != 0:
+        return False, f'workspace set mislukte: {out2[:120]}'
+    print(f'[higgsfield] workspace automatisch gekozen: {ids[0]}')
+    return True, ids[0]
+
+
+def _higgsfield_ready(force=False, heal=True):
+    """Zou een generatie nu lukken? -> {ok, kind, detail, account}.
+
+    `heal`: probeer een ontbrekende workspace zelf te zetten. Dat is de enige
+    faalvorm die de server zonder mens kan repareren.
+    """
+    now = time.time()
+    with _HF_READY_LOCK:
+        if not force and _HF_READY['ok'] is not None and (now - _HF_READY['at']) < _HF_READY_TTL:
+            return {k: _HF_READY[k] for k in ('ok', 'kind', 'detail', 'account')}
+
+    rc, out = _hf_run(['account', 'status'], timeout=45)
+    ok, kind, detail, account = (rc == 0), None, None, None
+    if ok:
+        account = out.splitlines()[0][:120] if out else None
+    else:
+        kind = _higgsfield_error_kind(out)
+        if kind == 'workspace' and heal:
+            healed, info = _hf_try_pick_workspace()
+            if healed:
+                rc, out = _hf_run(['account', 'status'], timeout=45)
+                ok = (rc == 0)
+                kind = None if ok else _higgsfield_error_kind(out)
+                account = out.splitlines()[0][:120] if ok and out else None
+                detail = None if ok else str(info)[:160]
+            else:
+                detail = str(info)[:160]
+        if not ok and not detail:
+            detail = _HF_ERROR_MESSAGE.get(kind) or str(out)[:160]
+
+    with _HF_READY_LOCK:
+        _HF_READY.update(at=now, ok=ok, kind=kind, detail=detail, account=account)
+    return {'ok': ok, 'kind': kind, 'detail': detail, 'account': account}
+
+
+def _higgsfield_ready_loop():
+    """Elk uur nakijken en zelfherstellen.
+
+    Zonder dit merkt niemand een weggevallen sessie tot een medewerker vier
+    beelden aanvraagt en vier fouten terugkrijgt — precies wat op 2026-08-22
+    gebeurde en een dag bleef liggen.
+    """
+    time.sleep(240)
+    last_bad = None
+    while True:
+        try:
+            st = _higgsfield_ready(force=True, heal=True)
+            if not st['ok']:
+                if st.get('kind') != last_bad:
+                    print(f"[higgsfield] NIET BRUIKBAAR ({st.get('kind')}): {st.get('detail')}")
+                last_bad = st.get('kind')
+            else:
+                if last_bad:
+                    print('[higgsfield] weer bruikbaar')
+                last_bad = None
+        except Exception as e:
+            print(f'[higgsfield] readiness-check faalde: {e}')
+        time.sleep(3600)
+
+
+threading.Thread(target=_higgsfield_ready_loop, daemon=True,
+                 name='higgsfield-ready').start()
 
 
 def _sane_image_url(u):

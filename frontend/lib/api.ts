@@ -434,6 +434,12 @@ export const api = {
       higgsfield_cli: boolean;
       /** Installed CLI version — "" when the binary is missing or silent. */
       higgsfield_cli_version?: string;
+      /** Would a generation succeed RIGHT NOW? A present CLI is not enough — it
+       *  also needs a live session and a selected workspace, and both have
+       *  failed silently before (2026-08-22: 8 blank errors, a day lost). */
+      higgsfield_ready?: boolean | null;
+      /** Plain-language reason when higgsfield_ready is false. */
+      higgsfield_reason?: string | null;
       /** Last MEASURED generate (/api/selftest?what=higgsfield); health never starts one. */
       higgsfield_generate?: {
         status: "ok" | "failing" | "unknown";

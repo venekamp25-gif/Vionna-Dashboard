@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { ImageTile } from "@/components/ui/ImageTile";
 import { Lightbox } from "@/components/ui/Lightbox";
@@ -55,6 +55,27 @@ export function NanoBananaSteps() {
   const [stepErrors, setStepErrors] = useState<Record<number, string | null>>({});
   const [zoomUrl, setZoomUrl] = useState<string | null>(null);
   const [runningColors, setRunningColors] = useState<Record<string, boolean>>({});
+  // Is beeldgeneratie op de server BRUIKBAAR? Een aanwezige CLI zegt niets: de
+  // sessie kan verlopen zijn of er kan geen workspace gekozen zijn, en dat
+  // faalde eerder stil (2026-08-22: 8 lege fouten, een dag verloren). Dit
+  // controleren we VOORDAT iemand vier beelden aanvraagt.
+  const [hfReason, setHfReason] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .health()
+      .then((h) => {
+        if (cancelled) return;
+        setHfReason(h.higgsfield_ready === false ? h.higgsfield_reason ?? "unknown reason" : null);
+      })
+      .catch(() => {
+        /* health down is its own visible problem elsewhere */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   /** Build reference image URLs for a given step based on current state. */
   const buildImageUrls = (step: number): string[] => {
@@ -482,6 +503,16 @@ export function NanoBananaSteps() {
 
   return (
     <div className="space-y-4 mt-2">
+      {hfReason && (
+        <div className="flex items-start gap-2.5 px-3.5 py-2 rounded-[10px] bg-danger/10 border border-danger/40 text-[12px] text-danger">
+          <span>⚠</span>
+          <span className="flex-1">
+            <strong>Image generation is not available right now.</strong> {hfReason}
+            <br />
+            Generating will fail until this is fixed — no point clicking the steps below yet.
+          </span>
+        </div>
+      )}
       {data.pinnedUrl && (
         <div className="flex items-center gap-2.5 px-3.5 py-2 rounded-[10px] bg-warning/15 border border-warning/40 text-[12px] text-warning">
           <span>📌</span>
