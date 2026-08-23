@@ -9638,6 +9638,60 @@ def api_pricing_lookup():
     return jsonify({'prices': out, 'errors': errors, 'found': len(out)})
 
 
+@app.route('/api/pricing/catalogue')
+def api_pricing_catalogue():
+    """Titels + varianten + prijzen van een winkel.
+
+    Nodig omdat Vionna DK/FR bij een ANDERE fulfiller zitten (Fillbox) die geen
+    inkoopprijs per product levert. De FI-winkel zit wel bij ServicePoints en
+    verkoopt dezelfde catalogus, dus de FI-quote is een bruikbare schatting voor
+    hetzelfde product in DK/FR -- mits je op titel + maat kunt koppelen, en
+    daarvoor is deze lijst nodig.
+
+    Gate: sessietoken OF het gedeelde cron-geheim (server-to-server).
+    """
+    secret = os.getenv('NOTIFY_SECRET', '')
+    if not (secret and request.headers.get('X-Notify-Token', '') == secret):
+        if not _verify_droplet_token(request.headers.get('X-Droplet-Token', '')):
+            return jsonify({'error': 'Unauthorized'}), 401
+
+    store = (request.args.get('store') or '').strip()
+    if not _shop_entry(store).get('token'):
+        return jsonify({'error': f'Not authenticated for {store.upper()}.'}), 401
+
+    q = ('{ products(first:250%s, query:"status:active"){ '
+         'pageInfo{hasNextPage endCursor} edges{ node{ id title handle '
+         'variants(first:50){ edges{ node{ id title price compareAtPrice } } } '
+         '} } } }')
+    out, cursor = [], None
+    try:
+        while True:
+            after = f', after:"{cursor}"' if cursor else ''
+            d = _sib_gql(store, q % after) or {}
+            conn = d.get('products') or {}
+            for e in conn.get('edges', []):
+                n = e['node']
+                pid = str(n.get('id') or '').rsplit('/', 1)[-1]
+                for ve in ((n.get('variants') or {}).get('edges') or []):
+                    v = ve['node']
+                    out.append({
+                        'product_id': pid,
+                        'variant_id': str(v.get('id') or '').rsplit('/', 1)[-1],
+                        'title': n.get('title'),
+                        'handle': n.get('handle'),
+                        'variant_title': v.get('title'),
+                        'price': v.get('price'),
+                        'compare_at': v.get('compareAtPrice'),
+                    })
+            pg = conn.get('pageInfo') or {}
+            if not pg.get('hasNextPage'):
+                break
+            cursor = pg.get('endCursor')
+    except Exception as e:
+        return jsonify({'error': str(e)[:200], 'store': store}), 502
+    return jsonify({'store': store, 'count': len(out), 'items': out})
+
+
 @app.route('/api/pricing/apply', methods=['POST'])
 @require_droplet_token
 def api_pricing_apply():

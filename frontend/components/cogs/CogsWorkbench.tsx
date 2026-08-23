@@ -157,6 +157,11 @@ export function CogsWorkbench() {
             <span>
               {data.counted ?? 0} variant(s) with a known cost
             </span>
+            {(data.estimated_rows ?? 0) > 0 && (
+              <span title="DK/FR run through Fillbox, which reports no per-product cost. These use the Finnish quote for the same product — an estimate, not a measurement.">
+                {data.estimated_rows} estimated from FI
+              </span>
+            )}
             {(data.unknown_count ?? 0) > 0 && (
               <span title="Sold, but we could not read a current price for them">
                 {data.unknown_count} not judged
@@ -230,6 +235,14 @@ export function CogsWorkbench() {
                         <div className="text-[11px] text-text-dim">
                           {r.store.toUpperCase()}
                           {r.seen ? ` · ${r.seen}× sold in window` : ""}
+                          {r.estimated && (
+                            <span
+                              className="ml-1.5 px-1.5 py-0.5 rounded bg-warning/20 text-warning font-medium"
+                              title={r.estimate_basis ?? "Derived from the Finnish quote for the same product"}
+                            >
+                              estimated
+                            </span>
+                          )}
                         </div>
                       </td>
                       <td className="px-3 py-2 text-right whitespace-nowrap">
@@ -294,7 +307,10 @@ export function CogsWorkbench() {
 
         <p className="text-[11px] text-text-faint mt-4 max-w-3xl">
           Cost comes from the accepted supplier quote in ServicePoints, matched to
-          the exact Shopify variant. Percentages are on the gross price (no VAT is
+          the exact Shopify variant. Rows marked <em>estimated</em> are Vionna
+          DK/FR: those run through Fillbox, which reports no per-product cost, so
+          they borrow the Finnish quote for the same product (converted to DKK
+          where needed). Treat those as an indication, not a measurement. Percentages are on the gross price (no VAT is
           remitted). Products that have never sold have no quote, so they cannot
           appear here. Raising a price also raises the struck-through was-price by
           the same factor, so the discount stays intact.

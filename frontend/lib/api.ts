@@ -160,6 +160,12 @@ export interface CogsRow {
   compare_at?: number | null;
   seen?: number;
   last_order?: string;
+  /** 'measured' = a real supplier quote for THIS store. 'estimated_from_fi' =
+   *  derived from the Finnish quote for the same product, because DK/FR run
+   *  through Fillbox which reports no per-product cost. Never blur the two. */
+  cost_source?: "measured" | "estimated_from_fi";
+  estimated?: boolean;
+  estimate_basis?: string;
 }
 
 export interface CogsOverview {
@@ -174,6 +180,13 @@ export interface CogsOverview {
   unknown_count?: number;
   price_errors?: Record<string, string>;
   stats?: Record<string, number>;
+  estimated_rows?: number;
+  estimate_info?: {
+    fi_reference_items?: number;
+    matched?: number;
+    note?: string;
+    errors?: Record<string, string>;
+  };
 }
 
 export interface BackendStatus {
