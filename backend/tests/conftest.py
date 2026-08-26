@@ -35,3 +35,17 @@ def _isolate_bs_product_cache(tmp_path, monkeypatch):
 
     monkeypatch.setattr(server, 'BS_PROD_CACHE_PATH', str(tmp_path / 'bs_product_cache.json'))
     monkeypatch.setattr(server, '_BS_PROD_CACHE', {})
+
+
+@pytest.fixture(autouse=True)
+def _isolate_hf_media(tmp_path, monkeypatch):
+    """Keep the captured-image store (plan #9, bug #46) out of the repo.
+
+    /api/higgsfield writes real image bytes next to server.py; without this a
+    test run would drop backend/hf_media/ into a PUBLIC repo and leave it there.
+    """
+    import server
+
+    d = tmp_path / 'hf_media'
+    d.mkdir()
+    monkeypatch.setattr(server, 'HF_MEDIA_DIR', str(d))

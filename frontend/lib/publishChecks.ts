@@ -26,32 +26,49 @@ export interface VerifyIssue {
 export const MISSING_IMAGES_MSG = "No images attached";
 
 /**
- * The post-publish issues `POST /api/retry_fix` can actually repair. It calls
- * `_publish_to_default_channels` and nothing else (backend/server.py:995-1021),
- * so the sales-channel issue is the entire list. Anything else needs a human or
- * a re-run of an earlier step — offering a retry for it is a dead end.
+ * The post-publish issues `POST /api/retry_fix` can repair on its own, with
+ * nothing but the product ids: it (re)publishes to the default sales channels.
+ * Anything else needs a human or a re-run of an earlier step — offering a retry
+ * for it is a dead end.
  */
 const RETRY_FIXABLE_MSGS = ["Not on any sales channel"];
 
-export function isRetryFixable(msg: string): boolean {
-  return RETRY_FIXABLE_MSGS.includes(msg.trim());
+/**
+ * Missing photos are the conditional case. Since plan #9 (bug #46) retry_fix
+ * can re-attach them too, but only from URLs we hand it — so this is fixable
+ * exactly when the run still holds photos for the affected products. When it
+ * doesn't, the honest answer is still "re-do step 5", not a button that loops.
+ */
+export function isRetryFixable(msg: string, canReattachImages = false): boolean {
+  const m = msg.trim();
+  if (canReattachImages && m === MISSING_IMAGES_MSG) return true;
+  return RETRY_FIXABLE_MSGS.includes(m);
 }
 
 export interface RetryAdvice {
   /** At least one issue that "Retry fix" can genuinely repair. */
   canRetry: boolean;
-  /** At least one product was created without any photo. */
+  /** At least one product was created without any photo AND retry cannot fix it. */
   missingImages: boolean;
-  /** Distinct messages retry cannot do anything about (missing images included). */
+  /** Distinct messages retry cannot do anything about. */
   unfixable: string[];
 }
 
-/** What, if anything, "Retry fix" can still do for this set of verify issues. */
-export function retryFixAdvice(issues: VerifyIssue[]): RetryAdvice {
+/**
+ * What, if anything, "Retry fix" can still do for this set of verify issues.
+ *
+ * `canReattachImages` — whether the run still holds photo URLs for the products
+ * that came out empty. With them, retry_fix re-attaches the photos itself; only
+ * without them is "No images attached" a dead end that needs step 5 re-run.
+ */
+export function retryFixAdvice(
+  issues: VerifyIssue[],
+  canReattachImages = false
+): RetryAdvice {
   const unfixable: string[] = [];
   let canRetry = false;
   for (const issue of issues) {
-    if (isRetryFixable(issue.msg)) {
+    if (isRetryFixable(issue.msg, canReattachImages)) {
       canRetry = true;
     } else if (!unfixable.includes(issue.msg)) {
       unfixable.push(issue.msg);

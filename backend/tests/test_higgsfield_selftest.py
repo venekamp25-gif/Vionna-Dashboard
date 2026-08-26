@@ -27,12 +27,17 @@ import server
 
 OUT_URL = f'https://{server.HIGGSFIELD_OUTPUT_CDN}/hf_abc123.jpg'
 INPUT_URL = 'https://d2ol7oe51mr4n9.cloudfront.net/ref_0.jpg'
+PNG = b'\x89PNG\r\n\x1a\n' + b'pixels' * 32
 
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch, tmp_path):
     monkeypatch.setattr(server, '_SELFTEST_CACHE', {})
     monkeypatch.setattr(server, '_HF_VERSION_CACHE', {'ts': 0.0, 'value': ''})
+    # The check downloads the image it generated (plan #9, bug #46) — a URL is
+    # not proof of an image. Default to a reachable one so the tests below stay
+    # about what they were about; the ones that care override this.
+    monkeypatch.setattr(server, '_hf_fetch_bytes', lambda url, timeout=30: PNG)
     # A real path so the "is the CLI installed" guard passes; nothing is executed
     # — subprocess.run is stubbed in every test that gets that far.
     exe = tmp_path / 'hf'
@@ -77,6 +82,43 @@ def test_a_working_generate_reports_ok(client, monkeypatch):
     assert body['ok'] is True
     assert body['reason'] == 'generated'
     assert run.generate_calls == 1
+
+
+def test_a_url_that_cannot_be_downloaded_is_not_a_working_generate(client, monkeypatch):
+    """Bug #46: every URL Higgsfield produced that morning answered 403 from the
+    first second. This check reported ok:true straight through it, because it
+    only ever looked at whether a URL came back — so the one ungated probe the
+    routine has said the image pipeline was healthy while nine products were
+    being created with no photos."""
+    _stub(monkeypatch, stdout='{"jobs":[{"output_url":"%s"}]}' % OUT_URL)
+
+    class _Forbidden(server.req.exceptions.HTTPError):
+        pass
+
+    def _dead(url, timeout=30):
+        err = _Forbidden('403 Forbidden')
+        err.response = type('R', (), {'status_code': 403})()
+        raise err
+
+    monkeypatch.setattr(server, '_hf_fetch_bytes', _dead)
+
+    body = client.get('/api/selftest?what=higgsfield').get_json()
+
+    assert body['ok'] is False
+    assert body['reason'] == 'unreachable_output'
+    assert 'HTTP 403' in body['message']
+    assert OUT_URL not in body['message'], 'the outcome never carries the URL itself'
+
+
+def test_a_url_serving_something_that_is_not_an_image_also_fails(client, monkeypatch):
+    _stub(monkeypatch, stdout='{"jobs":[{"output_url":"%s"}]}' % OUT_URL)
+    monkeypatch.setattr(server, '_hf_fetch_bytes',
+                        lambda url, timeout=30: b'<!doctype html><title>AccessDenied</title>')
+
+    body = client.get('/api/selftest?what=higgsfield').get_json()
+
+    assert body['ok'] is False
+    assert body['reason'] == 'unreachable_output'
 
 
 def test_a_lost_session_is_named_as_such(client, monkeypatch):

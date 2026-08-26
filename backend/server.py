@@ -686,6 +686,10 @@ def health():
         'higgsfield_reason': _higgsfield_ready().get('detail'),
         'higgsfield_cli_version': _higgsfield_version(),
         'higgsfield_generate': _higgsfield_generate_status(),
+        # The captured-image store (plan #9, bug #46). Its own risk is disk, so
+        # the size is the thing worth seeing from outside — the prune runs on
+        # every generation and this is how you check that it is keeping up.
+        'hf_media': _hf_media_stats(),
         'backups': {'count': n_backups, 'last': last_backup},
         # Whether competitor scraping CAN leave the droplet through the residential
         # proxy (bug #34). Boolean only — the proxy URL holds credentials.
@@ -984,21 +988,62 @@ def verify_products():
     return jsonify({'products': out})
 
 
+def _product_image_count(store, prod_id, hdrs):
+    """How many images Shopify currently holds for a product."""
+    r = req.get(shopify_url(store, f'products/{prod_id}/images.json'),
+                headers=hdrs, timeout=30)
+    r.raise_for_status()
+    return len((r.json() or {}).get('images') or [])
+
+
+def _reattach_images_if_missing(store, prod_id, urls, hdrs):
+    """Give a photoless product its photos back. Returns (attached, errors).
+
+    Only ever touches a product that has ZERO images, so pressing "Retry fix"
+    twice cannot duplicate a carousel. Goes through the same
+    download-then-base64 path publish uses, so a URL we cannot fetch is reported
+    here as well instead of being handed to Shopify as a src it will never
+    manage to fetch itself (bug #45/#46).
+    """
+    if _product_image_count(store, prod_id, hdrs) > 0:
+        return 0, []
+    report = _new_image_report()
+    payload = _build_image_payload(urls, max_images=10, report=report)
+    if not payload:
+        return 0, [f'{prod_id}: no usable photo URLs to re-attach']
+    _attach_images_one_by_one(store, prod_id, payload, hdrs, report=report)
+    return report['verified'], [f'{prod_id}: {e}' for e in report['errors']]
+
+
 @app.route('/api/retry_fix', methods=['POST'])
 @require_droplet_token
 def retry_fix():
-    """Re-attempt the auto-fixable post-publish issues for the given products — currently
-    (re)publishes each to the default sales channels (Online Store / Facebook / Google). The
-    frontend re-verifies afterwards and offers to report whatever still fails as a bug. Gated."""
+    """Re-attempt the auto-fixable post-publish issues for the given products. Gated.
+
+    Two repairs, both idempotent:
+      - (re)publish each product to the default sales channels (Online Store /
+        Facebook / Google);
+      - re-attach photos to a product that has NONE, from the URLs the caller
+        published with (`images_by_product`: {product_id: [url, ...]}).
+
+    The second one is new (plan #9, bug #46). Before it, this endpoint touched
+    sales channels and nothing else, so the ONE button the post-publish screen
+    offers for "No images attached" could not repair that issue by construction
+    — which is why #43/#44/#45 came back reporting exactly the same thing after
+    every retry. Callers that send no `images_by_product` get the old behaviour.
+    """
     if not DROPLET_TOKEN_SECRET:
         return jsonify({'error': 'session-token gate not configured'}), 503
     data = request.json or {}
     store = data.get('store', 'dk')
     ids = data.get('product_ids') or []
+    images_by_product = data.get('images_by_product') or {}
+    if not isinstance(images_by_product, dict):
+        images_by_product = {}
     if store not in tokens:
         return jsonify({'error': f'Not authenticated for {store.upper()} store.'}), 401
     hdrs = shopify_headers(store)
-    fixed, errors = 0, []
+    fixed, errors, images_attached = 0, [], 0
     for pid in ids:
         num = re.sub(r'\D', '', str(pid).rsplit('/', 1)[-1])
         if not num:
@@ -1011,8 +1056,20 @@ def retry_fix():
                 fixed += 1
         except Exception as e:
             errors.append(f'{num}: {str(e)[:150]}')
+        # The caller keys these by whatever it holds (gid, int or string id), so
+        # match on the digits we already normalised out of it.
+        urls = next((v for k, v in images_by_product.items()
+                     if re.sub(r'\D', '', str(k).rsplit('/', 1)[-1]) == num), None)
+        if urls:
+            try:
+                got, img_errs = _reattach_images_if_missing(store, num, urls, hdrs)
+                images_attached += got
+                errors.extend(img_errs)
+            except Exception as e:
+                errors.append(f'{num}: re-attaching photos failed ({_image_failure_reason(e)})')
         time.sleep(0.2)
-    return jsonify({'success': True, 'fixed': fixed, 'errors': errors[:20]})
+    return jsonify({'success': True, 'fixed': fixed, 'images_attached': images_attached,
+                    'errors': errors[:20]})
 
 
 @app.route('/api/audit')
@@ -1365,6 +1422,17 @@ _SCRAPE_UA_FALLBACK = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537
 _SCRAPER_PROXY_LOCAL_HOSTS = {'localhost', '127.0.0.1', '::1'}
 
 
+def _own_public_host():
+    """The droplet's own public hostname.
+
+    Since plan #9 (bug #46) the publish path downloads generated photos from our
+    OWN /api/hf_media URLs, so "our own host" has to include the public name and
+    not just loopback — otherwise every publish sends a few MB per photo out to
+    a residential proxy and straight back to us, billed per GB."""
+    return (urllib.parse.urlparse(
+        os.getenv('PUBLIC_BASE_URL', 'https://188-166-11-177.nip.io')).hostname or '').lower()
+
+
 def _scraper_proxies(url):
     """requests-style `proxies` dict for `url`, or None when it should go direct.
 
@@ -1378,7 +1446,8 @@ def _scraper_proxies(url):
     if not proxy:
         return None
     host = (urllib.parse.urlparse(url).hostname or '').lower()
-    if host in _SCRAPER_PROXY_LOCAL_HOSTS or host.startswith('cdn.'):
+    if (host in _SCRAPER_PROXY_LOCAL_HOSTS or host == _own_public_host()
+            or host.startswith('cdn.')):
         return None
     return {'http': proxy, 'https': proxy}
 
@@ -5854,6 +5923,9 @@ _HF_SELFTEST_MESSAGE = {
     'network':        'The droplet could not reach Higgsfield.',
     'image_rejected': 'Higgsfield rejected the test prompt image.',
     'empty':          'The CLI produced no output at all.',
+    'unreachable_output': 'Higgsfield returned an image URL that cannot be downloaded — its '
+                          'generated files are not publicly readable. Photos generated now will '
+                          'not reach Shopify.',
     'unknown':        'The CLI refused the test generation for a reason we do not recognise — '
                       'read its own output on the droplet.',
 }
@@ -5891,9 +5963,23 @@ def _selftest_higgsfield():
     stdout, stderr = (r.stdout or '').strip(), (r.stderr or '').strip()
     # No reference images are sent, so anything that is not the input CDN is a
     # result — including one from a moved output host.
-    if _higgsfield_outputs(_urls_from_stdout(stdout)):
+    outputs = _higgsfield_outputs(_urls_from_stdout(stdout))
+    if outputs:
+        # A URL is not an image. This check used to stop here and report ok:true
+        # straight through bug #46, where every generated URL answered 403 from
+        # the first second — the one outage it should have caught. So download
+        # it. The status code is safe to report (it carries nothing secret); the
+        # URL itself is never echoed.
+        try:
+            body = _hf_fetch_bytes(outputs[0], timeout=30)
+            if not _hf_media_ext(body):
+                raise _HFCaptureError('the response was not an image')
+        except Exception as e:
+            return {'ok': False, 'reason': 'unreachable_output', 'cli_version': ver,
+                    'message': f'{_HF_SELFTEST_MESSAGE["unreachable_output"]} '
+                               f'({_hf_capture_reason(e)})'}
         return {'ok': True, 'reason': 'generated', 'cli_version': ver,
-                'message': 'Higgsfield generated a test image.'}
+                'message': 'Higgsfield generated a test image and we could download it.'}
     if stdout and not stderr and r.returncode == 0:
         # It ran and claims success, but nothing landed on the output CDN. That
         # is what a renamed model or a moved output host looks like — a code
@@ -14021,6 +14107,166 @@ def theme_probe():
     return jsonify(out)
 
 
+# --- Generated-image store: capture the bytes at generation (plan #9, bug #46) ---
+# Higgsfield hands back a URL on ITS OWN CDN and we used to keep that URL — in
+# the draft, in the Meta-ads job, and all the way into the publish call hours
+# later. On 26 Aug 2026 a whole batch of those objects was never made publicly
+# readable: every URL answered 403 from the first second. So by the time publish
+# ran, _build_image_payload could not download them, fell back to {'src': url},
+# Shopify accepted that with a 201 and then failed the very same fetch itself.
+# Nine products created with zero photos (bug #46; #43/#44/#45 are the same
+# import). Older objects from the same bucket and the same user prefix still
+# answer 200, so nothing expired and nothing on our side was wrong — those files
+# were simply never readable.
+#
+# The durable answer is to stop holding a foreign URL at all: /api/higgsfield
+# downloads each result while the generation is fresh, keeps the bytes here and
+# returns OUR url. Publishing then reads from our own disk, and a result we
+# cannot download never enters the draft in the first place.
+HF_MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hf_media')
+os.makedirs(HF_MEDIA_DIR, exist_ok=True)
+
+# A generated photo is 5-9 MB and the droplet's disk is small, so the store
+# cannot grow forever. A draft published within the window keeps working; an
+# abandoned one loses its photos — the same thing that happened before, only
+# later and on purpose.
+HF_MEDIA_RETENTION_DAYS = int(os.getenv('HF_MEDIA_RETENTION_DAYS', '30') or 30)
+HF_MEDIA_MAX_BYTES = 25_000_000
+# Content-addressed: same bytes, same file, so re-running a generation costs no
+# extra disk. The pattern is also what the serve route validates against.
+_HF_MEDIA_NAME_RE = re.compile(r'^hf_[0-9a-f]{40}\.(png|jpg|webp)$')
+
+
+def _hf_media_ext(content):
+    """The image type of these bytes, by magic number — '' if it is not an image.
+
+    Sniffing rather than trusting the URL's extension is the point: a CDN that
+    answers 200 with an HTML error page must not become a "photo" that then
+    fails silently inside Shopify."""
+    if content.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'png'
+    if content.startswith(b'\xff\xd8\xff'):
+        return 'jpg'
+    if content[:4] == b'RIFF' and content[8:12] == b'WEBP':
+        return 'webp'
+    return ''
+
+
+def _hf_fetch_bytes(url, timeout=30):
+    """GET a generated image — DIRECTLY, never through the scraper proxy.
+
+    The proxy exists for competitor shops that rate-limit our datacentre IP, and
+    it bills per GB; these files are 5-9 MB each and Higgsfield does not
+    rate-limit us. Raises for a non-200 so the caller learns the status.
+    """
+    r = req.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r.content or b''
+
+
+class _HFCaptureError(Exception):
+    """A generated image did not make it to disk, for a reason we worded ourselves.
+
+    Its own type, not a bare ValueError, so _hf_capture_reason can repeat the
+    message without having to guess who wrote it: requests raises ValueError for
+    a malformed URL, and a Higgsfield URL can carry a signed query token.
+    """
+
+
+def _hf_capture_reason(exc):
+    """Why a generated image could not be captured — safe to show and to log."""
+    if isinstance(exc, _HFCaptureError):
+        return str(exc)
+    return _image_failure_reason(exc)
+
+
+def _hf_media_store(url, timeout=30):
+    """Download one generated image and keep its bytes. Returns our filename.
+
+    Raises unless a real image is on disk afterwards — the caller drops that
+    result rather than handing the frontend a URL that may already be dead.
+    """
+    content = _hf_fetch_bytes(url, timeout=timeout)
+    if not content:
+        raise _HFCaptureError('the download was empty')
+    if len(content) > HF_MEDIA_MAX_BYTES:
+        raise _HFCaptureError(f'the image is too large ({len(content)} bytes)')
+    ext = _hf_media_ext(content)
+    if not ext:
+        raise _HFCaptureError('the response was not an image')
+    fname = f'hf_{hashlib.sha1(content).hexdigest()}.{ext}'
+    path = os.path.join(HF_MEDIA_DIR, fname)
+    if not os.path.exists(path):
+        # Write-then-rename: a half-written file must never be servable.
+        tmp = f'{path}.part'
+        with open(tmp, 'wb') as f:
+            f.write(content)
+        os.replace(tmp, path)
+    return fname
+
+
+def _hf_media_public_url(fname):
+    """The URL we hand out for a captured image — ours, and publicly readable."""
+    base = os.getenv('PUBLIC_BASE_URL', 'https://188-166-11-177.nip.io').rstrip('/')
+    return f'{base}/api/hf_media/{fname}'
+
+
+def _hf_media_prune(now=None):
+    """Delete captured images past the retention window. Returns how many went."""
+    cutoff = (now or time.time()) - HF_MEDIA_RETENTION_DAYS * 86400
+    removed = 0
+    try:
+        names = os.listdir(HF_MEDIA_DIR)
+    except OSError:
+        return 0
+    for name in names:
+        path = os.path.join(HF_MEDIA_DIR, name)
+        try:
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            continue
+    if removed:
+        print(f'[hf] media store: removed {removed} file(s) older than '
+              f'{HF_MEDIA_RETENTION_DAYS} days')
+    return removed
+
+
+def _hf_media_stats():
+    """How much disk the captured images hold — the one real risk of keeping them."""
+    files = size = 0
+    try:
+        for name in os.listdir(HF_MEDIA_DIR):
+            path = os.path.join(HF_MEDIA_DIR, name)
+            if os.path.isfile(path):
+                files += 1
+                size += os.path.getsize(path)
+    except OSError:
+        return {'files': None, 'mb': None, 'retention_days': HF_MEDIA_RETENTION_DAYS}
+    return {'files': files, 'mb': round(size / 1_000_000, 1),
+            'retention_days': HF_MEDIA_RETENTION_DAYS}
+
+
+@app.route('/api/hf_media/<fname>', methods=['GET'])
+def hf_media(fname):
+    """Serve an image we captured at generation time.
+
+    Ungated on purpose: Shopify's own image fetcher reads these URLs when the
+    base64 upload falls back to {'src': ...}, and neither it nor the Meta-ads
+    flow can carry a session token. Nothing here is secret — they are model
+    photos we generated ourselves — and the name is matched against our own
+    content-hash pattern, so no other file on the droplet is reachable through
+    this route.
+    """
+    if not _HF_MEDIA_NAME_RE.match(fname or ''):
+        return jsonify({'error': 'invalid image reference'}), 404
+    if not os.path.isfile(os.path.join(HF_MEDIA_DIR, fname)):
+        return jsonify({'error': 'image not found'}), 404
+    # Content-addressed names never change meaning, so cache them hard.
+    return send_from_directory(HF_MEDIA_DIR, fname, max_age=31_536_000)
+
+
 # --- Higgsfield CLI stdout parsing (shared by /api/higgsfield and _blog_hero_image) ---
 def _extract_urls_from_text(text):
     """Find all image URLs in a string (plain text or JSON)."""
@@ -14208,7 +14454,34 @@ def higgsfield_generate():
         seen = set()
         all_urls = [u for u in all_urls if not (u in seen or seen.add(u))]
         all_urls = all_urls[:count]
-        return jsonify({'urls': all_urls, 'prompt_used': prompt})
+
+        # Capture the bytes NOW, while the generation is fresh, and hand back our
+        # own URL (plan #9, bug #46). A result we cannot download is not a photo:
+        # it is dropped here instead of becoming a tile the employee can select
+        # and a dead URL the publish call discovers hours later.
+        kept, lost = [], []
+        for u in all_urls:
+            try:
+                kept.append(_hf_media_public_url(_hf_media_store(u)))
+            except Exception as e:
+                reason = _hf_capture_reason(e)
+                lost.append(reason)
+                print(f'[hf] capture failed ({_safe_image_ref(u)}): {reason}')
+        _hf_media_prune()
+        print(f'[hf] captured {len(kept)}/{len(all_urls)} generated image(s)')
+
+        if not kept:
+            # Loud, not silent: generation "worked" and we still have nothing.
+            # That is exactly the shape of bug #46, and it used to read as success.
+            return jsonify({
+                'error': f'Higgsfield generated {len(all_urls)} image(s) but none of them '
+                         f'could be downloaded ({", ".join(sorted(set(lost))[:3]) or "unknown"}). '
+                         f'Its files are not readable right now — try again in a few minutes.',
+                'urls': [], 'generated': len(all_urls), 'unreachable': len(lost),
+            }), 502
+
+        return jsonify({'urls': kept, 'prompt_used': prompt,
+                        'generated': len(all_urls), 'unreachable': len(lost)})
 
     except subprocess.TimeoutExpired:
         return jsonify({'error': _map_higgsfield_error('timeout')}), 504

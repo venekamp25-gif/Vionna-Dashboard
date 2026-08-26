@@ -77,3 +77,8 @@ wtl_discover_seen.json
 backend/wtl_discover_seen.json
 bs_product_cache.json
 backend/bs_product_cache.json
+
+# Higgsfield images captured at generation time (plan #9, bug #46) — droplet-only
+# binary store, pruned on a retention window. Never belongs in a public repo.
+hf_media/
+backend/hf_media/
