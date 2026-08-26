@@ -12624,7 +12624,83 @@ def _ensure_siblings_collection(store, product_name, siblings_handle, hdrs, base
     return collection_id, returned_handle, False
 
 
-def _build_image_payload(urls, max_images=10):
+# --- Image attach: reporting (plan #8, bug #45) -----------------------------
+# Ten products were published with 0 photos while publish reported success and
+# publish_history logged image_count=4. Every failure along the attach path was
+# a print() and nothing else, so the run looked clean from every side the
+# operator or the routine can see. The helpers below give the caller the same
+# view the log has: what we tried, what Shopify verifiably stored, and why the
+# rest did not make it.
+
+def _new_image_report():
+    """Collector threaded through _build_image_payload + _attach_images_one_by_one.
+
+    requested — usable source URLs we intended to attach (after dedupe + cap)
+    verified  — photos Shopify stored SYNCHRONOUSLY (a base64 attachment it
+                accepted). This is the only count that proves a photo exists.
+    errors    — operator-readable reasons, safe for an API response (see
+                _image_failure_reason: never raw exception text).
+    """
+    return {'requested': 0, 'verified': 0, 'errors': []}
+
+
+# (needles, message) — same shape and the same reason as _PROXY_FAILURE_HINTS:
+# the message is written by us and contains no part of the exception. str(exc)
+# from requests can carry the proxy URL WITH ITS CREDENTIALS (the scraper proxy
+# fetches these images), and these strings end up in the publish response and
+# in publish_history.jsonl.
+_IMG_SIZE_GUARD = 'empty or oversized image'
+_IMG_FAILURE_HINTS = (
+    (('timed out', 'timeout'), 'the host did not answer in time'),
+    (('name or service not known', 'nodename nor servname', 'failed to resolve', 'getaddrinfo'),
+     'the hostname could not be resolved'),
+    (('connection refused', 'connection reset', 'connection aborted', 'remotedisconnected'),
+     'the connection was dropped'),
+    (('tunnel connection failed', 'cannot connect to proxy', 'proxyerror'),
+     'the request could not be routed to the host'),
+    (('certificate', 'ssl'), 'the TLS handshake failed'),
+    (('too many redirects',), 'the URL redirected in a loop'),
+)
+
+
+def _image_failure_reason(exc):
+    """Why one image could not be downloaded — safe to show and to log.
+
+    An HTTP status is the single most useful fact (403/404 = the URL is gone or
+    signed-expired, 429 = rate-limited) and carries nothing secret, so it wins.
+    Otherwise: one of our own curated messages, else the exception CLASS name.
+    Never str(exc) — see _IMG_FAILURE_HINTS.
+    """
+    status = getattr(getattr(exc, 'response', None), 'status_code', None)
+    if status:
+        return f'HTTP {status}'
+    # Our own size guard below is the ONE exception whose text we wrote and can
+    # therefore repeat. Matched on its prefix, not on the ValueError type: a
+    # ValueError raised by anything else in that try block (urlparse) carries
+    # wording we did not write and have not checked.
+    if isinstance(exc, ValueError) and str(exc).startswith(_IMG_SIZE_GUARD):
+        return str(exc)
+    low = str(exc).lower()
+    for needles, msg in _IMG_FAILURE_HINTS:
+        if any(n in low for n in needles):
+            return msg
+    return type(exc).__name__
+
+
+def _safe_image_ref(url):
+    """host + path of an image URL — never the query string.
+
+    Higgsfield and Shopify CDN URLs carry signed tokens in the query, and these
+    references are written to publish_history.jsonl and returned by the API.
+    """
+    try:
+        p = urllib.parse.urlparse(url)
+        return f'{p.netloc}{p.path}'[:100] or '(unparseable url)'
+    except Exception:
+        return '(unparseable url)'
+
+
+def _build_image_payload(urls, max_images=10, report=None):
     """Build Shopify product-image dicts from a list of URLs.
 
     CRITICAL RELIABILITY FIX: instead of passing {'src': url} and trusting
@@ -12636,6 +12712,14 @@ def _build_image_payload(urls, max_images=10):
 
     Falls back to {'src': url} for any image we couldn't download, so a
     transient download error still has a chance via Shopify's own fetch.
+
+    That fallback re-opens exactly the hole the paragraph above closes, and
+    bug #45 is what it looks like from outside: Shopify answers 201 to a
+    {'src': ...} POST, never manages to fetch the URL, and nobody is told. It
+    stays — a URL Shopify might still fetch beats no photo at all — but it is
+    no longer SILENT: pass a `report` (see _new_image_report) and every fallback
+    and every failure comes back with it. A fallback is never counted as
+    verified, because nothing about it is.
     """
     seen = set()
     out = []
@@ -12648,12 +12732,14 @@ def _build_image_payload(urls, max_images=10):
         seen.add(url)
         if len(out) >= max_images:
             break
+        if report is not None:
+            report['requested'] += 1
         try:
             r = _scrape_get(url, timeout=20)
             r.raise_for_status()
             content = r.content
             if not content or len(content) > 20_000_000:   # 20MB sanity cap
-                raise ValueError(f'empty or oversized image ({len(content) if content else 0} bytes)')
+                raise ValueError(f'{_IMG_SIZE_GUARD} ({len(content) if content else 0} bytes)')
             b64 = _b64.b64encode(content).decode('ascii')
             # Derive a filename so Shopify keeps a sensible extension
             path = urllib.parse.urlparse(url).path
@@ -12663,11 +12749,16 @@ def _build_image_payload(urls, max_images=10):
             out.append({'attachment': b64, 'filename': fname})
         except Exception as e:
             print(f"[publish] image download failed ({url[:80]}): {e} — falling back to src")
+            if report is not None:
+                report['errors'].append(
+                    f'photo {len(out) + 1} ({_safe_image_ref(url)}): could not be downloaded '
+                    f'({_image_failure_reason(e)}) — handed to Shopify as a URL to fetch '
+                    f'itself, which may never happen')
             out.append({'src': url})
     return out
 
 
-def _attach_images_one_by_one(store, prod_id, img_payload, hdrs):
+def _attach_images_one_by_one(store, prod_id, img_payload, hdrs, report=None):
     """Upload product images ONE PER REQUEST.
 
     Bundling many base64-encoded images into the single product-create POST
@@ -12676,6 +12767,12 @@ def _attach_images_one_by_one(store, prod_id, img_payload, hdrs):
     and add each image via its own POST /products/{id}/images.json, which keeps
     every request small. Returns the list of created Shopify image objects (in
     upload order) so the caller can assign the first one to the variants.
+
+    Pass a `report` (see _new_image_report) to learn what actually landed. Note
+    that the returned list is NOT that answer: an accepted {'src': ...} POST
+    yields an image object too, and that photo may never materialise — so it is
+    returned (the caller still needs its id for the variant) but not counted as
+    verified.
     """
     created = []
     for i, img in enumerate(img_payload):
@@ -12686,14 +12783,39 @@ def _attach_images_one_by_one(store, prod_id, img_payload, hdrs):
             )
             if r.status_code in (200, 201):
                 created.append(r.json().get('image'))
+                if report is not None and 'attachment' in img:
+                    report['verified'] += 1
             else:
                 # If a base64 attachment was rejected, try Shopify's own fetch
                 # via src as a last resort (we don't have the src here unless it
                 # was the fallback shape, so just log).
                 print(f"[publish] image {i+1} upload failed {r.status_code}: {r.text[:160]}")
+                if report is not None:
+                    report['errors'].append(
+                        f'photo {i+1}: Shopify rejected the upload (HTTP {r.status_code})')
         except Exception as e:
             print(f"[publish] image {i+1} upload error: {e}")
+            if report is not None:
+                report['errors'].append(
+                    f'photo {i+1}: the upload to Shopify failed ({_image_failure_reason(e)})')
     return created
+
+
+def _image_report_errors(report):
+    """The report's errors, with a headline first when nothing verifiably landed.
+
+    The headline is the sentence bug #45 needed and nobody had: it names the
+    outcome ("0 of 4"), so the next occurrence explains itself instead of
+    needing a run of the audit endpoints to be noticed at all.
+    """
+    errs = list(report.get('errors') or [])
+    requested, verified = report.get('requested') or 0, report.get('verified') or 0
+    if requested and not verified:
+        errs.insert(0, f'NO photos are confirmed on this product (0 of {requested}) — '
+                       f'check it in Shopify before setting it live')
+    elif requested and verified < requested:
+        errs.insert(0, f'only {verified} of {requested} photos are confirmed on this product')
+    return errs
 
 
 # Het THEMA plakt er "- VIONNA DK" achter (live geverifieerd op alle drie de
@@ -12864,7 +12986,14 @@ def _publish_one_variant(
     hdrs, base,
 ):
     """Create one colour-variant product. Returns dict:
-        { product_id, product_url, metafield_errors, error? }
+        { product_id, product_url, metafield_errors, image_errors,
+          images_attached, error? }
+
+    image_errors mirrors metafield_errors for the photos (plan #8, bug #45).
+    images_attached is how many photos Shopify VERIFIABLY stored — None means
+    "not established" (the reuse branch below, which does not touch photos) and
+    is deliberately not 0: claiming a count we never measured is the defect
+    this is here to end.
     """
     size_option_name = STORE_SIZE_OPTION.get(store, 'Taille')
 
@@ -12882,6 +13011,8 @@ def _publish_one_variant(
                       'the product\'s other colours (the cause of the duplicate '
                       'listings). Set a colour for this variant and retry.'),
             'metafield_errors': [],
+            'image_errors': [],
+            'images_attached': None,
         }
 
     product_handle = _publish_make_handle(product_name, color)
@@ -12912,6 +13043,14 @@ def _publish_one_variant(
             'product_id':      eid,
             'product_url':     f'https://{shop_domain}/admin/products/{eid}' if shop_domain else '',
             'metafield_errors': [],
+            # We reuse the product as-is and never look at its photos, so we do
+            # not know whether it has any. Say that instead of implying success:
+            # a reused product is exactly the half-finished state (the -1
+            # duplicates from the bug #45 runs) where photos are most likely
+            # missing.
+            'image_errors':    ['photos were not checked: this colour already existed and was '
+                                'reused as-is — verify its photos in Shopify'],
+            'images_attached': None,
             'reused':          True,
             'activated':       bool(activate and already_active),
         }
@@ -12919,7 +13058,8 @@ def _publish_one_variant(
     # Download + base64-encode images (reliable — no dependency on Shopify
     # async-fetching the Higgsfield URL later). Uploaded SEPARATELY below to
     # avoid 413 Payload Too Large from bundling them into the create request.
-    img_payload = _build_image_payload(images, max_images=10)
+    img_report = _new_image_report()
+    img_payload = _build_image_payload(images, max_images=10, report=img_report)
 
     # Create the product WITHOUT images first.
     product_payload = {
@@ -12948,13 +13088,16 @@ def _publish_one_variant(
     prod_res = req.post(f"{base}products.json", headers=hdrs, json=product_payload)
     if prod_res.status_code not in (200, 201):
         return {'error': f'Product create failed ({prod_res.status_code}): {prod_res.text[:200]}',
-                'metafield_errors': []}
+                'metafield_errors': [], 'image_errors': [], 'images_attached': None}
 
     prod_data = prod_res.json()['product']
     prod_id   = prod_data['id']
 
     # Upload images one at a time (avoids the 413 from bundling base64 bytes).
-    uploaded_images = _attach_images_one_by_one(store, prod_id, img_payload, hdrs)
+    uploaded_images = _attach_images_one_by_one(store, prod_id, img_payload, hdrs, report=img_report)
+    img_errors = _image_report_errors(img_report)
+    if img_errors:
+        print(f"[publish] Color '{color}' photo problems: " + ' | '.join(img_errors))
 
     # --- Metafields ---
     # Page title stond NOOIT gezet -> Shopify viel terug op de kale producttitel
@@ -13041,7 +13184,8 @@ def _publish_one_variant(
     shop_domain = tokens.get(store, {}).get('shop', '')
     product_url = f'https://{shop_domain}/admin/products/{prod_id}' if shop_domain else ''
     return {'product_id': prod_id, 'product_url': product_url,
-            'metafield_errors': mf_errors, 'activated': activated}
+            'metafield_errors': mf_errors, 'activated': activated,
+            'image_errors': img_errors, 'images_attached': img_report['verified']}
 
 
 # --- Granular publish endpoints (for live per-variant progress in the dashboard) ---
@@ -13178,7 +13322,13 @@ def publish_create_variant():
         'product_url':   result.get('product_url'),
         'source_url':    source_url,
         'collection_handle': actual_handle,
+        # image_count = what we ASKED for, images_attached = what Shopify
+        # verifiably stored (None = not established). For the bug #45 runs the
+        # log said image_count:4 for ten products that have zero photos — a
+        # logbook that cannot be wrong about that is the point of plan #8.
         'image_count':   len(images),
+        'images_attached': result.get('images_attached'),
+        'image_errors':  result.get('image_errors') or [],
         'metafield_errors': result.get('metafield_errors') or [],
         # --- join-key: de listing-BESLISSING (inputs) meeloggen zodat ze later
         # aan de outcome (verkoop/ad-ROAS) gekoppeld kunnen worden. ---
@@ -13334,6 +13484,7 @@ def publish():
             print(f"[publish] WARNING: collection creation failed: {coll_res.status_code} — {coll_res.text[:200]}")
 
     created = []
+    all_image_errors = []      # plan #8: photo failures, per colour, in the response
 
     # Primary color = first color in list (matches the original competitor product).
     # Steps 1-4 ("shared") photos depict that original color, so they ONLY go to
@@ -13373,7 +13524,8 @@ def publish():
         seen_imgs = set()
         all_imgs = [u for u in all_imgs if not (u in seen_imgs or seen_imgs.add(u))]
         # Download + base64-attach (reliable) instead of {'src': url} async fetch
-        img_payload = _build_image_payload(all_imgs, max_images=10)
+        img_report = _new_image_report()
+        img_payload = _build_image_payload(all_imgs, max_images=10, report=img_report)
         primary_tag = ' (PRIMARY)' if color == primary_color else ''
         print(f"[publish] Color '{color}'{primary_tag}: {len(shared_images) if color == primary_color else 0} shared + {len(color_specific)} color-specific = {len(img_payload)} total images")
 
@@ -13410,8 +13562,13 @@ def publish():
             prod_id    = prod_data['id']
             created.append(prod_id)
             # Upload images one at a time (avoids the 413 from bundling base64)
-            uploaded_images = _attach_images_one_by_one(store, prod_id, img_payload, hdrs)
+            uploaded_images = _attach_images_one_by_one(store, prod_id, img_payload, hdrs,
+                                                        report=img_report)
             prod_data['images'] = uploaded_images or prod_data.get('images', [])
+            img_errors = _image_report_errors(img_report)
+            if img_errors:
+                print(f"[publish] Color '{color}' photo problems: " + ' | '.join(img_errors))
+                all_image_errors.extend(f'{color}: {e}' for e in img_errors)
 
             # --- Metafields via separate POST ---
             # Namespace+key MUST match the metafield definitions configured in the Shopify store.
@@ -13478,7 +13635,9 @@ def publish():
                 'product_id':         prod_id,
                 'source_url':         (data.get('competitorUrl') or data.get('source_url') or ''),
                 'collection_handle':  actual_handle,
-                'image_count':        len(img_payload),
+                'image_count':        len(img_payload),      # asked for
+                'images_attached':    img_report['verified'], # verifiably stored
+                'image_errors':       img_errors,
                 'metafield_errors':   mf_errors,
                 # --- join-key velden ---
                 'keywords':           data.get('keywords') or [],
@@ -13507,6 +13666,7 @@ def publish():
         'product_ids':      created,
         'product_urls':     product_urls,
         'metafield_errors': mf_errors if 'mf_errors' in dir() else [],
+        'image_errors':     all_image_errors,
     })
 
 
@@ -18849,17 +19009,23 @@ def api_lighting_publish():
                              f'{len(wanted_imgs)} photos were uploaded (Shopify cap)')
             wanted_imgs = wanted_imgs[:LIGHT_MAX_IMAGES]
         for u in wanted_imgs:
-            payload_img = _build_image_payload([u], max_images=1)
+            # plan #8: dezelfde stille route als fashion. `uploaded_n` telt hier
+            # bewust nog steeds een {'src': ...}-terugval mee (Shopify KAN hem
+            # alsnog ophalen) — maar de reden staat er nu bij, zodat een foto
+            # die het niet haalt niet meer als schoon succes wegloopt.
+            img_report = _new_image_report()
+            payload_img = _build_image_payload([u], max_images=1, report=img_report)
             if not payload_img:
-                mf_errors.append(f'image skipped (unreadable): {u[:70]}')
+                mf_errors.append(f'image skipped (unreadable): {_safe_image_ref(u)}')
                 continue
-            got = _attach_images_one_by_one(store, pid, payload_img, hdrs)
+            got = _attach_images_one_by_one(store, pid, payload_img, hdrs, report=img_report)
             got_id = (got[0] or {}).get('id') if got else None
+            mf_errors.extend(img_report['errors'])
             if got_id:
                 url_to_img_id[u] = got_id
                 uploaded_n += 1
             else:
-                mf_errors.append(f'image upload failed: {u[:70]}')
+                mf_errors.append(f'image upload failed: {_safe_image_ref(u)}')
         uploaded = uploaded_n
 
         # Per-variant foto's. Alleen een EXACTE match telt; kunnen we een variant
