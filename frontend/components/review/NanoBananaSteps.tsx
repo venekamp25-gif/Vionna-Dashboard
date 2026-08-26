@@ -125,7 +125,20 @@ export function NanoBananaSteps() {
     const imageUrls = buildImageUrls(stepNum);
 
     // Reset slots — show 4 empty loading tiles immediately (functional → never overwrites a parallel step)
-    setData((prev) => ({ ...prev, nbResults: { ...prev.nbResults, [stepNum]: [] } }));
+    // Drop this step's pool entries too. The fresh tiles come back unselected,
+    // so leaving the old rows in place would publish the photos the employee is
+    // in the middle of replacing — and poolCoverage would still see a photo for
+    // the colour, so nothing would warn. Clearing them makes a forgotten
+    // re-select show up as "no photos" instead of silently shipping the old set.
+    setData((prev) => ({
+      ...prev,
+      nbResults: { ...prev.nbResults, [stepNum]: [] },
+      publishPool: poolWithoutStep(prev.publishPool, {
+        isStep5: false,
+        color: "",
+        tagPrefix: `NB Step ${stepNum}`,
+      }),
+    }));
 
     const slots: (NbResult | null)[] = Array(TOTAL_VARIANTS).fill(null);
 
@@ -300,9 +313,16 @@ export function NanoBananaSteps() {
       { length: stepFavourites.length },
       () => ({ url: "", selected: false })
     );
+    // Same as in runStep: the previous round's pool entries have to go, or a
+    // regenerate silently publishes the photos it was meant to replace.
     setData((prev) => ({
       ...prev,
       nbResultsPerColor: { ...prev.nbResultsPerColor, [color]: placeholders },
+      publishPool: poolWithoutStep(prev.publishPool, {
+        isStep5: true,
+        color,
+        tagPrefix: `NB Step 5 — ${color}`,
+      }),
     }));
 
     // Fire one Higgsfield call per step-format in parallel
