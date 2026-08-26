@@ -9,6 +9,17 @@ export interface CheckItem {
   label: string;
   level: "ok" | "warn" | "fail";
   detail?: string;
+  /**
+   * A blocking check cannot be overridden with "Publish anyway" — the popup
+   * only offers the way back. Reserved for states that are guaranteed to
+   * create broken products, not for heuristics.
+   */
+  blocking?: boolean;
+}
+
+/** True when at least one check makes publishing impossible (see `blocking`). */
+export function hasBlockingIssue(checks: CheckItem[]): boolean {
+  return checks.some((c) => c.blocking);
 }
 
 /**
@@ -63,14 +74,25 @@ export function buildPrePublishChecks(
     });
   }
 
-  // 4. Publish pool: at least one image per (canonical) colour
+  // 4. Publish pool: at least one image per (canonical) colour.
+  //
+  // A colour with no photos of its own is NOT a warning: the publish flow gives
+  // the steps 1-4 photos to the primary colour only (ReviewStep.tsx variantImages
+  // / server.py `_publish`), because those photos show the primary colour and
+  // would misrepresent any other one. So a colour without step-5 photos is
+  // created in Shopify with an empty image list — the post-publish check then
+  // reports "No images attached" and "Retry fix" can never repair it (the photo
+  // pool is client-side and gone by then). Blocking here is the only moment the
+  // product can still be saved. Bug #43/#44/#45, plan #7.
   const selectedPool = data.publishPool.filter((p) => p.selected);
   if (selectedPool.length === 0) {
     out.push({
       id: "pool-empty",
       label: "No photos selected in publish pool",
       level: "fail",
-      detail: "Products will be created without images",
+      blocking: true,
+      detail:
+        "Every product would be created without a single image. Select photos in the publish pool first.",
     });
   } else {
     const primaryCanonical = data.canonicalColors[0] ?? null;
@@ -93,8 +115,12 @@ export function buildPrePublishChecks(
       out.push({
         id: "pool-coverage",
         label: `${missing.length} ${missing.length === 1 ? "colour has" : "colours have"} no photos`,
-        level: "warn",
-        detail: missing.join(", "),
+        level: "fail",
+        blocking: true,
+        detail:
+          `${missing.join(", ")} — these would be created without any image. ` +
+          `Generate step-5 photos for ${missing.length === 1 ? "this colour" : "these colours"}, ` +
+          `or remove ${missing.length === 1 ? "it" : "them"} from the colour list.`,
       });
     }
   }
@@ -196,8 +222,9 @@ interface PopupProps {
 /**
  * Confirmation modal shown when the user clicks Publish but the checks
  * surfaced one or more issues. Lists every issue with its severity and lets
- * the user proceed anyway (for warnings) or block (for fails — but we still
- * allow override since some checks are heuristics).
+ * the user proceed anyway — most checks are heuristics, so an override is
+ * right. A check marked `blocking` is not: it is a state that provably
+ * creates broken products, and there "Publish anyway" is not offered.
  */
 export function PrePublishChecklistPopup({
   open,
@@ -210,6 +237,7 @@ export function PrePublishChecklistPopup({
   const fails = checks.filter((c) => c.level === "fail");
   const warns = checks.filter((c) => c.level === "warn");
   const hasFails = fails.length > 0;
+  const blocked = hasBlockingIssue(checks);
 
   return (
     <div
@@ -234,13 +262,17 @@ export function PrePublishChecklistPopup({
             </div>
             <div>
               <h2 className="text-[15px] font-semibold text-text">
-                {hasFails
+                {blocked
+                  ? "Publishing is blocked"
+                  : hasFails
                   ? `${fails.length} issue${fails.length === 1 ? "" : "s"} found`
                   : `${warns.length} warning${warns.length === 1 ? "" : "s"}`}
-                {hasFails && warns.length > 0 && ` · ${warns.length} warning${warns.length === 1 ? "" : "s"}`}
+                {!blocked && hasFails && warns.length > 0 && ` · ${warns.length} warning${warns.length === 1 ? "" : "s"}`}
               </h2>
               <p className="text-[12px] text-text-faint mt-1">
-                {hasFails
+                {blocked
+                  ? "This would create products without any photo — that can't be repaired afterwards, so publishing can't continue until it's resolved."
+                  : hasFails
                   ? "We found problems that may cause your publish to fail or render incorrectly. Review below."
                   : "Things to double-check before publishing. You can proceed anyway if you've already considered them."}
               </p>
@@ -258,16 +290,18 @@ export function PrePublishChecklistPopup({
         </div>
 
         <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-border bg-bg-elev-2 rounded-b-2xl">
-          <Button variant="secondary" size="sm" onClick={onCancel}>
+          <Button variant={blocked ? "primary" : "secondary"} size="sm" onClick={onCancel}>
             ← Back to review
           </Button>
-          <Button
-            variant={hasFails ? "danger" : "primary"}
-            size="sm"
-            onClick={onPublishAnyway}
-          >
-            Publish anyway →
-          </Button>
+          {!blocked && (
+            <Button
+              variant={hasFails ? "danger" : "primary"}
+              size="sm"
+              onClick={onPublishAnyway}
+            >
+              Publish anyway →
+            </Button>
+          )}
         </div>
       </div>
     </div>

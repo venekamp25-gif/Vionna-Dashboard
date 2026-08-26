@@ -47,6 +47,9 @@ fi
 run "Type-check (tsc --noEmit)" \
   npx --prefix frontend tsc --noEmit -p frontend/tsconfig.json
 
+run "Unit tests (vitest)" \
+  npm --prefix frontend test
+
 run "Build (same as Netlify publish)" \
   npm --prefix frontend run build
 

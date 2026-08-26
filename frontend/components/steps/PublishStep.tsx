@@ -176,6 +176,7 @@ export function PublishStep() {
             }
             getColorLabel={(canonical) => colorLabelFor(data, canonical, store)}
             onJump={() => setStore(store)}
+            onBackToPhotos={() => setStep(3)}
           />
         );
       })}
@@ -494,7 +495,19 @@ interface CardProps {
   onVerificationUpdate?: (verification: ProductVerify[]) => void;
   getColorLabel: (canonical: string) => string;
   onJump: () => void;
+  onBackToPhotos: () => void;
 }
+
+/**
+ * What "Retry fix" can actually repair. It calls /api/retry_fix, which only ever
+ * runs _publish_to_default_channels (server.py) — so a missing sales channel is
+ * the one issue it can close. Everything else it re-checks and reports back
+ * unchanged; "No images attached" in particular can never be fixed from here
+ * because the photo pool lives in the browser and is gone after publish. Saying
+ * so up front beats a retry that is guaranteed to change nothing (bug #43/44/45).
+ */
+const RETRY_FIXABLE_ISSUES = ["Not on any sales channel"];
+const NO_IMAGES_ISSUE = "No images attached";
 
 function StoreResultCard({
   store,
@@ -513,11 +526,15 @@ function StoreResultCard({
   onVerificationUpdate,
   getColorLabel,
   onJump,
+  onBackToPhotos,
 }: CardProps) {
   const verifyIssues = (verification ?? []).filter((p) => (p.issues ?? []).length > 0);
   const verifyFails = (verification ?? []).some((p) =>
     (p.issues ?? []).some((i) => i.level === "fail")
   );
+  const allIssueMsgs = verifyIssues.flatMap((p) => (p.issues ?? []).map((i) => i.msg));
+  const retryableCount = allIssueMsgs.filter((m) => RETRY_FIXABLE_ISSUES.includes(m)).length;
+  const missingImages = allIssueMsgs.some((m) => m === NO_IMAGES_ISSUE);
 
   const [retrying, setRetrying] = useState(false);
   const [retryMsg, setRetryMsg] = useState<string | null>(null);
@@ -706,18 +723,56 @@ function StoreResultCard({
                   </li>
                 ))}
               </ul>
+              <div className="mt-2 text-[11px] opacity-90">
+                {retryableCount > 0 ? (
+                  <>
+                    ↻ Retry fix kan hiervan {retryableCount} van {allIssueMsgs.length} punt
+                    {allIssueMsgs.length === 1 ? "" : "en"} herstellen (verkoopkanalen opnieuw
+                    publiceren). De rest moet handmatig.
+                  </>
+                ) : (
+                  <>
+                    ↻ Retry fix herstelt alleen verkoopkanalen — daar zit hier geen enkel punt bij,
+                    dus een retry verandert niets.
+                  </>
+                )}
+                {missingImages && (
+                  <>
+                    {" "}
+                    <strong>&laquo;{NO_IMAGES_ISSUE}&raquo;</strong> is niet automatisch te
+                    herstellen: de foto&apos;s staan alleen in je browser en zijn na het publiceren
+                    weg. Genereer de foto&apos;s in stap 5 en importeer de kleur opnieuw.
+                  </>
+                )}
+              </div>
               <div className="flex items-center gap-2 mt-2.5 flex-wrap">
                 <button
                   type="button"
                   onClick={() => void retryFix()}
-                  disabled={retrying}
+                  disabled={retrying || retryableCount === 0}
+                  title={
+                    retryableCount === 0
+                      ? "Er is niets bij dat Retry fix kan herstellen"
+                      : undefined
+                  }
                   className="text-[11px] font-semibold uppercase tracking-wider px-2.5 py-1 rounded-md border border-current/40 hover:bg-current/10 disabled:opacity-50"
                 >
                   {retrying ? "↻ Bezig…" : "↻ Retry fix"}
                 </button>
+                {missingImages && (
+                  <button
+                    type="button"
+                    onClick={onBackToPhotos}
+                    className="text-[11px] font-semibold uppercase tracking-wider px-2.5 py-1 rounded-md border border-current/40 hover:bg-current/10"
+                  >
+                    ← Naar de fotostap
+                  </button>
+                )}
                 {retryMsg && <span className="text-[11px] font-medium">{retryMsg}</span>}
               </div>
-              {showBug && (
+              {/* Retry is disabled when it can't fix anything — but the worker must
+                  still be able to report what's wrong, so keep this route open. */}
+              {(showBug || retryableCount === 0) && (
                 <div className="mt-1.5 text-[11px]">
                   {bugState === "sent" ? (
                     <span className="text-accent">✓ Als bug gemeld — Claude pakt 'm op bij de volgende sessie.</span>
