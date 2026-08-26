@@ -444,7 +444,14 @@ export function NanoBananaSteps() {
       const updated = current.map((r, i) => (i === slotIndex ? { ...r, selected: willSelect } : r));
 
       const tagPrefix = isStep5 ? `NB Step 5 — ${color}` : `NB Step ${stepNum}`;
-      const pool: PoolPhoto[] = prev.publishPool.filter((p) => !p.label.startsWith(tagPrefix));
+      // Opschonen op het COLOR-veld, niet op de labeltekst. Een prefix-test op
+      // het label wiste ook andere kleuren: 'Blå' is het begin van
+      // 'Blå Blomstret' (18 zulke paren op DK alleen). Die beelden bleven wel
+      // op het scherm staan maar verdwenen uit de pool — en de publish leest de
+      // pool, dus ze kwamen nooit in Shopify aan.
+      const pool: PoolPhoto[] = prev.publishPool.filter((p) =>
+        isStep5 ? p.color !== color : p.color !== "shared" || !p.label.startsWith(tagPrefix)
+      );
       updated.forEach((r, i) => {
         if (r.selected && r.url) {
           pool.push({
@@ -477,7 +484,8 @@ export function NanoBananaSteps() {
       const updated = current.map((r) => (r.url ? { ...r, selected: willSelect } : r));
 
       const tagPrefix = `NB Step 5 — ${color}`;
-      const pool: PoolPhoto[] = prev.publishPool.filter((p) => !p.label.startsWith(tagPrefix));
+      // Zie de toelichting hierboven: exact op kleur vergelijken, niet op label.
+      const pool: PoolPhoto[] = prev.publishPool.filter((p) => p.color !== color);
       updated.forEach((r, i) => {
         if (r.selected && r.url) {
           pool.push({
