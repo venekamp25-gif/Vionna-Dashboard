@@ -57,14 +57,29 @@ test("without shared photos even the primary colour fails", () => {
 });
 
 // ── Bug #43 part two: "Retry fix" was offered for problems it cannot solve ──
-// retry_fix() only re-publishes to the sales channels (backend/server.py:995),
-// so offering it for a missing photo is a loop with no exit.
+// retry_fix() used to only re-publish to the sales channels, so offering it for
+// a missing photo was a loop with no exit. Since plan #9 (bug #46) it can also
+// re-attach photos — but only from URLs the caller still holds, so the dead-end
+// case has to stay distinguishable from the repairable one.
 
-test("'No images attached' never offers a retry", () => {
+test("'No images attached' offers no retry when we have no photos left to send", () => {
   const advice = retryFixAdvice([{ level: "fail", msg: MISSING_IMAGES_MSG }]);
   assert.equal(advice.canRetry, false);
   assert.equal(advice.missingImages, true);
   assert.deepEqual(advice.unfixable, [MISSING_IMAGES_MSG]);
+});
+
+test("'No images attached' IS retryable once we can re-attach the photos", () => {
+  const advice = retryFixAdvice([{ level: "fail", msg: MISSING_IMAGES_MSG }], true);
+  assert.equal(advice.canRetry, true);
+  assert.equal(advice.missingImages, false, "not a dead end any more");
+  assert.deepEqual(advice.unfixable, []);
+});
+
+test("being able to re-attach photos does not make other issues retryable", () => {
+  const advice = retryFixAdvice([{ level: "fail", msg: "No variants" }], true);
+  assert.equal(advice.canRetry, false);
+  assert.deepEqual(advice.unfixable, ["No variants"]);
 });
 
 test("a sales-channel issue is still retryable", () => {
@@ -104,5 +119,7 @@ test("no issues at all means nothing to retry", () => {
 test("only the exact backend messages count as retryable", () => {
   assert.equal(isRetryFixable("Not on any sales channel"), true);
   assert.equal(isRetryFixable("No images attached"), false);
+  assert.equal(isRetryFixable("No images attached", true), true);
   assert.equal(isRetryFixable("Siblings link missing"), false);
+  assert.equal(isRetryFixable("Siblings link missing", true), false);
 });

@@ -85,8 +85,10 @@ tells "no URL set" apart from "kill switch on".
 
 - Unset = direct traffic, exactly as before. The code ships inert until the key
   is set, so deploying it changes nothing on its own.
-- Asset CDNs (`cdn.*`) and localhost always go direct: images are most of the
-  bytes, aren't what gets rate-limited, and residential proxies bill per GB.
+- Asset CDNs (`cdn.*`), localhost and **our own public host** always go direct:
+  images are most of the bytes, aren't what gets rate-limited, and residential
+  proxies bill per GB. (Our own host matters since v1.279.0 — publish downloads
+  generated photos from `/api/hf_media`, see below.)
 - A proxy that is down falls back to a direct request (logged) rather than
   taking the scraper with it.
 - Verify from anywhere: `curl https://188-166-11-177.nip.io/api/health` →
@@ -143,6 +145,50 @@ Notes:
   need any Slack access — only the GitHub repo + (when reachable) the public API.
 - Data-mutation tasks that need live Shopify tokens (`tokens.json`) only work from
   the laptop, not cloud sessions.
+
+---
+
+## 🖼️ Generated photos live on OUR disk (since v1.279.0)
+
+`/api/higgsfield` no longer hands back a Higgsfield CDN URL. It downloads every
+result while the generation is fresh, stores the bytes in `backend/hf_media/`
+(gitignored) and returns `https://…/api/hf_media/hf_<sha1>.<ext>`.
+
+Why: on 2026-08-26 every object Higgsfield produced answered **403 from the
+first second** — older objects in the same bucket, same user prefix, still
+answered 200, so nothing expired. The dashboard kept those URLs in the draft,
+publish tried to download them hours later, failed, fell back to `{'src': url}`,
+and Shopify accepted that with a 201 before failing the identical fetch itself.
+Nine products created with zero photos and no error anywhere (bug #46; #43/#44/
+#45 are the same import).
+
+- A result that can't be downloaded is **dropped at generation**, never handed
+  to the frontend as a selectable tile. All of them undownloadable ⇒ HTTP 502
+  with a real message, not a green "4 images".
+- Names are content-addressed (sha1 of the bytes), so a re-roll of an identical
+  result costs no extra disk and the serve route can validate the name against
+  one regex — nothing else on the droplet is reachable through it.
+- The serve route is **ungated on purpose**: Shopify's own image fetcher and the
+  Meta-ads job read these URLs and neither can carry a session token. They are
+  model photos we generated ourselves; nothing there is secret.
+- Fetched **direct**, never through the scraper proxy — that proxy is for
+  competitor shops that rate-limit our datacentre IP and it bills per GB, and
+  these files are 5-9 MB each.
+- Retention: `HF_MEDIA_RETENTION_DAYS` (default 30), pruned on every generation.
+  Deliberately **not** in `_run_backup`'s file list — 14 day-folders of photos
+  would fill the droplet. A draft published within the window keeps working; an
+  abandoned one loses its photos, later and on purpose.
+- Verify from anywhere: `curl https://188-166-11-177.nip.io/api/health` →
+  `"hf_media":{"files":N,"mb":X,"retention_days":30}`.
+
+Two things nearby changed with it:
+- `/api/selftest?what=higgsfield` now **downloads** the image it generated. It
+  used to check only that a URL came back, so it reported `ok:true` straight
+  through this outage. New failure reason: `unreachable_output`.
+- `/api/retry_fix` re-attaches photos to a product that has **none**, from
+  `images_by_product` ({product_id: [url, …]}) the frontend sends along. Before,
+  it touched sales channels only — which is why "Retry fix" could never repair
+  the "No images attached" it was being offered for.
 
 ---
 

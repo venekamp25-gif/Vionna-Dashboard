@@ -274,8 +274,15 @@ export interface GenerateResponse {
 export type GenerateField = "description" | "meta_description" | "m_title_specs";
 
 export interface HiggsfieldResponse {
+  /** OUR urls (`/api/hf_media/...`), not Higgsfield's. The backend downloads
+   *  every result at generation time and serves the bytes itself, because a
+   *  Higgsfield CDN URL can be dead by the time we publish — bug #46. */
   urls?: string[];
   prompt_used?: string;
+  /** How many images the CLI produced. */
+  generated?: number;
+  /** How many of those could not be downloaded and were therefore dropped. */
+  unreachable?: number;
   error?: string;
 }
 
@@ -436,12 +443,28 @@ export const api = {
       error?: string;
     }>("/api/verify_products", { method: "POST", body: { store, product_ids } }),
 
-  /** Re-attempt the auto-fixable post-publish issues (re-publish to sales channels). Gated. */
-  retryFix: (store: "dk" | "fr" | "fi", product_ids: (number | string)[]) =>
-    call<{ success: boolean; fixed: number; errors: string[]; error?: string }>(
-      "/api/retry_fix",
-      { method: "POST", body: { store, product_ids }, authed: true }
-    ),
+  /** Re-attempt the auto-fixable post-publish issues. Gated.
+   *
+   *  Re-publishes to the sales channels, and — when `images_by_product` is
+   *  supplied — re-attaches photos to any of those products that has none.
+   *  Without the URLs the backend has nothing to attach, which is why this
+   *  button used to be a dead end for "No images attached" (#43/#44/#45). */
+  retryFix: (
+    store: "dk" | "fr" | "fi",
+    product_ids: (number | string)[],
+    images_by_product?: Record<string, string[]>
+  ) =>
+    call<{
+      success: boolean;
+      fixed: number;
+      images_attached?: number;
+      errors: string[];
+      error?: string;
+    }>("/api/retry_fix", {
+      method: "POST",
+      body: { store, product_ids, images_by_product },
+      authed: true,
+    }),
 
   /** Catalogue audit (#2): scan a store for missing cutlines / images, duplicate
    *  products, and active-but-off-channel products. */

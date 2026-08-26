@@ -74,6 +74,26 @@ export function PublishStep() {
     const own = (data.nbResultsPerColor?.[c] ?? []).map((r) => r.url).filter(Boolean);
     imagesByColor[c] = own.length > 0 ? own : sharedFallback;
   }
+  // Photos "Retry fix" can re-attach to a product that landed without any (bug #46).
+  // Mirrors what ReviewStep really published per colour (ReviewStep.tsx:188-194):
+  // the PRIMARY colour gets the shared step 1-4 photos plus its own step-5 ones,
+  // every other colour gets strictly its own. Colour i lines up with productIds[i].
+  const selectedPool = (data.publishPool ?? []).filter((p) => p.selected);
+  const publishedByCanonical: Record<string, string[]> = { shared: [] };
+  for (const p of selectedPool) {
+    const key = p.color || "shared";
+    (publishedByCanonical[key] ??= []).push(p.url);
+  }
+  const publishedShared = publishedByCanonical.shared ?? [];
+  const primaryCanonical = data.canonicalColors?.[0] ?? null;
+  const publishedImagesByColor: Record<string, string[]> = {};
+  for (const c of colorKeys) {
+    const own = publishedByCanonical[c] ?? [];
+    publishedImagesByColor[c] = Array.from(
+      new Set(c === primaryCanonical ? [...publishedShared, ...own] : own)
+    );
+  }
+
   const urlByStoreColor: Partial<Record<StoreKey, string[]>> = {};
   for (const store of fallbackList) {
     const result =
@@ -164,6 +184,7 @@ export function PublishStep() {
             metafieldErrors={result.metafieldErrors}
             verification={result.verification}
             productIds={result.productIds}
+            publishedImagesByColor={publishedImagesByColor}
             activateRequested={result.activateRequested}
             liveCount={result.liveCount}
             onVerificationUpdate={(v) =>
@@ -490,6 +511,9 @@ interface CardProps {
   metafieldErrors: string[];
   verification?: ProductVerify[];
   productIds?: number[];
+  /** Canonical colour → the photos that colour was published with. Lets
+   *  "Retry fix" re-attach them if the product landed empty (bug #46). */
+  publishedImagesByColor?: Record<string, string[]>;
   activateRequested?: boolean;
   liveCount?: number;
   onVerificationUpdate?: (verification: ProductVerify[]) => void;
@@ -509,6 +533,7 @@ function StoreResultCard({
   metafieldErrors,
   verification,
   productIds,
+  publishedImagesByColor,
   activateRequested,
   liveCount,
   onVerificationUpdate,
@@ -519,10 +544,25 @@ function StoreResultCard({
   const verifyFails = (verification ?? []).some((p) =>
     (p.issues ?? []).some((i) => i.level === "fail")
   );
-  // "Retry fix" only re-publishes to the sales channels — it cannot attach a photo,
-  // add a variant or write a metafield. Offering it for those was a loop with no exit
-  // and produced one duplicate bug report per store (#43, #44, #45).
-  const advice = retryFixAdvice(verifyIssues.flatMap((p) => p.issues ?? []));
+  // What "Retry fix" can send along: product id → the photos that colour was
+  // published with. Colour i lines up with productIds[i] (ReviewStep creates one
+  // product per canonical colour, in order).
+  const imagesByProduct: Record<string, string[]> = {};
+  (productIds ?? []).forEach((pid, i) => {
+    const urls = publishedImagesByColor?.[canonicalColors[i]] ?? [];
+    if (urls.length > 0) imagesByProduct[String(pid)] = urls;
+  });
+  // Retry re-publishes to the sales channels, and — since bug #46 — re-attaches
+  // photos to a product that landed empty, but only from URLs we still hold.
+  // Without them it cannot attach a photo, and offering the button anyway was a
+  // loop with no exit that produced one duplicate bug report per store (#43/#44/#45).
+  const canReattachImages = verifyIssues
+    .filter((p) => (p.issues ?? []).some((i) => i.msg === MISSING_IMAGES_MSG))
+    .every((p) => (imagesByProduct[String(p.id)] ?? []).length > 0);
+  const advice = retryFixAdvice(
+    verifyIssues.flatMap((p) => p.issues ?? []),
+    canReattachImages
+  );
   // Missing photos have their own explanation below, so reporting them as a bug adds
   // nothing — the cause is known and sits in step 5, not in the code.
   const onlyMissingImages = advice.missingImages && advice.unfixable.length === 1;
@@ -548,7 +588,7 @@ function StoreResultCard({
     setShowBug(false);
     setBugState("idle");
     try {
-      await api.retryFix(store, productIds);
+      await api.retryFix(store, productIds, imagesByProduct);
       const v = await api.verifyProducts(store, productIds);
       onVerificationUpdate?.(v.products as ProductVerify[]);
       const stillBroken = (v.products ?? []).some((p) => (p.issues ?? []).length > 0);
@@ -738,14 +778,15 @@ function StoreResultCard({
                       : `Deze ${noPhotoTitles.length} kleuren hebben geen foto's`}
                     :
                   </strong>{" "}
-                  {noPhotoTitles.join(", ")}. &quot;Retry fix&quot; kan foto&apos;s niet toevoegen — die
-                  zet alleen verkoopkanalen goed. Genereer stap 5 (Nano Banana) opnieuw voor deze
-                  kleur(en) en publiceer het product daarna nog een keer.
+                  {noPhotoTitles.join(", ")}. Er zijn voor deze kleur(en) geen foto&apos;s meer in
+                  deze run, dus &quot;Retry fix&quot; kan ze niet terugzetten. Genereer stap 5 (Nano
+                  Banana) opnieuw voor deze kleur(en) en publiceer het product daarna nog een keer.
                 </div>
               )}
               {!advice.canRetry && !advice.missingImages && advice.unfixable.length > 0 && (
                 <div className="mt-2.5 text-[11px] leading-relaxed">
-                  &quot;Retry fix&quot; kan dit niet oplossen — het zet alleen verkoopkanalen goed.
+                  &quot;Retry fix&quot; kan dit niet oplossen — het zet verkoopkanalen goed en hangt
+                  ontbrekende foto&apos;s terug, meer niet.
                 </div>
               )}
               {!onlyMissingImages && (showBug || !advice.canRetry) && (
