@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { api, CogsOverview, CogsRow } from "@/lib/api";
+import { api, CogsOverview, CogsProduct } from "@/lib/api";
 import { Button } from "@/components/ui/Button";
 
 /** Margin watch: which products have a supplier cost eating too much of the
@@ -40,12 +40,13 @@ export function CogsWorkbench() {
     void load(scope);
   }, [scope, load]);
 
+  // PRODUCTEN, niet varianten: acht maten van dezelfde jurk is een besluit.
   const rows = useMemo(() => {
-    const all = data?.rows ?? [];
+    const all = data?.products ?? [];
     return onlyOver ? all.filter((r) => r.over) : all;
   }, [data, onlyOver]);
 
-  const keyOf = (r: CogsRow) => `${r.store}:${r.variant_id}`;
+  const keyOf = (r: CogsProduct) => `${r.store}:${r.product_id ?? r.title}`;
 
   const money = (v: number | null | undefined, cur?: string | null) =>
     v == null
@@ -54,7 +55,7 @@ export function CogsWorkbench() {
 
   /** Ratio the row WOULD have at the price currently typed in the box, so the
    *  operator sees the effect of their own number, not only of my suggestion. */
-  const previewPct = (r: CogsRow) => {
+  const previewPct = (r: CogsProduct) => {
     const raw = edited[keyOf(r)];
     const p = raw ? Number(raw.replace(",", ".")) : r.suggested_price ?? null;
     if (!p || p <= 0) return null;
@@ -62,7 +63,7 @@ export function CogsWorkbench() {
     return (r.cost / basis) * 100;
   };
 
-  const apply = async (r: CogsRow) => {
+  const apply = async (r: CogsProduct) => {
     const k = keyOf(r);
     const raw = edited[k] ?? String(r.suggested_price ?? "");
     const price = Number(raw.replace(",", "."));
@@ -82,14 +83,21 @@ export function CogsWorkbench() {
     setBusy((b) => ({ ...b, [k]: true }));
     setDone((d) => ({ ...d, [k]: "" }));
     try {
-      const res = await api.pricingApply(r.store, [
-        { variant_id: r.variant_id, price, compare_at_price: compareAt },
-      ]);
+      // Elke maat krijgt dezelfde prijs — dat is hoe het assortiment is opgezet.
+      const res = await api.pricingApply(
+        r.store,
+        r.variants.map((v) => ({
+          variant_id: v.variant_id,
+          price,
+          compare_at_price: compareAt,
+        }))
+      );
       setDone((d) => ({
         ...d,
         [k]:
           res.updated > 0
-            ? `✓ now ${money(price, r.currency)}${compareAt ? ` (was-price ${money(compareAt, r.currency)})` : ""}`
+            ? `✓ ${res.updated}/${r.variants.length} sizes now ${money(price, r.currency)}` +
+              (res.failed ? ` — ${res.failed} failed` : "")
             : `✕ ${res.errors?.[0]?.error ?? "failed"}`,
       }));
     } catch (e) {
@@ -99,7 +107,7 @@ export function CogsWorkbench() {
     }
   };
 
-  const alertCount = (data?.rows ?? []).filter((r) => r.over).length;
+  const alertCount = (data?.products ?? []).filter((r) => r.over).length;
 
   return (
     <div className="min-h-screen bg-bg text-text">
@@ -228,13 +236,11 @@ export function CogsWorkbench() {
                       <td className="px-3 py-2">
                         <div className="font-medium">
                           {r.shopify_title || r.title}
-                          {r.variant_title && r.variant_title !== "Default Title" && (
-                            <span className="text-text-dim"> · {r.variant_title}</span>
-                          )}
                         </div>
                         <div className="text-[11px] text-text-dim">
                           {r.store.toUpperCase()}
-                          {r.seen ? ` · ${r.seen}× sold in window` : ""}
+                          {r.variant_count > 1 ? ` · ${r.variant_count} sizes` : ""}
+                          {r.seen ? ` · ${r.seen}× sold` : ""}
                           {r.estimated && (
                             <span
                               className="ml-1.5 px-1.5 py-0.5 rounded bg-warning/20 text-warning font-medium"
@@ -250,6 +256,14 @@ export function CogsWorkbench() {
                       </td>
                       <td className="px-3 py-2 text-right whitespace-nowrap">
                         {money(r.price, r.currency)}
+                        {r.price_varies && (
+                          <span
+                            className="text-[10.5px] text-text-dim"
+                            title={`Sizes range up to ${money(r.price_max, r.currency)}. We judge the lowest price — that is the tightest margin.`}
+                          >
+                            {" "}–{money(r.price_max, r.currency)}
+                          </span>
+                        )}
                         {r.compare_at ? (
                           <div className="text-[10.5px] text-text-dim line-through">
                             {money(r.compare_at, r.currency)}

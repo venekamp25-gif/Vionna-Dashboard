@@ -168,6 +168,22 @@ export interface CogsRow {
   estimate_basis?: string;
 }
 
+/** A PRODUCT (all its sizes collapsed). You price a product, not a size — one
+ *  dress showed up as 123 separate alerts before this grouping existed. */
+export interface CogsProduct extends Omit<CogsRow, "variant_id" | "variant_title"> {
+  variants: {
+    variant_id: string;
+    variant_title?: string;
+    price?: number;
+    compare_at?: number | null;
+  }[];
+  variant_count: number;
+  /** Lowest price across sizes — the tightest margin, so that is what we judge. */
+  price: number;
+  price_max?: number;
+  price_varies?: boolean;
+}
+
 export interface CogsOverview {
   configured?: boolean;
   error?: string;
@@ -176,7 +192,9 @@ export interface CogsOverview {
   days?: number;
   counted?: number;
   rows?: CogsRow[];
-  alerts?: CogsRow[];
+  /** Variant rows collapsed per product — what the table and Slack use. */
+  products?: CogsProduct[];
+  alerts?: CogsProduct[];
   unknown_count?: number;
   price_errors?: Record<string, string>;
   stats?: Record<string, number>;
