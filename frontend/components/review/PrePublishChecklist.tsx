@@ -1,7 +1,9 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { useProduct, colorLabelFor } from "@/lib/product";
 import { StoreKey, STORE_CONFIG } from "@/lib/store";
+import { poolCoverage } from "@/lib/publishChecks";
 import { Button } from "@/components/ui/Button";
 
 export interface CheckItem {
@@ -10,6 +12,10 @@ export interface CheckItem {
   level: "ok" | "warn" | "fail";
   detail?: string;
 }
+
+/** Check id of the "colours without photos" rule — the popup asks for an
+ *  explicit acknowledgement before it lets that one be overridden. */
+export const POOL_COVERAGE_ID = "pool-coverage";
 
 /**
  * Live pre-publish checks. Used both as a confirmation popup (when the user
@@ -73,28 +79,25 @@ export function buildPrePublishChecks(
       detail: "Products will be created without images",
     });
   } else {
-    const primaryCanonical = data.canonicalColors[0] ?? null;
-    const hasSharedImages = selectedPool.some((p) => p.color === "shared");
-    const missing: string[] = [];
-    for (const c of data.canonicalColors) {
-      const hasOwn = selectedPool.some((p) => p.color === c);
-      const isPrimaryWithShared = c === primaryCanonical && hasSharedImages;
-      if (!hasOwn && !isPrimaryWithShared) {
-        missing.push(c);
-      }
-    }
-    if (missing.length === 0) {
+    const { missing, level } = poolCoverage(data.canonicalColors, selectedPool);
+    if (level === "ok") {
       out.push({
-        id: "pool-coverage",
+        id: POOL_COVERAGE_ID,
         label: `Every colour has at least one photo (${selectedPool.length} total)`,
         level: "ok",
       });
     } else {
+      // A `fail`, not a warning: these colours get created with zero images and
+      // nothing afterwards can repair that — "Retry fix" only touches sales
+      // channels. Publishing anyway stays possible, but has to be ticked off
+      // explicitly in the popup below (bug #43).
       out.push({
-        id: "pool-coverage",
+        id: POOL_COVERAGE_ID,
         label: `${missing.length} ${missing.length === 1 ? "colour has" : "colours have"} no photos`,
-        level: "warn",
-        detail: missing.join(", "),
+        level: "fail",
+        detail:
+          `${missing.join(", ")} — these products would go into the store without a single ` +
+          `photo. Generate step 5 (Nano Banana) for them first; it cannot be fixed after publishing.`,
       });
     }
   }
@@ -205,11 +208,20 @@ export function PrePublishChecklistPopup({
   onCancel,
   onPublishAnyway,
 }: PopupProps) {
+  // The "colours without photos" override has to be ticked every time the popup
+  // opens — never carried over from a previous publish attempt.
+  const [acknowledgedNoPhotos, setAcknowledgedNoPhotos] = useState(false);
+  useEffect(() => {
+    if (open) setAcknowledgedNoPhotos(false);
+  }, [open]);
+
   if (!open) return null;
 
   const fails = checks.filter((c) => c.level === "fail");
   const warns = checks.filter((c) => c.level === "warn");
   const hasFails = fails.length > 0;
+  const missingPhotos = fails.find((c) => c.id === POOL_COVERAGE_ID) ?? null;
+  const blocked = missingPhotos !== null && !acknowledgedNoPhotos;
 
   return (
     <div
@@ -257,6 +269,23 @@ export function PrePublishChecklistPopup({
           ))}
         </div>
 
+        {missingPhotos && (
+          <div className="px-6 pb-1">
+            <label className="flex items-start gap-2 text-[12px] text-text cursor-pointer px-3 py-2.5 rounded-md bg-danger/10 border border-danger/40">
+              <input
+                type="checkbox"
+                checked={acknowledgedNoPhotos}
+                onChange={(e) => setAcknowledgedNoPhotos(e.target.checked)}
+                className="mt-0.5 shrink-0"
+              />
+              <span>
+                I know these colours will be created <strong>without any photo</strong>, and that
+                &ldquo;Retry fix&rdquo; cannot add photos afterwards. Publish anyway.
+              </span>
+            </label>
+          </div>
+        )}
+
         <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-border bg-bg-elev-2 rounded-b-2xl">
           <Button variant="secondary" size="sm" onClick={onCancel}>
             ← Back to review
@@ -265,6 +294,7 @@ export function PrePublishChecklistPopup({
             variant={hasFails ? "danger" : "primary"}
             size="sm"
             onClick={onPublishAnyway}
+            disabled={blocked}
           >
             Publish anyway →
           </Button>
