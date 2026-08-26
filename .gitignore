@@ -24,6 +24,7 @@ __pycache__/
 node_modules/
 frontend/.next/
 frontend/out/
+frontend/.tsbuild/
 frontend/.env.local
 frontend/.env*.local
 

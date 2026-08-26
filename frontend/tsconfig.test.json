@@ -1,0 +1,18 @@
+{
+  // Unit tests run on plain node (node --test), which cannot read .ts. The CI
+  // runner is on Node 20, so type stripping isn't available either — tsc emits
+  // CommonJS into .tsbuild/ and node runs that. Only dependency-free modules
+  // belong here: there is no bundler, so no "@/..." aliases and no JSX.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": ".tsbuild",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "isolatedModules": false,
+    "incremental": false,
+    "types": ["node"],
+    "plugins": []
+  },
+  "include": ["lib/publishChecks.ts", "tests/**/*.ts"]
+}

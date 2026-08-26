@@ -47,6 +47,9 @@ jobs:
       - name: Type-check
         run: npx tsc --noEmit -p tsconfig.json
         working-directory: frontend
+      - name: Unit tests (publish-safety rules)
+        run: npm test
+        working-directory: frontend
       - name: Build (same as Netlify publish)
         run: npm run build
         working-directory: frontend

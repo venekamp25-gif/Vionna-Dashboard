@@ -5,6 +5,7 @@ import { AnimatedCheckmark } from "@/components/ui/AnimatedCheckmark";
 import { Button } from "@/components/ui/Button";
 import { api, MetaDraftResult } from "@/lib/api";
 import { useProduct, colorLabelFor, pickRandomBgReferenceUrl, ProductVerify, PublishResult, saveLastProduct } from "@/lib/product";
+import { MISSING_IMAGES_MSG, retryFixAdvice } from "@/lib/publishChecks";
 import { useStore, StoreKey, STORE_CONFIG } from "@/lib/store";
 import { useStep } from "@/lib/step";
 
@@ -518,6 +519,16 @@ function StoreResultCard({
   const verifyFails = (verification ?? []).some((p) =>
     (p.issues ?? []).some((i) => i.level === "fail")
   );
+  // "Retry fix" only re-publishes to the sales channels — it cannot attach a photo,
+  // add a variant or write a metafield. Offering it for those was a loop with no exit
+  // and produced one duplicate bug report per store (#43, #44, #45).
+  const advice = retryFixAdvice(verifyIssues.flatMap((p) => p.issues ?? []));
+  // Missing photos have their own explanation below, so reporting them as a bug adds
+  // nothing — the cause is known and sits in step 5, not in the code.
+  const onlyMissingImages = advice.missingImages && advice.unfixable.length === 1;
+  const noPhotoTitles = verifyIssues
+    .filter((p) => (p.issues ?? []).some((i) => i.msg === MISSING_IMAGES_MSG))
+    .map((p) => p.title);
 
   const [retrying, setRetrying] = useState(false);
   const [retryMsg, setRetryMsg] = useState<string | null>(null);
@@ -706,24 +717,44 @@ function StoreResultCard({
                   </li>
                 ))}
               </ul>
-              <div className="flex items-center gap-2 mt-2.5 flex-wrap">
-                <button
-                  type="button"
-                  onClick={() => void retryFix()}
-                  disabled={retrying}
-                  className="text-[11px] font-semibold uppercase tracking-wider px-2.5 py-1 rounded-md border border-current/40 hover:bg-current/10 disabled:opacity-50"
-                >
-                  {retrying ? "↻ Bezig…" : "↻ Retry fix"}
-                </button>
-                {retryMsg && <span className="text-[11px] font-medium">{retryMsg}</span>}
-              </div>
-              {showBug && (
+              {advice.canRetry && (
+                <div className="flex items-center gap-2 mt-2.5 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={() => void retryFix()}
+                    disabled={retrying}
+                    className="text-[11px] font-semibold uppercase tracking-wider px-2.5 py-1 rounded-md border border-current/40 hover:bg-current/10 disabled:opacity-50"
+                  >
+                    {retrying ? "↻ Bezig…" : "↻ Retry fix"}
+                  </button>
+                </div>
+              )}
+              {retryMsg && <div className="mt-2.5 text-[11px] font-medium">{retryMsg}</div>}
+              {advice.missingImages && (
+                <div className="mt-2.5 text-[11px] leading-relaxed">
+                  <strong>
+                    {noPhotoTitles.length === 1
+                      ? "Deze kleur heeft geen foto's"
+                      : `Deze ${noPhotoTitles.length} kleuren hebben geen foto's`}
+                    :
+                  </strong>{" "}
+                  {noPhotoTitles.join(", ")}. &quot;Retry fix&quot; kan foto&apos;s niet toevoegen — die
+                  zet alleen verkoopkanalen goed. Genereer stap 5 (Nano Banana) opnieuw voor deze
+                  kleur(en) en publiceer het product daarna nog een keer.
+                </div>
+              )}
+              {!advice.canRetry && !advice.missingImages && advice.unfixable.length > 0 && (
+                <div className="mt-2.5 text-[11px] leading-relaxed">
+                  &quot;Retry fix&quot; kan dit niet oplossen — het zet alleen verkoopkanalen goed.
+                </div>
+              )}
+              {!onlyMissingImages && (showBug || !advice.canRetry) && (
                 <div className="mt-1.5 text-[11px]">
                   {bugState === "sent" ? (
                     <span className="text-accent">✓ Als bug gemeld — Claude pakt 'm op bij de volgende sessie.</span>
                   ) : (
                     <>
-                      Lukt het niet automatisch?{" "}
+                      {advice.canRetry ? "Lukt het niet automatisch?" : "Klopt dit niet?"}{" "}
                       <button
                         type="button"
                         onClick={() => void reportBug()}
