@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/Button";
 import { ImageTile } from "@/components/ui/ImageTile";
 import { Lightbox } from "@/components/ui/Lightbox";
 import { useProduct, NbResult, PoolPhoto } from "@/lib/product";
+import { poolWithoutStep } from "@/lib/publishChecks";
 import { api } from "@/lib/api";
 import { higgsfieldQueue } from "@/lib/concurrency";
 import { MAX_IMAGES_PER_COLOR } from "@/lib/scrape-utils";
@@ -444,14 +445,7 @@ export function NanoBananaSteps() {
       const updated = current.map((r, i) => (i === slotIndex ? { ...r, selected: willSelect } : r));
 
       const tagPrefix = isStep5 ? `NB Step 5 — ${color}` : `NB Step ${stepNum}`;
-      // Opschonen op het COLOR-veld, niet op de labeltekst. Een prefix-test op
-      // het label wiste ook andere kleuren: 'Blå' is het begin van
-      // 'Blå Blomstret' (18 zulke paren op DK alleen). Die beelden bleven wel
-      // op het scherm staan maar verdwenen uit de pool — en de publish leest de
-      // pool, dus ze kwamen nooit in Shopify aan.
-      const pool: PoolPhoto[] = prev.publishPool.filter((p) =>
-        isStep5 ? p.color !== color : p.color !== "shared" || !p.label.startsWith(tagPrefix)
-      );
+      const pool: PoolPhoto[] = poolWithoutStep(prev.publishPool, { isStep5, color, tagPrefix });
       updated.forEach((r, i) => {
         if (r.selected && r.url) {
           pool.push({
@@ -484,8 +478,11 @@ export function NanoBananaSteps() {
       const updated = current.map((r) => (r.url ? { ...r, selected: willSelect } : r));
 
       const tagPrefix = `NB Step 5 — ${color}`;
-      // Zie de toelichting hierboven: exact op kleur vergelijken, niet op label.
-      const pool: PoolPhoto[] = prev.publishPool.filter((p) => p.color !== color);
+      const pool: PoolPhoto[] = poolWithoutStep(prev.publishPool, {
+        isStep5: true,
+        color,
+        tagPrefix,
+      });
       updated.forEach((r, i) => {
         if (r.selected && r.url) {
           pool.push({

@@ -113,3 +113,37 @@ export function poolCoverage(
   }
   return { missing, level: missing.length === 0 ? "ok" : "fail" };
 }
+
+/** Structural subset of PoolPhoto (lib/product.tsx) incl. its human label. */
+export interface LabelledPoolEntry extends PoolEntry {
+  /** Display text only, e.g. "NB Step 5 — Blå.2". Never matched on. */
+  label: string;
+}
+
+/**
+ * The pool entries that survive when one step's selection is rebuilt.
+ *
+ * Toggling a tile re-adds every selected photo for that step, so its previous
+ * entries have to come out first. Step 1-4 photos are shared by all colours and
+ * are identified by their label; step 5 photos belong to exactly one colour.
+ *
+ * Bug: step 5 used to be cleaned with `label.startsWith(`NB Step 5 — ${color}`)`.
+ * Colour names where one is the start of another are everywhere: of the 237
+ * colours measured on DK, 58 are the start of another one ('Blå'/'Blå Grå',
+ * 'Gul'/'Guld', 'Rød'/'Rødbrun'), and 'Sort' alone starts six of them
+ * ('Sort/Hvid', 'Sort/Beige', 'Sort & Guld', ...). So selecting a photo for
+ * 'Sort' silently dropped every entry of those six. The tiles stayed on screen
+ * (they live in
+ * nbResultsPerColor) but the publish loop reads the POOL, so those colours were
+ * created without photos. Compare the `color` field exactly; never the label.
+ */
+export function poolWithoutStep<T extends LabelledPoolEntry>(
+  pool: T[],
+  step: { isStep5: boolean; color: string; tagPrefix: string }
+): T[] {
+  return pool.filter((p) =>
+    step.isStep5
+      ? p.color !== step.color
+      : p.color !== "shared" || !p.label.startsWith(step.tagPrefix)
+  );
+}
