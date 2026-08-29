@@ -16080,6 +16080,11 @@ BLOG_PLAYBOOK_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), '
 BLOG_OPTIMIZE_FOR = os.getenv('BLOG_OPTIMIZE_FOR', 'sales')   # sales | traffic | ranking
 DFS_RANKED_ENDPOINT = 'https://api.dataforseo.com/v3/dataforseo_labs/google/ranked_keywords/live'
 BLOG_MEASURE_MIN_AGE_DAYS = int(os.getenv('BLOG_MEASURE_MIN_AGE_DAYS', '21'))
+# Learn-loop guardrails: an article needs ~6 weeks before a zero score means
+# anything, and one winner is not a pattern. Below these thresholds the playbook
+# stays empty instead of steering the writer with noise.
+BLOG_LEARN_MIN_AGE_DAYS = int(os.getenv('BLOG_LEARN_MIN_AGE_DAYS', '42'))
+BLOG_LEARN_MIN_WINNERS  = int(os.getenv('BLOG_LEARN_MIN_WINNERS', '5'))
 
 # Last-run diagnostics surfaced (read-only) via /api/blog/status so failures of
 # the unattended scheduler/bootstrap are visible without droplet log access.
@@ -16610,11 +16615,39 @@ def _blog_measure_all(force=False):
 
 def _blog_learn(min_articles=4):
     """Correlate levers with measured performance and distil an evolving playbook
-    via Claude. Writes blog_playbook.json. Returns a status dict."""
-    perf = [p for p in _blog_perf_latest() if p.get('levers')]
-    if len(perf) < min_articles:
-        res = {'ok': False, 'reason': f'need >= {min_articles} measured articles, have {len(perf)}'}
+    via Claude. Writes blog_playbook.json. Returns a status dict.
+
+    GUARDRAILS (added 2026-08-29 after the loop overfitted on noise): SEO needs
+    ~2-3 months before an article ranks, so a young article scoring 0 is not
+    evidence of anything. Without them the loop drew rules from a single winning
+    article — "avoid pillar articles", "no questions in titles" — and actively
+    steered the writer away from the cluster strategy. Rules are only inferred
+    once enough OLD ENOUGH articles actually scored; until then the playbook is
+    deliberately empty (the writer then uses its own quality rules)."""
+    perf_all = [p for p in _blog_perf_latest() if p.get('levers')]
+    if len(perf_all) < min_articles:
+        res = {'ok': False, 'reason': f'need >= {min_articles} measured articles, have {len(perf_all)}'}
         _BLOG_LAST['learn'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z', **res}
+        return res
+    # only articles that have had a fair chance to rank count as evidence
+    perf = [p for p in perf_all if (p.get('age_days') or 0) >= BLOG_LEARN_MIN_AGE_DAYS]
+    winners = [p for p in perf if (p.get('score') or 0) > 0]
+    if len(winners) < BLOG_LEARN_MIN_WINNERS:
+        reason = (f'insufficient signal: {len(winners)} article(s) with a positive score among '
+                  f'{len(perf)} old enough (>= {BLOG_LEARN_MIN_AGE_DAYS}d) — need '
+                  f'{BLOG_LEARN_MIN_WINNERS}; keeping the playbook empty rather than '
+                  'inferring rules from noise')
+        playbook = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
+                    'n_articles': len(perf), 'n_winners': len(winners),
+                    'optimize_for': BLOG_OPTIMIZE_FOR, 'rules': [], 'status': reason}
+        try:
+            with open(BLOG_PLAYBOOK_PATH, 'w', encoding='utf-8') as f:
+                json.dump(playbook, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[blog] playbook write failed: {e}")
+        res = {'ok': False, 'reason': reason}
+        _BLOG_LAST['learn'] = {'ts': playbook['ts'], **res}
+        print(f"[blog] learn: {reason}")
         return res
     perf.sort(key=lambda p: -(p.get('score') or 0))
 
@@ -16641,10 +16674,20 @@ def _blog_learn(min_articles=4):
             "style, number/question in title, n_h2, n_product_links, category, topic_source) "
             "correlate with HIGH vs LOW score.\n\n"
             f"DATA (best→worst):\n{json.dumps(table, ensure_ascii=False)}\n\n"
-            "Write a concise PLAYBOOK of 5-8 concrete, imperative rules the writer should follow "
-            "next time to score higher (e.g. 'Aim for 900-1000 words', 'Put a number in the title', "
-            "'Link 4-5 products', 'Prioritise <category> topics'). Base each rule on THIS data, not "
-            "generic SEO advice. Return ONLY a JSON array of short strings."
+            "Write a PLAYBOOK of concrete, imperative rules the writer should follow next time to "
+            "score higher (e.g. 'Aim for 900-1000 words', 'Link 4-5 products'). Base each rule on "
+            "THIS data, not generic SEO advice.\n"
+            "STATISTICAL DISCIPLINE — this matters more than producing rules:\n"
+            "- Only state a rule when at least 3 articles support it on the winning side AND "
+            "counter-examples are absent. Never generalise from a single article.\n"
+            "- Articles differ in AGE. Organic ranking takes 2-3 months, so a younger article "
+            "scoring 0 proves nothing; never conclude that a format/category/topic_source is bad "
+            "when its articles are simply younger than the winners.\n"
+            "- Do NOT invent rules about title punctuation, question marks or numbers unless the "
+            "pattern is strong and supported by several articles on both sides.\n"
+            "- Returning FEWER rules (even an empty array) is the correct answer when the data does "
+            "not support more. Quality over quantity: at most 8.\n"
+            "Return ONLY a JSON array of short strings."
         )
         msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=700,
                                       messages=[{'role': 'user', 'content': prompt}])
