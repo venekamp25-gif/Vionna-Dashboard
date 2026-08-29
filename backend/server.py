@@ -16755,6 +16755,28 @@ def _blog_ensure(store, hdrs):
     return cr.json()['blog']['id']
 
 
+# Vionna sells WOMENSWEAR only. Keywords aimed at men's or children's clothing
+# carry the wrong search intent no matter how high their volume, so they are
+# rejected before scoring (word-boundary, accent-insensitive).
+_BLOG_WRONG_AUDIENCE = (
+    # men
+    'homme', 'hommes', 'masculin', 'masculine', 'men', 'mens', 'man', 'herre', 'herrer',
+    'herremode', 'mand', 'maend', 'miesten', 'miehet', 'mies', 'miehille',
+    # children / baby
+    'enfant', 'enfants', 'garcon', 'garcons', 'bebe', 'kids', 'kid', 'child', 'children',
+    'boys', 'boy', 'born', 'barn', 'boern', 'drenge', 'pige', 'piger',
+    'lasten', 'lapset', 'lapsille', 'poikien', 'tytto', 'tyttojen', 'vauva',
+)
+
+
+def _blog_wrong_audience(keyword):
+    """True when a keyword targets menswear or kidswear (wrong audience)."""
+    s = ''.join(c for c in unicodedata.normalize('NFKD', (keyword or '').lower())
+                if not unicodedata.combining(c))
+    words = set(re.split(r'[^a-z0-9]+', s))
+    return bool(words & set(_BLOG_WRONG_AUDIENCE))
+
+
 def _blog_lead_time_bonus(seasonality):
     """A blog article needs ~3-8 weeks to be indexed and climb, so the IDEAL
     subject peaks 2-3 months from now — not today. (Product listing wants the
@@ -16847,6 +16869,12 @@ def _blog_hot_topics(store, k=3, hdrs=None):
     # set also gates the CLUSTER below: an unfiltered cluster put "adidas bukser" /
     # "carhartt bukser" into the DK article as a competitor-brands section.
     cands = _dfs_clean_keywords_llm(cands, store, max_tokens=4000)
+    # Deterministic audience guard on top of the LLM filter: "pantalon homme"
+    # (22k searches) slipped through and produced a men's-trousers article on a
+    # womenswear shop. High volume, wrong intent — those visitors never convert.
+    cands = [c for c in cands if not _blog_wrong_audience(c.get('keyword'))]
+    if not cands:
+        return []
     clean_kws = {(c.get('keyword') or '').strip().lower() for c in cands}
     _recommend_keywords(cands, store, top_n=len(cands))   # attaches 'score'
     cands.sort(key=lambda x: -(x.get('score') or 0))
