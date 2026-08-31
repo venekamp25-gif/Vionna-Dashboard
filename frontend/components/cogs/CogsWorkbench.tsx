@@ -58,11 +58,13 @@ function Th({
 export function CogsWorkbench() {
   const [data, setData] = useState<CogsOverview | null>(null);
   const [loading, setLoading] = useState(false);
-  // GEMETEN 2026-08-26: scope=weekly (120 dagen) laat de worker van
-  // master-dashboard omvallen -- drie keer herhaald, elke keer HTTP 500 na
-  // ~30s, en na een paar pogingen lag de HELE service er even uit (dus ook
-  // P&L en Klaviyo). Daarom opent de tab op de lichte scope; weekly blijft
-  // kiesbaar maar is als zwaar gemarkeerd tot de bron het aankan.
+  // Weekly werkt weer (2026-08-26). Het viel om doordat gunicorn op Render op
+  // zijn STANDAARD --timeout van 30s draaide in plaats van de 120 uit de
+  // Procfile: de sweep duurt 72s, dus de worker werd er middenin afgeschoten
+  // (SystemExit uit handle_abort, wat langs elke `except Exception` glipt).
+  // Opgelost met een gunicorn.conf.py in master-dashboard.
+  // De tab opent nog steeds op de lichte scope, puur omdat 72s wachten bij het
+  // openen van een tab niemand helpt; weekly is een bewuste keuze.
   const [scope, setScope] = useState<"daily" | "weekly">("daily");
   const [onlyOver, setOnlyOver] = useState(true);
   // "" = alle winkels. De keuze blijft staan als de scope verandert,
@@ -219,7 +221,7 @@ export function CogsWorkbench() {
             className="text-[12px] bg-surface border border-border rounded px-2 py-1"
           >
             <option value="daily">Just sold (5 days)</option>
-            <option value="weekly">All recently sold (120 days) — heavy</option>
+            <option value="weekly">All recently sold (120 days) — takes ~75s</option>
           </select>
           <Button variant="secondary" onClick={() => void load(scope)} disabled={loading}>
             {loading ? "Loading…" : "Refresh"}
