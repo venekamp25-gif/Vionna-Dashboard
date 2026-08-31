@@ -16,7 +16,13 @@ if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
 load_dotenv(ENV_PATH, override=True)
 
-app = Flask(__name__, static_folder='.')
+# static_folder=None is DELIBERATE. With static_folder='.' Flask derives
+# static_url_path='/.' and registers an ungated route `/./<path:filename>` over
+# this very directory — so .env, tokens.json and lighting_tokens.json were
+# publicly downloadable (audit 2026-08-31, verified live). Nothing needs the
+# static endpoint: `/` serves index.html via its own send_from_directory, and
+# bug_screenshots/hf_media have their own handlers. See test_no_static_dir_exposure.py.
+app = Flask(__name__, static_folder=None)
 app.secret_key = os.environ.get('SECRET_KEY') or os.urandom(24)
 
 # CORS: allow the Next.js dashboard frontend (localhost in dev, Netlify in prod). Routes under
