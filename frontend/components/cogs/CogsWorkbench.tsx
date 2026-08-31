@@ -284,7 +284,14 @@ export function CogsWorkbench() {
             customers actually paid, not the price in Shopify. The Light Supplier
             runs Kaching bundle deals, so buying more drops the price per unit and
             the list price flatters the margin. Hover a row to see the ladder and
-            how many orders it is based on.
+            how many orders it is based on.{" "}
+            <strong>
+              Raising the list price is not the only lever here.
+            </strong>{" "}
+            The suggestion assumes the bundle stays the same percentage of the
+            list price, which is what the orders show today — so it can come out
+            near double. Tightening the bundle deal itself often costs less
+            volume than that.
           </p>
         )}
 
