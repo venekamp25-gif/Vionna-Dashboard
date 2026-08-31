@@ -163,6 +163,15 @@ export interface CogsRow {
   /** The old ratio, on the list price. Kept alongside so a changed number can
    *  always be explained. */
   pct_list?: number | null;
+  /** The purchase price the ratio was computed with. */
+  cost_used?: number;
+  /** "opgave" = supplied by hand because the source is unreliable for this
+   *  product (e.g. one Shopify unit is a 5-pack). Must never read as measured. */
+  cost_basis?: "gemeten" | "opgave";
+  /** One row per bundle tier: what it costs, what it earns, what it should be. */
+  tiers?: CogsTier[];
+  /** Which tiers sit above the threshold — the actionable unit. */
+  tiers_over?: number[];
   /** Altijd 0: er wordt geen BTW afgedragen (dropshipping). Blijft in de
    *  uitvoer staan zodat er niets hoeft te veranderen; niet gebruiken om
    *  een netto prijs af te leiden. */
@@ -198,6 +207,24 @@ export interface CogsProduct extends Omit<CogsRow, "variant_id" | "variant_title
   price: number;
   price_max?: number;
   price_varies?: boolean;
+}
+
+/** One rung of a Kaching bundle ladder, e.g. "4 for 79,95". */
+export interface CogsTier {
+  units: number;
+  price_per_unit: number;
+  tier_total: number;
+  /** Purchase price per unit for THIS tier — it drops with volume too. */
+  cost_per_unit: number;
+  /** False when we fell back to the single-unit cost for this tier. */
+  cost_measured: boolean;
+  pct: number;
+  over: boolean;
+  /** The supplier's unit does not match Shopify's, so this ratio is unreliable. */
+  unit_suspect: boolean;
+  /** Only set for a tier that is actually over the threshold. */
+  needed_per_unit?: number | null;
+  needed_total?: number | null;
 }
 
 export interface CogsOverview {
