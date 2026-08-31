@@ -210,6 +210,19 @@ export interface CogsOverview {
    *  others are read through the droplet, so this is NOT the list of covered
    *  stores — do not present it as one. */
   stores_configured_here?: string[];
+  /** Wanneer deze cijfers zijn uitgerekend. De tab leest een OPSLAG, dus dit is
+   *  niet "nu" — daarom staat het altijd op het scherm. */
+  generated_at?: string | null;
+  age_seconds?: number;
+  stale?: boolean;
+  /** Er wordt op dit moment in de achtergrond een verse berekening gemaakt. */
+  refreshing?: boolean;
+  max_age_seconds?: number;
+  /** De laatste poging tot bijwerken mislukte; de cijfers hierboven zijn de
+   *  laatste die WEL lukten. Twee dingen los van elkaar: hoe oud zijn ze, en
+   *  doet het bijwerken het nog. */
+  refresh_error?: string | null;
+  refresh_error_at?: string | null;
   estimate_info?: {
     fi_reference_items?: number;
     matched?: number;
@@ -845,8 +858,11 @@ export const api = {
   // reaches the browser. `configured:false` means the link is not set up yet —
   // show that, never an empty table, or "nothing over the threshold" would be
   // indistinguishable from "we could not look".
-  cogsOverview: (scope: "daily" | "weekly" = "weekly") =>
-    call<CogsOverview>(`/api/cogs/overview?scope=${scope}`, { authed: true }),
+  cogsOverview: (scope: "daily" | "weekly" = "daily", force = false) =>
+    call<CogsOverview>(
+      `/api/cogs/overview?scope=${scope}${force ? "&refresh=1" : ""}`,
+      { authed: true }
+    ),
 
   /** Write new prices. Always send compare_at_price when the product carries a
    *  struck-through price, otherwise the discount badge breaks. */

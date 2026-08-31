@@ -12,6 +12,18 @@ import {
   storeSummaries,
 } from "@/lib/cogsStores";
 
+/** "3 minutes ago" — leesbaarder dan een tijdstempel, en het gaat hier om de
+ *  vraag "hoe vers is dit", niet om het exacte moment (dat staat in de tooltip). */
+function ageLabel(seconds?: number): string {
+  if (seconds == null) return "an unknown moment";
+  if (seconds < 90) return "just now";
+  const min = Math.round(seconds / 60);
+  if (min < 60) return `${min} min ago`;
+  const hrs = Math.round(min / 60);
+  if (hrs < 48) return `${hrs} hour${hrs === 1 ? "" : "s"} ago`;
+  return `${Math.round(hrs / 24)} days ago`;
+}
+
 /** A column header you can click to sort on. The arrow shows the direction, so
  *  the operator can always see WHY the list is in this order. */
 function Th({
@@ -79,11 +91,11 @@ export function CogsWorkbench() {
   const [done, setDone] = useState<Record<string, string>>({});
   const [err, setErr] = useState<string | null>(null);
 
-  const load = useCallback(async (s: "daily" | "weekly") => {
+  const load = useCallback(async (s: "daily" | "weekly", force = false) => {
     setLoading(true);
     setErr(null);
     try {
-      setData(await api.cogsOverview(s));
+      setData(await api.cogsOverview(s, force));
     } catch (e) {
       setErr(e instanceof Error ? e.message : "could not load");
       setData(null);
@@ -223,8 +235,17 @@ export function CogsWorkbench() {
             <option value="daily">Just sold (5 days)</option>
             <option value="weekly">All recently sold (120 days) — takes ~75s</option>
           </select>
-          <Button variant="secondary" onClick={() => void load(scope)} disabled={loading}>
-            {loading ? "Loading…" : "Refresh"}
+          {/* De tab leest een opslag, dus "Refresh" moet echt opnieuw laten
+              rekenen -- anders zou de knop dezelfde oude cijfers teruggeven en
+              lijken alsof er niets aan de hand is. Dat duurt 18s (5 dagen) tot
+              ~75s (120 dagen); vandaar de tekst. */}
+          <Button
+            variant="secondary"
+            onClick={() => void load(scope, true)}
+            disabled={loading}
+            title="Recalculate from scratch. Takes 18s for 5 days, about 75s for 120 days."
+          >
+            {loading ? "Recalculating…" : "Recalculate"}
           </Button>
         </div>
       </div>
@@ -257,6 +278,35 @@ export function CogsWorkbench() {
             te gunstig zijn, want een ontbrekende periode kan juist de laatst
             bekende inkoopprijs bevatten. Zonder deze regel leest een half
             rapport als een gezond rapport. */}
+        {/* De cijfers komen uit een opslag. Hoe oud ze zijn hoort dus altijd op
+            het scherm: anders leest een uur oud rapport als "zo net gemeten". */}
+        {data?.generated_at && !data.error && (
+          <p className="text-[11.5px] text-text-dim mb-3 flex flex-wrap items-center gap-x-2">
+            <span>
+              Figures from{" "}
+              <span title={data.generated_at} className={data.stale ? "text-warning" : ""}>
+                {ageLabel(data.age_seconds)}
+              </span>
+              .
+            </span>
+            {data.refreshing && <span>A fresh calculation is running now — reload in a minute.</span>}
+            {!data.refreshing && data.stale && (
+              <span>Past its refresh window; press Recalculate for current numbers.</span>
+            )}
+          </p>
+        )}
+
+        {/* Twee verschillende dingen, bewust apart: hoe oud de cijfers zijn, en
+            of het BIJWERKEN nog werkt. Een mislukte verversing mag niet
+            verstopt raken achter cijfers die er prima uitzien. */}
+        {data?.refresh_error && (
+          <p className="text-[12.5px] rounded-md border border-warning/40 bg-warning/10 px-3 py-2 mb-4">
+            <strong>The last refresh failed.</strong> The numbers below are the
+            last ones that did come through. {data.refresh_error}
+            {data.refresh_error_at ? ` (${data.refresh_error_at})` : ""}
+          </p>
+        )}
+
         {typeof data?.stats?.stale === "string" && (
           <p className="text-[12.5px] rounded-md border border-warning/40 bg-warning/10 px-3 py-2 mb-4">
             <strong>These figures are not complete.</strong> {data.stats.stale}

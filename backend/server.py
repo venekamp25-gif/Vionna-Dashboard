@@ -9656,7 +9656,9 @@ def api_cogs_overview():
     try:
         r = req.get(f'{COGS_SOURCE_URL}/api/cogs/report',
                     headers={'X-Notify-Token': secret},
-                    params={'scope': scope}, timeout=120)
+                    params={'scope': scope,
+                            **({'refresh': '1'} if request.args.get('refresh') else {})},
+                    timeout=180)
         if r.status_code != 200:
             return jsonify({'error': f'bron gaf HTTP {r.status_code}',
                             'detail': r.text[:200], 'configured': True}), 200
