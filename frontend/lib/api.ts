@@ -199,6 +199,14 @@ export interface CogsOverview {
   price_errors?: Record<string, string>;
   stats?: Record<string, number>;
   estimated_rows?: number;
+  /** Stores where a real supplier quote was found. DK/FR run through Fillbox,
+   *  which reports no per-product cost, so they are absent here even though
+   *  they do appear in `products` with an estimate. */
+  stores_with_costs?: string[];
+  /** Stores whose Shopify config lives on the report host itself. Prices for the
+   *  others are read through the droplet, so this is NOT the list of covered
+   *  stores — do not present it as one. */
+  stores_configured_here?: string[];
   estimate_info?: {
     fi_reference_items?: number;
     matched?: number;

@@ -14,5 +14,5 @@
     "types": ["node"],
     "plugins": []
   },
-  "include": ["lib/publishChecks.ts", "tests/**/*.ts"]
+  "include": ["lib/publishChecks.ts", "lib/cogsStores.ts", "tests/**/*.ts"]
 }
