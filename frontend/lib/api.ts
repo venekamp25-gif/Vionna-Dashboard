@@ -147,9 +147,22 @@ export interface CogsRow {
   currency?: string | null;
   cost: number;
   price: number;
-  /** Basis the ratio was computed on. Equals `price` on gross basis (venek does
-   *  not remit VAT), lower when a VAT correction is switched on. */
+  /** Basis the ratio was computed on: the realised price where we know it,
+   *  otherwise the Shopify list price. */
   net_price: number;
+  /** What the percentage was judged on. "realised" means customers actually
+   *  paid less than the list price (Kaching bundle at The Light Supplier), so
+   *  the list price would flatter the margin. */
+  price_basis?: "list" | "realised";
+  /** Actually received per unit, revenue-weighted over the sampled orders. */
+  realised_price?: number | null;
+  realised_orders?: number | null;
+  realised_units?: number | null;
+  /** The bundle ladder: units bought -> price per unit. Makes the deal visible. */
+  staffel?: Record<string, number> | null;
+  /** The old ratio, on the list price. Kept alongside so a changed number can
+   *  always be explained. */
+  pct_list?: number | null;
   /** Altijd 0: er wordt geen BTW afgedragen (dropshipping). Blijft in de
    *  uitvoer staan zodat er niets hoeft te veranderen; niet gebruiken om
    *  een netto prijs af te leiden. */

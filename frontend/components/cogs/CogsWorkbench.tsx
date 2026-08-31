@@ -275,6 +275,19 @@ export function CogsWorkbench() {
           </p>
         )}
 
+        {/* Verandert er een percentage zonder dat prijs of inkoop wijzigde, dan
+            hoort daar een verklaring bij te staan -- niet in een release-notitie
+            maar op het scherm zelf. */}
+        {rows.some((r) => r.price_basis === "realised") && (
+          <p className="text-[11.5px] text-text-dim mb-3">
+            Rows marked <em>on what was paid</em> are judged on the price
+            customers actually paid, not the price in Shopify. The Light Supplier
+            runs Kaching bundle deals, so buying more drops the price per unit and
+            the list price flatters the margin. Hover a row to see the ladder and
+            how many orders it is based on.
+          </p>
+        )}
+
         {/* Een tab per winkel. De bedragen staan in de valuta van de winkel, dus
             per winkel kijken is hier de normale manier van werken -- niet een
             extra filter bovenop een gemengde lijst. */}
@@ -527,6 +540,25 @@ export function CogsWorkbench() {
                             {money(r.compare_at, r.currency)}
                           </div>
                         ) : null}
+                        {/* Wat er ECHT binnenkwam. Zonder deze regel verandert
+                            het percentage zonder zichtbare reden: bij een
+                            bundeldeal betaalt de klant minder dan de lijstprijs,
+                            en dan vleit de lijstprijs de marge. */}
+                        {r.price_basis === "realised" && r.realised_price != null && (
+                          <div
+                            className="text-[10.5px] text-warning"
+                            title={
+                              (r.staffel
+                                ? Object.entries(r.staffel)
+                                    .map(([n, p]) => `${n}× → ${p}`)
+                                    .join("  ·  ") + "  —  "
+                                : "") +
+                              `measured over ${r.realised_orders ?? "?"} orders`
+                            }
+                          >
+                            actually {money(r.realised_price, r.currency)}
+                          </div>
+                        )}
                       </td>
                       <td
                         className={`px-3 py-2 text-right font-semibold whitespace-nowrap ${
@@ -534,6 +566,14 @@ export function CogsWorkbench() {
                         }`}
                       >
                         {r.pct.toLocaleString("nl-NL", { maximumFractionDigits: 1 })}%
+                        {r.price_basis === "realised" && (
+                          <div
+                            className="text-[10px] font-normal text-text-dim"
+                            title={`On the list price it would read ${r.pct_list ?? "?"}%. Bundle deals mean customers pay less, so the list price flatters the margin.`}
+                          >
+                            on what was paid
+                          </div>
+                        )}
                       </td>
                       <td className="px-3 py-2 text-right">
                         <input
