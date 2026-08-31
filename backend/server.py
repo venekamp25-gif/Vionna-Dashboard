@@ -16096,6 +16096,12 @@ BLOG_MEASURE_MIN_AGE_DAYS = int(os.getenv('BLOG_MEASURE_MIN_AGE_DAYS', '21'))
 # stays empty instead of steering the writer with noise.
 BLOG_LEARN_MIN_AGE_DAYS = int(os.getenv('BLOG_LEARN_MIN_AGE_DAYS', '42'))
 BLOG_LEARN_MIN_WINNERS  = int(os.getenv('BLOG_LEARN_MIN_WINNERS', '5'))
+# Maintenance loop: published articles are re-evaluated and improved on language,
+# SEO and conversion. Writing is only half the job — an article that ranks at 40
+# with a dead product link earns nothing, and fixing it beats writing a new one.
+BLOG_MAINT_PER_STORE      = int(os.getenv('BLOG_MAINT_PER_STORE', '2'))
+BLOG_MAINT_INTERVAL_DAYS  = int(os.getenv('BLOG_MAINT_INTERVAL_DAYS', '45'))
+BLOG_MAINT_MIN_AGE_DAYS   = int(os.getenv('BLOG_MAINT_MIN_AGE_DAYS', '14'))
 
 # Last-run diagnostics surfaced (read-only) via /api/blog/status so failures of
 # the unattended scheduler/bootstrap are visible without droplet log access.
@@ -18563,6 +18569,28 @@ def api_blog_conversions():
     return jsonify({'since_days': since, 'stores': res})
 
 
+@app.route('/api/blog/maintain', methods=['POST'])
+@require_droplet_token
+def api_blog_maintain():
+    """Run the maintenance pass now (language + SEO + conversion) on the articles
+    that are due. Body: {stores?, per_store?}."""
+    body = request.get_json(silent=True) or {}
+    stores = body.get('stores') or BLOG_SCHED_STORES
+    per = max(1, min(int(body.get('per_store') or BLOG_MAINT_PER_STORE), 5))
+    out = {}
+    for st in stores:
+        if st not in STORES:
+            continue
+        res = []
+        for _ in range(per):
+            r = _blog_maintain_one(st)
+            res.append(r)
+            if r != 'updated':
+                break
+        out[st] = res
+    return jsonify({'results': out})
+
+
 @app.route('/api/blog/learn', methods=['POST'])
 @require_droplet_token
 def api_blog_learn():
@@ -18694,6 +18722,197 @@ def _blog_refresh_one(store):
         print(f"[blog] refresh {store} failed: {e}")
 
 
+def _blog_dead_product_links(store, body, hdrs):
+    """Unlink products that no longer exist or are no longer active, and drop
+    their shop-the-look cards. Dead links are a silent conversion killer (the
+    catalogue loses products to deletions and archiving). Returns
+    (new_body, [names of removed products])."""
+    handles = list(dict.fromkeys(re.findall(r'href="/products/([^"?#]+)', body or '')))
+    dead = []
+    for h in handles:
+        try:
+            q = '{ productByHandle(handle: %s) { status } }' % json.dumps(h)
+            r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                              json={'query': q}, timeout=20)
+            nd = ((r.json().get('data') or {}).get('productByHandle') or None)
+            if nd is None or nd.get('status') != 'ACTIVE':
+                dead.append(h)
+        except Exception:
+            continue                      # transient failure is never a verdict
+    if not dead:
+        return body, []
+    names = []
+    for h in dead:
+        # drop the product card (a div containing this product's link)
+        body = re.sub(r'<div style="max-width:min\(420px[^>]*>(?:(?!</div></div>).)*?/products/'
+                      + re.escape(h) + r'(?:(?!</div></div>).)*?</div></div>', '', body, flags=re.S)
+        # unlink but keep the words, so the sentence still reads
+        def _unlink(m):
+            names.append(re.sub(r'<[^>]+>', '', m.group(1)).strip())
+            return m.group(1)
+        body = re.sub(r'<a href="/products/' + re.escape(h) + r'"[^>]*>(.*?)</a>', _unlink,
+                      body, flags=re.S)
+    return body, list(dict.fromkeys([n for n in names if n]))
+
+
+def _blog_near_ranking_terms(store, handle, lo=6, hi=30, limit=4):
+    """Queries this article almost ranks for, from our own measurements."""
+    for p in _blog_perf_latest():
+        if p.get('store') == store and p.get('article_handle') == handle:
+            out = [k for k in (p.get('top_keywords') or [])
+                   if k.get('keyword') and k.get('position') and lo <= k['position'] <= hi]
+            out.sort(key=lambda k: -(k.get('volume') or 0))
+            return out[:limit]
+    return []
+
+
+def _blog_maint_state(store):
+    """{article_id: last maintenance ts} from the history markers."""
+    out = {}
+    for r in _blog_read_jsonl(BLOG_HISTORY_PATH):
+        if r.get('store') == store and r.get('maint') and r.get('article_id'):
+            out[r['article_id']] = r.get('ts') or ''
+    return out
+
+
+def _blog_maintain_one(store, hdrs=None):
+    """Evaluate and improve ONE published article: native language correctness,
+    SEO (near-ranking terms, title/meta), and conversion (dead product links, a
+    clear call to action). QA-gated, same URL, links preserved. Returns a short
+    status string. Never raises."""
+    try:
+        hdrs = hdrs or shopify_headers(store)
+        if not hdrs.get('X-Shopify-Access-Token'):
+            return 'no token'
+        blog_id = _blog_ensure(store, hdrs)
+        r = _shopify_call('get', shopify_url(store, f'blogs/{blog_id}/articles.json?limit=250'),
+                          hdrs, timeout=40)
+        if r.status_code != 200:
+            return f'list failed {r.status_code}'
+        now = datetime.datetime.utcnow()
+        done = _blog_maint_state(store)
+        cands = []
+        for a in r.json().get('articles', []):
+            if not a.get('published_at'):
+                continue
+            try:
+                age = (now - datetime.datetime.fromisoformat(
+                    (a['published_at'][:19]).replace('T', ' ').replace(' ', 'T'))).days
+            except Exception:
+                age = 999
+            if age < BLOG_MAINT_MIN_AGE_DAYS:
+                continue
+            last = done.get(a['id'])
+            if last:
+                try:
+                    if (now - datetime.datetime.fromisoformat(last.replace('Z', ''))).days \
+                            < BLOG_MAINT_INTERVAL_DAYS:
+                        continue
+                except Exception:
+                    pass
+            cands.append((last or '', a))       # never maintained ('') sorts first
+        if not cands:
+            return 'nothing due'
+        cands.sort(key=lambda x: x[0])
+        art = cands[0][1]
+        aid, handle, title = art['id'], art.get('handle'), art.get('title') or ''
+        body = art.get('body_html') or ''
+
+        # --- deterministic conversion fix: dead product links
+        body2, dead = _blog_dead_product_links(store, body, hdrs)
+
+        # split editorial head from the machine tail (schema + beacon)
+        idx = len(body2)
+        i = body2.find('<script')
+        if i != -1:
+            idx = i
+        head, tail = body2[:idx], body2[idx:]
+        n_links = head.count('/products/')
+
+        near = _blog_near_ranking_terms(store, handle)
+        others = [t for t in _blog_previous_texts(store, hdrs, n=6)
+                  if _blog_plain_text(head)[:120] not in t]
+        avoid = _blog_avoid_phrases(others, max_items=10)
+        lang = DFS_LANG_NAME.get(store, 'Danish')
+        pitfalls = BLOG_LANG_PITFALLS.get(store) or ''
+
+        seo_line = ('This article almost ranks for: '
+                    + ', '.join(f"\"{k['keyword']}\" (position {k['position']})" for k in near)
+                    + '. Work those phrasings in naturally where they genuinely fit.\n') if near else ''
+        dead_line = ('These products were REMOVED from the shop and are already unlinked: '
+                     + ', '.join(dead) + '. Rewrite or delete those mentions so the text reads '
+                     'naturally without them, and never link them again.\n') if dead else ''
+
+        if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+            return 'no anthropic key'
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=16000,
+            messages=[{'role': 'user', 'content':
+                f"You are maintaining a PUBLISHED article on a {lang}-language womenswear shop blog "
+                f"(Vionna). Improve it on three axes without changing its subject or structure:\n"
+                f"1. LANGUAGE — fix every grammar, agreement, spelling and idiom error; make it read "
+                f"like a native {lang} fashion journalist wrote it.\n"
+                f"2. SEO — a sharper title (max ~60 chars, keyword-bearing, natural) and a "
+                f"meta_description under 155 characters that earns the click.\n{seo_line}"
+                f"3. CONVERSION — make the opening answer the reader's question fast, and make each "
+                f"product mention concrete about who it suits and why, so clicking feels useful. "
+                f"Do not add sales pressure and never mention prices.\n{dead_line}\n"
+                f"{lang.upper()} PITFALLS (recurring errors on this blog — check each):\n{pitfalls}\n\n"
+                f"WRITING RULES:\n{BLOG_ANTI_AI_RULES}\n\n"
+                + (("ALREADY USED IN OTHER ARTICLES ON THIS BLOG — do not reuse these lines or "
+                    "their close variants:\n" + '\n'.join(f'- {p}' for p in avoid) + '\n\n')
+                   if avoid else '') +
+                "HARD RULES: keep every remaining <a href> exactly as-is (same URLs, same count); "
+                "keep the FAQ section; do not change the URL handle; keep the same headings unless "
+                "one is genuinely wrong.\n\n"
+                f"CURRENT TITLE: {title}\n\nCURRENT HTML:\n{head}\n\n"
+                'Return ONLY compact JSON: {"title": "...", "meta_description": "...", '
+                '"body_html": "...", "changes": ["short note per change"]}'}])
+        data = _blog_first_json((msg.content[0].text if msg.content else '') or '')
+        new_head = (data or {}).get('body_html') or ''
+        if not new_head or new_head.count('/products/') < n_links:
+            print(f"[blog] maint {store}/{handle}: unusable result, skipped")
+            return 'unusable'
+        rep = _blog_repetition_violations(new_head, others)
+        if rep:
+            print(f"[blog] maint {store}/{handle}: still repeats other articles, skipped")
+            return 'repeats'
+        new_title = (data.get('title') or title).strip()[:120]
+        new_meta = (data.get('meta_description') or '').strip()[:160]
+        qa = _blog_qa_gate(store, {'title': new_title, 'meta_description': new_meta,
+                                   'excerpt': '', 'body_html': new_head})
+        if not qa or qa['score'] < BLOG_QA_MIN_SCORE or qa['critical']:
+            print(f"[blog] maint {store}/{handle}: QA refused ({qa and qa['score']})")
+            return f"qa refused ({qa and qa['score']})"
+        payload = {'id': aid, 'title': new_title, 'body_html': new_head + tail}
+        if new_meta:
+            payload['metafields'] = [
+                {'namespace': 'global', 'key': 'title_tag', 'value': new_title[:70],
+                 'type': 'single_line_text_field'},
+                {'namespace': 'global', 'key': 'description_tag', 'value': new_meta,
+                 'type': 'single_line_text_field'}]
+        u = _shopify_call('put', shopify_url(store, f'blogs/{blog_id}/articles/{aid}.json'),
+                          hdrs, json={'article': payload}, timeout=40)
+        if u.status_code != 200:
+            return f'update failed {u.status_code}'
+        with open(BLOG_HISTORY_PATH, 'a', encoding='utf-8') as f:
+            f.write(json.dumps({'ts': now.isoformat() + 'Z', 'store': store, 'maint': True,
+                                'article_id': aid, 'article_handle': handle, 'title': new_title,
+                                'qa': qa['score'], 'dead_links_fixed': dead,
+                                'seo_terms': [k['keyword'] for k in near],
+                                'changes': (data.get('changes') or [])[:6]},
+                               ensure_ascii=False) + '\n')
+        extra = (f", {len(dead)} dode productlink(s) hersteld" if dead else '')
+        _blog_slack(f"🛠️ Blog-onderhoud [{store.upper()}]: '{new_title[:60]}' bijgewerkt "
+                    f"(QA {qa['score']}{extra})")
+        print(f"[blog] maint {store}/{handle}: updated (QA {qa['score']}){extra}")
+        return 'updated'
+    except Exception as e:
+        print(f"[blog] maint {store} failed: {e}")
+        return f'error {str(e)[:80]}'
+
+
 def _blog_run_learn_cycle():
     """Weekly: measure published articles, then rebuild the writer playbook."""
     try:
@@ -18711,8 +18930,14 @@ def _blog_run_learn_cycle():
     except Exception as e:
         print(f"[blog] learn failed: {e}")
         _blog_slack(f"🚨 Blog-leerronde (playbook) mislukt: {str(e)[:180]}")
+    # Maintenance: keep the existing catalogue of articles healthy (language, SEO,
+    # conversion). This supersedes the old refresh-only pass, which never fired
+    # because it required an article to already rank 5-20.
     for st in BLOG_SCHED_STORES:
-        _blog_refresh_one(st)
+        for _ in range(max(1, BLOG_MAINT_PER_STORE)):
+            if _blog_maintain_one(st) != 'updated':
+                break
+        _blog_refresh_one(st)   # extra section for articles that DO rank 5-20
 
 
 # Bookkeeping seeds: two articles were (re)generated from the laptop on 2026-07-07
