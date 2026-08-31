@@ -135,6 +135,18 @@ bug queue"), run this flow without asking for clarification first:
    workflows/ci.yml` runs the backend tests + an import smoke test on the file the
    droplet executes, plus the same `next build` Netlify publishes. Never merge
    red, and never disable a check to get to green.
+   **That gate is now actually enforced** (2026-08-31): ruleset 17995185
+   "Protect main – require CI" is `active` — it had been created on 2026-06-22
+   and switched off 30 seconds later, so for two months auto-merge merged
+   straight through. It also blocks force-pushes to and deletion of `main`, and
+   there are no bypass actors (the fix routine opens its PRs as the owner's own
+   account, so an admin bypass would have made the gate meaningless).
+   Consequence for humans: **a direct `git push origin main` of a fresh commit is
+   rejected** — the commit has no green checks yet. Deploy either via a PR with
+   auto-merge (what the fix routine already does), or push the branch first, wait
+   for CI on that SHA, then fast-forward `main`. `publish-update.bat` pushes
+   straight to main and will hit this. To undo, one command:
+   `gh api -X PUT repos/venekamp25-gif/Vionna-Dashboard/rulesets/17995185 --input <full-ruleset-json-with-enforcement-disabled>`.
 7. Still require a human for: anything that spends money, anything that writes to
    Shopify with live tokens, and any change whose *cause* lies outside the code
    (empty API balance, expired key, shop down) — those go through
