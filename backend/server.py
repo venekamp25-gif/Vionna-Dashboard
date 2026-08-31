@@ -9638,10 +9638,13 @@ def api_cogs_overview():
     secret = os.getenv('NOTIFY_SECRET', '')
     if not secret:
         return jsonify({
+            # Paden nagemeten op de droplet 2026-08-26. De IMPLEMENTATION_GUIDE
+            # noemt /opt/listing-dashboard + listing-backend; die bestaan niet,
+            # en `nano` had daar stilzwijgend een NIEUW bestand aangemaakt.
             'error': 'NOTIFY_SECRET staat nog niet op de droplet. Kopieer de waarde '
                      'uit Render (master-dashboard > Environment) naar '
-                     '/opt/listing-dashboard/backend/.env en draai '
-                     '"systemctl restart listing-backend".',
+                     '/opt/vionna/backend/.env en draai '
+                     '"systemctl restart vionna-backend".',
             'configured': False}), 200
     scope = request.args.get('scope', 'weekly')
     try:
@@ -16152,7 +16155,23 @@ BLOG_LANG_PITFALLS = {
         "- Reflexives follow the subject: 'du ... klæde dig' (not 'sig'); 'hvile i dig selv'.\n"
         "- Calques to avoid: 'par den med' -> 'kombinér den med'; 'går aldrig galt' -> 'man går aldrig "
         "galt i byen med'; 'koordinerer med hinanden' -> 'passer til hinanden'; garments are not "
-        "'stykker'; 'tilføje' requires 'til'."
+        "'stykker'; 'tilføje' requires 'til'.\n"
+        "- THE VERB 'STYLE' (got this wrong 5/5 times): imperative is 'styl den', infinitive is "
+        "'style' (after at/prøv at/kan du: 'Prøv at style den'). 'stil' is from 'stille' (to put) "
+        "and is NEVER the styling verb.\n"
+        "- Compounds again, because it keeps happening in TITLES and slugs: 'nederdelsstyling' or "
+        "'styling af nederdele', never 'Nederdel styling'. Danish does not split compounds.\n"
+        "- These are COMMON gender (en-words) and are often mis-gendered: en top, en finish, en "
+        "halskæde, en buks, en kjole. So: 'en cremehvid top', 'den sidste raffinerede finish'.\n"
+        "- Words that do NOT exist in Danish (all produced before): 'stropeløs' -> stropløs; "
+        "'åndebar' -> åndbar; 'højtaljeret' -> højtaljet; 'maskevask' -> maskinvask; 'semiformal' "
+        "-> semiformel; 'vikleoptik' -> slå-om-look; 'nedstukket/nedstoppet bluse' -> 'en bluse "
+        "stukket ned i'.\n"
+        "- 'Overdøve' is about SOUND. To outshine someone (the bride) is 'overstråle'.\n"
+        "- Washing: 'vask i hånden' or 'brug håndvaskeprogrammet' — never 'vask på/ved håndvask'.\n"
+        "- English nouns are not Danish: 'neutrals' -> 'neutrale farver' (never 'neutraler'); "
+        "'solid colour' -> 'ensfarvet'.\n"
+        "- Filler discipline: 'faktisk' and 'egentlig' at most twice per article combined."
     ),
     'fr': (
         "- French typography: espace insécable before : ; ? ! and inside « guillemets ». Correct "
@@ -16160,7 +16179,21 @@ BLOG_LANG_PITFALLS = {
         "- Past participle vs infinitive: 'on la voit déclinée' (not 'décliner').\n"
         "- Anglicisms: 'versatile' -> 'polyvalente'; 'Rien ne dit été' -> 'Rien n'évoque l'été'.\n"
         "- Keyword phrases like 'jupe longue été' are search queries, not French: write 'la jupe "
-        "longue, cet été,' or 'jupe longue d'été'."
+        "longue, cet été,' or 'jupe longue d'été'.\n"
+        "- NEVER drop a raw keyword string into a TITLE or a sentence. Every keyword must run "
+        "through grammatical French: 'chaussures pour femmes' (not 'Femmes chaussures'); 'robe "
+        "d'invitée de mariage' (not 'robe invitée mariage'); 'jupe-short' (not 'jupe shorts'); "
+        "'blouse blanche pour femme' (not 'blouse blanche femme'). This is the single most "
+        "credibility-damaging error made so far.\n"
+        "- Tucking direction (inverted 3x): you tuck the TOP into the skirt/trousers — 'on rentre "
+        "le haut dans la jupe'. Never 'on rentre la jupe dans un t-shirt'.\n"
+        "- 'Sécheuse' is Québécois: use 'sèche-linge'. 'Portatif' means a portable DEVICE: for "
+        "clothes use 'polyvalent' or 'facile à porter'.\n"
+        "- Materials: 'similicuir' (never 'cuir PU'). 'Coût à l'usage' (never 'coût par port').\n"
+        "- Earrings come in pairs: 'des boucles d'oreilles'. 'Grandes tailles' means plus-size, "
+        "NOT tall women.\n"
+        "- The season in the text must match the publication month: do not write 'ce printemps' in "
+        "July or 'le vestiaire automnal' in mid-summer."
     ),
     'fi': (
         "- Standard spellings: siluetti (not silhuetti), terassi (not terrassi). 'Stailausvinkki', "
@@ -16169,7 +16202,19 @@ BLOG_LANG_PITFALLS = {
         "raikkaina'; 'Tässä piilee'; conditional after 'ikään kuin' ('ikään kuin sinulla olisi').\n"
         "- Word order: 'naisten mekot', not 'mekot naisille' as a subject.\n"
         "- Word choice: olkilaukku (not olkipussi), monikäyttöisyys (not monitoimisuus).\n"
-        "- Inflect product names carefully and keep the stem intact: Flora -> Floran (never 'Flotan')."
+        "- Inflect product names carefully and keep the stem intact: Flora -> Floran (never 'Flotan').\n"
+        "- YHDYSSANAT — the #1 marker of non-native Finnish, and it landed in a TITLE and a slug: "
+        "compounds are ONE word. 'mohairneule' (never 'Mohair neule'), 'kashmirneule', "
+        "'plisseerattu hame' (never 'pliseehame'), 'nahkatakki', 'villapaita'.\n"
+        "- Do NOT attach features with the adessive -lla/-llä the way English uses 'with': not "
+        "'paita pehmeällä vintage-hengellä' but 'pehmeän vintagehenkinen paita'.\n"
+        "- housut, farkut, shortsit, sukkahousut are PLURALE TANTUM: 'farkkujen kanssa', 'housujen "
+        "kanssa' — never 'farkun kanssa' or 'housulla'.\n"
+        "- 'Helma' means HEM, not a garment: you cannot wash or wear a 'helma'. Write 'satiinihame' "
+        "or 'tyllihame'.\n"
+        "- Spelling that slipped through: mekot (not 'mekkot'), neutraalit (not 'neutralit'), "
+        "neuleliivi (not 'neuleliiivi'), siististi (not 'siisteästi'), toppiin (not 'tooppiin').\n"
+        "- Verb rection: 'kaipaa suojasuihketta' (partitive), 'sopii farkkujen kanssa'."
     ),
 }
 
@@ -16240,12 +16285,12 @@ def _blog_fallback_topic(store, hdrs=None):
         return None
     hdrs = hdrs or shopify_headers(store)
     month = datetime.datetime.utcnow().month
-    recent = _blog_recent_sigs(store)
+    recent = _blog_recent_sig_sets(store)
     recent_cats = _blog_recent_categories(store)
 
     def _pick(cooldown, season):
         for t in pool:
-            if _kw_signature(t['keyword']) in recent:
+            if _blog_subject_taken(t['keyword'], recent):
                 continue
             if season and t.get('months') and month not in t['months']:
                 continue
@@ -16298,6 +16343,26 @@ def _blog_recent_sigs(store, days=120):
     except Exception as e:
         print(f"[blog] history read failed: {e}")
     return sigs
+
+
+def _blog_subject_taken(keyword, sig_sets):
+    """Has this SUBJECT already been covered? Exact signature matching missed the
+    real duplicates found in the audit ("jupe longue" vs "comment porter la jupe
+    longue", "blouse blanche" vs "la blouse blanche femme"), so containment counts
+    too: if one keyword's content words fully contain the other's, they compete for
+    the same intent. Pillars are exempt — a category guide is SUPPOSED to own the
+    head term."""
+    w = set((_kw_signature(keyword or '') or '').split())
+    if not w:
+        return False
+    for prev in sig_sets:
+        if prev and (w == prev or w <= prev or prev <= w):
+            return True
+    return False
+
+
+def _blog_recent_sig_sets(store, days=120):
+    return [set(s.split()) for s in _blog_recent_sigs(store, days=days) if s]
 
 
 def _blog_recent_categories(store, days=21):
@@ -16878,7 +16943,7 @@ def _blog_hot_topics(store, k=3, hdrs=None):
     clean_kws = {(c.get('keyword') or '').strip().lower() for c in cands}
     _recommend_keywords(cands, store, top_n=len(cands))   # attaches 'score'
     cands.sort(key=lambda x: -(x.get('score') or 0))
-    recent = _blog_recent_sigs(store)
+    recent = _blog_recent_sig_sets(store)
     recent_cats = _blog_recent_categories(store)
     gap_sigs = _blog_gap_keywords(store)   # secondary signal: bonus only, never a gate
     max_vol = max((x.get('volume') or 0) for x in cands) or 1
@@ -16887,8 +16952,8 @@ def _blog_hot_topics(store, k=3, hdrs=None):
         out = []
         for x in cands:
             sig = _kw_signature(x.get('keyword') or '')
-            if sig in recent:
-                continue                      # exact/variant subject already blogged
+            if _blog_subject_taken(x.get('keyword'), recent):
+                continue                      # this subject (or a containing one) is covered
             bucket = _season_bucket(x.get('seasonality'))
             if bucket == 'off':
                 continue                      # articles rank in ~3-6 weeks: skip out-of-season
@@ -16991,9 +17056,86 @@ def _blog_match_products(store, category, hdrs, n=6, keyword=None, exclude=None)
 BLOG_FAQ_HEADING = {'dk': 'Ofte stillede spørgsmål', 'fr': 'Questions fréquentes',
                     'fi': 'Usein kysytyt kysymykset'}
 
+# --- Anti self-plagiarism ----------------------------------------------------
+# Every article was generated in isolation, so the model reached for the same
+# phrasings again and again: an audit of 40 published articles found one Finnish
+# sentence repeated verbatim in 9 of 13 articles, French product blurbs
+# copy-pasted between pieces, and identical Danish openings. The writer now sees
+# what it has already written for this store, and a deterministic check catches
+# any long verbatim overlap that slips through anyway.
+BLOG_REPEAT_SHINGLE = 8      # words; a verbatim run this long counts as reuse
+BLOG_REPEAT_HISTORY = 8      # how many previous articles to compare against
+
+
+def _blog_plain_text(html):
+    t = re.sub(r'<script[^>]*>.*?</script>', ' ', html or '', flags=re.S)
+    t = re.sub(r'<[^>]+>', ' ', t)
+    t = t.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&#39;', "'").replace('&quot;', '"')
+    return ' '.join(t.split())
+
+
+def _blog_previous_texts(store, hdrs, n=BLOG_REPEAT_HISTORY):
+    """Plain text of this store's most recent published articles (newest first).
+    Best-effort: [] on any failure — anti-repetition must never block a run."""
+    try:
+        blog_id = _blog_ensure(store, hdrs)
+        r = _shopify_call('get', shopify_url(store, f'blogs/{blog_id}/articles.json?limit=50'),
+                          hdrs, timeout=30)
+        if r.status_code != 200:
+            return []
+        arts = [a for a in r.json().get('articles', []) if a.get('published_at')]
+        arts.sort(key=lambda a: a.get('published_at') or '', reverse=True)
+        return [_blog_plain_text(a.get('body_html')) for a in arts[:n]]
+    except Exception as e:
+        print(f"[blog] previous texts failed: {e}")
+        return []
+
+
+def _blog_avoid_phrases(prev_texts, max_items=14):
+    """Openings and stock lines from earlier articles, handed to the writer as a
+    do-not-reuse list. Takes the first two sentences of each previous article
+    (that is where the templates live) plus its closing sentence."""
+    out = []
+    for t in prev_texts:
+        sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', t) if len(s.split()) >= 5]
+        for s in sents[:2] + sents[-1:]:
+            s = s.strip()
+            if s and s not in out:
+                out.append(s[:160])
+    return out[:max_items]
+
+
+def _blog_repetition_violations(body, prev_texts, min_words=BLOG_REPEAT_SHINGLE, max_hits=5):
+    """Verbatim word-runs of >= min_words shared with an earlier article. Returns
+    human-readable violations for the repair pass (empty = clean)."""
+    if not prev_texts:
+        return []
+    def _norm(s):
+        s = ''.join(c for c in unicodedata.normalize('NFKD', s.lower()) if not unicodedata.combining(c))
+        return re.sub(r'[^a-z0-9 ]+', ' ', s).split()
+    prev_shingles = set()
+    for t in prev_texts:
+        w = _norm(t)
+        for i in range(len(w) - min_words + 1):
+            prev_shingles.add(' '.join(w[i:i + min_words]))
+    words = _norm(_blog_plain_text(body))
+    hits, i = [], 0
+    while i <= len(words) - min_words:
+        if ' '.join(words[i:i + min_words]) in prev_shingles:
+            # extend the match to report the full repeated run
+            j = i + min_words
+            while j < len(words) and ' '.join(words[j - min_words + 1:j + 1]) in prev_shingles:
+                j += 1
+            hits.append(' '.join(words[i:j]))
+            i = j
+        else:
+            i += 1
+    return [f"this passage is copied almost verbatim from an earlier article on this blog — "
+            f"rewrite it completely in different words: \"{h[:180]}\"" for h in hits[:max_hits]]
+
 
 def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns=None,
-                serp_brief=None, fmt=None):
+                serp_brief=None, fmt=None, avoid_phrases=None):
     """Claude writes the SEO article in the store's language. Returns a dict:
     {title, handle, meta_description, excerpt, tags[], body_html, faq[]}. None on
     failure. avoid: QA findings from a rejected earlier attempt (rewrite mode).
@@ -17053,6 +17195,14 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns
         faq_block = ("\n\nREAL SEARCH QUESTIONS about this subject (people literally type these into "
                      "Google — build the FAQ from the most relevant ones, rephrased naturally):\n"
                      + '\n'.join(f"- {q}" for q in faq_questions[:6]) + "\n")
+    repeat_block = ''
+    if avoid_phrases:
+        repeat_block = (
+            "\n\nALREADY USED ON THIS BLOG — do NOT reuse these sentences, openings or their "
+            "close variants; find genuinely different wording, a different opening move and "
+            "different stock phrases. Repeating yourself across articles is the single worst "
+            "quality problem this blog has:\n"
+            + '\n'.join(f"- {p}" for p in avoid_phrases) + "\n")
     fmt_block = ''
     if fmt and fmt in BLOG_FORMATS:
         fmt_block = f"\n\nEDITORIAL FORMAT for this article: {BLOG_FORMATS[fmt]}\n"
@@ -17098,7 +17248,7 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns
         f"You are the content writer for Vionna, writing an SEO blog article. {BLOG_BRAND_VOICE}\n\n"
         f"Write the ENTIRE article in {lang}. Native, fluent, elegant {lang} — not translated-sounding.\n\n"
         f"WRITING RULES (hard requirements):\n{BLOG_ANTI_AI_RULES}\n"
-        f"{style_block}{pitfall_block}{avoid_block}{fmt_block}{pillar_block}\n"
+        f"{style_block}{pitfall_block}{avoid_block}{repeat_block}{fmt_block}{pillar_block}\n"
         f"PRIMARY SEO KEYWORD (must rank for this): \"{kw}\"\n"
         f"Supporting keywords to weave in naturally: {', '.join(cluster) if cluster else '(none)'}"
         f"{season_hint}{pb_block}\n\n"
@@ -18180,16 +18330,20 @@ def _blog_generate_one(store, topic=None, published=None):
     concerns = _blog_reddit_concerns(store, topic)
     brief = _blog_serp_brief(store, topic)
     fmt = _blog_pick_format(store, topic)
+    prev_texts = _blog_previous_texts(store, hdrs)
+    avoid_phrases = _blog_avoid_phrases(prev_texts)
     art = _blog_write(store, topic, products, faq_questions=faqs, concerns=concerns,
-                      serp_brief=brief, fmt=fmt)
+                      serp_brief=brief, fmt=fmt, avoid_phrases=avoid_phrases)
     if not art or not art.get('title') or not art.get('body_html'):
         return {'store': store, 'topic': topic, 'error': 'writer failed'}
     art['primary_keyword'] = topic.get('keyword')
     art = _blog_edit(store, art, products)
     # Deterministic style gate: models under-obey the dash/length budget when merely
-    # prompted, so verify and run up to 2 targeted repair passes.
+    # prompted, so verify and run up to 2 targeted repair passes. Verbatim reuse of
+    # earlier articles is checked here too — prompting alone did not stop it.
     for _ in range(2):
         viol = _blog_quality_violations(art, store, products)
+        viol += _blog_repetition_violations(art.get('body_html'), prev_texts)
         if not viol:
             break
         print(f"[blog] {store}: repair pass for: {viol}")
@@ -18206,12 +18360,14 @@ def _blog_generate_one(store, topic=None, published=None):
             print(f"[blog] {store}: QA keeps failing — full rewrite on the same topic")
             prev = ((qa['critical'] + qa['minor'])[:6] if qa else ['previous attempt failed QA'])
             art2 = _blog_write(store, topic, products, avoid=prev, faq_questions=faqs,
-                               concerns=concerns, serp_brief=brief, fmt=fmt)
+                               concerns=concerns, serp_brief=brief, fmt=fmt,
+                               avoid_phrases=avoid_phrases)
             if art2 and art2.get('title') and art2.get('body_html'):
                 art2['primary_keyword'] = topic.get('keyword')
                 art2 = _blog_edit(store, art2, products)
                 for _ in range(2):
                     viol2 = _blog_quality_violations(art2, store, products)
+                    viol2 += _blog_repetition_violations(art2.get('body_html'), prev_texts)
                     if not viol2:
                         break
                     art2 = _blog_edit(store, art2, products, violations=viol2)
