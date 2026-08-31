@@ -150,6 +150,9 @@ export interface CogsRow {
   /** Basis the ratio was computed on. Equals `price` on gross basis (venek does
    *  not remit VAT), lower when a VAT correction is switched on. */
   net_price: number;
+  /** Altijd 0: er wordt geen BTW afgedragen (dropshipping). Blijft in de
+   *  uitvoer staan zodat er niets hoeft te veranderen; niet gebruiken om
+   *  een netto prijs af te leiden. */
   vat: number;
   ratio: number;
   pct: number;

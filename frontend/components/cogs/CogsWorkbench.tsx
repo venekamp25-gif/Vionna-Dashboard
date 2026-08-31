@@ -161,7 +161,11 @@ export function CogsWorkbench() {
     const raw = edited[keyOf(r)];
     const p = raw ? Number(raw.replace(",", ".")) : r.suggested_price ?? null;
     if (!p || p <= 0) return null;
-    const basis = r.vat ? p / (1 + r.vat) : p;
+    // Altijd de volle prijs: er wordt geen BTW afgedragen (dropshipping).
+    // Hier stond een netto-omrekening die op nul stond maar wel kon gaan
+    // rekenen zodra `vat` ooit gevuld raakte -- dan zou de preview iets
+    // anders tonen dan de bron uitrekent. De bron kent die weg niet meer.
+    const basis = p;
     return (r.cost / basis) * 100;
   };
 
