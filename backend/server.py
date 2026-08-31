@@ -16257,6 +16257,20 @@ BLOG_FALLBACK_TOPICS = {
          'cluster': ['habitbukser', 'vide bukser']},
         {'keyword': 'bluser til hverdag og fest', 'category': 'top',
          'cluster': ['bluse outfit', 'skjorte til kvinder', 'elegant top']},
+        # Occasion angles: same categories, genuinely different search intent —
+        # a narrow catalogue still supports plenty of subjects this way.
+        {'keyword': 'kjole til julefrokost', 'category': 'dress', 'months': [8, 9, 10, 11],
+         'cluster': ['festkjole', 'sort kjole', 'pailletkjole']},
+        {'keyword': 'nytarskjole', 'category': 'dress', 'months': [9, 10, 11, 12],
+         'cluster': ['festtoj til nytar', 'elegant kjole', 'glitterkjole']},
+        {'keyword': 'toj til jobsamtale', 'category': 'top',
+         'cluster': ['professionelt outfit', 'skjorte til arbejde', 'bukser til kontoret']},
+        {'keyword': 'overgangstoj til efteraret', 'category': 'top', 'months': [6, 7, 8, 9],
+         'cluster': ['lagpalag', 'let jakke', 'langaermet top']},
+        {'keyword': 'den lille sorte kjole', 'category': 'dress',
+         'cluster': ['sort kjole', 'klassisk kjole', 'kjole til middag']},
+        {'keyword': 'sadan bygger du en capsule garderobe', 'category': 'top',
+         'cluster': ['basisgarderobe', 'tidlose styles', 'faerre men bedre']},
     ],
     'fr': [
         {'keyword': "robe d'été", 'category': 'dress', 'months': [2, 3, 4, 5, 6],
@@ -16271,6 +16285,16 @@ BLOG_FALLBACK_TOPICS = {
          'cluster': ['pantalon large', 'pantalon tailleur']},
         {'keyword': 'la chemise blanche', 'category': 'top',
          'cluster': ['blouse blanche', 'chemise femme']},
+        {'keyword': 'robe pour les fetes', 'category': 'dress', 'months': [8, 9, 10, 11],
+         'cluster': ['robe de fete', 'robe noire', 'robe a paillettes']},
+        {'keyword': 'tenue pour un entretien', 'category': 'top',
+         'cluster': ['tenue professionnelle', 'chemise de travail', 'pantalon de bureau']},
+        {'keyword': 'garde-robe capsule', 'category': 'top',
+         'cluster': ['basiques intemporels', 'pieces essentielles']},
+        {'keyword': 'la petite robe noire', 'category': 'dress',
+         'cluster': ['robe noire', 'robe classique', 'robe pour diner']},
+        {'keyword': 'comment porter le total look', 'category': 'skirt', 'months': [6, 7, 8, 9],
+         'cluster': ['superposition', 'camaieu', 'ton sur ton']},
     ],
     'fi': [
         {'keyword': 'kesämekko', 'category': 'dress', 'months': [2, 3, 4, 5, 6],
@@ -16285,6 +16309,16 @@ BLOG_FALLBACK_TOPICS = {
          'cluster': ['leveälahkeiset housut', 'puvunhousut']},
         {'keyword': 'naisten puserot arkeen ja juhlaan', 'category': 'top',
          'cluster': ['pusero asu', 'siisti toppi', 'paita naisille']},
+        {'keyword': 'mekko pikkujouluihin', 'category': 'dress', 'months': [8, 9, 10, 11],
+         'cluster': ['juhlamekko', 'musta mekko', 'paljettimekko']},
+        {'keyword': 'asu tyohaastatteluun', 'category': 'top',
+         'cluster': ['tyoasu', 'siisti paita', 'puvunhousut']},
+        {'keyword': 'kapselivaatekaappi', 'category': 'top',
+         'cluster': ['perusvaatteet', 'ajattomat vaatteet']},
+        {'keyword': 'pieni musta mekko', 'category': 'dress',
+         'cluster': ['musta mekko', 'klassinen mekko', 'illallismekko']},
+        {'keyword': 'valivaatteet syksyyn', 'category': 'top', 'months': [6, 7, 8, 9],
+         'cluster': ['kerrospukeutuminen', 'ohut takki', 'pitkahihainen']},
     ],
 }
 
@@ -16300,7 +16334,7 @@ def _blog_fallback_topic(store, hdrs=None):
     hdrs = hdrs or shopify_headers(store)
     month = datetime.datetime.utcnow().month
     recent = _blog_recent_sig_sets(store)
-    recent_cats = _blog_recent_categories(store)
+    recent_cats = _blog_recent_categories(store, days=_blog_cooldown_days(store, hdrs))
 
     def _pick(cooldown, season):
         for t in pool:
@@ -16377,6 +16411,23 @@ def _blog_subject_taken(keyword, sig_sets):
 
 def _blog_recent_sig_sets(store, days=120):
     return [set(s.split()) for s in _blog_recent_sigs(store, days=days) if s]
+
+
+def _blog_cooldown_days(store, hdrs):
+    """How long a category stays on cooldown, scaled to how much the store can
+    actually write about. A narrow catalogue (DK: 6 usable categories, 4 of them
+    on cooldown at any moment) runs dry and silently skips its slots; a broad one
+    (FR) never does. Fewer usable categories -> shorter cooldown."""
+    try:
+        usable = sum(1 for c in set(DFS_TYPE_CATEGORY.values())
+                     if _blog_category_stock(store, c, hdrs) >= BLOG_MIN_CATEGORY_STOCK)
+    except Exception:
+        return 21
+    if usable >= 8:
+        return 21
+    if usable >= 6:
+        return 14
+    return 10
 
 
 def _blog_recent_categories(store, days=21):
@@ -16958,7 +17009,7 @@ def _blog_hot_topics(store, k=3, hdrs=None):
     _recommend_keywords(cands, store, top_n=len(cands))   # attaches 'score'
     cands.sort(key=lambda x: -(x.get('score') or 0))
     recent = _blog_recent_sig_sets(store)
-    recent_cats = _blog_recent_categories(store)
+    recent_cats = _blog_recent_categories(store, days=_blog_cooldown_days(store, hdrs))
     gap_sigs = _blog_gap_keywords(store)   # secondary signal: bonus only, never a gate
     max_vol = max((x.get('volume') or 0) for x in cands) or 1
 
