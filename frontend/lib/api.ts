@@ -197,7 +197,10 @@ export interface CogsOverview {
   alerts?: CogsProduct[];
   unknown_count?: number;
   price_errors?: Record<string, string>;
-  stats?: Record<string, number>;
+  /** Tellers, plus `stale`: een TEKST die zegt dat de ophaal niet compleet
+   *  of niet vers was. Die moet altijd zichtbaar zijn -- anders leest een
+   *  half rapport als een gezond rapport. */
+  stats?: Record<string, number | string>;
   estimated_rows?: number;
   /** Stores where a real supplier quote was found. DK/FR run through Fillbox,
    *  which reports no per-product cost, so they are absent here even though

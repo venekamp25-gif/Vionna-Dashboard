@@ -253,6 +253,16 @@ export function CogsWorkbench() {
         {/* Een tab per winkel. De bedragen staan in de valuta van de winkel, dus
             per winkel kijken is hier de normale manier van werken -- niet een
             extra filter bovenop een gemengde lijst. */}
+        {/* Een ophaal die maar deels lukte MOET je zien. De cijfers kunnen dan
+            te gunstig zijn, want een ontbrekende periode kan juist de laatst
+            bekende inkoopprijs bevatten. Zonder deze regel leest een half
+            rapport als een gezond rapport. */}
+        {typeof data?.stats?.stale === "string" && (
+          <p className="text-[12.5px] rounded-md border border-warning/40 bg-warning/10 px-3 py-2 mb-4">
+            <strong>These figures are not complete.</strong> {data.stats.stale}
+          </p>
+        )}
+
         {data && !data.error && stores.length > 1 && (
           <div className="flex flex-wrap items-center gap-1.5 mb-3" role="tablist">
             <button
