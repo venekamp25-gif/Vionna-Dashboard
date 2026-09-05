@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useProduct, colorLabelFor } from "@/lib/product";
 import { StoreKey, STORE_CONFIG } from "@/lib/store";
-import { poolCoverage } from "@/lib/publishChecks";
+import { nameCheck, poolCoverage } from "@/lib/publishChecks";
 import { Button } from "@/components/ui/Button";
 
 export interface CheckItem {
@@ -25,23 +25,16 @@ export const POOL_COVERAGE_ID = "pool-coverage";
 export function buildPrePublishChecks(
   data: ReturnType<typeof useProduct>["data"],
   stores: StoreKey[],
-  takenNamesLower: Set<string>
+  takenNameSlugs: Set<string>,
+  namesUnavailable: StoreKey[] = []
 ): CheckItem[] {
   const out: CheckItem[] = [];
 
-  // 1. Product name set + unique
-  if (!data.name.trim()) {
-    out.push({ id: "name", label: "Product name is empty", level: "fail" });
-  } else if (takenNamesLower.has(data.name.toLowerCase())) {
-    out.push({
-      id: "name",
-      label: "Product name is already used in your store",
-      level: "fail",
-      detail: `"${data.name}" — pick another`,
-    });
-  } else {
-    out.push({ id: "name", label: `Product name "${data.name}" is unique`, level: "ok" });
-  }
+  // 1. Product name set + unique -- op SLUG (Adele == Adèle voor Shopify), en
+  //    een winkel waarvan de lijst niet laadde maakt de check rood: onbekend is
+  //    niet uniek.
+  const nc = nameCheck(data.name, takenNameSlugs, namesUnavailable.filter((s) => stores.includes(s)));
+  out.push({ id: "name", label: nc.label, level: nc.level, detail: nc.detail });
 
   // 2. At least one colour
   if (data.canonicalColors.length === 0) {

@@ -147,9 +147,31 @@ export interface CogsRow {
   currency?: string | null;
   cost: number;
   price: number;
-  /** Basis the ratio was computed on. Equals `price` on gross basis (venek does
-   *  not remit VAT), lower when a VAT correction is switched on. */
+  /** Basis the ratio was computed on: the realised price where we know it,
+   *  otherwise the Shopify list price. */
   net_price: number;
+  /** What the percentage was judged on. "realised" means customers actually
+   *  paid less than the list price (Kaching bundle at The Light Supplier), so
+   *  the list price would flatter the margin. */
+  price_basis?: "list" | "realised";
+  /** Actually received per unit, revenue-weighted over the sampled orders. */
+  realised_price?: number | null;
+  realised_orders?: number | null;
+  realised_units?: number | null;
+  /** The bundle ladder: units bought -> price per unit. Makes the deal visible. */
+  staffel?: Record<string, number> | null;
+  /** The old ratio, on the list price. Kept alongside so a changed number can
+   *  always be explained. */
+  pct_list?: number | null;
+  /** The purchase price the ratio was computed with. */
+  cost_used?: number;
+  /** "opgave" = supplied by hand because the source is unreliable for this
+   *  product (e.g. one Shopify unit is a 5-pack). Must never read as measured. */
+  cost_basis?: "gemeten" | "opgave";
+  /** One row per bundle tier: what it costs, what it earns, what it should be. */
+  tiers?: CogsTier[];
+  /** Which tiers sit above the threshold — the actionable unit. */
+  tiers_over?: number[];
   /** Altijd 0: er wordt geen BTW afgedragen (dropshipping). Blijft in de
    *  uitvoer staan zodat er niets hoeft te veranderen; niet gebruiken om
    *  een netto prijs af te leiden. */
@@ -185,6 +207,24 @@ export interface CogsProduct extends Omit<CogsRow, "variant_id" | "variant_title
   price: number;
   price_max?: number;
   price_varies?: boolean;
+}
+
+/** One rung of a Kaching bundle ladder, e.g. "4 for 79,95". */
+export interface CogsTier {
+  units: number;
+  price_per_unit: number;
+  tier_total: number;
+  /** Purchase price per unit for THIS tier — it drops with volume too. */
+  cost_per_unit: number;
+  /** False when we fell back to the single-unit cost for this tier. */
+  cost_measured: boolean;
+  pct: number;
+  over: boolean;
+  /** The supplier's unit does not match Shopify's, so this ratio is unreliable. */
+  unit_suspect: boolean;
+  /** Only set for a tier that is actually over the threshold. */
+  needed_per_unit?: number | null;
+  needed_total?: number | null;
 }
 
 export interface CogsOverview {
@@ -285,6 +325,9 @@ export interface SizeChart {
 export interface NamesResponse {
   names: string[];
   error?: string;
+  /** False when the store has more products than the endpoint pages through --
+   *  the list is then truncated and must not be treated as complete. */
+  complete?: boolean;
 }
 
 export interface GenerateResponse {
@@ -325,6 +368,15 @@ export interface PublishResponse {
 }
 
 export interface PublishStartStoreResponse {
+  /** Human-readable reason when `error` is "siblings_collision". */
+  message?: string;
+  collision?: {
+    existing_type?: string;
+    existing_class?: string;
+    incoming_type?: string;
+    incoming_class?: string;
+    count: number;
+  };
   success: boolean;
   collection_id?: number | null;
   actual_handle?: string;
@@ -814,6 +866,11 @@ export const api = {
     store: "dk" | "fr" | "fi";
     product_name: string;
     siblings_handle: string;
+    /** Lets the backend refuse a siblings collection that already holds a
+     *  DIFFERENT garment under this name (409 siblings_collision). */
+    product_type?: string;
+    /** Operator override: share the collection anyway. */
+    force?: boolean;
   }) => call<PublishStartStoreResponse>("/api/publish/start_store", { method: "POST", body: params, authed: true }),
 
   /** Scan a competitor's best-selling page: ordered top products with type/price/

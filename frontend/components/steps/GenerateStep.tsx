@@ -130,17 +130,28 @@ export function GenerateStep() {
 
       // ── 2. Pick unique product name (checked against ALL selected stores) ──
       setStage("names");
+      // Onbekend is niet vrij. Voorheen werd een mislukte ophaal hier
+      // stilzwijgend genegeerd, en dan koos de pool een naam uit een
+      // onvolledige lijst -- zo kregen 38 kledingstukken een al bezette naam.
       const usedFromShopify = new Set<string>();
+      const failedStores: string[] = [];
       await Promise.all(
         selectedStores.map(async (s) => {
           try {
             const r = await api.names(s);
-            (r.names ?? []).forEach((n) => usedFromShopify.add(n.toLowerCase()));
+            if (r.error || r.complete === false) failedStores.push(s);
+            (r.names ?? []).forEach((n) => usedFromShopify.add(n));
           } catch {
-            // non-fatal for that one store
+            failedStores.push(s);
           }
         })
       );
+      if (failedStores.length > 0) {
+        throw new Error(
+          `Could not load the names already in use for ${failedStores.map((s) => s.toUpperCase()).join(", ")}. ` +
+            "Without that list any name could be a duplicate -- retry."
+        );
+      }
       const chosenName = randomName(Array.from(usedFromShopify));
 
       const ctx: PendingCtx = {

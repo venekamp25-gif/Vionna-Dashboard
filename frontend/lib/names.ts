@@ -1,3 +1,4 @@
+import { slugName } from "./publishChecks";
 // Pool of women's names used for product names.
 // Each Shopify product is named after one (must be unique across all
 // selected stores' catalogues — see useUsedNames). Curated for an elegant
@@ -50,6 +51,94 @@ export const WOMEN_NAMES = [
   "Alessia", "Bianca", "Carla", "Elena", "Gaia", "Indira", "Livia", "Lucia",
   "Luna", "Mariana", "Marina", "Noemi", "Nova", "Paloma", "Romy", "Serena",
   "Sienna", "Yara", "Zara",
+  // 2026-08-31: de pool was OP (280 namen, 701 titels in gebruik over de 3
+  // winkels). Elke nieuwe listing botste per definitie met een bestaande naam.
+  // Zelfde stijl (Scandinavisch/Frans), gefilterd op wat al in gebruik was.
+  "Aase",
+  "Adele",
+  "Aïda",
+  "Ailsa",
+  "Aina",
+  "Alette",
+  "Alfhild",
+  "Anais",
+  "Andrea",
+  "Anouk",
+  "Antonie",
+  "Ariane",
+  "Arielle",
+  "Aslaug",
+  "Axelle",
+  "Bénédicte",
+  "Bergljot",
+  "Berit",
+  "Bettina",
+  "Bolette",
+  "Borghild",
+  "Charline",
+  "Christel",
+  "Clotilde",
+  "Cordelia",
+  "Dagmar",
+  "Dagny",
+  "Dorthe",
+  "Dorothée",
+  "Ebba",
+  "Edel",
+  "Eir",
+  "Eivor",
+  "Eline",
+  "Elna",
+  "Elodie",
+  "Elvira",
+  "Emmanuelle",
+  "Enya",
+  "Eugénie",
+  "Filippa",
+  "Gerda",
+  "Gudrun",
+  "Gunhild",
+  "Gwenaëlle",
+  "Halla",
+  "Heidrun",
+  "Hjördis",
+  "Iselin",
+  "Josiane",
+  "Karen",
+  "Kirsten",
+  "Kjersti",
+  "Léonie",
+  "Ludivine",
+  "Magnhild",
+  "Marit",
+  "Marlène",
+  "Marthe",
+  "Nathalie",
+  "Noor",
+  "Oda",
+  "Ottilie",
+  "Ragna",
+  "Ragnhild",
+  "Randi",
+  "Rosalie",
+  "Runa",
+  "Sanne",
+  "Ségolène",
+  "Sigrún",
+  "Siri",
+  "Sunniva",
+  "Svea",
+  "Synnøve",
+  "Thora",
+  "Tone",
+  "Tove",
+  "Unn",
+  "Valentine",
+  "Vigdis",
+  "Viviane",
+  "Ylvi",
+  "Yrsa",
+  "Ysolde",
 ];
 
 /**
@@ -65,9 +154,11 @@ export const WOMEN_NAMES = [
  * refresh button once Nova itself got published.
  */
 export function randomName(exclude: string[] = []): string {
-  const lower = new Set(exclude.map((n) => n.toLowerCase()));
+  // Op SLUG, niet op kleine letters: 'Adele' en 'Adèle' zijn voor Shopify
+  // dezelfde handle en botsen dus ook in de siblings-collecties.
+  const lower = new Set(exclude.map((n) => slugName(n)));
   // Tier 1
-  const pool = WOMEN_NAMES.filter((n) => !lower.has(n.toLowerCase()));
+  const pool = WOMEN_NAMES.filter((n) => !lower.has(slugName(n)));
   if (pool.length > 0) {
     return pool[Math.floor(Math.random() * pool.length)];
   }

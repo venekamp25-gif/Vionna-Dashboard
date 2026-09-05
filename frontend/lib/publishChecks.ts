@@ -147,3 +147,62 @@ export function poolWithoutStep<T extends LabelledPoolEntry>(
       : p.color !== "shared" || !p.label.startsWith(step.tagPrefix)
   );
 }
+
+/**
+ * Shopify's handle-slug, zodat 'Adele' en 'Adèle' als DEZELFDE naam gelden --
+ * Shopify maakt van beide 'adele', en dan botsen ook de siblings-collecties.
+ * Afgeleid uit 3.933 bestaande handles: ø->o, æ->ae, å->a, rest via NFKD.
+ */
+export function slugName(text: string): string {
+  const map: Record<string, string> = {
+    ø: "o", æ: "ae", å: "a", ä: "a", ö: "o", ü: "u", ß: "ss", œ: "oe", ð: "d", þ: "th", ł: "l",
+  };
+  return Array.from((text || "").toLowerCase())
+    .map((c) => map[c] ?? c)
+    .join("")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+export interface NameCheck {
+  level: "ok" | "fail";
+  label: string;
+  detail?: string;
+}
+
+/**
+ * Is deze productnaam vrij?
+ *
+ * `takenSlugs`: alle titels in gebruik op de doelwinkels, als slug.
+ * `unavailable`: winkels waarvan de lijst NIET geladen kon worden. Die maken
+ * de check rood -- een controle die niet is uitgevoerd is geen geslaagde
+ * controle. Precies zo kregen 38 kledingstukken een naam die al bezet was: een
+ * trage store gaf een lege lijst, en "leeg" werd gelezen als "uniek".
+ */
+export function nameCheck(
+  name: string,
+  takenSlugs: Set<string>,
+  unavailable: string[] = []
+): NameCheck {
+  const clean = (name || "").trim();
+  if (!clean) return { level: "fail", label: "Product name is empty" };
+  if (unavailable.length > 0) {
+    return {
+      level: "fail",
+      label: "Could not verify the product name is unique",
+      detail: `Used names could not be loaded for ${unavailable.map((s) => s.toUpperCase()).join(", ")} -- retry before publishing`,
+    };
+  }
+  const slug = slugName(clean);
+  if (!slug) return { level: "fail", label: "Product name has no usable letters" };
+  if (takenSlugs.has(slug)) {
+    return {
+      level: "fail",
+      label: "Product name is already used in your store",
+      detail: `"${clean}" (or a spelling Shopify treats the same) -- pick another`,
+    };
+  }
+  return { level: "ok", label: `Product name "${clean}" is unique` };
+}
