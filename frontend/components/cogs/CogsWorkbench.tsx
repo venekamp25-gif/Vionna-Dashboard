@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { api, CogsOverview, CogsProduct } from "@/lib/api";
+import { api, CogsOverview, CogsProduct, CogsTier } from "@/lib/api";
 import { Button } from "@/components/ui/Button";
 import {
   SortDir,
@@ -11,6 +11,107 @@ import {
   storeLabel,
   storeSummaries,
 } from "@/lib/cogsStores";
+
+/** Wat elke bundeltrede oplevert en kost.
+ *
+ *  Nodig omdat een productregel EEN percentage toont, terwijl de tredes ver
+ *  uiteen kunnen lopen: los 36% en op de 4-pack 62%. De knop zit bovendien in
+ *  Kaching en werkt per trede, dus zonder deze tabel weet je wel dat er iets
+ *  mis is maar niet waar je moet zijn. */
+function TierTable({
+  tiers,
+  currency,
+  costBasis,
+  money,
+}: {
+  tiers: CogsTier[];
+  currency?: string | null;
+  costBasis?: "gemeten" | "opgave";
+  money: (v: number | null | undefined, cur?: string | null) => string;
+}) {
+  const suspect = tiers.some((t) => t.unit_suspect);
+  return (
+    <div className="rounded border border-border bg-bg">
+      <table className="w-full text-[11.5px]">
+        <thead className="text-text-dim">
+          <tr>
+            <th className="text-left font-medium px-2.5 py-1.5">Bundle</th>
+            <th className="text-right font-medium px-2.5 py-1.5">Pack price</th>
+            <th className="text-right font-medium px-2.5 py-1.5">Per unit</th>
+            <th className="text-right font-medium px-2.5 py-1.5">Cost/unit</th>
+            <th className="text-right font-medium px-2.5 py-1.5">COGS</th>
+            <th className="text-right font-medium px-2.5 py-1.5">
+              Pack should cost
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {tiers.map((t) => (
+            <tr key={t.units} className="border-t border-border">
+              <td className="px-2.5 py-1.5">{t.units}×</td>
+              <td className="px-2.5 py-1.5 text-right whitespace-nowrap">
+                {money(t.tier_total, currency)}
+              </td>
+              <td className="px-2.5 py-1.5 text-right whitespace-nowrap text-text-dim">
+                {money(t.price_per_unit, currency)}
+              </td>
+              <td className="px-2.5 py-1.5 text-right whitespace-nowrap text-text-dim">
+                {money(t.cost_per_unit, currency)}
+                {/* Geschat en gemeten mogen er niet hetzelfde uitzien. */}
+                {!t.cost_measured && (
+                  <span
+                    className="ml-1 text-warning"
+                    title="No cost measured for this tier — the single-unit cost was used instead."
+                  >
+                    ~
+                  </span>
+                )}
+              </td>
+              <td
+                className={`px-2.5 py-1.5 text-right font-semibold whitespace-nowrap ${
+                  t.over ? "text-danger" : "text-text"
+                }`}
+              >
+                {t.pct.toLocaleString("nl-NL", { maximumFractionDigits: 1 })}%
+              </td>
+              <td className="px-2.5 py-1.5 text-right whitespace-nowrap">
+                {t.needed_total != null ? (
+                  <span title={`${money(t.needed_per_unit, currency)} per unit`}>
+                    {money(t.needed_total, currency)}
+                  </span>
+                ) : (
+                  <span className="text-text-faint">—</span>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className="text-[10.5px] text-text-faint px-2.5 py-1.5 border-t border-border">
+        {suspect ? (
+          <>
+            <strong className="text-warning">
+              The supplier&apos;s unit does not match Shopify&apos;s here
+            </strong>{" "}
+            — the cost per unit could not be established, so no target is
+            suggested. Give the real purchase price to fix it.
+          </>
+        ) : (
+          <>
+            These are Kaching tiers, so the lever is the tier price, not the
+            Shopify price — raising the list price only moves the 1× row.
+            {costBasis === "opgave" && (
+              <>
+                {" "}
+                The purchase price here was supplied by hand, not measured.
+              </>
+            )}
+          </>
+        )}
+      </p>
+    </div>
+  );
+}
 
 /** "3 minutes ago" — leesbaarder dan een tijdstempel, en het gaat hier om de
  *  vraag "hoe vers is dit", niet om het exacte moment (dat staat in de tooltip). */
@@ -88,6 +189,8 @@ export function CogsWorkbench() {
   });
   const [edited, setEdited] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<Record<string, boolean>>({});
+  /** Welke productregels hun bundeltredes tonen. */
+  const [openTiers, setOpenTiers] = useState<Record<string, boolean>>({});
   const [done, setDone] = useState<Record<string, string>>({});
   const [err, setErr] = useState<string | null>(null);
 
@@ -272,6 +375,26 @@ export function CogsWorkbench() {
           <p className="text-[12.5px] rounded-md border border-danger/40 bg-danger/10 text-danger px-3 py-2 mb-4">
             <strong>Could not read the source:</strong> {data.error}
             {data.detail ? ` — ${data.detail}` : ""}
+          </p>
+        )}
+
+        {/* Verandert er een percentage zonder dat prijs of inkoop wijzigde, dan
+            hoort daar een verklaring bij te staan -- niet in een release-notitie
+            maar op het scherm zelf. */}
+        {rows.some((r) => r.price_basis === "realised") && (
+          <p className="text-[11.5px] text-text-dim mb-3">
+            Rows marked <em>on what was paid</em> are judged on the price
+            customers actually paid, not the price in Shopify. The Light Supplier
+            runs Kaching bundle deals, so buying more drops the price per unit and
+            the list price flatters the margin. Hover a row to see the ladder and
+            how many orders it is based on.{" "}
+            <strong>
+              Raising the list price is not the only lever here.
+            </strong>{" "}
+            The suggestion assumes the bundle stays the same percentage of the
+            list price, which is what the orders show today — so it can come out
+            near double. Tightening the bundle deal itself often costs less
+            volume than that.
           </p>
         )}
 
@@ -480,15 +603,36 @@ export function CogsWorkbench() {
                 </tr>
               </thead>
               <tbody>
-                {rows.map((r) => {
+                {rows.flatMap((r) => {
                   const k = keyOf(r);
                   const preview = previewPct(r);
                   const value = edited[k] ?? (r.suggested_price ?? "").toString();
-                  return (
+                  return [
                     <tr key={k} className="border-t border-border align-middle">
                       <td className="px-3 py-2">
-                        <div className="font-medium">
+                        <div className="font-medium flex items-center gap-1.5">
                           {r.shopify_title || r.title}
+                          {/* Alleen waar er echt tredes zijn: de meeste
+                              producten hebben geen bundel. */}
+                          {(r.tiers?.length ?? 0) > 1 && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setOpenTiers((s) => ({ ...s, [k]: !s[k] }))
+                              }
+                              className="text-[11px] text-accent hover:underline"
+                              aria-expanded={!!openTiers[k]}
+                              title="Show what each bundle tier earns and costs"
+                            >
+                              {openTiers[k] ? "\u25be" : "\u25b8"} {r.tiers!.length} tiers
+                              {(r.tiers_over?.length ?? 0) > 0 && (
+                                <span className="text-danger">
+                                  {" "}
+                                  ({r.tiers_over!.length} over)
+                                </span>
+                              )}
+                            </button>
+                          )}
                         </div>
                         <div className="text-[11px] text-text-dim">
                           {r.variant_count > 1 ? `${r.variant_count} sizes` : ""}
@@ -527,6 +671,25 @@ export function CogsWorkbench() {
                             {money(r.compare_at, r.currency)}
                           </div>
                         ) : null}
+                        {/* Wat er ECHT binnenkwam. Zonder deze regel verandert
+                            het percentage zonder zichtbare reden: bij een
+                            bundeldeal betaalt de klant minder dan de lijstprijs,
+                            en dan vleit de lijstprijs de marge. */}
+                        {r.price_basis === "realised" && r.realised_price != null && (
+                          <div
+                            className="text-[10.5px] text-warning"
+                            title={
+                              (r.staffel
+                                ? Object.entries(r.staffel)
+                                    .map(([n, p]) => `${n}× → ${p}`)
+                                    .join("  ·  ") + "  —  "
+                                : "") +
+                              `measured over ${r.realised_orders ?? "?"} orders`
+                            }
+                          >
+                            actually {money(r.realised_price, r.currency)}
+                          </div>
+                        )}
                       </td>
                       <td
                         className={`px-3 py-2 text-right font-semibold whitespace-nowrap ${
@@ -534,6 +697,14 @@ export function CogsWorkbench() {
                         }`}
                       >
                         {r.pct.toLocaleString("nl-NL", { maximumFractionDigits: 1 })}%
+                        {r.price_basis === "realised" && (
+                          <div
+                            className="text-[10px] font-normal text-text-dim"
+                            title={`On the list price it would read ${r.pct_list ?? "?"}%. Bundle deals mean customers pay less, so the list price flatters the margin.`}
+                          >
+                            on what was paid
+                          </div>
+                        )}
                       </td>
                       <td className="px-3 py-2 text-right">
                         <input
@@ -569,8 +740,20 @@ export function CogsWorkbench() {
                           </div>
                         )}
                       </td>
-                    </tr>
-                  );
+                    </tr>,
+                    openTiers[k] && (r.tiers?.length ?? 0) > 1 ? (
+                      <tr key={`${k}-tiers`} className="bg-surface/50">
+                        <td colSpan={store ? 6 : 7} className="px-3 pb-3 pt-0">
+                          <TierTable
+                            tiers={r.tiers!}
+                            currency={r.currency}
+                            costBasis={r.cost_basis}
+                            money={money}
+                          />
+                        </td>
+                      </tr>
+                    ) : null,
+                  ];
                 })}
               </tbody>
             </table>
