@@ -9482,9 +9482,13 @@ SIB_HEAL_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 _SIB_Q_COLS = ('{ collections(first:250%s){ pageInfo{hasNextPage endCursor} '
                'edges{ node{ id handle productsCount{count} '
                'ruleSet{ rules{ column relation condition } } } } } }')
+# `collections` erbij: zonder lidmaatschap kan de audit niet zien dat een
+# collectie de VERKEERDE producten bevat (chloe-siblings: 3 stale drafts erin, de
+# 20 live Chloé-jurken erbuiten omdat de smart-regel het accent niet matcht).
 _SIB_Q_PRODS = ('{ products(first:250%s, query:"status:active"){ '
                 'pageInfo{hasNextPage endCursor} edges{ node{ id handle title '
-                'sib: metafield(namespace:"theme",key:"siblings"){value} } } } }')
+                'sib: metafield(namespace:"theme",key:"siblings"){value} '
+                'collections(first:12){ nodes{ handle } } } } } }')
 _SIB_M_ADD = ('mutation($id:ID!, $ids:[ID!]!){ collectionAddProducts(id:$id, productIds:$ids)'
               '{ collection{ id } userErrors{ field message } } }')
 _SIB_M_RULE = ('mutation($input:CollectionInput!){ collectionUpdate(input:$input)'
@@ -9557,15 +9561,28 @@ def _siblings_audit(store):
                 continue
             missing.append(h)
             continue
-        if (c.get('productsCount') or {}).get('count', 0) > 0:
+        # Niet "is de collectie leeg" maar "zitten de VERWIJZENDE producten erin".
+        # Een smart collection kan vol zitten met de verkeerde producten
+        # (chloe-siblings: 3 stale 'Chloe'-drafts, terwijl de 20 live 'Chloé'
+        # ernaar wijzen en er niet in zitten omdat de regel het accent niet
+        # matcht). Dat las hier maandenlang als gezond.
+        ontbreekt = [p for p in plist
+                     if h not in {x.get('handle') for x in ((p.get('collections') or {}).get('nodes') or [])}]
+        if not ontbreekt:
             continue
         if c.get('ruleSet'):
             titles = {p['title'] for p in plist}
             if len(titles) == 1:
-                plan_rule.append({'id': c['id'], 'handle': h, 'title': titles.pop()})
+                title = titles.pop()
+                huidige = [r.get('condition') for r in (c['ruleSet'].get('rules') or [])]
+                # Alleen als de regel echt anders staat -- anders elke nacht
+                # dezelfde "reparatie" die niets verandert.
+                if huidige != [title]:
+                    plan_rule.append({'id': c['id'], 'handle': h, 'title': title,
+                                      'missing': len(ontbreekt)})
         else:
             plan_add.append({'id': c['id'], 'handle': h,
-                             'pids': [p['id'] for p in plist]})
+                             'pids': [p['id'] for p in ontbreekt]})
     return {'checked': len(refs), 'broken_manual': len(plan_add),
             'broken_smart': len(plan_rule), 'broken_case': len(plan_case),
             'missing': len(missing), 'missing_handles': missing[:10],
