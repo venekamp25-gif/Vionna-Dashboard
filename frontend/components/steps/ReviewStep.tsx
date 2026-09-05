@@ -31,7 +31,7 @@ export function ReviewStep() {
   const { setStep } = useStep();
   const { data, patch, setData, syncActiveView, clearDraft } = useProduct();
   const { setStore } = useStore();
-  const { takenLower: takenNamesLower } = useUsedNames();
+  const { takenSlugs: takenNameSlugs, unavailable: namesUnavailable } = useUsedNames();
   const { entries: recentHistory } = useRecentHistory(200);
   const [publishing, setPublishing] = useState(false);
   const [publishingStore, setPublishingStore] = useState<StoreKey | null>(null);
@@ -51,7 +51,7 @@ export function ReviewStep() {
    */
   const publish = () => {
     setError(null);
-    const checks = buildPrePublishChecks(data, targetStores, takenNamesLower);
+    const checks = buildPrePublishChecks(data, targetStores, takenNameSlugs, namesUnavailable);
     // Extra check: was this same product name JUST published? (within 7 days)
     // Catches accidental double-publishes when the publish flow errored halfway,
     // OR when the user resumes an old draft and forgets that already shipped.
@@ -159,10 +159,13 @@ export function ReviewStep() {
           store,
           product_name: data.name,
           siblings_handle: data.siblingsHandle,
+          // Zodat de backend een collectie van een ANDER kledingstuk kan
+          // weigeren -- zo kwam de Maeve-jas in de swatches van de Maeve-blouse.
+          product_type: data.productType,
         });
         if (!startRes.success || startRes.error) {
           throw new Error(
-            `${STORE_CONFIG[store].label}: ${startRes.error || "Collection setup failed"}`
+            `${STORE_CONFIG[store].label}: ${startRes.message || startRes.error || "Collection setup failed"}`
           );
         }
         const collectionId = startRes.collection_id ?? null;

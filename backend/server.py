@@ -8445,10 +8445,17 @@ def get_names():
                     break
             pages += 1
         print(f'[names] {store}: {len(names)} product titles fetched across {pages} pages')
-        return jsonify({'names': names})
+        # `complete`: is de HELE catalogus gelezen? Bij 10 pagina's van 250 is de
+        # grens 2500; DK zit op ~1940. Loopt een winkel daar overheen, dan is de
+        # lijst afgekapt en mag de frontend hem niet als volledig behandelen.
+        return jsonify({'names': names, 'complete': next_url is None})
     except Exception as e:
+        # Dit gaf HTTP 200 met een LEGE lijst. De frontend las dat als "geen
+        # namen in gebruik" en de pre-publish-check zei "unique" -- zo kregen 38
+        # kledingstukken een naam die al bezet was. Een mislukte controle is
+        # geen geslaagde controle.
         print(f'[names] Error: {e}')
-        return jsonify({'names': [], 'error': str(e)})
+        return jsonify({'names': [], 'error': str(e)[:300]}), 502
 
 
 # --- Generate content via Claude ---
@@ -12497,18 +12504,29 @@ def _find_product_by_handle(store, handle, hdrs):
     returns an exact (not prefix) match."""
     if not handle:
         return None
+    # FAIL CLOSED. Dit was: bij een fout iets printen en None teruggeven, wat de
+    # aanroeper leest als "bestaat niet" -- waarna hij een tweede product
+    # aanmaakt en Shopify er -1 achter plakt. Zo kreeg Hortense op 4 september
+    # om 19:42 een complete tweede set naast die van 19:39. Een controle die
+    # niet kon worden uitgevoerd is geen geslaagde controle.
     try:
         r = req.get(
             shopify_url(store, f'products.json?handle={urllib.parse.quote(handle)}&fields=id,handle,status&status=any'),
             headers=hdrs, timeout=15,
         )
-        if r.status_code == 200:
-            for p in (r.json().get('products') or []):
-                if (p.get('handle') or '') == handle:
-                    return {'id': p.get('id'), 'status': p.get('status')}
     except Exception as e:
-        print(f"[publish] handle-existence check failed for {handle}: {e}")
+        raise HandleCheckFailed(f'could not check whether {handle!r} already exists: {e}')
+    if r.status_code != 200:
+        raise HandleCheckFailed(f'could not check whether {handle!r} already exists: HTTP {r.status_code}')
+    for p in (r.json().get('products') or []):
+        if (p.get('handle') or '') == handle:
+            return {'id': p.get('id'), 'status': p.get('status')}
     return None
+
+
+class HandleCheckFailed(RuntimeError):
+    """De bestaan-check kon niet worden uitgevoerd. De aanroeper mag dan NIETS
+    aanmaken: liever een duidelijke fout dan een -1 duplicaat."""
 
 
 def _parse_money_amount(raw):
@@ -13120,7 +13138,12 @@ def _publish_one_variant(
     # Re-creating would make Shopify auto-suffix the handle (jasmine-X-1) and
     # leave duplicate products — exactly the Jasmine mess we just cleaned up.
     # Reuse the existing product instead of creating a duplicate.
-    existing = _find_product_by_handle(store, product_handle, hdrs)
+    try:
+        existing = _find_product_by_handle(store, product_handle, hdrs)
+    except HandleCheckFailed as e:
+        # Niets aanmaken: dat is precies hoe de -1 duplicaten ontstonden.
+        return {'error': f'{e}. Nothing was created for this colour -- retry.',
+                'verify_failed': True}
     if existing:
         eid = existing.get('id')
         shop_domain = tokens.get(store, {}).get('shop', '')
@@ -13287,6 +13310,71 @@ def _publish_one_variant(
 
 # --- Granular publish endpoints (for live per-variant progress in the dashboard) ---
 
+_TYPE_CLASSES = (
+    ('robe', 'dress'), ('dress', 'dress'), ('kjole', 'dress'), ('mekko', 'dress'),
+    ('cardigan', 'cardigan'), ('gilet', 'cardigan'), ('neuletakki', 'cardigan'),
+    ('jacket', 'jacket'), ('veste', 'jacket'), ('jakke', 'jacket'), ('takki', 'jacket'),
+    ('coat', 'coat'), ('manteau', 'coat'), ('frakke', 'coat'), ('outerwear', 'coat'),
+    ('blouse', 'blouse'), ('bluse', 'blouse'), ('chemis', 'blouse'), ('top', 'top'),
+    ('sweater', 'sweater'), ('pull', 'sweater'), ('knit', 'knit'), ('maille', 'knit'), ('strik', 'knit'),
+    ('trouser', 'trousers'), ('pantalon', 'trousers'), ('broek', 'trousers'), ('buks', 'trousers'), ('housut', 'trousers'),
+    ('skirt', 'skirt'), ('jupe', 'skirt'), ('nederdel', 'skirt'), ('hame', 'skirt'),
+    ('jumpsuit', 'jumpsuit'), ('combinaison', 'jumpsuit'),
+    ('shoe', 'shoes'), ('chaussure', 'shoes'), ('sko', 'shoes'),
+    ('bag', 'bag'), ('sac', 'bag'), ('taske', 'bag'), ('laukku', 'bag'),
+    ('swim', 'swimwear'), ('bikini', 'swimwear'), ('maillot', 'swimwear'),
+    ('accessor', 'accessory'),
+)
+
+
+def _type_class(product_type):
+    """'Dress', 'Robes en maille', 'kjole' -> 'dress'. Grof met opzet: het gaat
+    om 'is dit hetzelfde SOORT stuk', niet om een exacte match."""
+    t = (product_type or '').lower()
+    for needle, klas in _TYPE_CLASSES:
+        if needle in t:
+            return klas
+    return t.strip()
+
+
+def _name_collision(store, product_name, siblings_handle, product_type, hdrs):
+    """Staat er onder deze naam al een ander kledingstuk in deze winkel?
+
+    Kijkt naar de producten in de bestaande siblings-collectie EN naar producten
+    met dezelfde titel (slug-gelijk: 'Adele' en 'Adèle' zijn voor Shopify
+    dezelfde handle). Geeft None als het veilig is, anders een dict met wat er
+    botst. Kan de controle niet worden uitgevoerd, dan is het antwoord GEEN
+    botsing-op-basis-van-niets maar een fout omhoog -- fail closed.
+    """
+    if not product_name:
+        return None
+    mine = _type_class(product_type)
+    q = ('query($h:String!,$t:String!){'
+         ' collectionByHandle(handle:$h){ products(first:20){ nodes{ title productType status } } }'
+         ' products(first:20, query:$t){ nodes{ title productType status handle } } }')
+    r = req.post(shopify_url(store, 'graphql.json'), headers=hdrs, timeout=20,
+                 json={'query': q, 'variables': {'h': siblings_handle or '-',
+                                                 't': f'title:{product_name}'}})
+    if r.status_code != 200:
+        raise RuntimeError(f'name check failed: HTTP {r.status_code}')
+    d = (r.json() or {}).get('data') or {}
+    kandidaten = []
+    coll = d.get('collectionByHandle') or {}
+    kandidaten += ((coll.get('products') or {}).get('nodes') or [])
+    kandidaten += ((d.get('products') or {}).get('nodes') or [])
+    slug_mine = _publish_slug(product_name)
+    anders = [p for p in kandidaten
+              if (p.get('status') or '').upper() != 'ARCHIVED'
+              and _publish_slug(p.get('title') or '') == slug_mine
+              and _type_class(p.get('productType')) not in ('', mine)]
+    if not anders:
+        return None
+    return {'existing_type': anders[0].get('productType'),
+            'existing_class': _type_class(anders[0].get('productType')),
+            'incoming_type': product_type, 'incoming_class': mine,
+            'count': len(anders)}
+
+
 @app.route('/api/publish/start_store', methods=['POST'])
 @require_droplet_token
 def publish_start_store():
@@ -13301,8 +13389,27 @@ def publish_start_store():
 
     product_name    = data.get('product_name', '')
     siblings_handle = data.get('siblings_handle', '')
+    product_type    = data.get('product_type', '')
+    force           = bool(data.get('force'))
     hdrs            = shopify_headers(store)
     base            = shopify_url(store, '')
+
+    # Zit er onder deze naam al een ANDER kledingstuk? _ensure_siblings_collection
+    # hergebruikt een bestaande collectie als de handle bezet is -- bedoeld voor
+    # een herkansing van hetzelfde stuk, maar bij een tweede stuk met dezelfde
+    # naam stopt het de jas in de swatch-collectie van de blouse. Op alle drie
+    # winkels zat 'Maeve Siblings' vol met 7 blouses EN 4 jassen. Kijk dus eerst
+    # wat er al onder die naam staat, en weiger tenzij de operator dat bewust
+    # overruled (warn, never block -- maar wel warn).
+    if not force:
+        botsing = _name_collision(store, product_name, siblings_handle, product_type, hdrs)
+        if botsing:
+            return jsonify({'success': False, 'error': 'siblings_collision',
+                            'collision': botsing,
+                            'message': (f"'{product_name}' is already used for a different garment "
+                                        f"({botsing['existing_type'] or 'unknown type'}, "
+                                        f"{botsing['count']} product(s)) -- pick another name, "
+                                        f"or pass force to share the collection anyway.")}), 409
 
     collection_id, actual_handle, reused = _ensure_siblings_collection(
         store, product_name, siblings_handle, hdrs, base
@@ -19452,7 +19559,12 @@ def api_lighting_publish():
             continue
 
         handle = _light_slug(product_name)          # geen kleur-segment: 1 product per lamp
-        existing = _find_product_by_handle(store, handle, hdrs)
+        try:
+            existing = _find_product_by_handle(store, handle, hdrs)
+        except HandleCheckFailed as e:
+            # Fail closed: niets aanmaken als we niet konden controleren.
+            results[store] = {'error': f'{e}. Nothing was created -- retry.', 'verify_failed': True}
+            continue
         if existing:
             # Zelfde idempotency-gedachte als fashion: nooit een Shopify-gesuffixte
             # duplicate maken bij een retry/dubbelklik.

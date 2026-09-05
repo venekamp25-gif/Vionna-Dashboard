@@ -325,6 +325,9 @@ export interface SizeChart {
 export interface NamesResponse {
   names: string[];
   error?: string;
+  /** False when the store has more products than the endpoint pages through --
+   *  the list is then truncated and must not be treated as complete. */
+  complete?: boolean;
 }
 
 export interface GenerateResponse {
@@ -365,6 +368,15 @@ export interface PublishResponse {
 }
 
 export interface PublishStartStoreResponse {
+  /** Human-readable reason when `error` is "siblings_collision". */
+  message?: string;
+  collision?: {
+    existing_type?: string;
+    existing_class?: string;
+    incoming_type?: string;
+    incoming_class?: string;
+    count: number;
+  };
   success: boolean;
   collection_id?: number | null;
   actual_handle?: string;
@@ -854,6 +866,11 @@ export const api = {
     store: "dk" | "fr" | "fi";
     product_name: string;
     siblings_handle: string;
+    /** Lets the backend refuse a siblings collection that already holds a
+     *  DIFFERENT garment under this name (409 siblings_collision). */
+    product_type?: string;
+    /** Operator override: share the collection anyway. */
+    force?: boolean;
   }) => call<PublishStartStoreResponse>("/api/publish/start_store", { method: "POST", body: params, authed: true }),
 
   /** Scan a competitor's best-selling page: ordered top products with type/price/
