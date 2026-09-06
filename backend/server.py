@@ -16476,9 +16476,26 @@ def _blog_fallback_topic(store, hdrs=None):
 
     t = _pick(True, True) or _pick(False, True) or _pick(False, False)
     if not t:
-        stocked = [x for x in pool
-                   if not (0 <= _blog_category_stock(store, x.get('category'), hdrs) < BLOG_MIN_CATEGORY_STOCK)]
-        t = (stocked or pool)[0]
+        # Nothing passed every constraint. Do NOT fall back to pool[0]: that blindly
+        # returned the same first topic twice, which is how DK published two nearly
+        # identical summer-dress articles three days apart. Rank the pool instead —
+        # an unused subject beats a stocked one beats an in-season one — and take
+        # the least-bad option.
+        month = datetime.datetime.utcnow().month
+
+        def _rank(x):
+            taken = _blog_subject_taken(x['keyword'], recent)
+            stock = _blog_category_stock(store, x.get('category'), hdrs)
+            thin = 0 <= stock < BLOG_MIN_CATEGORY_STOCK
+            off_season = bool(x.get('months')) and month not in x['months']
+            return (1 if taken else 0, 1 if thin else 0, 1 if off_season else 0)
+        t = sorted(pool, key=_rank)[0]
+    # Republishing a subject we covered in the last three weeks is worse than
+    # skipping a slot: the two articles cannibalise each other in search.
+    if _blog_subject_taken(t['keyword'], _blog_recent_sig_sets(store, days=21)):
+        print(f"[blog] {store}: fallback '{t['keyword']}' would duplicate a very recent "
+              f"article — skipping this slot instead")
+        return None
     return {**{k: v for k, v in t.items() if k != 'months'}, 'source': 'fallback',
             'seasonality': None, 'intent': 'commercial', 'label': None, 'seed': None, 'volume': None}
 
@@ -18604,6 +18621,8 @@ def _blog_generate_one(store, topic=None, published=None):
     _blog_slack_article(store, created, publish, qa_slim, topic)
     if publish and not topic.get('pillar') and topic.get('category'):
         _blog_update_pillar_links(store, topic['category'], hdrs)
+    if publish and topic.get('source') == 'bestsellers':
+        _blog_retire_previous_bestsellers(store, hdrs, created)
     return {'store': store, 'topic': topic, 'products_linked': len(products), 'qa': qa_slim,
             'published': publish, 'article': created, 'preview': {'title': art['title'],
             'meta_description': art['meta_description'], 'excerpt': art['excerpt'],
@@ -18895,6 +18914,35 @@ def _blog_refresh_one(store):
             print(f"[blog] refresh {store}: {art_now.get('handle')} updated (QA {qa['score']})")
     except Exception as e:
         print(f"[blog] refresh {store} failed: {e}")
+
+
+def _blog_retire_previous_bestsellers(store, hdrs, created):
+    """'Most loved right now' is published monthly, which quietly stacked up
+    near-identical articles competing for the same query. Keep only the newest:
+    unpublish the earlier ones and 301 them to it. Never raises."""
+    try:
+        new_id = created.get('id')
+        olds = []
+        for r in _blog_read_jsonl(BLOG_HISTORY_PATH):
+            if (r.get('store') == store and r.get('article_id') and r['article_id'] != new_id
+                    and (r.get('source') == 'bestsellers'
+                         or (r.get('levers') or {}).get('format') == 'bestsellers')):
+                olds.append(r)
+        if not olds:
+            return
+        blog_id = _blog_ensure(store, hdrs)
+        target = '/blogs/%s/%s' % (BLOG_HANDLE, created.get('handle'))
+        for r in {x['article_id']: x for x in olds}.values():
+            aid, handle = r['article_id'], r.get('article_handle')
+            u = _shopify_call('put', shopify_url(store, f'blogs/{blog_id}/articles/{aid}.json'),
+                              hdrs, json={'article': {'id': aid, 'published': False}}, timeout=30)
+            if u.status_code == 200 and handle:
+                _shopify_call('post', shopify_url(store, 'redirects.json'), hdrs,
+                              json={'redirect': {'path': '/blogs/%s/%s' % (BLOG_HANDLE, handle),
+                                                 'target': target}}, timeout=30)
+                print(f"[blog] bestsellers {store}: retired '{handle}' -> {target}")
+    except Exception as e:
+        print(f"[blog] retire bestsellers {store} failed: {e}")
 
 
 def _blog_dead_product_links(store, body, hdrs):
