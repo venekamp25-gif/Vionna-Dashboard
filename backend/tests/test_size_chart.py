@@ -95,3 +95,104 @@ def test_sniff_image_mime_detects_png_jpeg_gif():
 
 def test_sniff_image_mime_falls_back_when_unrecognized():
     assert server._sniff_image_mime(b'not-an-image', fallback='image/png') == 'image/png'
+
+
+# ---------------------------------------------------------------------------
+# Bug #57: a HIDDEN size-guide button is not a size chart we failed to read.
+#
+# monaco-mode.fr (Minimog theme) renders a FoxKit size-chart button that is
+# permanently display:none (`.m\:hidden{display:none}`) with nothing behind it:
+# no <table> anywhere on the product page, no size-guide page on the shop, and
+# the FoxKit app script that would reveal and fill the button is not loaded.
+# _detect_size_chart_hint matched its label text anyway, so size_chart_status
+# became 'unread' and the review step offered a "Notify" button for a chart that
+# does not exist — which is how bug #57 was filed.
+# ---------------------------------------------------------------------------
+
+MONACO_HIDDEN_FOXKIT_BUTTON = '''
+<html><body>
+  <div class="m-product-option--label">
+    <label class="option-label"><span class="option-label--title">Taille:</span></label>
+      <button data-open-sizeguide class="foxkit-sizechart-button m:inline-flex m:items-center m:hidden">
+        <svg viewBox="0 0 640 512"><path d="M0 0v56c0 4.42 3.58 8 8 8h16z"/></svg>
+        <span class="foxkit-sizechart-button--label">Guide des tailles</span>
+      </button>
+  </div>
+  <div class="m-collapsible--content" data-content hidden>
+    <p>Lorsque des informations ou un guide des tailles sont disponibles,
+       consultez-les sur cette fiche produit avant de commander.</p>
+  </div>
+</body></html>
+'''
+
+VISIBLE_SIZE_GUIDE_BUTTON = '''
+<html><body>
+  <button class="product-sizeguide-trigger">
+    <span class="label">Guide des tailles</span>
+  </button>
+</body></html>
+'''
+
+
+def test_hidden_size_guide_button_is_not_reported_as_an_unread_chart():
+    """The reported page: the only size-guide trigger is display:none and there is
+    no chart behind it, so the hint must stay silent (status 'none', no Notify)."""
+    assert server._detect_size_chart_hint(MONACO_HIDDEN_FOXKIT_BUTTON) is None
+
+
+def test_visible_size_guide_button_is_still_reported():
+    """A trigger the shopper can see may well open a JS-loaded chart from an app we
+    don't read yet — that is still worth flagging."""
+    assert server._detect_size_chart_hint(VISIBLE_SIZE_GUIDE_BUTTON) == 'size-guide link/button'
+
+
+def test_visible_size_guide_link_is_still_reported():
+    """Bug #17's footer link must keep reporting when _linked_page_size_chart fails."""
+    assert server._detect_size_chart_hint(
+        PRODUCT_PAGE_WITH_SIZE_LINK) == 'size-guide link/button'
+
+
+def test_breakpoint_hidden_trigger_is_still_reported():
+    """`md:hidden` hides the trigger at ONE width only — it is still a real chart."""
+    assert server._detect_size_chart_hint(
+        '<button class="md:hidden"><span>Size Guide</span></button>'
+    ) == 'size-guide link/button'
+
+
+def test_size_guide_prose_alone_is_not_a_chart():
+    """Only a label that is nothing BUT the phrase counts; prose mentioning a size
+    guide (an FAQ, a shipping note) must not raise the hint."""
+    assert server._detect_size_chart_hint(
+        '<p>When a size guide is available, consult it before ordering.</p>') is None
+
+
+def test_size_guide_label_inside_script_is_not_a_chart():
+    """Theme/app JSON often carries the label as a translation string."""
+    assert server._detect_size_chart_hint(
+        '<script>var t = {"sizeguide_label": "Size Guide"};</script>') is None
+
+
+def test_known_app_marker_still_wins_over_a_hidden_button():
+    """Ordering is unchanged: a named app is a better hint than the generic one."""
+    assert server._detect_size_chart_hint(
+        '<div>kiwiSizing</div>'
+        '<button class="m:hidden"><span>Size Guide</span></button>'
+    ) == 'Kiwi Sizing app'
+
+
+def test_element_is_hidden_recognises_the_common_forms():
+    assert server._element_is_hidden('<div hidden>')
+    assert server._element_is_hidden('<div aria-hidden="true">')
+    assert server._element_is_hidden('<div style="display: none">')
+    assert server._element_is_hidden('<div style="visibility:hidden">')
+    assert server._element_is_hidden('<button class="a m:hidden b">')
+    assert server._element_is_hidden('<div class="visually-hidden">')
+
+
+def test_element_is_hidden_does_not_over_match():
+    assert not server._element_is_hidden('<div>')
+    assert not server._element_is_hidden('<div class="md:hidden">')
+    assert not server._element_is_hidden('<div aria-hidden="false">')
+    assert not server._element_is_hidden('<div data-hidden="true">')
+    # 'hidden' appearing only inside another attribute's value is not the attribute
+    assert not server._element_is_hidden('<div data-target="hidden-panel">')

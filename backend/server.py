@@ -2903,6 +2903,91 @@ def _linked_page_size_chart(page_html, page_url):
         return None
 
 
+_HIDDEN_CLASS_TOKENS = {
+    'hidden', 'm:hidden', 'is-hidden', 'hide', 'is-hide', 'invisible',
+    'd-none', 'sr-only', 'visually-hidden', 'visuallyhidden',
+    'foxkit-hidden', '!foxkit-hidden',
+}
+# Elements that never wrap anything, so they must not be pushed on the tag stack.
+_VOID_TAGS = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link',
+              'meta', 'param', 'source', 'track', 'wbr',
+              'path', 'circle', 'rect', 'line', 'polygon', 'polyline', 'stop', 'use'}
+_TAG_RE = re.compile(r'<(/?)([a-zA-Z][-\w:]*)((?:"[^"]*"|\'[^\']*\'|[^>])*?)(/?)>', re.S)
+_ATTR_RE = re.compile(r'([a-zA-Z_:][-\w:.]*)\s*(?:=\s*("[^"]*"|\'[^\']*\'|[^\s"\'>]+))?')
+# The residual hint only fires on an element whose text is NOTHING BUT a size-guide
+# label — the same "whole text node" rule the old inline regex enforced, so prose
+# like "when a size guide is available, consult it" stays a non-match.
+_SIZE_LINK_LABEL_RE = re.compile(
+    r'^\W*(?:size\s?guide|size\s?chart|maattabel|guide des tailles|kokotaulukko|'
+    r'st[oø]rrelsesguide)\W*$', re.I)
+
+
+def _element_is_hidden(open_tag):
+    """True when this element's OWN open tag marks it invisible: a bare `hidden`
+    attribute, aria-hidden="true", an inline display:none/visibility:hidden, or a
+    class token that is a plain hidden utility.
+
+    Class tokens are compared whole, so a breakpoint-scoped utility (`md:hidden`,
+    `lg:m:hidden` — visible at other widths) is deliberately NOT treated as
+    hidden, while an unconditional one (`hidden`, `m:hidden`) is."""
+    attrs = {}
+    inner = open_tag[1:-1].lstrip('/')
+    nm = re.match(r'\s*[a-zA-Z][-\w:]*', inner)
+    if nm:
+        inner = inner[nm.end():]
+    for am in _ATTR_RE.finditer(inner):
+        val = am.group(2) or ''
+        if val[:1] in ('"', "'"):
+            val = val[1:-1]
+        attrs[am.group(1).lower()] = val
+    if 'hidden' in attrs and attrs['hidden'].strip().lower() not in ('false', '0'):
+        return True
+    if attrs.get('aria-hidden', '').strip().lower() == 'true':
+        return True
+    style = re.sub(r'\s+', '', attrs.get('style', '')).lower()
+    if 'display:none' in style or 'visibility:hidden' in style:
+        return True
+    return any(t.lower() in _HIDDEN_CLASS_TOKENS
+               for t in attrs.get('class', '').split())
+
+
+def _has_visible_size_guide_trigger(page_html):
+    """True when the page shows a size-guide link/button a SHOPPER can actually see.
+
+    Bug #57: monaco-mode.fr (Minimog theme) ships a FoxKit size-chart button that is
+    permanently `display:none` — `<button data-open-sizeguide class="… m:hidden">
+    <span …>Guide des tailles</span></button>` — with no chart behind it: no <table>
+    anywhere on the page, no size-guide page on the shop, and the FoxKit app script
+    that would reveal and fill the button isn't even loaded. Matching its label as
+    "the page has a size chart we can't read" sent the employee a Notify button for a
+    chart that does not exist. So walk the tag stack and ignore any label sitting
+    inside a hidden ancestor. Best-effort; a parse it can't follow errs on the side
+    of the old behaviour (reporting the hint)."""
+    h = page_html or ''
+    stack = []          # [(tagname, is_hidden), …]
+    hidden_depth = 0
+    pos = 0
+    for m in _TAG_RE.finditer(h):
+        text = h[pos:m.start()]
+        pos = m.end()
+        if hidden_depth == 0 and text.strip() and _SIZE_LINK_LABEL_RE.match(text.strip()):
+            return True
+        closing, name, selfclose = m.group(1), m.group(2).lower(), m.group(4)
+        if closing:
+            for i in range(len(stack) - 1, -1, -1):
+                if stack[i][0] == name:
+                    del stack[i:]
+                    break
+        elif not selfclose and name not in _VOID_TAGS:
+            stack.append((name, _element_is_hidden(m.group(0))))
+            if name in ('script', 'style', 'template', 'noscript'):
+                # Their contents are code, not shopper-visible text.
+                stack[-1] = (name, True)
+        hidden_depth = sum(1 for _, hid in stack if hid)
+    tail = h[pos:].strip()
+    return bool(hidden_depth == 0 and tail and _SIZE_LINK_LABEL_RE.match(tail))
+
+
 def _detect_size_chart_hint(page_html):
     """When automatic extraction FAILS, sniff whether the page still clearly HAS a
     size chart (a known app / a size-chart image / a size-guide widget) so a human
@@ -2915,7 +3000,9 @@ def _detect_size_chart_hint(page_html):
     that false positive). Vitals charts are now read by _vitals_size_chart above;
     this hint only fires for Vitals pages whose chart couldn't be fetched/OCR'd.
     Likewise 'size-guide link/button' (bug #17) is now attempted by
-    _linked_page_size_chart above and only surfaces here when that also fails."""
+    _linked_page_size_chart above and only surfaces here when that also fails —
+    and only for a trigger the shopper can actually SEE, since a theme's hidden
+    size-guide button has no chart behind it to read (bug #57)."""
     try:
         h = (page_html or '').lower()
         # (regex marker, friendly app name). Order = specificity; first hit wins.
@@ -2939,7 +3026,7 @@ def _detect_size_chart_hint(page_html):
                 return 'size-chart image'
         if re.search(r'(class|id)\s*=\s*"[^"]*siz[a-z]*[\-_](chart|guide)[^"]*"', h):
             return 'size-guide widget'
-        if re.search(r'>\s*(size\s?guide|size\s?chart|maattabel|guide des tailles|kokotaulukko|st[oø]rrelsesguide)\s*<', h):
+        if _has_visible_size_guide_trigger(page_html):
             return 'size-guide link/button'
         return None
     except Exception:
