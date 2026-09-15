@@ -1,6 +1,13 @@
 import type { ScrapedProduct } from "./api";
 import { isColorLike } from "./colors";
-import { BAG_OVERRIDE_RE, NB_TYPE_RES, stripTypeNoise } from "./nbCategory";
+import { BAG_OVERRIDE_RE, GARMENT_RE, NB_TYPE_RES, stripTypeNoise } from "./nbCategory";
+
+/** TYPE_MAP tokens that are accessories — skipped when the title also names a
+ *  garment ("dress with belt" is a dress, photographed as a dress). */
+const ACCESSORY_TOKENS = new Set([
+  "sunglasses", "watch", "hair accessory", "necklace", "earrings", "bracelet", "ring", "gloves",
+  "jewellery", "scarf", "belt", "hat",
+]);
 
 // Recognise the full Shopify-ish size lexicon so an option like
 // ["XXS","XS","S","M","L","XL","XXL","3XL"] is correctly identified as
@@ -126,7 +133,12 @@ export function guessProductType(product: ScrapedProduct["product"]): string {
   // Lower-cased, minus the garment descriptors that contain an accessory word
   // ("cap sleeve", "scarf print", "jewel neck", "o-ring" …) — see nbCategory.ts.
   const text = stripTypeNoise(`${product?.title ?? ""} ${product?.handle ?? ""}`);
+  // A garment word wins over an accessory word ("robe ceinturée", "coat with
+  // belt"): otherwise the dress is photographed as a belt (waist crop, product
+  // shot without the model). Compound bags are settled by their own first row.
+  const garmentFirst = GARMENT_RE.test(text) && !BAG_OVERRIDE_RE.test(text);
   for (const [type, re] of TYPE_MAP) {
+    if (garmentFirst && ACCESSORY_TOKENS.has(type)) continue;
     if (re.test(text)) return type;
   }
   return "";  // unknown → let the publish-time LLM category decide

@@ -61,6 +61,18 @@ CASES = [
     ("d-ring belt", "accessory", "belt"),
     ("chain strap bag", "bag", None),
     ("cœur pendant", "accessory", "jewelry"),   # œ must not split the word (JS side)
+    # a garment word wins over an accessory word
+    ("dress with belt", "garment", None),
+    ("coat with detachable belt", "garment", None),
+    ("jumper with scarf", "garment", None),
+    ("tie belt dress", "garment", None),
+    ("scarf neck top", "garment", None),
+    ("robe col bijou", "garment", None),
+    ("jurk met kettingprint", "garment", None),
+    ("toe cap boots", "shoes", None),
+    ("dress shoes", "shoes", None),
+    ("chain belt", "accessory", "belt"),
+    ("bucket hat", "accessory", "headwear"),
     # eyewear
     ("sunglasses", "accessory", "eyewear"),
     ("solbriller", "accessory", "eyewear"),

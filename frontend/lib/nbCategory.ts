@@ -47,7 +47,8 @@ export type AccessoryKind =
 // JS "\b" is ASCII-only, so /\bvyö\b/ would never match — build the boundary
 // by hand. Python's "\b" is Unicode-aware; the backend mirror uses that.
 // Includes œ and Latin Extended-A (ā ă ą ć … ž), so "cœur" is not split at the œ.
-const L = "a-zà-öø-ÿœĀ-ſ";
+// Digits and ß are word characters for Python's \b too, so keep parity.
+const L = "a-z0-9ßà-öø-ÿœĀ-ſ";
 
 interface Vocab {
   /** matched as whole words (regex fragments; may carry their own groups) */
@@ -70,8 +71,15 @@ const NOISE_RE = new RegExp(
   [
     "cap[- ]?sleeves?",              // cap sleeve dress ≠ a cap
     "cap[- ]?toe",                   // cap toe boots ≠ a cap
-    "scarf[- ]?print",               // scarf print dress ≠ a scarf
+    "toe[- ]?caps?",                 // toe cap boots ≠ a cap
+    "cap[- ]?details?",
+    "scarf[- ]?(?:print|neck|tie|collar|hem|details?)", // scarf print / scarf neck top ≠ a scarf
     "jewel[- ]?neck(?:line)?",       // jewel neckline ≠ jewellery
+    "col[- ]bijou", "encolure[- ]bijou",
+    `(?:ketting|chain|hat|scarf|sjaal|foulard)[- ]?(?:print|motif|m[øo]nster|kuvio)`,
+    `(?:k[æa]de|chain)[- ]?(?:details?|detalje)`,
+    "(?:tie|self[- ]tie|with|detachable|removable|matching)[- ]belts?", // tie belt dress ≠ a belt
+    "belt[- ]?(?:details?|loops?)",
     `(?:^|[^${L}])(?:o|d|double|toe)[- ]rings?`, // o-ring belt, d-ring, toe ring sandals ≠ a ring
     "ring[- ]?(?:details?|handles?|spun|buckles?)", // ring detail dress, ring-spun cotton, ring buckle
     "chain[- ]?(?:details?|straps?)", // chain strap bag ≠ a necklace
@@ -253,10 +261,24 @@ const kindOf = (pt: string): AccessoryKind | null => {
   return null;
 };
 
+/** A garment word wins over an accessory word: "robe ceinturée" is a dress,
+ *  "jumper with scarf" a jumper — except compound bags (settled earlier) and
+ *  shoes ("dress shoes"). Mirrored by server._NB_GARMENT_RE. */
+export const GARMENT_RE = build({
+  word: [
+    "dress(?:es)?", "kjole\\w*", "robes?", "mekko\\w*", "jurk\\w*", "kleid\\w*", "blouses?", "bluse\\w*",
+    "pusero\\w*", "tops?", "shirts?", "t-?shirts?", "skirts?", "nederdel\\w*", "jupes?", "hame", "trousers?",
+    "pants", "jeans", "bukser", "pantalons?", "housut", "jackets?", "jakke\\w*", "veste", "takki", "coats?",
+    "frakke\\w*", "manteau\\w*", "blazers?", "cardigans?", "sweaters?", "jumpers?", "strik\\w*", "neule\\w*",
+    "pulls?", "jumpsuits?", "bikinis?", "swimsuits?", "hoodies?", "sweatshirts?",
+  ].map((w) => w.replace(/\\w/g, `[${L}]`)),
+});
+
 /** Category of a free product-type string (EN/DK/FR/FI/NL/DE). */
 export function nbCategory(productType: string): NbCategory {
   const pt = stripTypeNoise(productType);
   if (BAG_OVERRIDE_RE.test(pt)) return "bag";
+  if (GARMENT_RE.test(pt) && kindOf(pt)) return SHOES_RE.test(pt) ? "shoes" : "garment";
   if (kindOf(pt)) return "accessory";
   if (BAG_RE.test(pt)) return "bag";
   if (SHOES_RE.test(pt)) return "shoes";

@@ -10540,7 +10540,7 @@ _BS_FASHION_BUCKETS = ('dress', 'jumpsuit', 'knitwear', 'outerwear', 'swim', 'sk
 _BS_CLOTHING_BUCKETS = ('dress', 'jumpsuit', 'knitwear', 'outerwear', 'swim', 'skirt', 'pants',
                         'lingerie', 'top', 'clothing')
 _BS_NON_FASHION_BUCKETS = ('kids', 'men', 'pet', 'beauty', 'tech', 'bundle', 'hosiery',
-                           'home', 'sport', 'food')
+                           'home', 'sport', 'food', 'craft')
 
 
 def _bs_rx(pattern):
@@ -10553,12 +10553,13 @@ def _bs_rx(pattern):
 _BS_PRE_RULES = [
     ('kids', _bs_rx(r"\b(?:kids?|children|child|toddler|babies|b[ée]b[ée]s?|enfants?|gar[çc]ons?|filles?|"
                     r"b[øo]rn|b[øo]rne\w*|drenge\w*|piger?|pige\w*|lasten|lapsille|lapset|pojat|poikien|"
-                    r"tyt[öo]t|tyt[öo]n|tytt[öo]jen|junior|girls?|boys?)\b|"
+                    r"tyt[öo]t|tyt[öo]n|tytt[öo]jen|junior|girls|girl'?s|boys?)\b|\b(?:little|baby|teen|big) girl\b|"
                     # 'baby'/'vauva' als KLEURWOORD (babyblå, baby pink, vauvansininen) is
                     # geen doelgroep -- zonder deze uitzonderingen werd elke lichtblauwe
                     # jurk 'kids'.
                     r"\bbaby(?![- ]?(?:blue|pink|rose|bleu|rosa|bl[åa]|r[øo]d|lyser[øo]d|vaaleanpunainen|"
-                    r"sininen|doll|shower))|\bvauva(?!n?(?:sininen|vaaleanpunainen))\w*")),
+                    r"sininen|doll|shower|tees?|t-?shirts?|tops?|cardigan))|"
+                    r"\bvauva(?!n?(?:sininen|vaaleanpunainen))\w*")),
     ('pet', _bs_rx(r"\b(?:dogs?|hund|hunde\w*|chiens?|koira\w*|puppy|hvalp\w*|chiot|pentu|"
                    r"cat (?:toy|bed|collar|tree|food)|katte\w*|kissan\w*|pets?|k[æa]ledyr|"
                    r"animal de compagnie|lemmikki\w*)\b")),
@@ -10566,9 +10567,21 @@ _BS_PRE_RULES = [
                     r"smykkeholder|shoe rack|skostativ|kenk[äa]teline|\bhangers?\b|t[øo]jb[øo]jle\w*|\bcintres?\b|"
                     r"vaatepuu|garment bag|laundry|vasket[øo]j|lessive|pyykki|wine glass|vinglas|"
                     r"verres? [àa] vin|viinilasi|drinking glass|champagne glass|sleeping bag|sovepose|"
-                    r"sac de couchage|makuupussi")),
+                    r"sac de couchage|makuupussi|(?:storage|wicker|woven|rattan|hanging|laundry|picnic) baskets?|"
+                    r"baskets? set|(?:whisk(?:e)?y|cocktail|highball|shot|gin|beer|tumbler) glass(?:es)?|"
+                    r"pendant (?:lamps?|lights?)|ring lights?|curtain rings?|napkin rings?|teething ring|"
+                    r"oven (?:gloves?|mitts?)|ovnhandsker|grydelap\w*|shower cap|bean ?bag|diaper bag|"
+                    r"body pillow|body mirror|coat (?:rack|stand|hooks?)|(?:base|top|gel) coat|fish tank|"
+                    r"brochettes?")),
     ('food', _bs_rx(r"tea ?bags?|tebreve|sachets? de th[ée]|teepussi|coffee beans|kaffeb[øo]nner|grains de caf[ée]|"
                     r"kahvipavut|protein ?powder|proteinpulver")),
+    # Garen, opskrifter en breinaalden: een garenwinkel is geen strikwinkel.
+    # Géén kale 'laine'/'crochet'/'hækl'/'virkk': 'pull en laine', 'crochet top',
+    # 'hæklet top' en 'virkattu toppi' zijn kleding.
+    ('craft', _bs_rx(r"strikkeopskrift|\bopskrift\w*|strikkepind\w*|strikkekit|\bgarn\b|\byarn\b|"
+                     r"knitting (?:pattern|needles?|kit|bag)|neuleohje|neulepuiko\w*|\blanka\b|neulepakkaus|"
+                     r"pelote\w*|(?:laine|fil) [àa] tricoter|aiguilles? [àa] tricoter|crochet (?:hooks?|kit|pattern)|"
+                     r"h[æa]kle(?:opskrift|n[åa]l|garn|kit)|virkkuu(?:koukku|ohje)|virkkausohje")),
     ('beauty', _bs_rx(r"lipstick|l[æa]bestift|rouge [àa] l[èe]vres|huulipuna|lip ?gloss|mascara|eyeliner|"
                       r"foundation|concealer|blush brush|bronzer|highlighter|perfume|parfum|hajuvesi|eau de|"
                       r"\bserum\b|s[ée]rum|seerumi|moisturi[sz]er|face cream|ansigtscreme|cr[èe]me visage|"
@@ -10601,18 +10614,19 @@ _BS_PRE_RULES = [
 _BS_FASHION_RULES = [
     # (?!marimekko): het merk Marimekko bevat 'mekko' en is geen jurk.
     ('dress',     _bs_rx(r"\bdress(?:es)?\b|\w*kjole\w*|\brobes?\b(?! de chambre)|\b(?!marimekko)\w*mekko\w*|"
-                         r"\bgowns?\b|\bjurk\w*|\bkleid\w*")),
+                         r"\bgowns?\b|\bjurk\w*|\bkleid\w*|\bkaftan\w*")),
     ('jumpsuit',  _bs_rx(r"jumpsuit|playsuit|romper|combinaison(?! de (?:ski|plong[ée]e|travail))|combishort|"
-                         r"\boveralls?\b|buksedragt|\bhaalari\w*")),
+                         r"\boveralls?\b|buksedragt|\bhaalari\w*|dungarees|salopette\w*")),
     ('knitwear',  _bs_rx(r"\bknit\w*|sweater|cardigan|\bjumper|pullover|\w*strik\w*|\bpulls?\b|\btricot\w*|"
                          r"\w*neule\w*|\btrui\b|villapaita|villatakki|strickjacke")),
     ('outerwear', _bs_rx(r"jacket|\w*jakke\w*|\bcoats?\b|blazer|trench|parka|manteau|\bveste\b|\bjas\b|"
                          r"\w*frakke\w*|\w*takki\b|\bmantel\b|anorak|puffer|doudoune|blouson|\bcape\b|poncho|"
-                         r"\bgilet\b|\bliivi\b|kimono")),
+                         r"\bgilet\b|\bliivi\b|kimono|\bjakku\w*|bleiseri|waistcoat|bolero")),
     ('swim',      _bs_rx(r"bikini\w*|swimsuit|\bswim\w*|maillot|badpak|badedragt|badet[øo]j|uimapuku|\buima\w*|badeanzug")),
     ('skirt',     _bs_rx(r"\bskirts?\b|\bskort\b|nederdel\w*|\bjupes?\b|\w*hame\b|\bhameet\b")),
     ('pants',     _bs_rx(r"\bpants\b|trousers?|\bjeans?\b|\bshorts\b|legging\w*|jogger\w*|pantalon\w*|\bbroek\w*|"
-                         r"\w*housut\b|\w*bukser\b|farkut|farkku\w*|shortsit|culottes?|\bcargo\b|chino\w*")),
+                         r"\w*housut\b|\w*bukser\b|farkut|farkku\w*|shortsit|culottes?|\bcargo\b|chino\w*|"
+                         r"sweatpants|tracksuit|\bjogging\w*|jeggings|surv[êe]tement\w*|verryttelyhousut")),
     ('lingerie',  _bs_rx(r"\bbras?\b|\bbh\b|soutien-?gorge|rintaliivi\w*|lingerie|undert[øo]j|sous-?v[êe]tement\w*|"
                          r"alusvaatteet|alusasu\w*|panties|trusser|\bbriefs\b|\bthongs?\b|g-string|nightwear|"
                          r"natkjole|nuisette|y[öo]paita|nightdress|nightgown|pyjama\w*|pajama\w*|natt[øo]j|"
@@ -10620,12 +10634,16 @@ _BS_FASHION_RULES = [
     ('top',       _bs_rx(r"\btops?\b|blouse\w*|\bshirts?\b|t-?shirts?\b|\btees?\b|\btank\b|camisole|bodysuit|"
                          r"\bcami\b|chemisier|\bbluse\w*|pusero\w*|\w*paita\b|\btoppi\w*|\btunic\w*|tunika|"
                          r"tunique|hoodie|huppari|h[æa]ttetr[øo]je|sweatshirt|collegepaita|\bvest\b|\bcrop\b|"
-                         r"\bhaut\b|d[ée]bardeur|\bbody\b(?!\s?(?:lotion|oil|scrub|wash|cream|butter|mist|milk))")),
+                         # 'talon haut' = hoge hak, geen top
+                         r"(?<!talons )(?<!talon )\bhauts?\b|d[ée]bardeur|skjorte\w*|\btr[øo]je\w*|\bchemises?\b|"
+                         r"\bsweat\b|\bpolos?\b|bandeau|bustier|corset\w*|bodycon|"
+                         r"\bbody\b(?!\s?(?:lotion|oil|scrub|wash|cream|butter|mist|milk))")),
     ('shoes',     _bs_rx(r"\bshoes?\b|\bboots?\b|sneaker\w*|sandal\w*|\bheels?\b|loafer\w*|\bmules?\b|\w*sko\b|"
                          r"\w*st[øo]vle\w*|\w*keng[äa]t\b|\w*kenk[äa]\w*|saappaat|\w*nilkkuri\w*|lenkkari\w*|"
                          r"sandaalit|tennarit|chaussure\w*|\bbottes?\b|bottine\w*|\bbaskets?\b|espadrille\w*|"
                          r"ballerina\w*|\bpumps?\b|slipper\w*|hjemmesko|stiefel|\bschuh\w*|\bclogs?\b|"
-                         r"flip-?flops?|\bflats\b|\boxfords?\b|\bbrogues?\b")),
+                         r"flip-?flops?|\bflats\b|\boxfords?\b|\bbrogues?\b|\btalons?\b|escarpin\w*|"
+                         r"mocassin\w*|ballerine\w*")),
     ('accessory', _bs_rx(r"\bbags?\b|\btotes?\b|handbag\w*|\bsacs?\b|\w*taske\w*|\w*laukku\w*|\btas\b|\bbelts?\b|"
                          r"b[æa]lte\w*|ceinture\w*|\bvy[öo]\w*|\bscar(?:f|ves)\b|t[øo]rkl[æa]de\w*|[ée]charpe\w*|"
                          r"foulard\w*|\bhuivi\w*|\bsjaal\w*|\bhats?\b|\bhue\b|kasket\w*|chapeau\w*|\bbonnet\w*|"
@@ -10679,7 +10697,10 @@ _BS_POST_RULES = [
 # in elk geval kleding.
 _BS_GENERIC_CLOTHING_RE = _bs_rx(r"\bclothing\b|\bapparel\b|\bt[øo]j\b|damet[øo]j|v[êe]tements?\b|\bvaatteet\b|"
                                  r"\bvaate\b|\bkleding\b|\bmode\b|\bfashion\b|\bmuoti\b|\bnaisten\b|\bfemme\b|"
-                                 r"\bdame\b|\bdame-?mode\b|\bwomen'?s?\b|\bnew in\b|nyheder|nouveaut[ée]s|uutuudet")
+                                 r"\bdame\b|\bdame-?mode\b|\bwomen'?s?\b")
+# Merchandising-labels ('New In', 'Nyheder') zeggen alleen iets als ze het
+# product_TYPE zijn -- als tag maken ze een kaars geen kleding.
+_BS_MERCH_TYPE_RE = _bs_rx(r"\bnew in\b|nyheder|nouveaut[ée]s|uutuudet")
 
 
 def _bs_is_fashion(cat):
@@ -10719,7 +10740,7 @@ def _bs_category(title, ptype, tags=''):
     for cat, rx in _BS_POST_RULES:
         if rx.search(full):
             return cat
-    if _BS_GENERIC_CLOTHING_RE.search(full):
+    if _BS_GENERIC_CLOTHING_RE.search(f'{ptype} {title}') or (ptype and _BS_MERCH_TYPE_RE.search(ptype)):
         return 'clothing'
     return 'other'
 
@@ -10727,7 +10748,7 @@ def _bs_category(title, ptype, tags=''):
 _BS_JUNK_RE = re.compile(r'gift ?card|cadeaubon|e-?gift|lahjakortti|gavekort|presentkort|'
                          r'carte cadeau|ch[èe]que cadeau|bon cadeau|gift voucher|geschenkkarte|'
                          r'parcel protection|shipping protection|route package|package protection|'
-                         r'insurance|verzekering|priority processing|\bdonation\b|\btip\b', re.I)
+                         r'insurance|verzekering|priority processing|\bdonation\b|\btip (?:jar|for the team)', re.I)
 
 
 def _bs_host(domain):
@@ -10965,8 +10986,11 @@ def _bs_scan(host, limit=20):
     # hårelastik als 'other' gewoon mee als damesmode-bestseller (en als
     # 'nieuw te importeren'). Nu ziet de medewerker "7 niet-mode verborgen
     # (beauty 4, hosiery 3)" in plaats van een lijst vol junk.
-    non_fashion = [p for p in products if not _bs_is_fashion(p['category'])]
-    products = [p for p in products if _bs_is_fashion(p['category'])]
+    # Alleen BENOEMDE niet-mode weglaten. 'other' (onherkend) blijft staan:
+    # dropshippers noemen producten 'Livia' -- die wegfilteren maakte zo'n
+    # winkel bestseller-loos (review van #52, hersteld in #55).
+    non_fashion = [p for p in products if p['category'] in _BS_NON_FASHION_BUCKETS]
+    products = [p for p in products if p['category'] not in _BS_NON_FASHION_BUCKETS]
     dropped = Counter(p['category'] for p in non_fashion)
     by_cat = Counter(p['category'] for p in products)
     return {'ok': True, 'domain': host, 'url': url, 'count': len(products),
@@ -11416,15 +11440,54 @@ def _wtl_niche_fresh(n):
     return age < (_WTL_NICHE_TTL if definitive else _WTL_NICHE_TRANSIENT_TTL)
 
 
+_GD_HOST_RE = re.compile(r'^(?!-)[a-z0-9-]{1,63}(?:\.[a-z0-9-]{1,63})*\.[a-z]{2,24}$')
+_GD_MAX_BODY = 3 * 1024 * 1024
+
+
+def _public_host_ok(domain):
+    """Only a real public hostname: no IP literals, no localhost, and nothing
+    that resolves to a private / loopback / link-local address. The candidate
+    domains come from Google results and from an OPEN endpoint, so without
+    this the droplet could be pointed at 169.254.169.254 or 127.0.0.1."""
+    d = (domain or '').strip().lower().rstrip('.')
+    if not d or not _GD_HOST_RE.match(d) or d == 'localhost' or d.endswith('.localhost'):
+        return False
+    try:
+        import ipaddress
+        import socket
+        for info in socket.getaddrinfo(d, 443, proto=socket.IPPROTO_TCP):
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                return False
+    except Exception:
+        return False        # onoplosbaar = niet bereikbaar = geen winkel
+    return True
+
+
 def _gd_products_sample(domain, limit=_WTL_NICHE_SAMPLE, timeout=12):
     """One public products.json call. Returns (products|None, http_status, error).
-    products is a list when the host is a Shopify store that answered 200."""
+    products is a list when the host is a Shopify store that answered 200.
+    Refuses private/invalid hosts, a redirect to another host, and bodies
+    over _GD_MAX_BODY."""
+    if not _public_host_ok(domain):
+        return None, 404, 'invalid or private host'
     try:
         r = _scrape_get(f'https://{domain}/products.json?limit={int(limit)}', timeout=timeout)
     except Exception as e:
         return None, 0, str(e)[:60]
     if r.status_code != 200:
         return None, r.status_code, f'HTTP {r.status_code}'
+    try:
+        final = re.match(r'https?://(?:www\.)?([^/:?#]+)', str(getattr(r, 'url', '') or '')).group(1).lower()
+        if final and final != domain.lower().replace('www.', ''):
+            return None, 404, f'redirected to {final[:60]}'
+    except Exception:
+        pass
+    try:
+        if len(r.content or b'') > _GD_MAX_BODY:
+            return None, 200, 'body too large'
+    except Exception:
+        pass
     try:
         data = r.json() or {}
     except Exception:
@@ -11435,28 +11498,44 @@ def _gd_products_sample(domain, limit=_WTL_NICHE_SAMPLE, timeout=12):
     return (prods if isinstance(prods, list) else []), 200, None
 
 
+# Sportkleding IS kleding (een golfrok blijft een rok in een modewinkel), maar
+# een winkel die er vol mee staat is geen bron voor Vionna. Gemeten op
+# store-niveau, niet per product.
+_BS_ACTIVEWEAR_RE = _bs_rx(r"\b(?:yoga|gym|golf\w*|tennis|padel|running|jogging|training|workout|fitness|"
+                           r"cycling|cykel\w*|ski|dri-?fit|compression|seamless|sports?|sportswear|activewear|"
+                           r"l[øo]be\w*|tr[æa]nings\w*|treeni\w*|urheilu\w*|juoksu\w*|hiihto\w*|"
+                           r"sportif|sportive|fitness)\b")
+
+
 def _niche_profile(products):
-    """Bucket counts + fashion/clothing shares for a product sample."""
+    """Bucket counts + fashion/clothing/activewear shares for a product sample."""
     from collections import Counter
     counts = Counter()
+    activewear = 0
     for p in products or []:
         if not isinstance(p, dict):
             continue
         tags = p.get('tags')
         tags = ' '.join(str(t) for t in tags) if isinstance(tags, list) else str(tags or '')
-        counts[_bs_category(p.get('title') or '', p.get('product_type') or '', tags)] += 1
+        cat = _bs_category(p.get('title') or '', p.get('product_type') or '', tags)
+        counts[cat] += 1
+        if _bs_is_clothing(cat) and _BS_ACTIVEWEAR_RE.search(f"{p.get('product_type') or ''} {p.get('title') or ''}"):
+            activewear += 1
     total = sum(counts.values())
     fashion = sum(v for k, v in counts.items() if _bs_is_fashion(k))
     clothing = sum(v for k, v in counts.items() if _bs_is_clothing(k))
-    return {'total': total, 'fashion': fashion, 'clothing': clothing,
+    return {'total': total, 'fashion': fashion, 'clothing': clothing, 'activewear': activewear,
             'buckets': dict(counts.most_common()),
             'fashion_share': round(fashion / total, 2) if total else 0.0,
-            'clothing_share': round(clothing / total, 2) if total else 0.0}
+            'clothing_share': round(clothing / total, 2) if total else 0.0,
+            'activewear_share': round(activewear / total, 2) if total else 0.0}
 
 
 def _niche_kind_from_profile(profile):
     """Best label for a NON-fashion store, from its biggest bucket."""
     buckets = profile.get('buckets') or {}
+    if float(profile.get('activewear_share') or 0) >= 0.4:
+        return 'sport'
     non = [(k, v) for k, v in buckets.items() if not _bs_is_fashion(k)]
     if not non:
         # Wel mode, geen kleding: een sieraden- of schoenenwinkel.
@@ -11467,7 +11546,7 @@ def _niche_kind_from_profile(profile):
     top = max(non, key=lambda kv: kv[1])[0]
     return {'men': 'menswear', 'kids': 'kids', 'beauty': 'beauty', 'home': 'home', 'sport': 'sport',
             'tech': 'electronics', 'pet': 'pet', 'food': 'food', 'hosiery': 'other',
-            'bundle': 'other', 'other': 'general'}.get(top, 'other')
+            'bundle': 'other', 'craft': 'other', 'other': 'general'}.get(top, 'other')
 
 
 def _niche_verdict(profile):
@@ -11479,6 +11558,9 @@ def _niche_verdict(profile):
         # Lege lijst = wachtwoordpagina, nieuwe winkel of storing -- geen oordeel.
         return 'unknown', 'empty catalogue (locked or brand-new store?)'
     fs, cs = float(profile.get('fashion_share') or 0), float(profile.get('clothing_share') or 0)
+    aw = float(profile.get('activewear_share') or 0)
+    if aw >= 0.4:
+        return 'no', f'{round(aw * 100)}% activewear (sport store)'
     other = int((profile.get('buckets') or {}).get('other') or 0) / n
     if other >= 0.5:
         # Naam-titels zonder type/tags ('Livia', 'Maeve') zeggen niets -- dat is
@@ -15205,7 +15287,7 @@ NANO_BANANA_PROMPTS_BAGS = {
          "model, background and styling identical to IMAGE 1, but use a different pose and "
          "carry angle than in IMAGE 1."),
     13: ("I've uploaded reference images with TWO different roles:\n"
-         "- IMAGE 1: our model with the {product_type} (same setting and lighting).\n"
+         "- IMAGE 1: our styled product shot of the {product_type} — reuse its surface, setting and lighting.\n"
          "- IMAGES 2+: competitor colour references — EXACT colour ground truth.\n\n"
          "Task: generate a styled PRODUCT SHOT of the {product_type} standing alone on an "
          "elegant surface in the same setting — three-quarter front angle, silhouette, straps "
@@ -15283,7 +15365,7 @@ NANO_BANANA_PROMPTS_ACCESSORY = {
          "reference photos, not your prior idea of '{color}'. Keep our model, background and "
          "styling identical to IMAGE 1, but use a different pose and angle than in IMAGE 1."),
     13: ("I've uploaded reference images with TWO different roles:\n"
-         "- IMAGE 1: our model wearing the {product_type} (same setting and lighting).\n"
+         "- IMAGE 1: our styled product shot of the {product_type} — reuse its surface, setting and lighting.\n"
          "- IMAGES 2+: competitor colour references — EXACT colourway / finish ground truth.\n\n"
          "Task: generate a styled PRODUCT SHOT of the {product_type} on its own, displayed on "
          "an elegant surface in the same setting — three-quarter angle, full shape, "
@@ -15330,9 +15412,23 @@ def _nb_re(word=(), sub=()):
 
 
 _NB_NOISE_RE = re.compile(
-    r'cap[- ]?sleeves?|cap[- ]?toe|scarf[- ]?print|jewel[- ]?neck(?:line)?'
+    r'cap[- ]?sleeves?|cap[- ]?toe|toe[- ]?caps?|cap[- ]?details?|scarf[- ]?(?:print|neck|tie|collar|hem|details?)'
+    r'|jewel[- ]?neck(?:line)?|col[- ]bijou|encolure[- ]bijou'
+    r'|(?:ketting|chain|hat|scarf|sjaal|foulard)[- ]?(?:print|motif|m[øo]nster|kuvio)'
+    r'|(?:k[æa]de|chain)[- ]?(?:details?|detalje)'
+    r'|(?:tie|self[- ]tie|with|detachable|removable|matching)[- ]belts?|belt[- ]?(?:details?|loops?)'
     r'|\b(?:o|d|double|toe)[- ]rings?|ring[- ]?(?:details?|handles?|spun|buckles?)'
     r'|chain[- ]?(?:details?|straps?)|bootcut|baggy|skorts?'
+)
+# Een kledingwoord wint van een accessoirewoord ('robe ceinturée' is een jurk,
+# 'jumper with scarf' een trui) -- behalve bij samengestelde tassen (eerder
+# beslist) en schoenen ('dress shoes').
+_NB_GARMENT_RE = _nb_re(
+    word=(r'dress(?:es)?', r'kjole\w*', r'robes?', r'mekko\w*', r'jurk\w*', r'kleid\w*', r'blouses?', r'bluse\w*',
+          r'pusero\w*', r'tops?', r'shirts?', r't-?shirts?', r'skirts?', r'nederdel\w*', r'jupes?', r'hame', r'trousers?',
+          r'pants', r'jeans', r'bukser', r'pantalons?', r'housut', r'jackets?', r'jakke\w*', r'veste', r'takki', r'coats?',
+          r'frakke\w*', r'manteau\w*', r'blazers?', r'cardigans?', r'sweaters?', r'jumpers?', r'strik\w*', r'neule\w*',
+          r'pulls?', r'jumpsuits?', r'bikinis?', r'swimsuits?', r'hoodies?', r'sweatshirts?'),
 )
 _NB_BAG_OVERRIDE_RE = _nb_re(
     word=('belt[- ]?bags?', 'bum[- ]?bags?', 'fanny[- ]?packs?', 'sac[- ]ceinture', 'sac[- ]banane'),
@@ -15460,6 +15556,15 @@ def _nb_kind_of(pt):
 
 
 def _nb_category(product_type):
+    pt = _nb_normalise(product_type)
+    if _NB_BAG_OVERRIDE_RE.search(pt):
+        return 'bag'
+    if _NB_GARMENT_RE.search(pt) and _nb_kind_of(pt):
+        return 'shoes' if _NB_SHOES_RE.search(pt) else 'garment'
+    return _nb_category_inner(product_type)
+
+
+def _nb_category_inner(product_type):
     """'accessory' | 'bag' | 'shoes' | 'garment' voor een vrije product_type-string
     (EN/DK/FR/FI/NL/DE). Zie het blok hierboven voor de matching-regels."""
     pt = _nb_normalise(product_type)

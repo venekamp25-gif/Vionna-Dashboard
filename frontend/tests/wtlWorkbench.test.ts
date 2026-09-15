@@ -38,6 +38,13 @@ test("non-fashion stores are hidden only when PROVEN, never when unchecked", () 
   assert.match(api, /niche: WtlNiche \| null;/);
 });
 
+test("job pollers give up on a job the server no longer knows, and a stale stores load never overwrites a newer one", () => {
+  // discover, niche and classify each stop after 5 consecutive misses
+  assert.equal((wb.match(/Lost contact with the job/g) ?? []).length, 3);
+  assert.match(wb, /const seq = \+\+loadSeq\.current/);
+  assert.match(wb, /if \(seq !== loadSeq\.current\) return;/);
+});
+
 test("scan header names the non-fashion items the scan left out", () => {
   assert.match(wb, /scan\.dropped && Object\.keys\(scan\.dropped\)\.length > 0/);
   assert.match(api, /dropped\?: Record<string, number>;/);

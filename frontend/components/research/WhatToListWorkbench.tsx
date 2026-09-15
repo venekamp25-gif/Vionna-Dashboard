@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, DiscoverLive, WtlStore, WtlStoresResponse } from "@/lib/api";
 import { StoreKey, STORE_CONFIG, STORE_KEYS } from "@/lib/store";
 import { Button } from "@/components/ui/Button";
@@ -192,7 +192,11 @@ export function WhatToListWorkbench() {
   /** Haalt de gekozen markten op en voegt ze samen op domein. Dezelfde winkel
    *  kan in meerdere landen bestaan met eigen lokale bezoekersaantallen; we
    *  tonen 'm één keer, op zijn STERKSTE markt, met de andere als chip. */
+  // Overlapping loads (a background refresh racing a click) must not let an
+  // OLDER response overwrite a newer one: only the latest call may commit.
+  const loadSeq = useRef(0);
   const loadStores = useCallback(async (markets: StoreKey[], opts?: { quiet?: boolean }) => {
+    const seq = ++loadSeq.current;
     // quiet = background refresh (a discovery run just added a store): keep the
     // list on screen instead of flashing it to "Loading stores…" every poll.
     if (!opts?.quiet) setStoresLoading(true);
@@ -205,6 +209,7 @@ export function WhatToListWorkbench() {
             .catch(() => null)
         )
       );
+      if (seq !== loadSeq.current) return; // a newer load is in flight or done
       const ok = per.filter(Boolean) as { m: StoreKey; r: WtlStoresResponse }[];
       if (ok.length === 0) {
         setWtlStores(null);
@@ -337,11 +342,20 @@ export function WhatToListWorkbench() {
       let summary = "";
       let status = "";
       let finished = false;
+      let misses = 0;
       for (let i = 0; i < 400; i++) {
         await new Promise((r) => setTimeout(r, 3000));
         const j = await api.metaJobStatus(start.job_id).catch(() => null);
-        if (j && j.status !== "running") {
-          summary = j.summary || "";
+        if (!j) {
+          if (++misses >= 5) {
+            setClassifyMsg("⚠ Lost contact with the job (server restarted?) — press Verify again");
+            return;
+          }
+          continue;
+        }
+        misses = 0;
+        if (j.status !== "running") {
+          summary = j.summary || j.errors?.[0] || "";
           status = j.status || "";
           finished = true;
           break;
@@ -387,10 +401,20 @@ export function WhatToListWorkbench() {
       let lastAdded = 0;
       // Up to 40 min (the dropship gate is ~1 min per found store, 4 in
       // parallel). Poll every 2.5 s; the list below fills as rows arrive.
+      let misses = 0;
       for (let i = 0; i < 960; i++) {
         await new Promise((r) => setTimeout(r, 2500));
         const j = await api.metaJobStatus(start.job_id).catch(() => null);
-        if (!j) continue;
+        if (!j) {
+          // A blip is fine; a job the server no longer knows (restart) is not —
+          // don't sit on "Discovering…" for 40 minutes.
+          if (++misses >= 5) {
+            setDiscoverMsg("⚠ Lost contact with the job (server restarted?) — press Discover again");
+            return;
+          }
+          continue;
+        }
+        misses = 0;
         if (j.live) setDiscoverLive(j.live);
         setDiscoverPhase(j.phase ?? null);
         const added = (j.live?.found ?? []).filter((r) => r.status.startsWith("added")).length;
@@ -434,10 +458,19 @@ export function WhatToListWorkbench() {
       let summary = "";
       let finished = false;
       let failed = false;
+      let misses = 0;
       for (let i = 0; i < 240; i++) {
         await new Promise((r) => setTimeout(r, 2500));
         const j = await api.metaJobStatus(start.job_id).catch(() => null);
-        if (j && j.status !== "running") {
+        if (!j) {
+          if (++misses >= 5) {
+            setNicheMsg("⚠ Lost contact with the job (server restarted?) — press Check niche again");
+            return;
+          }
+          continue;
+        }
+        misses = 0;
+        if (j.status !== "running") {
           summary = j.summary || j.errors?.[0] || "";
           finished = true;
           failed = j.status === "error";
