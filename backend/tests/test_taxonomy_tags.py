@@ -755,3 +755,57 @@ def test_backfill_route_is_gated_and_status_is_open(monkeypatch, tmp_path):
     assert 'redacted' not in full
     assert full['sample'] == [{'family': 'Zoé', 'tags': ['cat:dress']}]
     assert full['daily_fill']['fill']['failed_families'] == ['k']
+
+
+# ── v1.301: daily loop unlocks on live evidence, new-arrivals repoint is automatic ──
+
+def test_live_backfill_done_accepts_live_tx_evidence(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, 'TAXONOMY_BACKFILL_STATE_PATH', str(tmp_path / 'absent.json'))
+    monkeypatch.setattr(server, 'tokens', {'dk': {}, 'fr': {}, 'fi': {}})
+    counts = {'dk': 0, 'fr': 0, 'fi': 0}
+    monkeypatch.setattr(server, '_taxonomy_count_tx_active', lambda store: counts[store])
+    assert server._taxonomy_live_backfill_done() is False
+    counts['fr'] = server.TAXONOMY_LIVE_MIN_TAGGED
+    assert server._taxonomy_live_backfill_done() is True
+    # a broken count on one store never blocks the others
+    def boom(store):
+        if store == 'dk':
+            raise RuntimeError('THROTTLED')
+        return counts[store]
+    monkeypatch.setattr(server, '_taxonomy_count_tx_active', boom)
+    assert server._taxonomy_live_backfill_done() is True
+
+
+def test_count_tx_active_uses_one_products_count_query(monkeypatch):
+    seen = []
+    monkeypatch.setattr(server, '_sib_gql', lambda store, q, v=None: seen.append(q) or {'c': {'count': 2693}})
+    assert server._taxonomy_count_tx_active('dk') == 2693
+    assert len(seen) == 1 and 'productsCount' in seen[0] and server.TX_TAG in seen[0] and 'status:active' in seen[0]
+
+
+def test_repoint_new_arrivals_only_above_min(monkeypatch):
+    calls = []
+    node = {'id': 'gid://shopify/Collection/1',
+            'ruleSet': {'rules': [{'column': 'VARIANT_PRICE', 'relation': 'GREATER_THAN', 'condition': '50'}]}}
+
+    def gql(store, query, variables=None):
+        calls.append(query)
+        if 'collectionByHandle' in query:
+            return {'collectionByHandle': node}
+        if 'collectionUpdate' in query:
+            return {'collectionUpdate': {'userErrors': []}}
+        return {}
+    monkeypatch.setattr(server, '_sib_gql', gql)
+    monkeypatch.setattr(server, '_taxonomy_count_new_active', lambda store: server.NEW_ARRIVALS_MIN - 1)
+    ent = server._taxonomy_repoint_new_arrivals('dk', dry_run=False)
+    assert ent['action'].startswith('left_price_rule') and not any('collectionUpdate' in q for q in calls)
+    monkeypatch.setattr(server, '_taxonomy_count_new_active', lambda store: server.NEW_ARRIVALS_MIN)
+    ent = server._taxonomy_repoint_new_arrivals('dk', dry_run=True)
+    assert ent['action'] == 'would_repoint_to_tag_new' and not any('collectionUpdate' in q for q in calls)
+    ent = server._taxonomy_repoint_new_arrivals('dk', dry_run=False)
+    assert ent['action'] == 'repointed_to_tag_new' and any('collectionUpdate' in q for q in calls)
+    # already repointed → no second write
+    node['ruleSet'] = {'rules': [{'column': 'TAG', 'relation': 'EQUALS', 'condition': server.NEW_TAG}]}
+    n = len(calls)
+    assert server._taxonomy_repoint_new_arrivals('dk', dry_run=False)['action'] == 'already_tag_new'
+    assert not any('collectionUpdate' in q for q in calls[n:])
