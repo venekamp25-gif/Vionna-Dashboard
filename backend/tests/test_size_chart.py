@@ -10,6 +10,8 @@ all — just a footer link ("Størrelsesguide") to a separate store page that
 holds the actual table. _linked_page_size_chart follows that link and reads
 the chart from the linked page instead.
 """
+import pytest
+
 import server
 
 
@@ -196,3 +198,114 @@ def test_element_is_hidden_does_not_over_match():
     assert not server._element_is_hidden('<div data-hidden="true">')
     # 'hidden' appearing only inside another attribute's value is not the attribute
     assert not server._element_is_hidden('<div data-target="hidden-panel">')
+
+
+# ---------------------------------------------------------------------------
+# Bug #58: a draft outlives the release that fixes its verdict.
+#
+# size_chart_status is decided once, at import, and then persisted with the draft
+# (localStorage + the server-side draft). A reader shipped afterwards never
+# reaches a draft that is already open, so the review step keeps offering
+# "Notify — we couldn't read this chart" for a page the current code has since
+# learned to read, or already knows has no chart at all. #58 was filed that way:
+# same monaco-mode.fr page as #57, 21 minutes after #57's fix went live.
+#
+# /api/size_chart_recheck re-asks the CURRENT code about the same page and hands
+# back the same three fields /api/scrape returns, so the stale verdict can be
+# replaced field for field.
+# ---------------------------------------------------------------------------
+
+STALE_DRAFT_URL = 'https://www.monaco-mode.fr/products/waleria-veste-en-cuir-silhouette-affinee'
+
+
+@pytest.fixture()
+def recheck_client(monkeypatch):
+    monkeypatch.setenv('DEV_LOCAL', '1')          # open the token gate for tests
+    monkeypatch.setattr(server, 'DROPLET_TOKEN_SECRET', '')
+    server.app.config['TESTING'] = True
+    with server.app.test_client() as c:
+        yield c
+
+
+def _serve(monkeypatch, html, status_code=200):
+    """Answer every competitor fetch the readers make with one page."""
+    monkeypatch.setattr(server, '_scrape_get',
+                        lambda url, timeout=10, **kw: _FakeResponse(status_code, html))
+
+
+def test_recheck_clears_a_stale_unread_verdict(recheck_client, monkeypatch):
+    """The reported page: the draft says 'unread', today's code says there is no
+    chart at all. Without this the employee keeps seeing a Notify button for a
+    chart that does not exist — which is how bug #58 got filed."""
+    _serve(monkeypatch, MONACO_HIDDEN_FOXKIT_BUTTON)
+
+    r = recheck_client.post('/api/size_chart_recheck', json={'url': STALE_DRAFT_URL})
+
+    assert r.status_code == 200
+    assert r.get_json() == {
+        'size_chart': None, 'size_chart_status': 'none', 'size_chart_hint': None,
+    }
+
+
+def test_recheck_hands_back_a_chart_the_old_import_could_not_read(recheck_client, monkeypatch):
+    """The other half: a reader added since the import now succeeds, so the draft
+    gets the real chart instead of a Notify button."""
+    _serve(monkeypatch, SIZE_GUIDE_PAGE_WITH_TABLE)
+
+    r = recheck_client.post('/api/size_chart_recheck', json={'url': STALE_DRAFT_URL})
+
+    body = r.get_json()
+    assert r.status_code == 200
+    assert body['size_chart_status'] == 'found'
+    assert body['size_chart_hint'] is None
+    assert body['size_chart']['headers'] == ['Size', 'Bust (cm)', 'Waist (cm)']
+
+
+def test_recheck_keeps_a_genuinely_unread_chart_unread(recheck_client, monkeypatch):
+    """The re-check must not become a way to lose a real signal: a trigger the
+    shopper can see, with no chart we can read, still reports 'unread'."""
+    _serve(monkeypatch, VISIBLE_SIZE_GUIDE_BUTTON)
+
+    r = recheck_client.post('/api/size_chart_recheck', json={'url': STALE_DRAFT_URL})
+
+    assert r.status_code == 200
+    assert r.get_json() == {
+        'size_chart': None,
+        'size_chart_status': 'unread',
+        'size_chart_hint': 'size-guide link/button',
+    }
+
+
+def test_recheck_rejects_a_url_that_is_not_http(recheck_client, monkeypatch):
+    def fail_scrape_get(*a, **kw):
+        raise AssertionError('must not fetch a non-http URL')
+
+    monkeypatch.setattr(server, '_scrape_get', fail_scrape_get)
+
+    r = recheck_client.post('/api/size_chart_recheck', json={'url': 'file:///etc/passwd'})
+
+    assert r.status_code == 400
+    assert 'error' in r.get_json()
+
+
+def test_recheck_reports_an_unreachable_store_instead_of_guessing_none(recheck_client, monkeypatch):
+    """A shop that is down must never be reported as 'no size chart' — the caller
+    keeps the draft's own verdict when the re-check fails."""
+    _serve(monkeypatch, '', status_code=503)
+
+    r = recheck_client.post('/api/size_chart_recheck', json={'url': STALE_DRAFT_URL})
+
+    assert r.status_code == 502
+    assert 'size_chart_status' not in r.get_json()
+
+
+def test_recheck_surfaces_a_connection_failure_as_502(recheck_client, monkeypatch):
+    def boom(*a, **kw):
+        raise server.req.exceptions.ConnectionError('name resolution failed')
+
+    monkeypatch.setattr(server, '_scrape_get', boom)
+
+    r = recheck_client.post('/api/size_chart_recheck', json={'url': STALE_DRAFT_URL})
+
+    assert r.status_code == 502
+    assert 'size_chart_status' not in r.get_json()

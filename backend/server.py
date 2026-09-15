@@ -3077,6 +3077,57 @@ def api_debug_extract_chart():
     return jsonify({**out, 'method': ('ocr' if c else None), 'chart': c})
 
 
+@app.route('/api/size_chart_recheck', methods=['POST'])
+@require_droplet_token
+def api_size_chart_recheck():
+    """Re-run the size-chart verdict for a draft that still carries an OLDER
+    import's answer.
+
+    A draft keeps `size_chart_status` from the moment it was scraped (it is
+    persisted to localStorage AND to the server-side draft), so a reader we ship
+    afterwards never reaches a draft that is already open: the review step keeps
+    offering "Notify — we can't read this chart" for a page the current code can
+    now read, or already knows has no chart at all. That is precisely how bug #58
+    was filed — against the same page as bug #57, whose false 'size-guide
+    link/button' hint had been fixed and deployed 21 minutes earlier.
+
+    Returns the three fields /api/scrape returns for this page TODAY, so the
+    caller can replace the stale verdict field for field. Deliberately runs the
+    same `_extract_size_chart_full` chain (OCR included) rather than a cheaper
+    subset: a verdict that differs from what a fresh import would say would just
+    trade one stale answer for another."""
+    payload = request.get_json(silent=True) or {}
+    url = _extract_first_url((payload.get('url') or '').strip())
+    if not url.lower().startswith(('http://', 'https://')):
+        return jsonify({'error': 'A competitor product URL is required.'}), 400
+    try:
+        r = _scrape_get(url, timeout=10)
+    except Exception as e:
+        return jsonify({
+            'error': f'Could not reach the store ({str(e)[:120]}). It may be down '
+                     f'or blocking us — try again in a bit.',
+        }), 502
+    if r.status_code != 200:
+        return jsonify({
+            'error': f'The store answered HTTP {r.status_code}, so the size chart '
+                     f'could not be re-checked.',
+        }), 502
+    html = r.text or ''
+    chart = None
+    try:
+        chart = _extract_size_chart_full(html, url)
+    except Exception as e:
+        # Same posture as the scrape itself: a reader that blows up must not cost
+        # the caller its verdict — it just means we didn't manage to read one.
+        print(f"[size-chart] recheck extraction failed: {e}")
+    hint = None if chart else _detect_size_chart_hint(html)
+    return jsonify({
+        'size_chart': chart,
+        'size_chart_status': 'found' if chart else ('unread' if hint else 'none'),
+        'size_chart_hint': hint,
+    })
+
+
 @app.route('/api/scrape', methods=['POST'])
 @require_droplet_token
 def scrape():
