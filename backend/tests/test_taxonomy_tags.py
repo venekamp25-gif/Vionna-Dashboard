@@ -145,8 +145,10 @@ def test_umbrella_seasons_are_derived():
     assert seasons_of('spring') == ['season:spring', 'season:ss']
     assert seasons_of('summer', 'spring') == ['season:spring', 'season:summer', 'season:ss']
     assert seasons_of('winter') == ['season:winter', 'season:aw']
-    assert seasons_of('spring', 'summer', 'autumn', 'winter') == [
-        'season:spring', 'season:summer', 'season:autumn', 'season:winter', 'season:ss', 'season:aw']
+    # at most SEASON_MAX (2) seasons survive, the model's first two (best first), emitted in allow-list order
+    assert seasons_of('spring', 'summer', 'autumn', 'winter') == ['season:spring', 'season:summer', 'season:ss']
+    assert seasons_of('winter', 'autumn', 'spring') == ['season:autumn', 'season:winter', 'season:aw']
+    assert seasons_of('summer', 'autumn') == ['season:summer', 'season:autumn', 'season:ss', 'season:aw']
     assert seasons_of() == []
     assert 'occ:party' in server._taxonomy_tags(_verdict(occasions='party, office'))
 
@@ -164,9 +166,12 @@ def test_length_only_with_visible_hemline_and_high_confidence():
     assert server._taxonomy_validate(_verdict(), has_image=False)['length'] is None
 
 
-def test_taxonomy_occasions_capped_at_three():
-    tags = server._taxonomy_tags(_verdict(occasions=['party', 'wedding', 'office', 'everyday', 'beach']))
-    assert len([t for t in tags if t.startswith('occ:')]) == 3
+def test_taxonomy_occasions_capped_at_two_best_first():
+    tags = server._taxonomy_tags(_verdict(occasions=['office', 'everyday', 'party', 'wedding', 'beach']))
+    occ = [t for t in tags if t.startswith('occ:')]
+    assert occ == ['occ:office', 'occ:everyday']          # the model's first two, allow-list order
+    tags = server._taxonomy_tags(_verdict(occasions=['everyday', 'party']))
+    assert [t for t in tags if t.startswith('occ:')] == ['occ:party', 'occ:everyday']
 
 
 # ── the Haiku call itself (fake anthropic module, no network) ────────────────

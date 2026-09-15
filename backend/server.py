@@ -4774,7 +4774,8 @@ SEASON_TAGS = ['spring', 'summer', 'autumn', 'winter']
 SEASON_SS = ('spring', 'summer')           # umbrella season:ss
 SEASON_AW = ('autumn', 'winter')           # umbrella season:aw
 OCCASION_TAGS = ['party', 'wedding', 'office', 'everyday', 'beach']
-OCCASION_MAX = 3
+OCCASION_MAX = 2                           # the 1-2 BEST-fitting occasions, not every possible one
+SEASON_MAX = 2                             # the 1-2 PRIMARY seasons; more makes seasonal collections meaningless
 LENGTH_TAGS = ['maxi', 'midi', 'mini']
 LENGTH_CATS = ('dress', 'skirt')           # len: only makes sense here
 PATTERN_TAGS = ['floral', 'striped', 'checked', 'dots', 'animal', 'plain', 'other']
@@ -4826,10 +4827,17 @@ def _taxonomy_prompt(title, description, category=None, has_image=False):
     return (
         "Classify this women's fashion product. Reply with ONE JSON object only, no prose.\n"
         "Step 1 - category: EXACTLY ONE of:\n" + _TAXONOMY_CATEGORY_BLOCK + known +
-        "Step 2 - sub: the construction/type from the list for THAT category, or null if none fits: " + subs + "\n"
-        "Step 3 - seasons: every season it suits, 1 to 4 of spring, summer, autumn, winter.\n"
-        "Step 4 - occasions: 0 to 3 of party (evening/festive/celebration), wedding (wedding-guest "
-        "appropriate), office (smart-casual/work), everyday (casual daily wear), beach (swim/holiday).\n"
+        "Step 2 - sub: the construction/type from the list for THAT category, or null if none clearly fits "
+        "(do NOT force a value: a regular dress without a special construction is null, not slip-dress): " + subs + "\n"
+        "Step 3 - seasons: the 1 or 2 seasons in which this item is PRIMARILY worn in Northern Europe "
+        "(Denmark, France, Finland), most important first. Rules of thumb: swimwear -> summer; puffers, "
+        "wool coats, thick knits -> winter (+autumn if lighter); light or sleeveless dresses, shorts, linen -> summer "
+        "(+spring); trench coats, light jackets, cardigans -> autumn, spring; year-round basics -> autumn, spring. "
+        "Never more than 2.\n"
+        "Step 4 - occasions: the 1 or 2 occasions that fit BEST (not every possible one), best first: party "
+        "(evening/cocktail/festive pieces: satin, sequins, elegant cuts), wedding (suitable for a wedding guest: elegant, "
+        "not casual), office (smart, business-appropriate), everyday (genuinely casual daily wear: denim, basic knit, "
+        "casual dresses), beach (swimwear, cover-ups, holiday wear).\n"
         + photo +
         "Step 6 - pattern: the dominant print, one of floral, striped, checked, dots, animal, plain, other.\n"
         'JSON shape: {"category":"...","sub":"...","seasons":["..."],"occasions":["..."],'
@@ -4862,10 +4870,12 @@ def _taxonomy_validate(obj, category=None, has_image=None):
 
     sub = _slug(obj.get('sub'))
     sub = sub if sub in SUB_TAGS_BY_CAT.get(cat, []) else None
-    given_s = set(_list(obj.get('seasons')))
-    seasons = [s for s in SEASON_TAGS if s in given_s]
-    given_o = _list(obj.get('occasions'))
-    occasions = [o for o in OCCASION_TAGS if o in given_o][:OCCASION_MAX]
+    # keep the first SEASON_MAX / OCCASION_MAX valid values in the MODEL's order (best first),
+    # then emit them in allow-list order so the tag list is stable
+    keep_s = list(dict.fromkeys(s for s in _list(obj.get('seasons')) if s in SEASON_TAGS))[:SEASON_MAX]
+    seasons = [s for s in SEASON_TAGS if s in keep_s]
+    keep_o = list(dict.fromkeys(o for o in _list(obj.get('occasions')) if o in OCCASION_TAGS))[:OCCASION_MAX]
+    occasions = [o for o in OCCASION_TAGS if o in keep_o]
     conf = str(obj.get('length_confidence') or '').strip().lower()
     conf = conf if conf in ('high', 'medium', 'low') else 'low'
     hem = bool(obj.get('hemline_visible'))
