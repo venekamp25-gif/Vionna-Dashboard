@@ -222,6 +222,7 @@ def _run_backup():
                       'blog_performance.jsonl', 'blog_views.json', 'blog_playbook.json',
                       'bs_snapshots.jsonl', 'known_sources.json', 'blocked_sources.json',
                       'wtl_verdicts.json', 'wtl_traffic.json', 'size_chart_fill.json',
+                      'taxonomy_backfill.json', 'taxonomy_fill.json',
                       'wtl_store_marks.json', 'wtl_extra_stores.json',
                       'wtl_discover_seen.json', 'wtl_discover_state.json'):
             src = os.path.join(_BASE_DIR, fname)
@@ -4760,52 +4761,314 @@ def _classify_category(title, description, taxonomy=''):
     return None, None
 
 
-def _classify_category_llm(title, description):
-    """LLM-classify one product → canonical category (or None), reading the
-    description. Used at import time. Returns None on any failure so the caller
-    can fall back to the deterministic classifier."""
+# ── Taxonomy tags v1 (season / occasion / length / sub-type / pattern / new) ──
+# ONE classification per colour FAMILY (normalised title), written as tags to
+# every colour product in all three stores. Strict allow-lists: an unknown value
+# is dropped, never invented. Tags are additive to cat:<x>; nothing here ever
+# touches cat:, sib* or the FR legacy tags. Smart collections use TAG EQUALS.
+TAXONOMY_VERSION = 1                       # bump when prompt/vocab changes materially
+TX_TAG = 'tx:%d' % TAXONOMY_VERSION        # marker "classified by taxonomy v<n>"
+NEW_TAG = 'new'                            # set at publish, expired after NEW_TAG_DAYS
+NEW_TAG_DAYS = 45
+SEASON_TAGS = ['spring', 'summer', 'autumn', 'winter']
+SEASON_SS = ('spring', 'summer')           # umbrella season:ss
+SEASON_AW = ('autumn', 'winter')           # umbrella season:aw
+OCCASION_TAGS = ['party', 'wedding', 'office', 'everyday', 'beach']
+OCCASION_MAX = 3
+LENGTH_TAGS = ['maxi', 'midi', 'mini']
+LENGTH_CATS = ('dress', 'skirt')           # len: only makes sense here
+PATTERN_TAGS = ['floral', 'striped', 'checked', 'dots', 'animal', 'plain', 'other']
+SUB_TAGS_BY_CAT = {
+    'dress':     ['knit-dress', 'shirt-dress', 'wrap-dress', 'slip-dress', 'jumpsuit', 'co-ord'],
+    'outerwear': ['coat', 'jacket', 'blazer', 'trench', 'puffer', 'teddy', 'denim-jacket', 'vest', 'leather-look'],
+    'knitwear':  ['sweater', 'cardigan', 'turtleneck', 'knit-vest', 'hoodie'],
+    'top':       ['blouse', 'shirt', 't-shirt', 'tank', 'tunic', 'bodysuit'],
+    'pants':     ['trousers', 'jeans', 'wide-leg', 'leggings', 'shorts', 'culottes'],
+    'skirt':     ['skirt', 'shorts'],
+    'shoes':     ['boots', 'sneakers', 'sandals', 'heels', 'loafers', 'flats'],
+    'accessory': ['bag', 'jewellery', 'scarf', 'belt', 'hat', 'sunglasses'],
+    'swim':      ['bikini', 'swimsuit', 'cover-up'],
+}
+# tag prefixes this module OWNS (may remove a conflicting old value); cat: is not ours
+TAXONOMY_DIMENSIONS = ('season', 'occ', 'len', 'sub', 'pat', 'tx')
+
+_TAXONOMY_CATEGORY_BLOCK = (
+    "- dress (also jumpsuits, playsuits, matching co-ord SETS)\n"
+    "- knitwear (sweaters, cardigans, hoodies, sweatshirts, knitted jumpers, ponchos)\n"
+    "- top (blouses, shirts, t-shirts, tanks, camisoles, tunics, bodysuits)\n"
+    "- pants (trousers, jeans, leggings, chinos)\n"
+    "- skirt (skirts, shorts)\n"
+    "- outerwear (coats, jackets, blazers, parkas, gilets, suit jackets)\n"
+    "- accessory (jewellery, bags, belts, scarves, hats, sunglasses, gloves)\n"
+    "- shoes (any footwear)\n"
+    "- swim (swimwear, bikinis, swimsuits, beach cover-ups)\n"
+    "- none (lingerie, homeware, non-products, or anything that fits none)\n"
+)
+
+
+def _taxonomy_enabled():
+    """Env kill switch TAXONOMY_TAGS=0 → publish emits only cat:<x> (today's list)."""
+    return os.getenv('TAXONOMY_TAGS', '1') != '0'
+
+
+def _taxonomy_prompt(title, description, category=None, has_image=False):
+    subs = '; '.join('%s: %s' % (c, ', '.join(v)) for c, v in SUB_TAGS_BY_CAT.items())
+    known = (f"The category is already known: {category}. Use exactly that category.\n"
+             if category in CATEGORY_TAGS else '')
+    if has_image:
+        photo = ("Step 5 - length (dresses and skirts only): maxi, midi or mini. Judge this ONLY from the "
+                 "product PHOTO, from where the hemline sits on the body — never from the text. "
+                 "hemline_visible must be true only when the hemline is actually visible in the photo; "
+                 "length_confidence is high only when the photo leaves no doubt.\n")
+    else:
+        photo = ("Step 5 - length: no photo is provided, so set length to null, hemline_visible to false "
+                 "and length_confidence to low.\n")
+    return (
+        "Classify this women's fashion product. Reply with ONE JSON object only, no prose.\n"
+        "Step 1 - category: EXACTLY ONE of:\n" + _TAXONOMY_CATEGORY_BLOCK + known +
+        "Step 2 - sub: the construction/type from the list for THAT category, or null if none fits: " + subs + "\n"
+        "Step 3 - seasons: every season it suits, 1 to 4 of spring, summer, autumn, winter.\n"
+        "Step 4 - occasions: 0 to 3 of party (evening/festive/celebration), wedding (wedding-guest "
+        "appropriate), office (smart-casual/work), everyday (casual daily wear), beach (swim/holiday).\n"
+        + photo +
+        "Step 6 - pattern: the dominant print, one of floral, striped, checked, dots, animal, plain, other.\n"
+        'JSON shape: {"category":"...","sub":"...","seasons":["..."],"occasions":["..."],'
+        '"length":"maxi|midi|mini|null","hemline_visible":false,"length_confidence":"high|medium|low",'
+        '"pattern":"..."}\n\n'
+        f"Title: {title}\nDescription: {(description or '')[:900]}\n\nJSON:"
+    )
+
+
+def _taxonomy_validate(obj, category=None, has_image=None):
+    """Strict validation of a classification dict against the allow-lists.
+    Invalid values are dropped (never invented). `category` (when valid) overrides
+    the model's category so the tags never disagree with the cat:<x> the publish
+    flow already resolved; `sub` is then re-checked against it. `has_image=False`
+    forces the length gate shut (text alone is no verification). Returns the
+    cleaned dict or None when there is no usable category."""
+    if not isinstance(obj, dict):
+        return None
+    cat = category if category in CATEGORY_TAGS else str(obj.get('category') or '').strip().lower()
+    if cat not in CATEGORY_TAGS:
+        return None
+
+    def _slug(v):
+        return re.sub(r'[\s_]+', '-', str(v or '').strip().lower())
+
+    def _list(v):
+        if isinstance(v, str):
+            v = re.split(r'[,\s/|]+', v)
+        return [_slug(x) for x in (v or []) if str(x or '').strip()] if isinstance(v, (list, tuple)) else []
+
+    sub = _slug(obj.get('sub'))
+    sub = sub if sub in SUB_TAGS_BY_CAT.get(cat, []) else None
+    given_s = set(_list(obj.get('seasons')))
+    seasons = [s for s in SEASON_TAGS if s in given_s]
+    given_o = _list(obj.get('occasions'))
+    occasions = [o for o in OCCASION_TAGS if o in given_o][:OCCASION_MAX]
+    conf = str(obj.get('length_confidence') or '').strip().lower()
+    conf = conf if conf in ('high', 'medium', 'low') else 'low'
+    hem = bool(obj.get('hemline_visible'))
+    if has_image is False:
+        hem = False
+    length = _slug(obj.get('length'))
+    if not (length in LENGTH_TAGS and cat in LENGTH_CATS and hem and conf == 'high'):
+        length = None
+    pat = _slug(obj.get('pattern'))
+    pat = pat if pat in PATTERN_TAGS else None
+    return {'category': cat, 'sub': sub, 'seasons': seasons, 'occasions': occasions,
+            'length': length, 'length_confidence': conf, 'hemline_visible': hem, 'pattern': pat}
+
+
+def _classify_taxonomy_llm(title, description, image_url=None, category=None):
+    """LLM-classify one product FAMILY → {category, sub, seasons, occasions, length,
+    length_confidence, hemline_visible, pattern} or None on any failure (the caller
+    falls back to plain cat:). One Haiku call; when `image_url` is given it is sent
+    as an image block BEFORE the text so the hemline verdict comes from the photo.
+    Every field is validated against the allow-lists (_taxonomy_validate)."""
     if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
         return None
+    has_image = bool(image_url and str(image_url).lower().startswith(('http://', 'https://')))
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        prompt = (
-            "Classify this women's fashion product into EXACTLY ONE category. "
-            "Reply with ONLY the category word, nothing else.\n"
-            "Categories:\n"
-            "- dress (also jumpsuits, playsuits, matching co-ord SETS)\n"
-            "- knitwear (sweaters, cardigans, hoodies, sweatshirts, knitted jumpers, ponchos)\n"
-            "- top (blouses, shirts, t-shirts, tanks, camisoles, tunics, bodysuits)\n"
-            "- pants (trousers, jeans, leggings, chinos)\n"
-            "- skirt (skirts, shorts)\n"
-            "- outerwear (coats, jackets, blazers, parkas, gilets, suit jackets)\n"
-            "- accessory (jewellery, bags, belts, scarves, hats, sunglasses, gloves)\n"
-            "- shoes (any footwear)\n"
-            "- swim (swimwear, bikinis, swimsuits, beach cover-ups)\n"
-            "- none (lingerie, homeware, non-products, or anything that fits none)\n\n"
-            f"Title: {title}\nDescription: {(description or '')[:900]}\n\nCategory:"
-        )
-        msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=8,
-                                     messages=[{'role': 'user', 'content': prompt}])
-        out = (msg.content[0].text if msg.content else '') or ''
-        out = re.sub(r'[^a-z]', '', out.strip().lower())
-        return out if out in CATEGORY_TAGS else None
+
+        def _ask(with_image):
+            prompt = _taxonomy_prompt(title, description, category=category, has_image=with_image)
+            if with_image:
+                content = [{'type': 'image', 'source': {'type': 'url', 'url': image_url}},
+                           {'type': 'text', 'text': prompt}]
+            else:
+                content = prompt
+            msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=140,
+                                         messages=[{'role': 'user', 'content': content}])
+            return (msg.content[0].text if msg.content else '') or ''
+
+        try:
+            out = _ask(has_image)
+        except Exception as e:
+            if not has_image:
+                raise
+            # The API fetches the URL itself; competitor/Higgsfield URLs expire or
+            # hotlink-block and oversized images are refused (400). A text-only
+            # verdict still beats the deterministic keyword fallback, so retry
+            # once without the photo — the length gate then stays shut.
+            print(f"[taxonomy] image rejected for '{title}' ({str(e)[:80]}), retrying text-only")
+            has_image = False
+            out = _ask(False)
+        obj = _taxonomy_extract_json(out)
+        if obj is None:
+            print(f"[taxonomy] no JSON in reply for '{title}': {out[:80]!r}")
+            return None
+        res = _taxonomy_validate(obj, category=category, has_image=has_image)
+        if not res:
+            print(f"[taxonomy] no usable category for '{title}': {out[:80]!r}")
+        return res
     except Exception as e:
-        print(f"[categorize] LLM classify failed: {e}")
+        print(f"[taxonomy] LLM classify failed for '{title}': {e}")
         return None
 
 
-def _category_for_publish(data, title):
+def _taxonomy_extract_json(text):
+    """First JSON object in a model reply → dict, else None. Greedy span first
+    (nested braces), then the shortest span in case the model echoed a second
+    brace pair (e.g. the JSON shape from the prompt) after the real answer."""
+    text = text or ''
+    for pattern in (r'\{.*\}', r'\{.*?\}'):
+        m = re.search(pattern, text, re.S)
+        if not m:
+            return None
+        try:
+            obj = json.loads(m.group(0))
+        except (ValueError, TypeError):
+            continue
+        return obj if isinstance(obj, dict) else None
+    return None
+
+
+def _classify_category_llm(title, description):
+    """LLM-classify one product → canonical category (or None). Thin wrapper over
+    the taxonomy classifier so the category wording stays identical; returns None
+    on any failure so the caller can fall back to the deterministic classifier."""
+    res = _classify_taxonomy_llm(title, description)
+    return res.get('category') if res else None
+
+
+# Family memo: the three stores publish the same family (same title) in sequence,
+# colour after colour. One verdict per family keeps the tags identical across
+# colours AND stores, and saves 14 of every 15 Haiku calls.
+_TAXONOMY_MEMO = {}
+_TAXONOMY_MEMO_TTL = 6 * 3600
+_TAXONOMY_MEMO_LOCK = threading.Lock()
+
+
+def _taxonomy_for_family(title, description, image_url=None, category=None):
+    """Memoised classification keyed on _norm_name(title) (TTL 6 h). Only a
+    successful verdict is memoised, so a transient failure is retried on the next
+    colour instead of poisoning the whole family."""
+    key = _norm_name(title)
+    now = time.time()
+    if key:
+        with _TAXONOMY_MEMO_LOCK:
+            hit = _TAXONOMY_MEMO.get(key)
+        if hit and now - hit[1] < _TAXONOMY_MEMO_TTL:
+            return hit[0]
+    res = _classify_taxonomy_llm(title, description, image_url=image_url, category=category)
+    if res and key:
+        with _TAXONOMY_MEMO_LOCK:
+            _TAXONOMY_MEMO[key] = (res, now)
+    return res
+
+
+def _taxonomy_tags(result, category=None):
+    """Classification dict → tags in a stable order:
+    ['cat:x', 'sub:y', 'season:a', ..., 'season:ss', 'season:aw', 'occ:..', 'len:..',
+     'pat:..', 'tx:1']. Re-validates, so a raw dict yields only allowed values.
+    [] when there is no usable category."""
+    res = _taxonomy_validate(result, category=category)
+    if not res:
+        return []
+    tags = ['cat:%s' % res['category']]
+    if res['sub']:
+        tags.append('sub:%s' % res['sub'])
+    tags += ['season:%s' % s for s in res['seasons']]
+    if any(s in SEASON_SS for s in res['seasons']):
+        tags.append('season:ss')
+    if any(s in SEASON_AW for s in res['seasons']):
+        tags.append('season:aw')
+    tags += ['occ:%s' % o for o in res['occasions']]
+    if res['length']:
+        tags.append('len:%s' % res['length'])
+    if res['pattern']:
+        tags.append('pat:%s' % res['pattern'])
+    tags.append(TX_TAG)
+    return tags
+
+
+def _first_image_url(images):
+    """First http(s) URL out of a publish image list (strings or {'src'|'url'} dicts)."""
+    for im in images or []:
+        u = (im.get('src') or im.get('url') or '') if isinstance(im, dict) else im
+        u = str(u or '').strip()
+        if u.lower().startswith(('http://', 'https://')):
+            return u
+    return None
+
+
+def _taxonomy_source_description(data):
+    """DK description when the payload carries one, else this store's description."""
+    for k in ('description_dk', 'dk_description'):
+        v = data.get(k)
+        if isinstance(v, str) and v.strip():
+            return v
+    d = data.get('descriptions')
+    if isinstance(d, dict) and isinstance(d.get('dk'), str) and d['dk'].strip():
+        return d['dk']
+    return data.get('description', '') or ''
+
+
+def _category_for_publish(data, title, image_url=None):
     """Resolve the cat:<x> category at publish time: honour a frontend-supplied
-    `category`, else LLM-classify the description, else deterministic keyword."""
+    `category`, else LLM-classify the description, else deterministic keyword.
+    With taxonomy tags enabled the LLM call goes through the family memo, so the
+    tag step right after it reuses the same verdict (one call per family)."""
     cat = (data.get('category') or '').strip().lower()
     if cat in CATEGORY_TAGS:
         return cat
     raw = data.get('description', '') or ''
-    cat = _classify_category_llm(title, raw)
+    if _taxonomy_enabled():
+        try:
+            res = _taxonomy_for_family(title, _taxonomy_source_description(data), image_url=image_url)
+        except Exception as e:
+            print(f"[taxonomy] family classify failed for '{title}': {e}")
+            res = None
+        cat = (res or {}).get('category')
+    else:
+        cat = _classify_category_llm(title, raw)
     if cat:
         return cat
     return _classify_category(title, raw)[0]
+
+
+def _publish_tags_for(data, title, category, images=None):
+    """Tags for the product-create payload → (tags, taxonomy_dict_or_None).
+    Kill switch off → ['cat:x'] exactly as before. Taxonomy failure → ['cat:x','new']
+    (never blocks a publish). Success → _taxonomy_tags(...) + ['new']. The cat: tag
+    always equals `category` (what the size guard / product_type already used)."""
+    base = ['cat:%s' % category] if category else []
+    if not _taxonomy_enabled():
+        return base, None
+    try:
+        res = _taxonomy_for_family(title, _taxonomy_source_description(data),
+                                   image_url=_first_image_url(images if images is not None else data.get('images')),
+                                   category=category)
+    except Exception as e:
+        print(f"[taxonomy] publish classify failed for '{title}': {e}")
+        res = None
+    tags = _taxonomy_tags(res, category=category) if res else []
+    if not tags:
+        return base + [NEW_TAG], None
+    return tags + [NEW_TAG], _taxonomy_validate(res, category=category)
 
 
 # --- Accessory size guard (user rule 2026-07-16) ---------------------------
@@ -10230,6 +10493,775 @@ def api_size_chart_fill_status():
         return jsonify({'error': str(e)[:150]}), 500
 
 
+# ── Taxonomy tags: backfill + daily self-heal ────────────────────────────────
+# One classification per colour FAMILY (normalised title across DK/FR/FI), then
+# tagsAdd on every member in every store. Reads through _sib_page, writes through
+# _sib_gql — the module-level GraphQL callers the siblings heal already uses.
+TAXONOMY_BACKFILL_STATE_PATH = os.path.join(_BASE_DIR, 'taxonomy_backfill.json')
+TAXONOMY_FILL_STATE_PATH = os.path.join(_BASE_DIR, 'taxonomy_fill.json')
+TAXONOMY_FILL_MAX_FAMILIES = 60        # per daily run
+TAXONOMY_DRY_RUN_DEFAULT_LIMIT = 25    # families classified in a dry run when no limit given
+_TAXONOMY_RUN_LOCK = threading.Lock()  # manual backfill and daily loop never overlap
+
+_TX_Q_PRODS = ('{ products(first:250%s, query:"status:active"){ '
+               'pageInfo{hasNextPage endCursor} edges{ node{ id handle title tags productType '
+               'status createdAt featuredMedia{ preview{ image{ url } } } '
+               'sib: metafield(namespace:"theme",key:"siblings"){value} '
+               'description(truncateAt:900) } } } }')
+# Shopify's `tag:new` search matches by WORD ("NEW IN", "New Arrivals" count too —
+# 88 legacy DK drafts, measured 2026-09-15), so the exact tag is re-checked in code.
+# ACTIVE only: 42 legacy DK drafts (2024-12) carry the exact tag 'new' that this
+# module never wrote — the expiry must not touch products it does not own.
+_TX_Q_NEW = ('{ products(first:250%s, query:"status:active AND tag:new"){ pageInfo{hasNextPage endCursor} '
+             'edges{ node{ id title status createdAt tags } } } }')
+_TX_M_ADD = ('mutation($id:ID!,$t:[String!]!){ tagsAdd(id:$id,tags:$t)'
+             '{ userErrors{ field message } } }')
+_TX_M_REMOVE = ('mutation($id:ID!,$t:[String!]!){ tagsRemove(id:$id,tags:$t)'
+                '{ userErrors{ field message } } }')
+
+
+def _taxonomy_owned_tag(tag):
+    t = str(tag or '').lower()
+    return any(t.startswith(p + ':') for p in TAXONOMY_DIMENSIONS)
+
+
+def _taxonomy_family_key(node):
+    """Family key = accent-stripped lowercase title; fallback theme.siblings value."""
+    key = _norm_name(node.get('title'))
+    if not key:
+        key = str(((node.get('sib') or {}) or {}).get('value') or '').strip().lower()
+    return key
+
+
+def _taxonomy_group_families(products_by_store):
+    """{store: [node,...]} → {key: {'key','title','members': [(store, node), ...]}}.
+    Members are appended DK → FR → FI so the DK description/image wins."""
+    fams = {}
+    for store in ('dk', 'fr', 'fi'):
+        for n in products_by_store.get(store) or []:
+            key = _taxonomy_family_key(n)
+            if not key:
+                continue
+            fam = fams.setdefault(key, {'key': key, 'title': n.get('title') or key, 'members': []})
+            fam['members'].append((store, n))
+    return fams
+
+
+def _taxonomy_family_inputs(fam):
+    """→ (description, image_url, category_hint): first non-empty description and
+    featured image in member order (DK first); the category hint is the majority
+    cat:<x> the members already carry, so `sub` is checked against the real cat."""
+    desc, image = '', None
+    cats = {}
+    for _store, n in fam['members']:
+        if not desc and (n.get('description') or '').strip():
+            desc = n['description']
+        if not image:
+            image = ((((n.get('featuredMedia') or {}).get('preview') or {}).get('image') or {}).get('url')) or None
+        c = _product_cat_from_tags(n.get('tags'))
+        if c and c != 'uncategorized' and c in CATEGORY_TAGS:
+            cats[c] = cats.get(c, 0) + 1
+    hint = max(cats, key=cats.get) if cats else None
+    return desc, image, hint
+
+
+def _taxonomy_member_plan(node, tags):
+    """One product → (add, remove). NEVER writes cat:<x> — the backfill is additive
+    to the category machinery (api_apply_category_tags owns cat:), so a member
+    without cat: is left for that route rather than given the family majority.
+    Removes an older value of a dimension we own (len:midi when the verdict is
+    len:maxi, or a stale tx:<n>) before the new tags go on."""
+    have = [str(t) for t in (node.get('tags') or [])]
+    have_l = {t.lower() for t in have}
+    new_l = {t.lower() for t in tags}
+    add = [t for t in tags if not t.lower().startswith('cat:') and t.lower() not in have_l]
+    remove = [t for t in have if _taxonomy_owned_tag(t) and t.lower() not in new_l]
+    return add, remove
+
+
+def _taxonomy_retry_delay(err, attempt):
+    """Backoff before retry `attempt` (0-based): Shopify THROTTLED answers need
+    the cost bucket to refill (100 pts/s; remove+add ≈ 20 pts, 5 workers), so
+    they wait 5 s / 10 s instead of the 1.5 s / 3 s used for other errors."""
+    if 'throttl' in str(err or '').lower():
+        return 5.0 * (attempt + 1)
+    return 1.5 * (attempt + 1)
+
+
+def _taxonomy_apply_member(store, gid, add, remove):
+    """tagsRemove the conflicts first, then tagsAdd; 3 attempts. → error text or None."""
+    last = None
+    for attempt in range(3):
+        try:
+            for mutation, tag_list in ((_TX_M_REMOVE, remove), (_TX_M_ADD, add)):
+                if not tag_list:
+                    continue
+                d = _sib_gql(store, mutation, {'id': gid, 't': tag_list}) or {}
+                node = d.get('tagsRemove') if mutation is _TX_M_REMOVE else d.get('tagsAdd')
+                ue = (node or {}).get('userErrors') or []
+                if ue:
+                    raise RuntimeError(str(ue)[:120])
+            return None
+        except Exception as e:
+            last = e
+            if attempt < 2:
+                time.sleep(_taxonomy_retry_delay(e, attempt))
+    return str(last)[:120]
+
+
+def _taxonomy_save_state(path, state):
+    if not path:
+        return
+    try:
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f'[taxonomy] state save failed: {e}')
+
+
+def _taxonomy_backfill_run(stores, dry_run=True, only_missing=True, limit=None, families=None,
+                           state_path=None, label='backfill', defer=None):
+    """Classify colour families once and tag every member in every store.
+    dry_run → NO Shopify writes; still classifies up to `limit` families (default 25)
+    and returns the plan + a tag histogram. `defer` = family keys that failed last
+    time: they go to the END of the queue (stable, still alphabetical within each
+    half) so a permanently failing family never starves the ones behind it under
+    `limit`. Returns (and persists) the state dict; `failed_families` lists the
+    keys that produced no tags this run."""
+    if dry_run and limit is None:
+        limit = TAXONOMY_DRY_RUN_DEFAULT_LIMIT
+    stores = [s for s in (stores or []) if s in tokens]
+    defer = {str(k) for k in (defer or []) if k}
+    state = {'status': 'running', 'label': label, 'dry_run': bool(dry_run),
+             'only_missing': bool(only_missing), 'limit': limit, 'stores': stores,
+             'started': datetime.datetime.utcnow().isoformat() + 'Z', 'finished': None,
+             'families_total': 0, 'families_done': 0, 'families_skipped': 0, 'families_failed': 0,
+             'families_deferred': 0, 'failed_families': [],
+             'products_seen': {s: 0 for s in stores}, 'products_tagged': {s: 0 for s in stores},
+             'llm_calls': 0, 'errors': [], 'sample': [], 'histogram': {}}
+    _taxonomy_save_state(state_path, state)
+    try:
+        by_store = {}
+        for st in stores:
+            by_store[st] = _sib_page(st, _TX_Q_PRODS, 'products') or []
+            state['products_seen'][st] = len(by_store[st])
+        fams = _taxonomy_group_families(by_store)
+        want = {_norm_name(x) for x in (families or []) if _norm_name(x)}
+        todo = []
+        for key in sorted(fams):
+            fam = fams[key]
+            if want and key not in want:
+                continue
+            if only_missing and all(TX_TAG in [str(t).lower() for t in (n.get('tags') or [])]
+                                    for _s, n in fam['members']):
+                state['families_skipped'] += 1
+                continue
+            todo.append(fam)
+        if defer:
+            state['families_deferred'] = sum(1 for f in todo if f['key'] in defer)
+            todo.sort(key=lambda f: f['key'] in defer)     # stable: failed-last
+        if limit is not None:
+            todo = todo[:int(limit)]
+        state['families_total'] = len(todo)
+        _taxonomy_save_state(state_path, state)
+
+        import concurrent.futures as _cf
+        for i, fam in enumerate(todo, 1):
+            try:
+                desc, image, hint = _taxonomy_family_inputs(fam)
+                key = fam['key']
+                with _TAXONOMY_MEMO_LOCK:
+                    memo_hit = _TAXONOMY_MEMO.get(key)
+                if not (memo_hit and time.time() - memo_hit[1] < _TAXONOMY_MEMO_TTL):
+                    state['llm_calls'] += 1
+                res = _taxonomy_for_family(fam['title'], desc, image_url=image, category=hint)
+                tags = _taxonomy_tags(res, category=hint) if res else []
+                if not tags:
+                    state['families_failed'] += 1
+                    state['failed_families'].append(key)
+                    if len(state['errors']) < 50:
+                        state['errors'].append({'family': fam['title'], 'error': 'no classification'})
+                    continue
+                jobs, members = [], {}
+                for st, n in fam['members']:
+                    add, remove = _taxonomy_member_plan(n, tags)
+                    members[st] = members.get(st, 0) + 1
+                    if add or remove:
+                        jobs.append((st, n['id'], add, remove))
+                for t in tags:
+                    state['histogram'][t] = state['histogram'].get(t, 0) + len(fam['members'])
+                entry = {'family': fam['title'], 'category': tags[0].split(':', 1)[1], 'tags': tags,
+                         'members': members, 'writes': len(jobs),
+                         'removes': sum(1 for j in jobs if j[3])}
+                if len(state['sample']) < 100:
+                    state['sample'].append(entry)
+                if not dry_run and jobs:
+                    def _one(job):
+                        st, gid, add, remove = job
+                        return st, _taxonomy_apply_member(st, gid, add, remove)
+                    with _cf.ThreadPoolExecutor(max_workers=5) as pool:
+                        for st, err in pool.map(_one, jobs):
+                            if err:
+                                if len(state['errors']) < 50:
+                                    state['errors'].append({'family': fam['title'], 'store': st, 'error': err})
+                            else:
+                                state['products_tagged'][st] = state['products_tagged'].get(st, 0) + 1
+                state['families_done'] += 1
+                print(f"[taxonomy] {label} {i}/{len(todo)} '{fam['title']}' → {tags}"
+                      f"{' (dry run)' if dry_run else ''}")
+            except Exception as e:
+                state['families_failed'] += 1
+                state['failed_families'].append(fam.get('key'))
+                if len(state['errors']) < 50:
+                    state['errors'].append({'family': fam.get('title'), 'error': str(e)[:150]})
+                print(f"[taxonomy] {label} family '{fam.get('title')}' failed: {e}")
+            if i % 10 == 0:
+                _taxonomy_save_state(state_path, state)
+        state['status'] = 'done'
+    except Exception as e:
+        state['status'] = 'error'
+        state['errors'].append({'error': str(e)[:200]})
+        print(f'[taxonomy] {label} aborted: {e}')
+    state['finished'] = datetime.datetime.utcnow().isoformat() + 'Z'
+    _taxonomy_save_state(state_path, state)
+    return state
+
+
+def _taxonomy_expire_new(store, now=None):
+    """Remove the exact tag 'new' from ACTIVE products created more than
+    NEW_TAG_DAYS ago (drafts/archived are skipped even if the search returns
+    them). → {checked, expired, errors}. Read-only when nothing is due."""
+    now = now or datetime.datetime.utcnow()
+    cutoff = now - datetime.timedelta(days=NEW_TAG_DAYS)
+    prods = _sib_page(store, _TX_Q_NEW, 'products') or []
+    rep = {'checked': len(prods), 'expired': 0, 'errors': []}
+    for n in prods:
+        if str(n.get('status') or '').upper() != 'ACTIVE':
+            continue
+        exact = [t for t in (n.get('tags') or []) if str(t).lower() == NEW_TAG]
+        if not exact:
+            continue
+        try:
+            created = datetime.datetime.strptime(str(n.get('createdAt') or '')[:19], '%Y-%m-%dT%H:%M:%S')
+        except Exception:
+            continue
+        if created >= cutoff:
+            continue
+        err = _taxonomy_apply_member(store, n['id'], [], exact)
+        if err:
+            if len(rep['errors']) < 20:
+                rep['errors'].append({'id': n['id'], 'error': err})
+        else:
+            rep['expired'] += 1
+    return rep
+
+
+def _taxonomy_load_state(path):
+    """State file → dict, or None when absent/unreadable."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f) or {}
+    except Exception:
+        return None
+
+
+def _taxonomy_live_backfill_done():
+    """True once a NON-dry-run backfill has completed (taxonomy_backfill.json
+    status=='done' and dry_run false). The daily fill only writes after that, so
+    the first live tagging is always the operator's reviewed backfill — never a
+    loop that fired 300 s after a self-update restart."""
+    st = _taxonomy_load_state(TAXONOMY_BACKFILL_STATE_PATH) or {}
+    return st.get('status') == 'done' and st.get('dry_run') is False
+
+
+def _taxonomy_fill_loop():
+    """Daily self-heal (mirrors _size_chart_fill_loop): after 300 s, then every 24 h:
+    (1) active products without tx:<n> → classify + tag, family-grouped, max 60
+    families per run, families that failed last run queued last; (2) 'new' older
+    than NEW_TAG_DAYS → tagsRemove. Only the fashion `tokens` — never
+    LIGHT_TOKENS. Kill switch TAXONOMY_FILL=0; DEV_LOCAL=1 and pytest never start
+    it. Step (1) waits until a live (non-dry-run) backfill has completed."""
+    time.sleep(300)
+    while True:
+        state = {'at': datetime.datetime.utcnow().isoformat() + 'Z'}
+        stores = [s for s in ('dk', 'fr', 'fi') if s in tokens]
+        if not _TAXONOMY_RUN_LOCK.acquire(blocking=False):
+            print('[taxonomy] daily fill skipped: a backfill is running — retry in 1 h')
+            time.sleep(3600)
+            continue
+        try:
+            if not _taxonomy_live_backfill_done():
+                state['fill'] = {'skipped': 'no completed live backfill yet — '
+                                            'POST /api/backfill_taxonomy {dry_run:false} first'}
+                print('[taxonomy] daily fill waiting: no completed live backfill yet')
+            else:
+                prev = (_taxonomy_load_state(TAXONOMY_FILL_STATE_PATH) or {}).get('fill') or {}
+                defer = prev.get('failed_families') if isinstance(prev, dict) else None
+                try:
+                    rep = _taxonomy_backfill_run(stores, dry_run=False, only_missing=True,
+                                                 limit=TAXONOMY_FILL_MAX_FAMILIES, label='daily-fill',
+                                                 defer=defer)
+                    state['fill'] = {k: v for k, v in rep.items() if k != 'sample'}
+                    print(f"[taxonomy] daily fill: {rep['families_done']}/{rep['families_total']} families, "
+                          f"tagged {rep['products_tagged']}, errors {len(rep['errors'])}")
+                except Exception as e:
+                    state['fill'] = {'error': str(e)[:150], 'failed_families': list(defer or [])}
+                    print(f'[taxonomy] daily fill failed: {e}')
+            state['new_expired'] = {}
+            for st in stores:
+                try:
+                    state['new_expired'][st] = _taxonomy_expire_new(st)
+                    if state['new_expired'][st].get('expired'):
+                        print(f"[taxonomy] {st}: 'new' expired on {state['new_expired'][st]['expired']} product(s)")
+                except Exception as e:
+                    state['new_expired'][st] = {'error': str(e)[:150]}
+                    print(f'[taxonomy] {st} new-expiry failed: {e}')
+        finally:
+            _TAXONOMY_RUN_LOCK.release()
+        _taxonomy_save_state(TAXONOMY_FILL_STATE_PATH, state)
+        time.sleep(24 * 3600)
+
+
+# Same guard as the self-updater / fix-watch: a dev machine (start.bat sets
+# DEV_LOCAL=1, tokens.json is local) must never tag the live stores or spend
+# Haiku calls concurrently with the droplet.
+if os.getenv('TAXONOMY_FILL') != '0' and os.getenv('DEV_LOCAL') != '1' and 'pytest' not in sys.modules:
+    threading.Thread(target=_taxonomy_fill_loop, daemon=True, name='taxonomy-fill').start()
+
+
+@app.route('/api/backfill_taxonomy', methods=['POST'])
+@require_droplet_token
+def api_backfill_taxonomy():
+    """Classify colour families once (Haiku, DK description + DK photo) and write
+    the taxonomy tags to every member in every store. Runs in a daemon thread;
+    progress in taxonomy_backfill.json → GET /api/taxonomy_backfill_status.
+    Body: {stores:["dk","fr","fi"], dry_run:true, only_missing:true, limit:null,
+    families:null}. dry_run (default) = NO Shopify writes, classifies ≤ limit
+    (default 25) families and leaves the plan + tag histogram in the status."""
+    body = request.get_json(silent=True) or {}
+    stores = body.get('stores') or ['dk', 'fr', 'fi']
+    if not isinstance(stores, list) or any(s not in ('dk', 'fr', 'fi') for s in stores):
+        return jsonify({'error': 'stores must be a list out of dk/fr/fi'}), 400
+    missing = [s for s in stores if s not in tokens]
+    if missing:
+        return jsonify({'error': f"Not authenticated for {', '.join(s.upper() for s in missing)}."}), 401
+    dry = bool(body.get('dry_run', True))
+    only_missing = bool(body.get('only_missing', True))
+    limit = body.get('limit')
+    if limit is not None:
+        try:
+            limit = max(1, int(limit))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'limit must be an integer or null'}), 400
+    families = body.get('families') or None
+    if families is not None and not isinstance(families, list):
+        return jsonify({'error': 'families must be a list of product names or null'}), 400
+    if not _TAXONOMY_RUN_LOCK.acquire(blocking=False):
+        return jsonify({'error': 'a taxonomy run is already in progress',
+                        'status_url': '/api/taxonomy_backfill_status'}), 409
+
+    def _run():
+        try:
+            _taxonomy_backfill_run(stores, dry_run=dry, only_missing=only_missing, limit=limit,
+                                   families=families, state_path=TAXONOMY_BACKFILL_STATE_PATH)
+        finally:
+            _TAXONOMY_RUN_LOCK.release()
+    threading.Thread(target=_run, daemon=True, name='taxonomy-backfill').start()
+    return jsonify({'started': True, 'dry_run': dry, 'only_missing': only_missing, 'stores': stores,
+                    'limit': limit, 'families': families,
+                    'status_url': '/api/taxonomy_backfill_status'}), 202
+
+
+@app.route('/api/taxonomy_backfill_status')
+def api_taxonomy_backfill_status():
+    """Read-only: last/current backfill run (plan + histogram in dry runs) plus the
+    last daily self-heal under `daily_fill`. The route stays open like the other
+    status routes, but the catalogue-shaped parts (`sample` with family titles +
+    tags, raw `errors` strings) are only returned to a caller holding a valid
+    X-Droplet-Token (or local dev); anonymous callers get the counters only."""
+    def _load(path):
+        try:
+            with open(path, encoding='utf-8') as f:
+                return json.load(f) or {}
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            return {'error': str(e)[:150]}
+    trusted = bool(_verify_droplet_token(request.headers.get('X-Droplet-Token', ''))) \
+        or (not DROPLET_TOKEN_SECRET and os.getenv('DEV_LOCAL') == '1')
+    out = _load(TAXONOMY_BACKFILL_STATE_PATH) or {'status': 'not run yet'}
+    out['daily_fill'] = _load(TAXONOMY_FILL_STATE_PATH)
+    if not trusted:
+        for k in ('sample', 'errors', 'failed_families'):
+            if k in out:
+                out[k] = len(out[k]) if isinstance(out[k], list) else out[k]
+        fill = (out.get('daily_fill') or {}).get('fill') if isinstance(out.get('daily_fill'), dict) else None
+        if isinstance(fill, dict):
+            for k in ('errors', 'failed_families'):
+                if isinstance(fill.get(k), list):
+                    fill[k] = len(fill[k])
+        out['redacted'] = True
+    return jsonify(out)
+
+
+# ── Taxonomy smart collections ───────────────────────────────────────────────
+# Data-driven table of the collections we own: per store a localised handle /
+# title / description / SEO, plus the rule (an AND-list `all` or an OR-list `any`
+# of tags — Shopify TAG rules only do EQUALS/NOT_EQUALS and a collection is either
+# all-AND or all-OR, hence the season:aw/ss umbrella tags). Created only when the
+# active product count reaches min_products; existing handles get title + rules
+# updated. Online Store publication ids: collectionCreate does NOT auto-publish
+# here (overtoj measured publishedOnPublication:false on DK+FR, 2026-09-15).
+TAXONOMY_ONLINE_STORE_PUBLICATION = {
+    'dk': 'gid://shopify/Publication/251895120221',
+    'fr': 'gid://shopify/Publication/288646267227',
+    'fi': 'gid://shopify/Publication/305094623559',
+}
+NEW_ARRIVALS_HANDLE = {'dk': 'nye-ankomster', 'fr': 'nouvelles', 'fi': 'uutiset'}
+NEW_ARRIVALS_MIN = 24     # repoint the price rule to TAG EQUALS new only above this
+
+
+def _txc(key, rules, dk, fr, fi):
+    """Row builder: rules = {'all': [...]} or {'any': [...]}; per store
+    (handle, title, description, seo_title, seo_description)."""
+    def loc(t):
+        return {'handle': t[0], 'title': t[1], 'description': t[2], 'seo_title': t[3], 'seo_description': t[4]}
+    return {'key': key, 'rules': rules, 'dk': loc(dk), 'fr': loc(fr), 'fi': loc(fi)}
+
+
+TAXONOMY_COLLECTIONS = [
+    # ── seasonal ──
+    _txc('aw-2026', {'any': ['season:autumn', 'season:winter']},
+         ('efteraar-vinter-2026', 'EFTERÅR/VINTER 2026',
+          'Sæsonens kjoler, strik og overtøj til de kølige måneder.',
+          'Efterår/vinter 2026 – dametøj', 'Opdag efterår/vinter 2026-kollektionen: kjoler, strik, jakker og frakker til kvinder.'),
+         ('automne-hiver-2026', 'AUTOMNE-HIVER 2026',
+          'Robes, mailles et manteaux de la saison pour les mois frais.',
+          'Automne-hiver 2026 – mode femme', 'Découvrez la collection automne-hiver 2026 : robes, pulls, vestes et manteaux pour femme.'),
+         ('syksyn-uutuudet', 'SYKSYN UUTUUDET',
+          'Kauden mekot, neuleet ja takit viileisiin kuukausiin.',
+          'Syksyn uutuudet – naisten muoti', 'Tutustu syksyn ja talven uutuuksiin: mekot, neuleet ja takit naisille.')),
+    _txc('autumn-jackets', {'all': ['cat:outerwear', 'season:autumn']},
+         ('efteraarsjakker', 'EFTERÅRSJAKKER',
+          'Lette jakker og overgangsjakker til efteråret.',
+          'Efterårsjakker til kvinder', 'Efterårsjakker og overgangsjakker til kvinder – find din nye jakke til sæsonen.'),
+         ('vestes-de-mi-saison', 'VESTES DE MI-SAISON',
+          'Vestes légères et manteaux de transition pour l’automne.',
+          'Vestes de mi-saison femme', 'Vestes de mi-saison et manteaux de transition pour femme – trouvez votre veste d’automne.'),
+         ('syystakit', 'SYYSTAKIT',
+          'Kevyet takit ja välikausitakit syksyyn.',
+          'Syystakit naisille', 'Syystakit ja välikausitakit naisille – löydä uusi takkisi syksyyn.')),
+    _txc('winter-coats', {'all': ['cat:outerwear', 'season:winter']},
+         ('vinterjakker-frakker', 'VINTERJAKKER & FRAKKER',
+          'Varme vinterjakker og frakker til de kolde måneder.',
+          'Vinterjakker & frakker til kvinder', 'Vinterjakker og frakker til kvinder – varme modeller til de kolde måneder.'),
+         ('manteaux-d-hiver', "MANTEAUX D'HIVER",
+          'Manteaux et vestes chaudes pour les mois d’hiver.',
+          'Manteaux d’hiver femme', 'Manteaux et vestes d’hiver pour femme – des modèles chauds pour les mois froids.'),
+         ('talvitakit', 'TALVITAKIT',
+          'Lämpimät talvitakit kylmiin kuukausiin.',
+          'Talvitakit naisille', 'Talvitakit naisille – lämpimät mallit kylmiin kuukausiin.')),
+    _txc('season-knits', {'all': ['cat:knitwear', 'season:aw']},
+         ('saesonens-strik', 'SÆSONENS STRIK',
+          'Sweatre, cardigans og strik til efterår og vinter.',
+          'Sæsonens strik til kvinder', 'Sæsonens strik: sweatre, cardigans og trøjer til efterår og vinter.'),
+         ('pulls-de-saison', 'PULLS DE SAISON',
+          'Pulls, cardigans et mailles pour l’automne et l’hiver.',
+          'Pulls de saison femme', 'Pulls de saison : pulls, cardigans et mailles pour l’automne et l’hiver.'),
+         ('kauden-neuleet', 'KAUDEN NEULEET',
+          'Neuleet, neuletakit ja villapaidat syksyyn ja talveen.',
+          'Kauden neuleet naisille', 'Kauden neuleet: villapaidat, neuletakit ja neuleet syksyyn ja talveen.')),
+    # ── occasion ──
+    _txc('party', {'all': ['occ:party']},
+         ('festtoj', 'FESTTØJ',
+          'Kjoler og outfits til fest, byture og særlige aftener.',
+          'Festtøj til kvinder', 'Festtøj til kvinder: kjoler og outfits til fest, byture og særlige aftener.'),
+         ('tenues-de-fete', 'TENUES DE FÊTE',
+          'Robes et tenues pour les soirées et les grandes occasions.',
+          'Tenues de fête femme', 'Tenues de fête pour femme : robes et ensembles pour les soirées et les grandes occasions.'),
+         ('juhlavaatteet', 'JUHLAVAATTEET',
+          'Mekot ja asut juhliin, iltoihin ja erityisiin tilaisuuksiin.',
+          'Juhlavaatteet naisille', 'Juhlavaatteet naisille: mekot ja asut juhliin ja erityisiin tilaisuuksiin.')),
+    _txc('wedding', {'all': ['occ:wedding']},
+         ('bryllupsgaest', 'BRYLLUPSGÆST',
+          'Kjoler og sæt til dig, der er gæst til bryllup.',
+          'Bryllupsgæst – kjoler & sæt', 'Kjoler og sæt til bryllupsgæster – find dit outfit til den store dag.'),
+         ('mariage-ceremonie', 'MARIAGE & CÉRÉMONIE',
+          'Robes et ensembles pour les invitées de mariage et les cérémonies.',
+          'Tenues d’invitée de mariage', 'Robes et ensembles pour invitée de mariage et cérémonies – trouvez votre tenue.'),
+         ('haihin', 'HÄIHIN',
+          'Mekot ja asut häävieraalle ja juhlatilaisuuksiin.',
+          'Hääasut vieraalle', 'Mekot ja asut häävieraalle – löydä asusi juhlapäivään.')),
+    _txc('office', {'all': ['occ:office']},
+         ('kontortoj', 'KONTORTØJ',
+          'Smarte hverdagsstyles til kontoret og arbejdsdagen.',
+          'Kontortøj til kvinder', 'Kontortøj til kvinder: smarte styles til kontoret og arbejdsdagen.'),
+         ('tenues-de-bureau', 'TENUES DE BUREAU',
+          'Des pièces élégantes pour le bureau et la journée de travail.',
+          'Tenues de bureau femme', 'Tenues de bureau pour femme : des pièces élégantes pour la journée de travail.'),
+         ('toimistovaatteet', 'TOIMISTOVAATTEET',
+          'Tyylikkäät vaatteet toimistoon ja työpäivään.',
+          'Toimistovaatteet naisille', 'Toimistovaatteet naisille: tyylikkäät vaatteet toimistoon ja työpäivään.')),
+    _txc('everyday', {'all': ['occ:everyday']},
+         ('hverdagstoj', 'HVERDAGSTØJ',
+          'Afslappede styles til hverdagen.',
+          'Hverdagstøj til kvinder', 'Hverdagstøj til kvinder: afslappede styles til hver dag.'),
+         ('les-essentiels', 'LES ESSENTIELS',
+          'Les pièces faciles à porter au quotidien.',
+          'Les essentiels du quotidien', 'Les essentiels pour femme : des pièces faciles à porter au quotidien.'),
+         ('arkivaatteet', 'ARKIVAATTEET',
+          'Rennot vaatteet arkeen.',
+          'Arkivaatteet naisille', 'Arkivaatteet naisille: rennot vaatteet jokaiseen päivään.')),
+    # ── dresses ──
+    _txc('party-dresses', {'all': ['cat:dress', 'occ:party']},
+         ('festkjoler', 'FESTKJOLER',
+          'Kjoler til fest og særlige aftener.',
+          'Festkjoler til kvinder', 'Festkjoler til kvinder – kjoler til fest, byture og særlige aftener.'),
+         ('robes-de-soiree', 'ROBES DE SOIRÉE',
+          'Robes pour les soirées et les grandes occasions.',
+          'Robes de soirée femme', 'Robes de soirée pour femme – pour les soirées et les grandes occasions.'),
+         ('juhlamekot', 'JUHLAMEKOT',
+          'Mekot juhliin ja erityisiin iltoihin.',
+          'Juhlamekot naisille', 'Juhlamekot naisille – mekot juhliin ja erityisiin iltoihin.')),
+    _txc('everyday-dresses', {'all': ['cat:dress', 'occ:everyday']},
+         ('hverdagskjoler', 'HVERDAGSKJOLER',
+          'Afslappede kjoler til hverdagen.',
+          'Hverdagskjoler til kvinder', 'Hverdagskjoler til kvinder – afslappede kjoler til hver dag.'),
+         ('robes-du-quotidien', 'ROBES DU QUOTIDIEN',
+          'Des robes faciles à porter tous les jours.',
+          'Robes du quotidien femme', 'Robes du quotidien pour femme – des robes faciles à porter tous les jours.'),
+         ('arkimekot', 'ARKIMEKOT',
+          'Rennot mekot arkeen.',
+          'Arkimekot naisille', 'Arkimekot naisille – rennot mekot jokaiseen päivään.')),
+    _txc('maxi-dresses', {'all': ['cat:dress', 'len:maxi']},
+         ('maxikjoler', 'MAXIKJOLER',
+          'Lange kjoler i maxilængde.',
+          'Maxikjoler til kvinder', 'Maxikjoler til kvinder – lange kjoler til fest og hverdag.'),
+         ('robes-longues', 'ROBES LONGUES',
+          'Robes longues, jusqu’à la cheville.',
+          'Robes longues femme', 'Robes longues pour femme – des robes maxi pour toutes les occasions.'),
+         ('maksimekot', 'MAKSIMEKOT',
+          'Pitkät maksimekot.',
+          'Maksimekot naisille', 'Maksimekot naisille – pitkät mekot juhlaan ja arkeen.')),
+    _txc('midi-dresses', {'all': ['cat:dress', 'len:midi']},
+         ('midikjoler', 'MIDIKJOLER',
+          'Kjoler i midilængde – under knæet.',
+          'Midikjoler til kvinder', 'Midikjoler til kvinder – kjoler i midilængde til fest og hverdag.'),
+         ('robes-midi', 'ROBES MIDI',
+          'Robes mi-longues, sous le genou.',
+          'Robes midi femme', 'Robes midi pour femme – des robes mi-longues pour toutes les occasions.'),
+         ('midimekot', 'MIDIMEKOT',
+          'Polven alle ulottuvat midimekot.',
+          'Midimekot naisille', 'Midimekot naisille – polven alle ulottuvat mekot juhlaan ja arkeen.')),
+    _txc('mini-dresses', {'all': ['cat:dress', 'len:mini']},
+         ('korte-kjoler', 'KORTE KJOLER',
+          'Korte kjoler over knæet.',
+          'Korte kjoler til kvinder', 'Korte kjoler til kvinder – minikjoler til fest og hverdag.'),
+         ('robes-courtes', 'ROBES COURTES',
+          'Robes courtes, au-dessus du genou.',
+          'Robes courtes femme', 'Robes courtes pour femme – des robes mini pour toutes les occasions.'),
+         ('lyhyet-mekot', 'LYHYET MEKOT',
+          'Polven yläpuolelle ulottuvat lyhyet mekot.',
+          'Lyhyet mekot naisille', 'Lyhyet mekot naisille – minimekot juhlaan ja arkeen.')),
+    _txc('knit-dresses', {'all': ['cat:dress', 'sub:knit-dress']},
+         ('strikkjoler', 'STRIKKJOLER',
+          'Strikkede kjoler til de kølige dage.',
+          'Strikkjoler til kvinder', 'Strikkjoler til kvinder – strikkede kjoler til efterår og vinter.'),
+         ('robes-en-maille', 'ROBES EN MAILLE',
+          'Robes en maille pour les jours frais.',
+          'Robes en maille femme', 'Robes en maille pour femme – des robes tricotées pour l’automne et l’hiver.'),
+         ('neulemekot', 'NEULEMEKOT',
+          'Neulemekot viileisiin päiviin.',
+          'Neulemekot naisille', 'Neulemekot naisille – neulotut mekot syksyyn ja talveen.')),
+    _txc('shirt-dresses', {'all': ['cat:dress', 'sub:shirt-dress']},
+         ('skjortekjoler', 'SKJORTEKJOLER',
+          'Skjortekjoler med krave og knapper.',
+          'Skjortekjoler til kvinder', 'Skjortekjoler til kvinder – kjoler med krave og knapper til hverdag og kontor.'),
+         ('robes-chemises', 'ROBES CHEMISES',
+          'Robes chemises à col et boutons.',
+          'Robes chemises femme', 'Robes chemises pour femme – des robes à col et boutons pour le quotidien et le bureau.'),
+         ('paitamekot', 'PAITAMEKOT',
+          'Paitamekot kauluksella ja napeilla.',
+          'Paitamekot naisille', 'Paitamekot naisille – kauluksella ja napeilla arkeen ja toimistoon.')),
+    _txc('floral-dresses', {'all': ['cat:dress', 'pat:floral']},
+         ('blomstrede-kjoler', 'BLOMSTREDE KJOLER',
+          'Kjoler med blomsterprint.',
+          'Blomstrede kjoler til kvinder', 'Blomstrede kjoler til kvinder – kjoler med blomsterprint til fest og hverdag.'),
+         ('robes-fleuries', 'ROBES FLEURIES',
+          'Robes à imprimé fleuri.',
+          'Robes fleuries femme', 'Robes fleuries pour femme – des robes à imprimé floral pour toutes les occasions.'),
+         ('kukkamekot', 'KUKKAMEKOT',
+          'Kukkakuvioiset mekot.',
+          'Kukkamekot naisille', 'Kukkamekot naisille – kukkakuvioiset mekot juhlaan ja arkeen.')),
+]
+
+
+def _taxonomy_rule_set(rules):
+    """{'all': [...]} → AND rule set; {'any': [...]} → OR rule set (TAG EQUALS)."""
+    tags = rules.get('all') or rules.get('any') or []
+    return {'appliedDisjunctively': bool(rules.get('any')) and not rules.get('all'),
+            'rules': [{'column': 'TAG', 'relation': 'EQUALS', 'condition': t} for t in tags]}
+
+
+def _taxonomy_count_query(rules):
+    """Shopify search query for the ACTIVE products a rule set would contain."""
+    if rules.get('all'):
+        return 'status:active AND ' + ' AND '.join("tag:'%s'" % t for t in rules['all'])
+    return 'status:active AND (' + ' OR '.join("tag:'%s'" % t for t in (rules.get('any') or [])) + ')'
+
+
+def _taxonomy_active_counts(store):
+    """One aliased productsCount query → {key: active count} for every table row."""
+    parts = []
+    for i, row in enumerate(TAXONOMY_COLLECTIONS):
+        parts.append('c%d: productsCount(query:"%s"){ count }' % (i, _taxonomy_count_query(row['rules'])))
+    d = _sib_gql(store, '{ ' + ' '.join(parts) + ' }') or {}
+    return {row['key']: int(((d.get('c%d' % i) or {}).get('count')) or 0)
+            for i, row in enumerate(TAXONOMY_COLLECTIONS)}
+
+
+def _taxonomy_count_new_active(store):
+    """ACTIVE products carrying the EXACT tag 'new' (tag:new search is word-based)."""
+    prods = _sib_page(store, _TX_Q_NEW, 'products') or []
+    return sum(1 for n in prods
+               if str(n.get('status') or '').upper() == 'ACTIVE'
+               and any(str(t).lower() == NEW_TAG for t in (n.get('tags') or [])))
+
+
+_TXC_Q_BY_HANDLE = ('query($h:String!){ collectionByHandle(handle:$h){ id handle title '
+                    'ruleSet{ appliedDisjunctively rules{ column relation condition } } } }')
+_TXC_M_UPDATE = ('mutation($input:CollectionInput!){ collectionUpdate(input:$input)'
+                 '{ collection{ id handle } userErrors{ field message } } }')
+_TXC_M_CREATE = ('mutation($input:CollectionInput!){ collectionCreate(input:$input)'
+                 '{ collection{ id handle } userErrors{ field message } } }')
+_TXC_M_PUBLISH = ('mutation($id:ID!,$input:[PublicationInput!]!){ publishablePublish(id:$id,input:$input)'
+                  '{ publishable{ ... on Collection { id } } userErrors{ field message } } }')
+
+
+def _manage_taxonomy_collections(store, dry_run=True, min_products=8):
+    """Create / update the taxonomy smart collections of one store from
+    TAXONOMY_COLLECTIONS. Existing handle → title + rules updated; missing handle →
+    created (BEST_SELLING, descriptionHtml, SEO) and published to the Online Store
+    when the active count ≥ min_products. Then: repoint the new-arrivals
+    collection to TAG EQUALS new only when ≥ NEW_ARRIVALS_MIN active products carry
+    the tag, else leave the price rule. → {store, dry_run, min_products, report}."""
+    report = []
+    counts = _taxonomy_active_counts(store)
+    pub = TAXONOMY_ONLINE_STORE_PUBLICATION.get(store)
+
+    def _ue(d, key):
+        return ((d or {}).get(key) or {}).get('userErrors') or []
+
+    for row in TAXONOMY_COLLECTIONS:
+        loc = row[store]
+        handle, count = loc['handle'], counts.get(row['key'], 0)
+        rs = _taxonomy_rule_set(row['rules'])
+        ent = {'handle': handle, 'title': loc['title'], 'key': row['key'], 'active_count': count,
+               'rules': row['rules']}
+        try:
+            node = (_sib_gql(store, _TXC_Q_BY_HANDLE, {'h': handle}) or {}).get('collectionByHandle')
+            if node:
+                if not node.get('ruleSet'):
+                    ent['action'] = 'skip_manual'
+                elif dry_run:
+                    ent['action'] = 'would_update'
+                else:
+                    d = _sib_gql(store, _TXC_M_UPDATE,
+                                 {'input': {'id': node['id'], 'title': loc['title'], 'ruleSet': rs}})
+                    ue = _ue(d, 'collectionUpdate')
+                    ent['action'] = 'updated' if not ue else 'ERROR'
+                    if ue:
+                        ent['errors'] = ue
+            elif count < int(min_products):
+                ent['action'] = 'skip_below_min'
+            elif dry_run:
+                ent['action'] = 'would_create'
+            else:
+                d = _sib_gql(store, _TXC_M_CREATE, {'input': {
+                    'title': loc['title'], 'handle': handle, 'descriptionHtml': '<p>%s</p>' % loc['description'],
+                    'sortOrder': 'BEST_SELLING',
+                    'seo': {'title': loc['seo_title'], 'description': loc['seo_description']},
+                    'ruleSet': rs}})
+                cc = (d or {}).get('collectionCreate') or {}
+                ue = cc.get('userErrors') or []
+                col = cc.get('collection') or {}
+                if ue or not col.get('id'):
+                    ent['action'] = 'ERROR'
+                    ent['errors'] = ue or ['no collection returned']
+                else:
+                    ent['action'] = 'created'
+                    ent['id'] = col['id']
+                    if pub:
+                        pd = _sib_gql(store, _TXC_M_PUBLISH, {'id': col['id'], 'input': [{'publicationId': pub}]})
+                        pue = _ue(pd, 'publishablePublish')
+                        ent['published'] = not pue
+                        if pue:
+                            ent['publish_errors'] = pue
+        except Exception as e:
+            ent['action'] = 'ERROR'
+            ent['errors'] = [str(e)[:150]]
+        report.append(ent)
+
+    # New arrivals: TAG EQUALS new only once the tag has real coverage.
+    nh = NEW_ARRIVALS_HANDLE.get(store)
+    ent = {'handle': nh, 'key': 'new-arrivals', 'rules': {'all': [NEW_TAG]}}
+    try:
+        n_new = _taxonomy_count_new_active(store)
+        ent['active_count'] = n_new
+        node = (_sib_gql(store, _TXC_Q_BY_HANDLE, {'h': nh}) or {}).get('collectionByHandle')
+        old_rules = [f"{r['column']} {r['relation']} {r['condition']}"
+                     for r in ((node or {}).get('ruleSet') or {}).get('rules') or []]
+        ent['old_rules'] = old_rules
+        already = old_rules == [f'TAG EQUALS {NEW_TAG}']
+        if not node:
+            ent['action'] = 'MISSING'
+        elif not node.get('ruleSet'):
+            ent['action'] = 'skip_manual'
+        elif already:
+            ent['action'] = 'already_tag_new'
+        elif n_new < NEW_ARRIVALS_MIN:
+            ent['action'] = 'left_price_rule (active new=%d < %d)' % (n_new, NEW_ARRIVALS_MIN)
+        elif dry_run:
+            ent['action'] = 'would_repoint_to_tag_new'
+        else:
+            d = _sib_gql(store, _TXC_M_UPDATE, {'input': {'id': node['id'], 'ruleSet': _taxonomy_rule_set(ent['rules'])}})
+            ue = _ue(d, 'collectionUpdate')
+            ent['action'] = 'repointed_to_tag_new' if not ue else 'ERROR'
+            if ue:
+                ent['errors'] = ue
+    except Exception as e:
+        ent['action'] = 'ERROR'
+        ent['errors'] = [str(e)[:150]]
+    report.append(ent)
+    return {'store': store, 'dry_run': bool(dry_run), 'min_products': int(min_products), 'report': report}
+
+
+@app.route('/api/manage_taxonomy_collections', methods=['POST'])
+@require_droplet_token
+def api_manage_taxonomy_collections():
+    """Create/update the taxonomy smart collections (season / occasion / dress
+    sub-collections) for one store from TAXONOMY_COLLECTIONS. Body: {store,
+    dry_run(default true), min_products(default 8)}. Run AFTER the backfill —
+    a collection is only created when it would already hold min_products."""
+    body = request.get_json(silent=True) or {}
+    store = body.get('store', 'dk')
+    if store not in TAXONOMY_ONLINE_STORE_PUBLICATION:
+        return jsonify({'error': 'store must be dk, fr or fi'}), 400
+    if store not in tokens:
+        return jsonify({'error': f'Not authenticated for {store.upper()}.'}), 401
+    dry = bool(body.get('dry_run', True))
+    try:
+        min_products = max(0, int(body.get('min_products', 8)))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'min_products must be an integer'}), 400
+    try:
+        return jsonify(_manage_taxonomy_collections(store, dry_run=dry, min_products=min_products))
+    except Exception as e:
+        return jsonify({'error': str(e)[:200]}), 502
+
+
 @app.route('/api/size_chart_audit')
 def api_size_chart_audit():
     """Read every ACTIVE product's custom.size_chart + cat:<x> tag + product type
@@ -14604,9 +15636,12 @@ def publish_create_variant():
     activate         = bool(data.get('activate'))   # publish LIVE (active) instead of draft
 
     # Description-driven category → cat:<x> tag (honours a frontend-supplied
-    # `category`, else classifies the description).
-    _pub_cat = _category_for_publish(data, product_name)
-    _cat_tags = ['cat:%s' % _pub_cat] if _pub_cat else []
+    # `category`, else classifies the description). The taxonomy tags (sub/season/
+    # occ/len/pat/tx + 'new') ride on the SAME family verdict; on any failure the
+    # list falls back to ['cat:<x>', 'new'] — a publish is never blocked by them.
+    _pub_cat = _category_for_publish(data, product_name, image_url=_first_image_url(images))
+    _cat_tags, _pub_tax = _publish_tags_for(data, product_name, _pub_cat, images=images)
+    print(f"[taxonomy] '{product_name}' ({store}) → tags {_cat_tags}")
 
     # Prevention (user rule 2026-07-16): no clothing sizes on accessories.
     sizes, _size_guarded = _guard_accessory_sizes(store, _pub_cat, sizes)
@@ -14677,6 +15712,13 @@ def publish_create_variant():
         # aan de outcome (verkoop/ad-ROAS) gekoppeld kunnen worden. ---
         'keywords':           data.get('keywords') or [],
         'category':           _pub_cat or None,
+        # taxonomy v1 verdict (None when the classifier failed / kill switch off)
+        'sub':                (_pub_tax or {}).get('sub'),
+        'seasons':            (_pub_tax or {}).get('seasons') or [],
+        'occasions':          (_pub_tax or {}).get('occasions') or [],
+        'length':             (_pub_tax or {}).get('length'),
+        'pattern':            (_pub_tax or {}).get('pattern'),
+        'tags':               _cat_tags,
         'product_type':       product_type or None,
         'sizes':              sizes,
         'size_guard_applied': _size_guarded,   # accessory clothing-size collapse fired
@@ -14729,8 +15771,11 @@ def publish():
 
     # Auto-categorise from the description → clean cat:<x> tag. This drives the
     # category smart-collections (accurate, description-based, not product_type).
-    _pub_category = _category_for_publish(data, product_name)
-    _cat_tags = ['cat:%s' % _pub_category] if _pub_category else []
+    # Taxonomy tags (sub/season/occ/len/pat/tx + 'new') ride on the same family
+    # verdict; any failure falls back to ['cat:<x>', 'new'] (never blocks a publish).
+    _legacy_imgs = shared_images or images_flat
+    _pub_category = _category_for_publish(data, product_name, image_url=_first_image_url(_legacy_imgs))
+    _cat_tags, _pub_tax = _publish_tags_for(data, product_name, _pub_category, images=_legacy_imgs)
     print(f"[publish] category='{_pub_category}' → tags {_cat_tags}")
 
     # Prevention (user rule 2026-07-16): no clothing sizes on accessories.
@@ -14985,6 +16030,12 @@ def publish():
                 # --- join-key velden ---
                 'keywords':           data.get('keywords') or [],
                 'category':           _pub_category or None,
+                'sub':                (_pub_tax or {}).get('sub'),
+                'seasons':            (_pub_tax or {}).get('seasons') or [],
+                'occasions':          (_pub_tax or {}).get('occasions') or [],
+                'length':             (_pub_tax or {}).get('length'),
+                'pattern':            (_pub_tax or {}).get('pattern'),
+                'tags':               _cat_tags,
                 'product_type':       product_type or None,
                 'size_chart_applied': bool(data.get('size_chart')),
                 'dfs_recommended':    data.get('dfs_recommended'),
