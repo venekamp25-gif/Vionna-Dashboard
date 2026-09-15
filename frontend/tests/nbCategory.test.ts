@@ -64,6 +64,18 @@ const CASES: [string, NbCategory, AccessoryKind | null][] = [
   ["d-ring belt", "accessory", "belt"],
   ["chain strap bag", "bag", null],
   ["cœur pendant", "accessory", "jewelry"],   // œ must not split the word (was: "watch")
+  // a garment word wins over an accessory word
+  ["dress with belt", "garment", null],
+  ["coat with detachable belt", "garment", null],
+  ["jumper with scarf", "garment", null],
+  ["tie belt dress", "garment", null],
+  ["scarf neck top", "garment", null],
+  ["robe col bijou", "garment", null],
+  ["jurk met kettingprint", "garment", null],
+  ["toe cap boots", "shoes", null],
+  ["dress shoes", "shoes", null],
+  ["chain belt", "accessory", "belt"],
+  ["bucket hat", "accessory", "headwear"],
   // eyewear
   ["sunglasses", "accessory", "eyewear"],
   ["solbriller", "accessory", "eyewear"],
@@ -138,6 +150,10 @@ const TITLE_CASES: [string, string][] = [
   ["Kaulakoru Helmi", "necklace"],
   ["Boucles d'oreilles Créoles", "earrings"],
   ["Armbånd Guld", "bracelet"],
+  ["Dress With Belt", "dress"],               // garment beats accessory in the guess too
+  ["Coat With Detachable Belt", "coat"],
+  ["Bæltetaske sort", "bag"],                 // compound bag, not a belt
+  ["Belt Bag Black", "bag"],
   ["Armbåndsur Classic", "watch"],
   ["Montre Élégante", "watch"],              // "élégante" is not "gants"
   ["Læderbælte", "belt"],

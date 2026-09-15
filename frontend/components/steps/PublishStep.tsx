@@ -346,7 +346,7 @@ function MetaDraftSection({
 
       const start = await api.metaCreateDraftJob({
         product_name: productName || "Product",
-        product_type: productType || "dress",
+        product_type: productType || "garment",
         stores: chosen as string[],
         color_keys: colorKeys,
         images_by_color: imagesByColor,

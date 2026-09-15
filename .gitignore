@@ -60,6 +60,8 @@ wtl_store_marks.json
 backend/wtl_store_marks.json
 wtl_discover_state.json
 backend/wtl_discover_state.json
+wtl_niche.json
+backend/wtl_niche.json
 bs_cache.json
 backend/bs_cache.json
 bs_snapshots.jsonl
