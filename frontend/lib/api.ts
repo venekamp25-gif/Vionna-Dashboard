@@ -322,6 +322,15 @@ export interface SizeChart {
   rows: string[][];
 }
 
+/** Today's size-chart verdict for a competitor page, re-asked for a draft that
+ *  still carries the one its own import produced. Same three fields as the
+ *  scrape, so a stale verdict can be replaced field for field. */
+export interface SizeChartRecheck {
+  size_chart: SizeChart | null;
+  size_chart_status: "found" | "unread" | "none";
+  size_chart_hint: string | null;
+}
+
 export interface NamesResponse {
   names: string[];
   error?: string;
@@ -606,6 +615,18 @@ export const api = {
     call<ScrapedProduct & { source?: string }>(
       "/api/scrape_manual",
       { method: "POST", body: { json: rawJson }, authed: true }
+    ),
+
+  /**
+   * Re-ask the backend what it makes of a competitor page's size chart NOW.
+   * A draft stores the verdict from the moment it was imported, so a reader
+   * shipped since then never reaches it — the review step would go on offering
+   * "Notify" for a chart the current code can read, or knows isn't there (bug #58).
+   */
+  sizeChartRecheck: (url: string) =>
+    call<SizeChartRecheck>(
+      "/api/size_chart_recheck",
+      { method: "POST", body: { url }, authed: true }
     ),
 
   names: (store: "dk" | "fr" | "fi") =>

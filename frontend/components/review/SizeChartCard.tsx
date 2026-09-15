@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Card } from "@/components/ui/Card";
 import { Field, Label } from "@/components/ui/Field";
 import { useProduct } from "@/lib/product";
@@ -37,10 +37,41 @@ export function SizeChartCard() {
   const { data, patch } = useProduct();
   const chart = data.sizeChart;
   const hasChart = !!chart && chart.rows.length > 0;
+
+  // The verdict in the draft is the one THAT import produced, and drafts outlive
+  // releases (localStorage + the server-side draft). A reader we ship afterwards
+  // therefore never reaches a draft that is already open, and this card goes on
+  // offering "Notify" for a chart the current backend can now read — or already
+  // knows isn't there. Bug #58 was filed exactly that way: against the page whose
+  // false 'size-guide link/button' hint bug #57 had fixed 21 minutes earlier.
+  // So before believing an 'unread' verdict, ask the backend what it says today.
+  const [recheck, setRecheck] = useState<"idle" | "checking" | "done">("idle");
+  const recheckedUrl = useRef<string | null>(null);
+  useEffect(() => {
+    const url = data.competitorUrl;
+    if (!url || hasChart || data.sizeChartStatus !== "unread") return;
+    if (recheckedUrl.current === url) return;   // once per draft, not per render
+    recheckedUrl.current = url;
+    setRecheck("checking");
+    api
+      .sizeChartRecheck(url)
+      .then((r) =>
+        patch({
+          sizeChart: r.size_chart ?? null,
+          sizeChartStatus: r.size_chart_status,
+          sizeChartHint: r.size_chart_hint ?? null,
+        })
+      )
+      // Store down / offline: keep the draft's own verdict rather than silently
+      // downgrading a real chart to "none" because we couldn't reach the shop.
+      .catch(() => {})
+      .finally(() => setRecheck("done"));
+  }, [data.competitorUrl, data.sizeChartStatus, hasChart, patch]);
+
   // A chart clearly EXISTS on the competitor page but we couldn't read it (unknown
   // app). Offer a one-click "Notify" so support gets added — not shown when there
-  // is genuinely no chart.
-  const unread = !hasChart && data.sizeChartStatus === "unread";
+  // is genuinely no chart, nor while the re-check above is still deciding.
+  const unread = !hasChart && data.sizeChartStatus === "unread" && recheck !== "checking";
 
   const [paste, setPaste] = useState("");
   const [editing, setEditing] = useState(false);
@@ -132,6 +163,10 @@ export function SizeChartCard() {
             </button>
           </div>
         </>
+      ) : recheck === "checking" ? (
+        <div className="text-[12px] text-text-faint mb-1">
+          Re-checking the competitor page for a size chart…
+        </div>
       ) : unread ? (
         <div className="rounded-[10px] border border-warning/40 bg-warning/10 px-3 py-2.5 mb-3">
           <div className="text-[12px] text-text">
