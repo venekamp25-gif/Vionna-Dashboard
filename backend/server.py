@@ -5489,11 +5489,23 @@ def _recommend_keywords(keywords, store, top_n=8):
     return keywords
 
 
+# Per store: did the last clean pass actually filter, or did it fall open and
+# return the raw list? Every fail-open path below used to be invisible: the
+# unfiltered list (brands, menswear) was served AND pinned in the 12h cache
+# with errors: []. The endpoint reads this and reports clean_ok.
+_DFS_CLEAN_LAST = {}
+
+
 def _dfs_clean_keywords_llm(keywords, store, max_tokens=2000):
     """LLM cleanup: from a keyword list keep only ones relevant to a WOMEN'S fashion
     store (drop other brand names, menswear, kids, off-topic). Keeps the objects,
-    just filters. Falls back to the input on any failure."""
-    if not keywords or not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+    just filters. Falls back to the input on any failure (recorded in
+    _DFS_CLEAN_LAST[store] so callers can say so)."""
+    if not keywords:
+        _DFS_CLEAN_LAST[store] = {'ok': True, 'why': ''}
+        return keywords
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        _DFS_CLEAN_LAST[store] = {'ok': False, 'why': 'no Anthropic key'}
         return keywords
     try:
         import anthropic
@@ -5536,12 +5548,18 @@ def _dfs_clean_keywords_llm(keywords, store, max_tokens=2000):
         txt = (msg.content[0].text if msg.content else '') or ''
         m = re.search(r'\[.*\]', txt, re.S)
         if not m:
+            _DFS_CLEAN_LAST[store] = {'ok': False, 'why': 'no JSON array in the reply (truncated?)'}
             return keywords
         keep = {str(x).strip().lower() for x in json.loads(m.group(0))}
         filtered = [k for k in keywords if (k.get('keyword') or '').strip().lower() in keep]
-        return filtered or keywords
+        if not filtered:
+            _DFS_CLEAN_LAST[store] = {'ok': False, 'why': 'model kept nothing — served unfiltered'}
+            return keywords
+        _DFS_CLEAN_LAST[store] = {'ok': True, 'why': ''}
+        return filtered
     except Exception as e:
         print(f"[keywords] clean failed: {e}")
+        _DFS_CLEAN_LAST[store] = {'ok': False, 'why': str(e)[:80]}
         return keywords
 
 
@@ -5700,8 +5718,81 @@ def api_keyword_research_niche():
 # Cache the (paid) What-to-list sweep per market so opening the tab doesn't
 # re-spend DataForSEO credits every time. In-memory → cleared on restart, which
 # is fine (a cache miss just re-fetches). `force` bypasses it (Refresh button).
+# ── DataForSEO: 'wie lijkt op deze winkel' + live SERP (voor store-discovery) ──
+# competitors_domain: domeinen die in DIT land op dezelfde Google-zoekwoorden
+# ranken als een bekende dropshipper. Kost ~$0,024 per call (100 domeinen),
+# 7 dagen op schijf gecacht zoals de andere Labs-calls.
+DFS_COMPETITORS_ENDPOINT = 'https://api.dataforseo.com/v3/dataforseo_labs/google/competitors_domain/live'
+
+
+def _dfs_competitor_domains(target, store, limit=100, offset=0):
+    """[{'domain', 'intersections', 'organic_count', 'etv'}] for `target` in the
+    store's market — sorted by shared keywords. [] when not configured or on a
+    DataForSEO error (printed)."""
+    if not _dfs_configured() or store not in DFS_LOCATION:
+        return []
+    key = f'comp|{store}|{target}|{int(limit)}|{int(offset)}'
+    hit = _dfs_cache_fresh(key)
+    if hit is not None:
+        return hit
+    body = [{'target': target, 'location_code': DFS_LOCATION[store],
+             'language_code': DFS_LANGUAGE[store], 'item_types': ['organic'],
+             'exclude_top_domains': True, 'limit': int(limit), 'offset': int(offset),
+             'order_by': ['intersections,desc']}]
+    try:
+        r = req.post(DFS_COMPETITORS_ENDPOINT, headers=_dfs_headers(), json=body, timeout=45)
+        t, err = _dfs_task_or_error(r, r.json())
+    except Exception as e:
+        print(f'[wtl-disc] competitors {target}/{store} failed: {str(e)[:80]}')
+        return []
+    if err:
+        print(f"[wtl-disc] competitors {target}/{store}: {err.get('error')}")
+        return []
+    items = (((t.get('result') or [{}])[0]) or {}).get('items') or []
+    out = []
+    for it in items:
+        d = re.sub(r'^www\.', '', str(it.get('domain') or '').strip().lower())
+        if not d:
+            continue
+        org = ((it.get('full_domain_metrics') or {}).get('organic') or {})
+        out.append({'domain': d, 'intersections': it.get('intersections'),
+                    'organic_count': org.get('count'), 'etv': org.get('etv')})
+    _dfs_cache_put(key, out)
+    return out
+
+
+def _dfs_serp_results(query, store, depth=30):
+    """Live Google SERP for one query in the store's market → [{'url','domain',
+    'type','rank'}] (organic + paid). Raises on a DataForSEO error so the
+    caller can count it; cached 7 days on disk."""
+    key = f'serp|{store}|{query}|{int(depth)}'
+    hit = _dfs_cache_fresh(key)
+    if hit is not None:
+        return hit
+    r = req.post(DFS_SERP_ENDPOINT, headers=_dfs_headers(), json=[{
+        'keyword': query, 'location_code': DFS_LOCATION[store],
+        'language_code': DFS_LANGUAGE[store], 'depth': int(depth)}], timeout=45)
+    t, err = _dfs_task_or_error(r, r.json())
+    if err:
+        raise RuntimeError(err.get('error') or 'dfs error')
+    items = (((t.get('result') or [{}])[0]) or {}).get('items') or []
+    out = [{'url': it.get('url'), 'domain': it.get('domain'), 'type': it.get('type'),
+            'rank': it.get('rank_absolute')}
+           for it in items if it.get('type') in ('organic', 'paid') and it.get('url')]
+    _dfs_cache_put(key, out)
+    return out
+
+
 _WTL_CACHE = {}
 _WTL_TTL = 12 * 3600  # seconds
+
+
+def _wtl_filter_audience(keywords):
+    """Drop keywords aimed at men or children (deterministic word list — the
+    LLM cleaner let 'pantalon homme' through). Returns (kept, dropped_count)."""
+    kept = [k for k in (keywords or [])
+            if not (isinstance(k, dict) and _blog_wrong_audience(k.get('keyword') or ''))]
+    return kept, len(keywords or []) - len(kept)
 
 
 @app.route('/api/what_to_list', methods=['POST'])
@@ -5750,7 +5841,12 @@ def api_what_to_list():
 
     seed_ranked = {}
     errors = []
-    with _cf.ThreadPoolExecutor(max_workers=6) as pool:
+    with _cf.ThreadPoolExecutor(max_workers=8) as pool:
+        # De twee Shopify-tellingen (recent gelist, live per categorie) lopen MEE
+        # met de DataForSEO-fanout in plaats van erna -- scheelt hun hele
+        # looptijd op een koude run.
+        f_recent = pool.submit(_recent_cat_counts, store)
+        f_live = pool.submit(_live_cat_counts, store)
         futs = {pool.submit(_one, s): s for s in seeds}
         for f in _cf.as_completed(futs):
             try:
@@ -5764,6 +5860,12 @@ def api_what_to_list():
     # pass over all candidates, THEN slice each type to its top-N clean keywords.
     all_cands = [kw for ranked in seed_ranked.values() for kw in ranked]
     cleaned = all_cands if body.get('no_clean') else _dfs_clean_keywords_llm(all_cands, store, max_tokens=4000)
+    # Deterministische doelgroep-guard NA de LLM: 'pantalon homme' en 'lasten
+    # mekko' kwamen door de cleaner heen (blog-pad had de guard al, dit pad niet).
+    cleaned, audience_dropped = _wtl_filter_audience(cleaned)
+    _cl = _DFS_CLEAN_LAST.get(store) or {'ok': True, 'why': ''}
+    clean_ok = bool(body.get('no_clean')) or bool(_cl.get('ok', True))
+    clean_why = '' if clean_ok else str(_cl.get('why') or '')
     from collections import defaultdict as _dd
     by_seed = _dd(list)
     for kw in cleaned:
@@ -5791,8 +5893,16 @@ def api_what_to_list():
     # Recommendation score = demand (volume) + season timing − how saturated the
     # category already is (recently listed in the last 45 days AND total live).
     # Favours in/near-season types the store hasn't covered, so it fills gaps.
-    recent_counts, recent_total = _recent_cat_counts(store)
-    live_counts = _live_cat_counts(store)
+    try:
+        recent_counts, recent_total = f_recent.result()
+    except Exception as e:
+        errors.append(f'recent counts: {str(e)[:60]}')
+        recent_counts, recent_total = {}, 0
+    try:
+        live_counts = f_live.result()
+    except Exception as e:
+        errors.append(f'live counts: {str(e)[:60]}')
+        live_counts = {}
     max_recent = max(recent_counts.values()) if recent_counts else 0
     max_live = max(live_counts.values()) if live_counts else 0
     max_vol = max((t.get('volume') or 0) for t in types) if types else 1
@@ -5825,6 +5935,9 @@ def api_what_to_list():
                'doc_min_volume': _DOC_MIN_KW_VOLUME,
                'count': len(types), 'recent_total': recent_total, 'recent_window_days': 45,
                'recent_counts': recent_counts, 'live_counts': live_counts, 'types': types,
+               'audience_dropped': audience_dropped,
+               # False = the brand/menswear cleaner fell open and this list is raw.
+               'clean_ok': clean_ok, 'clean_why': clean_why,
                'errors': errors[:3]}
     at = datetime.datetime.utcnow().isoformat() + 'Z'
     # Only cache a real result — an empty types list is almost always a transient
@@ -10408,34 +10521,192 @@ _BS_PROD_MAX = 4000
 # means a cold scan is now the exception rather than every 12h.
 _BS_WORKERS = 3
 
-_BS_CATEGORY_KEYWORDS = [
-    ('dress',     ['dress', 'kjole', 'robe', 'mekko', 'gown', 'jurk']),
-    ('jumpsuit',  ['jumpsuit', 'playsuit', 'romper', 'combinaison', 'overall']),
-    ('knitwear',  ['knit', 'sweater', 'cardigan', 'jumper', 'pullover', 'strik', 'pull ', 'tricot']),
-    ('outerwear', ['jacket', 'coat', 'blazer', 'trench', 'parka', 'manteau', 'veste', 'jas ']),
-    ('swim',      ['bikini', 'swimsuit', 'swim', 'maillot', 'badpak']),
-    ('skirt',     ['skirt', 'skort', 'nederdel', 'jupe', 'hame']),
-    ('pants',     ['pants', 'trouser', 'jeans', 'shorts', 'legging', 'jogger', 'pantalon', 'broek', 'housut']),
-    ('top',       ['top', 'blouse', 'shirt', 'tee', 'tank', 'camisole', 'bodysuit', 'cami ', 'chemisier']),
-    ('shoes',     ['shoe', 'boot', 'sneaker', 'sandal', 'heel', 'loafer', 'mule', 'sko', 'støvle']),
-    ('accessory', ['bag', 'tote', 'handbag', 'sac ', 'belt', 'scarf', 'necklace', 'earring', 'jewel', 'hat ', 'tas ']),
+# ── Product buckets ──────────────────────────────────────────────────────────
+# Twee families. MODE-buckets zijn wat Vionna verkoopt (en de What-to-list
+# categorieën); NIET-MODE-buckets bestaan zodat een hårelastik, een lipstick of
+# een sofa een NAAM krijgt en weggelaten wordt, in plaats van stil als 'other'
+# mee te tellen als damesmode-bestseller (mollyogmy.dk: 9 van 19, 2026-09-15).
+_BS_FASHION_BUCKETS = ('dress', 'jumpsuit', 'knitwear', 'outerwear', 'swim', 'skirt', 'pants',
+                       'lingerie', 'top', 'clothing', 'shoes', 'accessory', 'jewelry', 'eyewear')
+_BS_CLOTHING_BUCKETS = ('dress', 'jumpsuit', 'knitwear', 'outerwear', 'swim', 'skirt', 'pants',
+                        'lingerie', 'top', 'clothing')
+_BS_NON_FASHION_BUCKETS = ('kids', 'men', 'pet', 'beauty', 'tech', 'bundle', 'hosiery',
+                           'home', 'sport', 'food')
+
+
+def _bs_rx(pattern):
+    return re.compile(pattern, re.I)
+
+
+# Uitsluitingen EERST (op type + titel + tags samen): een kinderjurk is geen
+# damesmode, een hondentrui geen strik. Kort en eenduidig gehouden; 'baby blue'
+# is een kleur, geen doelgroep.
+_BS_PRE_RULES = [
+    ('kids', _bs_rx(r"\b(?:kids?|children|child|toddler|babies|b[ée]b[ée]s?|enfants?|gar[çc]ons?|filles?|"
+                    r"b[øo]rn|b[øo]rne\w*|drenge\w*|piger?|pige\w*|lasten|lapsille|lapset|pojat|poikien|"
+                    r"tyt[öo]t|tyt[öo]n|tytt[öo]jen|vauva\w*|junior|girls?|boys?)\b|"
+                    r"\bbaby(?!\s?(?:blue|pink|rose|bleu|rosa|r[øo]d|lyser[øo]d|vaaleanpunainen|doll))")),
+    ('pet', _bs_rx(r"\b(?:dogs?|hund|hunde\w*|chiens?|koira\w*|puppy|hvalp\w*|chiot|pentu|"
+                   r"cat (?:toy|bed|collar|tree|food)|katte\w*|kissan\w*|pets?|k[æa]ledyr|"
+                   r"animal de compagnie|lemmikki\w*)\b")),
+    ('home', _bs_rx(r"jewell?ery box|smykkeskrin|bo[îi]te [àa] bijoux|korurasia|jewell?ery stand|"
+                    r"smykkeholder|shoe rack|skostativ|kenk[äa]teline|\bhangers?\b|b[øo]jle\w*|\bcintres?\b|"
+                    r"vaatepuu|garment bag|laundry|vasket[øo]j|lessive|pyykki|wine glass|vinglas|"
+                    r"verres? [àa] vin|viinilasi|drinking glass|champagne glass|sleeping bag|sovepose|"
+                    r"sac de couchage|makuupussi")),
+    ('food', _bs_rx(r"tea ?bags?|tebreve|sachets? de th[ée]|teepussi|coffee beans|kaffeb[øo]nner|grains de caf[ée]|"
+                    r"kahvipavut|protein ?powder|proteinpulver")),
+    ('beauty', _bs_rx(r"lipstick|l[æa]bestift|rouge [àa] l[èe]vres|huulipuna|lip ?gloss|mascara|eyeliner|"
+                      r"foundation|concealer|\bblush\b|bronzer|highlighter|perfume|parfum|hajuvesi|eau de|"
+                      r"\bserum\b|s[ée]rum|seerumi|moisturi[sz]er|face cream|ansigtscreme|cr[èe]me visage|"
+                      r"kasvovoide|skincare|hudpleje|soin de la peau|ihonhoito|make-?up|sminke|maquillage|"
+                      r"meikki|self[- ]?tan\w*|selvbruner|autobronzant|itseruskettava|shampoo|conditioner|"
+                      r"h[åa]rpleje|hiustenhoito|nail polish|neglelak|\bvernis\b|kynsilakka|body (?:lotion|"
+                      r"oil|scrub|wash|cream|butter|mist|milk)|bodylotion|hair elastic\w*|h[åa]relastik\w*|"
+                      r"hair ties?|hiuslenkki|hiusdonitsi|hair ?spray|eyelash\w*|\blashes\b|\bvipper\b|"
+                      r"\bcils\b|\bripset\b|deodorant|toothbrush|tandb[øo]rste|hammasharja|\brazor\b|shaver")),
+    ('tech', _bs_rx(r"phone case|iphone|samsung|mobilcover|cover til|\bcoque\w*|puhelimen ?kuor\w*|\bkuoret\b|"
+                    r"charger|oplader|chargeur|\blaturi\b|powerbank|earbuds|earphones|headphones|"
+                    r"h[øo]retelefon\w*|[ée]couteurs|casque audio|kuulokkeet|\bspeaker\w*|h[øo]jttaler\w*|"
+                    r"\benceinte\b|\bkaiutin\b|\busb\b|\bcables?\b|\bkabel\w*|c[âa]ble\w*|kaapeli|laptop|"
+                    r"\btablet\b|smartwatch|led[- ]strip|\bcamera\b|\bkamera\b|\bdrone\b|gadget")),
+    ('bundle', _bs_rx(r"goodie ?bags?|lykkepose|mystery (?:box|bag)|lucky bag|surprise bag|pochette surprise|"
+                      r"yll[äa]tys\w*|\bbundles?\b|bestillingsvare|gift ?box|gaves[æa]t|\bcoffret\w*|lahjapakkaus")),
+    ('hosiery', _bs_rx(r"\btights\b|str[øo]mpebukser|\bcollants?\b|sukkahousut|\bpanty\b|pantyhose|\bsocks?\b|"
+                       r"str[øo]mper|chaussettes|\bsukat\b|\bsokk\w*|stockings|stay-?ups?|\bnylons\b")),
 ]
+
+# MODE-buckets, in volgorde: het meest specifieke woord wint ('strik kjole' is
+# een jurk). Eerst op product_type, dan op titel + tags -- zoals voorheen, maar
+# nu met woordgrenzen; DK/FI-samenstellingen (sommerkjole, nilkkurit, naisten
+# farkut) via expliciete \w*-suffixen.
+_BS_FASHION_RULES = [
+    # (?!marimekko): het merk Marimekko bevat 'mekko' en is geen jurk.
+    ('dress',     _bs_rx(r"\bdress(?:es)?\b|\w*kjole\w*|\brobes?\b(?! de chambre)|\b(?!marimekko)\w*mekko\w*|"
+                         r"\bgowns?\b|\bjurk\w*|\bkleid\w*")),
+    ('jumpsuit',  _bs_rx(r"jumpsuit|playsuit|romper|combinaison|combishort|\boveralls?\b|buksedragt|\bhaalari\w*")),
+    ('knitwear',  _bs_rx(r"\bknit\w*|sweater|cardigan|\bjumper|pullover|\w*strik\w*|\bpulls?\b|\btricot\w*|"
+                         r"\w*neule\w*|\btrui\b|villapaita|villatakki|strickjacke")),
+    ('outerwear', _bs_rx(r"jacket|\w*jakke\w*|\bcoats?\b|blazer|trench|parka|manteau|\bveste\b|\bjas\b|"
+                         r"\w*frakke\w*|\w*takki\b|\bmantel\b|anorak|puffer|doudoune|blouson|\bcape\b|poncho|"
+                         r"\bgilet\b|\bliivi\b|kimono")),
+    ('swim',      _bs_rx(r"bikini\w*|swimsuit|\bswim\w*|maillot|badpak|badedragt|badet[øo]j|uimapuku|\buima\w*|badeanzug")),
+    ('skirt',     _bs_rx(r"\bskirts?\b|\bskort\b|nederdel\w*|\bjupes?\b|\w*hame\b|\bhameet\b")),
+    ('pants',     _bs_rx(r"\bpants\b|trousers?|\bjeans?\b|\bshorts\b|legging\w*|jogger\w*|pantalon\w*|\bbroek\w*|"
+                         r"\w*housut\b|\w*bukser\b|farkut|farkku\w*|shortsit|culottes?|\bcargo\b|chino\w*")),
+    ('lingerie',  _bs_rx(r"\bbras?\b|\bbh\b|soutien-?gorge|rintaliivi\w*|lingerie|undert[øo]j|sous-?v[êe]tement\w*|"
+                         r"alusvaatteet|alusasu\w*|panties|trusser|\bbriefs\b|\bthongs?\b|g-string|nightwear|"
+                         r"natkjole|nuisette|y[öo]paita|nightdress|nightgown|pyjama\w*|pajama\w*|natt[øo]j|"
+                         r"\bslip\b(?!\s*dress)|shapewear|bodystocking")),
+    ('top',       _bs_rx(r"\btops?\b|blouse\w*|\bshirts?\b|t-?shirts?\b|\btees?\b|\btank\b|camisole|bodysuit|"
+                         r"\bcami\b|chemisier|\bbluse\w*|pusero\w*|\w*paita\b|\btoppi\w*|\btunic\w*|tunika|"
+                         r"tunique|hoodie|huppari|h[æa]ttetr[øo]je|sweatshirt|collegepaita|\bvest\b|\bcrop\b|"
+                         r"\bhaut\b|d[ée]bardeur|\bbody\b(?!\s?(?:lotion|oil|scrub|wash|cream|butter|mist|milk))")),
+    ('shoes',     _bs_rx(r"\bshoes?\b|\bboots?\b|sneaker\w*|sandal\w*|\bheels?\b|loafer\w*|\bmules?\b|\w*sko\b|"
+                         r"\w*st[øo]vle\w*|\w*keng[äa]t\b|\w*kenk[äa]\w*|saappaat|\w*nilkkuri\w*|lenkkari\w*|"
+                         r"sandaalit|tennarit|chaussure\w*|\bbottes?\b|bottine\w*|\bbaskets?\b|espadrille\w*|"
+                         r"ballerina\w*|\bpumps?\b|slipper\w*|hjemmesko|stiefel|\bschuh\w*|\bclogs?\b|"
+                         r"flip-?flops?|\bflats\b|\boxfords?\b|\bbrogues?\b")),
+    ('accessory', _bs_rx(r"\bbags?\b|\btotes?\b|handbag\w*|\bsacs?\b|\w*taske\w*|\w*laukku\w*|\btas\b|\bbelts?\b|"
+                         r"b[æa]lte\w*|ceinture\w*|\bvy[öo]\w*|\bscar(?:f|ves)\b|t[øo]rkl[æa]de\w*|[ée]charpe\w*|"
+                         r"foulard\w*|\bhuivi\w*|\bsjaal\w*|\bhats?\b|\bhue\b|kasket\w*|chapeau\w*|\bbonnet\w*|"
+                         r"casquette\w*|b[ée]ret\w*|\bhattu\b|\bpipo\b|\blippis\b|\bcaps?\b|beanie\w*|\bgloves?\b|"
+                         r"handsker|\bgants?\b|k[äa]sineet|wallet\w*|\bpung\b|portefeuille|lompakko|\bclutch\w*|"
+                         r"\bpurses?\b|backpack\w*|rygs[æa]k\w*|\breppu\b|scrunchie\w*|hair ?clips?|h[åa]rsp[æa]nde\w*|"
+                         r"headband\w*|h[åa]rb[åa]nd|hiuspanta|umbrella|paraply|parapluie|sateenvarjo|keychain|"
+                         r"key ?rings?|n[øo]glering|porte-cl[ée]s|avaimenper[äa]")),
+    ('jewelry',   _bs_rx(r"necklace\w*|halsk[æa]de\w*|collier\w*|kaulakoru\w*|\bketting\w*|earrings?|[øo]rering\w*|"
+                         r"boucles? d'oreille\w*|korvakoru\w*|\boorbel\w*|bracelet\w*|armb[åa]nd\w*|rannekoru\w*|"
+                         r"\barmband\w*|\brings?\b|\bbague\w*|\bsormu\w*|\bjewel\w*|smykke\w*|bijou\w*|\w*koru\b|"
+                         r"\bkorut\b|pendant\w*|vedh[æa]ng|pendentif\w*|riipu\w*|\bcharms?\b|anklet\w*|"
+                         r"ankelk[æa]de\w*|\bwatch(?:es)?\b|\bure?\b|\bmontres?\b|\bkello\b|\bkellot\b|horloge\w*|"
+                         r"piercing\w*|brooch|\bbroche\w*|rintakoru")),
+    ('eyewear',   _bs_rx(r"sunglasses|solbrille\w*|lunettes|aurinkolasit|zonnebril\w*|sonnenbrille\w*|eyewear|"
+                         r"\bglasses\b|\bbriller\b|\blasit\b|eyeglasses")),
+]
+
+# Resterende niet-mode (NA de mode-regels: 'plaid skirt' is een rok, geen plaid).
+_BS_POST_RULES = [
+    ('home',  _bs_rx(r"candle\w*|stearinlys|duftlys|bougie\w*|kynttil[äa]\w*|\bvases?\b|cushion\w*|\bpuder?\b|"
+                     r"coussin\w*|\btyyny\w*|blanket\w*|\bplaid\b|\bt[æa]ppe\w*|couverture\w*|\bviltti\b|"
+                     r"\blamps?\b|\blampe\w*|valaisin|\bmugs?\b|\bkrus\b|\btasse\w*|\bmuki\b|\bplates?\b|"
+                     r"tallerken\w*|assiette\w*|lautanen|\bbowls?\b|\bsk[åa]l\w*|\bdecor\w*|poster\w*|plakat\w*|"
+                     r"affiche\w*|juliste\w*|\bframes?\b|\bramme\w*|\bcadre\w*|\brugs?\b|towel\w*|h[åa]ndkl[æa]de\w*|"
+                     r"serviette\w*|pyyhe\w*|bedding|senget[øo]j|linge de lit|lakana\w*|\bduvet\w*|\bdyne\b|"
+                     r"diffuser\w*|storage|opbevaring|rangement|s[äa]ilytys\w*|furniture|m[øo]bel\w*|meuble\w*|"
+                     r"huonekalu\w*|\bsofa\w*|\bchairs?\b|\bstol\b|\bchaise\w*|\btuoli\b|\btables?\b|\bbord\b|"
+                     r"p[öo]yt[äa]|\bshel(?:f|ves)\b|\bhylde\w*|[ée]tag[èe]re\w*|\bhylly\w*|curtain\w*|gardin\w*|"
+                     r"rideau\w*|\bverho\w*|wall art|kitchen|k[øo]kken|cuisine|keitti[öo]|\bpans?\b|\bpots?\b|"
+                     r"planter|urtepotte|cache-pot|\bruukku\b|\bmirror\w*|\bspejl\w*|\bmiroir\w*|\bpeili\b|"
+                     r"\bclocks?\b|v[æa]gur|seinäkello|\btrays?\b|\bbakke\b|\bplateau\b|tarjotin|napkin\w*|"
+                     r"serviet\w*|coaster\w*")),
+    ('sport', _bs_rx(r"yoga ?mat\w*|yogam[åa]tte|tapis de yoga|joogamatto|dumbbell\w*|h[åa]ndv[æa]gt\w*|halt[èe]re\w*|"
+                     r"k[äa]sipaino\w*|kettlebell|resistance band|tr[æa]ningselastik|\bfitness\b|\bgolf\w*|"
+                     r"\btennis\b|racket|ketcher|raquette|\bmaila\b|\bskis?\b|snowboard|\bbikes?\b|bicycle|"
+                     r"\bcykel\w*|\bv[ée]lo\w*|polkupy[öo]r\w*|helmet|\bhjelm\w*|\bcasque\b|kyp[äa]r[äa]|"
+                     r"\bballs?\b|fodbold|football|soccer|jalkapallo|protein|proteiini|treadmill|l[øo]beb[åa]nd|"
+                     r"foam roller|skipping rope|sjippetov|hyppynaru|goggles|sv[øo]mmebriller")),
+    ('food',  _bs_rx(r"coffee|\bkaffe\w*|\bcaf[ée]\b|\bkahvi\w*|chocolate|chokolade|chocolat|suklaa\w*|\bsnacks?\b|"
+                     r"vitamin\w*|supplement\w*|kosttilskud|compl[ée]ment alimentaire|lis[äa]ravinne|\bhoney\b|"
+                     r"honning|\bmiel\b|hunaja|\bwine\b|\bvin\b|\bviini\b|\bbeer\b|\b[øo]l\b|bi[èe]re|\bolut\b|"
+                     r"\bcandy\b|\bslik\b|bonbon\w*|karkki\w*|granola|m[üu]sli|muesli|\bspices?\b|krydderi\w*|"
+                     r"[ée]pices?\b|mauste\w*")),
+]
+
+# Generieke kledingwoorden: als product_type dít is, beslist hij niet (kekale.fi
+# zet 'Vaatteet' op laarzen én broeken); als de titel verder niets zegt, is het
+# in elk geval kleding.
+_BS_GENERIC_CLOTHING_RE = _bs_rx(r"\bclothing\b|\bapparel\b|\bt[øo]j\b|damet[øo]j|v[êe]tements?\b|\bvaatteet\b|"
+                                 r"\bvaate\b|\bkleding\b|\bmode\b|\bfashion\b|\bmuoti\b|\bnaisten\b|\bfemme\b|"
+                                 r"\bdame\b|\bdame-?mode\b|\bwomen'?s?\b|\bnew in\b|nyheder|nouveaut[ée]s|uutuudet")
+
+
+def _bs_is_fashion(cat):
+    return cat in _BS_FASHION_BUCKETS
+
+
+def _bs_is_clothing(cat):
+    return cat in _BS_CLOTHING_BUCKETS
+
+
+def _bs_category(title, ptype, tags=''):
+    """Product bucket from product_type + title (+ tags). Buckets are the
+    What-to-list categories plus NAMED non-fashion buckets (see the tables
+    above); 'other' only when nothing at all matches.
+
+    Order: exclusions (kids/men/pet/beauty/tech/bundle/hosiery) on everything,
+    then the fashion rules on product_type (unless it is a generic word like
+    'Vaatteet'), then on title + tags, then the remaining non-fashion rules,
+    then generic-clothing → 'clothing'."""
+    ptype = (ptype or '').strip()
+    title = (title or '').strip()
+    tags = tags if isinstance(tags, str) else ' '.join(str(t) for t in (tags or []))
+    full = f'{ptype} | {title} | {tags}'
+    for cat, rx in _BS_PRE_RULES:
+        if rx.search(full):
+            return cat
+    if _BS_NOT_WOMENS_RE.search(full) or re.search(r'\bunisex\b', full, re.I):
+        return 'men'
+    if ptype and not _BS_GENERIC_CLOTHING_RE.search(ptype):
+        for cat, rx in _BS_FASHION_RULES:
+            if rx.search(ptype):
+                return cat
+    body = f'{title} {tags}'
+    for cat, rx in _BS_FASHION_RULES:
+        if rx.search(body):
+            return cat
+    for cat, rx in _BS_POST_RULES:
+        if rx.search(full):
+            return cat
+    if _BS_GENERIC_CLOTHING_RE.search(full):
+        return 'clothing'
+    return 'other'
 
 
 _BS_JUNK_RE = re.compile(r'gift ?card|cadeaubon|e-?gift|lahjakortti|gavekort|presentkort|'
-                         r'carte cadeau|geschenkkarte|parcel protection|shipping protection|'
-                         r'route package|package protection|insurance|verzekering|priority processing', re.I)
-
-
-def _bs_category(title, ptype):
-    """Rough product-type bucket from product_type + title text (same buckets as
-    the What-to-list categories). 'other' when nothing matches."""
-    for field in ((ptype or ''), (title or '')):
-        t = ' ' + field.lower() + ' '
-        for cat, kws in _BS_CATEGORY_KEYWORDS:
-            if any(k in t for k in kws):
-                return cat
-    return 'other'
+                         r'carte cadeau|ch[èe]que cadeau|bon cadeau|gift voucher|geschenkkarte|'
+                         r'parcel protection|shipping protection|route package|package protection|'
+                         r'insurance|verzekering|priority processing|\bdonation\b|\btip\b', re.I)
 
 
 def _bs_host(domain):
@@ -10522,10 +10793,15 @@ def _bs_prod_slim(p):
     unchanged whether the dict came from the network or from here."""
     imgs = p.get('images') or []
     var = (p.get('variants') or [{}])[0] or {}
+    tags = p.get('tags')
+    tags = ' '.join(str(t) for t in tags) if isinstance(tags, list) else str(tags or '')
     return {'title': p.get('title'),
             'images': ([{'src': imgs[0].get('src')}] if imgs else []),
             'variants': [{'price': var.get('price')}],
             'product_type': p.get('product_type'),
+            # tags erbij (max 300 tekens): de bucketer leest ze; 'Hårelastikker'
+            # staat vaak alleen in de tags.
+            'tags': tags[:300],
             'published_at': p.get('published_at')}
 
 
@@ -10649,7 +10925,7 @@ def _bs_scan(host, limit=20):
                 'price': ((p.get('variants') or [{}])[0]).get('price'),
                 'product_type': p.get('product_type') or '',
                 'published_at': (p.get('published_at') or '')[:10],
-                'category': _bs_category(title, p.get('product_type'))}
+                'category': _bs_category(title, p.get('product_type'), p.get('tags') or '')}
     import concurrent.futures as _cf
     with _cf.ThreadPoolExecutor(max_workers=_BS_WORKERS) as pool:
         products = list(pool.map(_one, enumerate(handles, start=1)))
@@ -10664,9 +10940,20 @@ def _bs_scan(host, limit=20):
                 if not _BS_NOT_WOMENS_RE.search((p.get('title') or '') + ' ' + (p.get('product_type') or '')
                                                 + ' ' + (p.get('handle') or ''))]
     from collections import Counter
+    # Niet-mode WEGLATEN en apart melden. Voorheen telde een lipstick of een
+    # hårelastik als 'other' gewoon mee als damesmode-bestseller (en als
+    # 'nieuw te importeren'). Nu ziet de medewerker "7 niet-mode verborgen
+    # (beauty 4, hosiery 3)" in plaats van een lijst vol junk.
+    non_fashion = [p for p in products if not _bs_is_fashion(p['category'])]
+    products = [p for p in products if _bs_is_fashion(p['category'])]
+    dropped = Counter(p['category'] for p in non_fashion)
     by_cat = Counter(p['category'] for p in products)
     return {'ok': True, 'domain': host, 'url': url, 'count': len(products),
-            'by_category': dict(by_cat.most_common()), 'products': products}, None
+            'by_category': dict(by_cat.most_common()), 'products': products,
+            'dropped': dict(dropped.most_common()),
+            'dropped_examples': [(p.get('title') or '')[:60] for p in non_fashion[:5]],
+            'fashion_share': (round(len(products) / (len(products) + len(non_fashion)), 2)
+                              if (products or non_fashion) else None)}, None
 
 
 def _bs_scan_cached(host, force=False):
@@ -11057,6 +11344,247 @@ def _similarweb_bulk(hosts):
     return out
 
 
+# ── Niche: is dit een DAMESMODE-winkel? ─────────────────────────────────────
+# De dropship-verdict zegt alleen 'dropshipper of merk'; niets keek naar wat er
+# verkocht wordt. Gemeten pool 2026-09-15: intersport, golfexperten, skechers,
+# een meubelwinkel met groene dropshipper-chip. Eén products.json-call + de
+# bucketer geeft het antwoord in ~1-3 s; alleen bij twijfel een haiku-call.
+WTL_NICHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wtl_niche.json')
+_WTL_NICHE_TTL = 30 * 86400
+_WTL_NICHE_TRANSIENT_TTL = 86400      # 'unknown' door een storing: morgen opnieuw
+_WTL_NICHE_LOCK = threading.Lock()
+_WTL_NICHE_SAMPLE = 30                # products.json?limit= (ruim genoeg, klein genoeg voor de proxy)
+_WTL_NICHE_MIN_FASHION = 5            # minder damesmode-producten dan dit = geen modewinkel
+_WTL_NICHE_KINDS = ('womenswear', 'menswear', 'kids', 'jewelry', 'shoes', 'beauty', 'home',
+                    'sport', 'electronics', 'pet', 'food', 'general', 'other')
+
+
+def _wtl_niche_load():
+    try:
+        with open(WTL_NICHE_PATH, encoding='utf-8') as f:
+            return json.load(f) or {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f'[niche] load failed: {e}')
+        return {}
+
+
+def _wtl_niche_save(data):
+    try:
+        tmp = WTL_NICHE_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, WTL_NICHE_PATH)
+    except Exception as e:
+        print(f'[niche] save failed: {e}')
+
+
+def _wtl_niche_fresh(n):
+    """Een echt oordeel (yes/no) blijft 30 dagen goed; 'unknown' (storing) 1 dag."""
+    if not isinstance(n, dict) or n.get('status') not in ('yes', 'no', 'unknown'):
+        return False
+    try:
+        age = (datetime.datetime.utcnow()
+               - datetime.datetime.fromisoformat(str(n.get('ts', '')).rstrip('Z'))).total_seconds()
+    except Exception:
+        return False
+    return age < (_WTL_NICHE_TTL if n.get('status') in ('yes', 'no') else _WTL_NICHE_TRANSIENT_TTL)
+
+
+def _gd_products_sample(domain, limit=_WTL_NICHE_SAMPLE, timeout=12):
+    """One public products.json call. Returns (products|None, http_status, error).
+    products is a list when the host is a Shopify store that answered 200."""
+    try:
+        r = _scrape_get(f'https://{domain}/products.json?limit={int(limit)}', timeout=timeout)
+    except Exception as e:
+        return None, 0, str(e)[:60]
+    if r.status_code != 200:
+        return None, r.status_code, f'HTTP {r.status_code}'
+    try:
+        data = r.json() or {}
+    except Exception:
+        return None, r.status_code, 'geen JSON'
+    if not isinstance(data, dict) or 'products' not in data:
+        return None, r.status_code, 'geen products-sleutel'
+    prods = data.get('products') or []
+    return (prods if isinstance(prods, list) else []), 200, None
+
+
+def _niche_profile(products):
+    """Bucket counts + fashion/clothing shares for a product sample."""
+    from collections import Counter
+    counts = Counter()
+    for p in products or []:
+        if not isinstance(p, dict):
+            continue
+        tags = p.get('tags')
+        tags = ' '.join(str(t) for t in tags) if isinstance(tags, list) else str(tags or '')
+        counts[_bs_category(p.get('title') or '', p.get('product_type') or '', tags)] += 1
+    total = sum(counts.values())
+    fashion = sum(v for k, v in counts.items() if _bs_is_fashion(k))
+    clothing = sum(v for k, v in counts.items() if _bs_is_clothing(k))
+    return {'total': total, 'fashion': fashion, 'clothing': clothing,
+            'buckets': dict(counts.most_common()),
+            'fashion_share': round(fashion / total, 2) if total else 0.0,
+            'clothing_share': round(clothing / total, 2) if total else 0.0}
+
+
+def _niche_kind_from_profile(profile):
+    """Best label for a NON-fashion store, from its biggest bucket."""
+    buckets = profile.get('buckets') or {}
+    non = [(k, v) for k, v in buckets.items() if not _bs_is_fashion(k)]
+    if not non:
+        # Wel mode, geen kleding: een sieraden- of schoenenwinkel.
+        fashion = [(k, v) for k, v in buckets.items() if not _bs_is_clothing(k)]
+        top = max(fashion, key=lambda kv: kv[1])[0] if fashion else 'other'
+        return {'jewelry': 'jewelry', 'shoes': 'shoes', 'eyewear': 'other',
+                'accessory': 'general'}.get(top, 'general')
+    top = max(non, key=lambda kv: kv[1])[0]
+    return {'men': 'menswear', 'kids': 'kids', 'beauty': 'beauty', 'home': 'home', 'sport': 'sport',
+            'tech': 'electronics', 'pet': 'pet', 'food': 'food', 'hosiery': 'other',
+            'bundle': 'other', 'other': 'general'}.get(top, 'other')
+
+
+def _niche_verdict(profile):
+    """('yes'|'no'|'ambiguous', reason). Damesmode = het merendeel mode EN een
+    stevig deel KLEDING (een puur sieraden- of beautywinkel is geen bron voor
+    een kledingmerk)."""
+    n = int(profile.get('total') or 0)
+    if n == 0:
+        return 'no', 'empty catalogue'
+    fs, cs = float(profile.get('fashion_share') or 0), float(profile.get('clothing_share') or 0)
+    if int(profile.get('fashion') or 0) < _WTL_NICHE_MIN_FASHION:
+        return 'no', f"only {profile.get('fashion')} womenswear products of {n}"
+    if fs >= 0.6 and cs >= 0.4:
+        return 'yes', f'{round(fs * 100)}% womenswear, {round(cs * 100)}% clothing'
+    if fs < 0.4 or cs < 0.2:
+        kind = _niche_kind_from_profile(profile)
+        return 'no', f'{round(fs * 100)}% fashion ({kind} dominates, {round(cs * 100)}% clothing)'
+    return 'ambiguous', f'{round(fs * 100)}% fashion, {round(cs * 100)}% clothing'
+
+
+def _niche_llm(domain, products, profile):
+    """Tie-break for the ambiguous zone. Returns (True|False|None, kind)."""
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        return None, None
+    lines = []
+    for p in (products or [])[:40]:
+        if isinstance(p, dict):
+            lines.append(f"- {(p.get('title') or '')[:70]} [{(p.get('product_type') or '')[:30]}]")
+    if not lines:
+        return None, None
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        msg = client.messages.create(
+            model='claude-haiku-4-5-20251001', max_tokens=120,
+            messages=[{'role': 'user', 'content':
+                f'Online store {domain}. Below is a sample of its products (title [type]). '
+                'Is this primarily a WOMEN\'S FASHION store (women\'s clothing first; shoes, bags and '
+                'jewellery are fine as extras)? A store that is mainly menswear, kidswear, jewellery-only, '
+                'beauty, home, sport, electronics or a general mixed shop is NOT. Return ONLY JSON: '
+                '{"womens_fashion": true|false, "kind": "womenswear"|"menswear"|"kids"|"jewelry"|"shoes"|'
+                '"beauty"|"home"|"sport"|"electronics"|"pet"|"food"|"general"|"other"}\n\n'
+                + '\n'.join(lines)}])
+        txt = (msg.content[0].text if msg.content else '') or ''
+        m = re.search(r'\{.*\}', txt, re.S)
+        data = json.loads(m.group(0)) if m else {}
+        wf = data.get('womens_fashion')
+        kind = data.get('kind') if data.get('kind') in _WTL_NICHE_KINDS else None
+        return (bool(wf) if isinstance(wf, bool) else None), kind
+    except Exception as e:
+        print(f'[niche] llm failed for {domain}: {str(e)[:80]}')
+        return None, None
+
+
+def _wtl_niche_check(domain, products=None, http_status=None, error=None, save=True):
+    """Compute (and cache) the niche verdict for one store. Pass `products` when
+    the caller already fetched products.json (discovery does), so the check is
+    free. Returns the cached-shape dict:
+      {status: yes|no|unknown, reason, kind, fashion_share, clothing_share,
+       buckets, total, unverified?, source, ts}
+    Storing ≠ oordeel: an HTTP failure is 'unknown' (short TTL), never 'no'."""
+    bare = (domain or '').replace('www.', '').strip().lower()
+    ts = datetime.datetime.utcnow().isoformat() + 'Z'
+    if products is None:
+        products, http_status, error = _gd_products_sample(bare)
+    if products is None:
+        entry = {'status': 'unknown', 'reason': f'check mislukt: {error or http_status}',
+                 'kind': None, 'fashion_share': None, 'clothing_share': None, 'buckets': {},
+                 'total': 0, 'source': 'http', 'ts': ts}
+    else:
+        prof = _niche_profile(products)
+        status, reason = _niche_verdict(prof)
+        kind, source, unverified = ('womenswear' if status == 'yes' else None), 'rules', False
+        if status == 'no':
+            kind = _niche_kind_from_profile(prof)
+        if status == 'ambiguous':
+            wf, k = _niche_llm(bare, products, prof)
+            source = 'llm'
+            if wf is True:
+                status, kind = 'yes', 'womenswear'
+            elif wf is False:
+                status, kind = 'no', (k or _niche_kind_from_profile(prof))
+            else:
+                # Geen oordeel te krijgen: doorlaten met een vlag (warn, never block).
+                status, kind, unverified = 'yes', 'womenswear', True
+                reason += ' — niet bevestigd'
+        entry = {'status': status, 'reason': reason, 'kind': kind,
+                 'fashion_share': prof['fashion_share'], 'clothing_share': prof['clothing_share'],
+                 'buckets': prof['buckets'], 'total': prof['total'], 'source': source, 'ts': ts}
+        if unverified:
+            entry['unverified'] = True
+    if save:
+        with _WTL_NICHE_LOCK:
+            cache = _wtl_niche_load()
+            cache[bare] = entry
+            _wtl_niche_save(cache)
+    return entry
+
+
+def _wtl_niche_public(n):
+    """The fields the stores tab shows (no bucket dump)."""
+    if not isinstance(n, dict) or not n.get('status'):
+        return None
+    return {'status': n.get('status'), 'kind': n.get('kind'), 'reason': n.get('reason'),
+            'fashion_share': n.get('fashion_share'), 'unverified': bool(n.get('unverified')),
+            'fresh': _wtl_niche_fresh(n)}
+
+
+def _wtl_niche_missing(domains, cap=60, jid=None, workers=8):
+    """Niche-check every domain without a fresh verdict, `cap` at a time, in
+    parallel (it is one HTTP call each). Returns {checked, due, yes, no, unknown}."""
+    cache = _wtl_niche_load()
+    marks = _wtl_marks_load()
+    due = [d for d in domains if not _wtl_niche_fresh(cache.get(d.replace('www.', '')))]
+    # Ongemarkeerde winkels eerst: die staan in beeld.
+    due.sort(key=lambda d: (1 if _wtl_mark_active(marks.get(d.replace('www.', '')) or {}) else 0, d))
+    todo = due[:max(0, int(cap))]
+    if jid:
+        _job_set(jid, phase='Niche checken (damesmode of niet)', total=len(todo), processed=0)
+    from collections import Counter
+    tally = Counter()
+    import concurrent.futures as _cf
+
+    def _one(d):
+        try:
+            return _wtl_niche_check(d).get('status')
+        except Exception as e:
+            print(f'[niche] {d}: {str(e)[:80]}')
+            return 'error'
+        finally:
+            if jid:
+                _job_inc(jid, processed=1)
+
+    if todo:
+        with _cf.ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+            for st in pool.map(_one, todo):
+                tally[st or 'unknown'] += 1
+    return {'checked': len(todo), 'due': len(due), 'yes': tally.get('yes', 0),
+            'no': tally.get('no', 0), 'unknown': tally.get('unknown', 0) + tally.get('error', 0)}
+
+
 def _wtl_all_domains():
     doms = {c['domain'] for c in _known_comp_data()}
     doms.update(_wtl_extra_stores())
@@ -11110,6 +11638,7 @@ def api_wtl_stores():
         min_local = TRAFFIC_MIN_VISITS
     cache = _wtl_traffic_load()
     verdicts = _wtl_verdicts_load()
+    niches = _wtl_niche_load()
     now = datetime.datetime.utcnow()
     marks = _wtl_marks_load()
     comps = {c['domain']: c for c in _known_comp_data()}
@@ -11170,6 +11699,9 @@ def api_wtl_stores():
                                  'overlap_matches': v.get('overlap_matches'),
                                  'overlap_of': v.get('overlap_of')}
                                 if v else None),
+                    # Damesmode of niet (chip + filter in de stores-tab). None = nog
+                    # niet gekeken; nooit als 'nee' lezen.
+                    'niche': _wtl_niche_public(niches.get(d.replace('www.', ''))),
                     'market_ok': local >= min_local})
 
     # ── Store score (0-100): the best store to mine sits on top. Local traffic is the
@@ -11206,11 +11738,13 @@ def api_wtl_stores():
     never_checked = sum(1 for s in out if not (s.get('verdict') or {}).get('label'))
     unknown_count = sum(1 for s in out
                         if (s.get('verdict') or {}).get('label') == 'Onbekend')
+    niche_missing = sum(1 for s in out if not ((s.get('niche') or {}).get('fresh')))
     return jsonify({'store': store, 'country': cc, 'min_local': min_local,
                     'stores': out, 'traffic_missing': missing,
                     'verdicts_missing': verdicts_missing,
                     'never_checked': never_checked,
                     'unknown_count': unknown_count,
+                    'niche_missing': niche_missing,
                     'apify_configured': bool(os.getenv('APIFY_TOKEN', '').strip())})
 
 
@@ -11258,7 +11792,49 @@ def api_wtl_stores_add():
             os.replace(tmp, WTL_EXTRA_STORES_PATH)
         except Exception as e:
             return jsonify({'error': f'opslaan mislukt: {e}'}), 500
-    return jsonify({'ok': True, 'domain': dom, 'extra_total': len(cur)})
+    # Niche meteen bepalen (één HTTP-call): een lampenwinkel komt er wél in
+    # (warn, never block) maar met een waarschuwing en een rode chip.
+    warning = None
+    try:
+        niche = _wtl_niche_public(_wtl_niche_check(dom))
+        if niche and niche.get('status') == 'no':
+            warning = (f"{dom} looks like a {niche.get('kind') or 'non-fashion'} store, not womenswear "
+                       f"({niche.get('reason')}). Added anyway — it shows with a warning chip.")
+        elif niche and niche.get('status') == 'unknown':
+            warning = f"Could not read {dom}'s catalogue right now ({niche.get('reason')}); niche unchecked."
+    except Exception as e:
+        niche, warning = None, f'niche check failed: {str(e)[:80]}'
+    return jsonify({'ok': True, 'domain': dom, 'extra_total': len(cur), 'niche': niche, 'warning': warning})
+
+
+@app.route('/api/wtl_stores/niche', methods=['POST'])
+def api_wtl_stores_niche():
+    """Background job: niche-check (womenswear or not) every store in the pool
+    without a fresh verdict. Body: {max?} (default 150, cap 300). One
+    products.json call per store, 8 in parallel — a few minutes for the whole
+    pool. Poll via /api/catalog_job/status."""
+    body = request.get_json(silent=True) or {}
+    try:
+        cap = max(1, min(int(body.get('max') or 150), 300))
+    except Exception:
+        cap = 150
+    jid = _job_new('wtl_niche', 'wtl')
+
+    def _runner():
+        try:
+            res = _wtl_niche_missing(sorted(_wtl_all_domains()), cap=cap, jid=jid)
+            _job_set(jid, status='done', result=res,
+                     finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+            left = max(0, res['due'] - res['checked'])
+            _job_summary(jid, f"{res['checked']} store(s) checked: {res['yes']} womenswear, "
+                              f"{res['no']} not fashion, {res['unknown']} unreadable"
+                              + (f" — {left} still to check, run again" if left else ""))
+        except Exception as e:
+            _job_error(jid, str(e))
+            _job_set(jid, status='error', finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+
+    threading.Thread(target=_runner, daemon=True).start()
+    return jsonify({'job_id': jid, 'status': 'running'})
 
 
 @app.route('/api/wtl_export')
@@ -11888,9 +12464,13 @@ WTL_DISCOVER_SEEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__))
                                       'wtl_discover_seen.json')
 # Per afwijsreden hoe lang we het onthouden. Een niet-Shopify-winkel wordt dat
 # niet snel; te weinig bestsellers kan over 2 weken anders zijn.
-_GD_SEEN_TTL_DAYS = {'geen Shopify': 30, 'niet lokaal': 90, 'te weinig bestsellers': 14,
-                     'onder de marktgrootte-lat': 14, 'merk/eigen voorraad': 60}
+_GD_SEEN_TTL_DAYS = {'check mislukt': 1,           # storing ≠ oordeel: morgen opnieuw
+                     'geen Shopify': 30, 'niet lokaal': 90, 'te weinig bestsellers': 14,
+                     'geen damesmode': 60, 'onder de marktgrootte-lat': 14,
+                     'merk/eigen voorraad': 60}
 _GD_SEEN_DEFAULT_TTL = 14
+_GD_QUERIES_PER_RUN = 24     # per markt per run, uit een roulerende bank van ~150
+_GD_SEEDS_PER_RUN = 3        # bekende dropshippers als 'lijkt op'-seed per markt
 
 
 def _gd_seen_load():
@@ -11951,6 +12531,173 @@ def _gd_wtl_terms(market):
                     if t.get('recommended') and t.get('seed')
                     and (t.get('volume') or 0) >= _DOC_MIN_KW_VOLUME][:3]
     return []
+
+
+# Zoekbank: term x modifier. Elke run pakt de 24 minst recent gedraaide
+# queries per markt (staat in wtl_discover_state.json), dus opeenvolgende runs
+# zoeken ANDERS in plaats van dezelfde 26 queries te herhalen.
+_GD_MODIFIERS = {
+    'dk': ['webshop', 'online', 'køb online', 'tilbud', 'nyheder', '"gratis fragt"', 'shop', 'billig',
+           'udsalg', 'dametøj online', 'nye styles', 'outlet'],
+    'fr': ['boutique en ligne', 'en ligne', 'acheter', 'promo', 'nouveautés', '"livraison gratuite"',
+           'e-shop', 'pas cher', 'soldes', 'mode femme en ligne', 'tendance', 'outlet'],
+    'fi': ['verkkokauppa', 'netistä', 'osta', 'tarjous', 'uutuudet', '"ilmainen toimitus"',
+           'nettikauppa', 'halvalla', 'ale', 'naisten muoti verkkokauppa', 'trendi', 'outlet'],
+}
+
+
+def _gd_wtl_terms_any(market, n=6):
+    """Recommended What-to-list seeds for the market (any volume) from the free
+    _WTL_CACHE — what shoppers there look for now."""
+    for key, ent in _WTL_CACHE.items():
+        if key.startswith(market + ':'):
+            types = (ent.get('payload') or {}).get('types') or []
+            return [t.get('seed') for t in types if t.get('recommended') and t.get('seed')][:n]
+    return []
+
+
+def _gd_query_bank(market):
+    terms = list(_GD_TERMS.get(market) or [])
+    terms += [t for t in _gd_wtl_terms_any(market) if t not in terms]
+    bank = [f'{t} {mod}' for t in terms for mod in (_GD_MODIFIERS.get(market) or [])]
+    bank += _gd_build_queries(market, limit=40)        # de oude term x tell x site:
+    seen, uniq = set(), []
+    for q in bank:
+        if q not in seen:
+            seen.add(q)
+            uniq.append(q)
+    return uniq
+
+
+def _gd_state_load():
+    try:
+        with open(WTL_DISCOVER_STATE_PATH, encoding='utf-8') as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _gd_state_save(st):
+    try:
+        tmp = WTL_DISCOVER_STATE_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(st, f, ensure_ascii=False)
+        os.replace(tmp, WTL_DISCOVER_STATE_PATH)
+    except Exception as e:
+        print(f'[wtl-disc] state save failed: {e}')
+
+
+def _gd_pick_queries(market, state, n=_GD_QUERIES_PER_RUN):
+    """The n least-recently-run queries for this market; stamps them as run."""
+    ran = state.setdefault('queries', {}).setdefault(market, {})
+    bank = _gd_query_bank(market)
+    bank.sort(key=lambda q: ran.get(q) or '')      # nooit gedraaid ('') eerst, dan oudste
+    picked = bank[:max(1, int(n))]
+    now = datetime.datetime.utcnow().isoformat() + 'Z'
+    for q in picked:
+        ran[q] = now
+    return picked
+
+
+def _gd_seed_candidates(market):
+    """Known stores that are PROVEN sources for this market — dropshipper
+    verdict or AliExpress-verified, not marked, not a known non-fashion store —
+    best local traffic first. Falls back to the most-imported-from stores."""
+    cc = _WTL_MARKET_CC.get(market, 'DK')
+    traffic, verdicts = _wtl_traffic_load(), _wtl_verdicts_load()
+    marks, niches = _wtl_marks_load(), _wtl_niche_load()
+    scored = []
+    for d in _wtl_all_domains():
+        bare = d.replace('www.', '')
+        if _wtl_mark_active(marks.get(bare) or {}):
+            continue
+        v = verdicts.get(bare) or {}
+        if not (v.get('override') == 'ali-verified' or v.get('label') == 'Dropshipper'):
+            continue
+        nch = niches.get(bare) or {}
+        if nch.get('status') == 'no':
+            continue
+        t = traffic.get(d) or {}
+        local = (t.get('total_visits') or 0) * ((t.get('shares') or {}).get(cc) or 0)
+        scored.append((local, bare))
+    scored.sort(reverse=True)
+    out = [d for _, d in scored]
+    if len(out) < _GD_SEEDS_PER_RUN:
+        for c in _known_comp_data():
+            bare = c['domain'].replace('www.', '')
+            if bare not in out and (niches.get(bare) or {}).get('status') != 'no':
+                out.append(bare)
+            if len(out) >= 8:
+                break
+    return out
+
+
+def _gd_pick_seed_stores(market, state, n=_GD_SEEDS_PER_RUN):
+    """[(seed_domain, offset)]: least-recently-used seeds first; a seed that
+    has been used pages 100 deeper next time (0 → 100 → 200 → 0)."""
+    used = state.setdefault('seeds', {}).setdefault(market, {})
+    offs = state.setdefault('seed_offsets', {}).setdefault(market, {})
+    cands = _gd_seed_candidates(market)[:12]
+    cands.sort(key=lambda d: used.get(d) or '')
+    now = datetime.datetime.utcnow().isoformat() + 'Z'
+    out = []
+    for d in cands[:max(0, int(n))]:
+        off = int(offs.get(d) or 0)
+        out.append((d, off))
+        used[d] = now
+        offs[d] = 0 if off >= 200 else off + 100
+    return out
+
+
+# Live voortgang van een discovery-job: elke gevonden winkel staat er zodra hij
+# de modecheck haalt, en wordt bijgewerkt als de dropship-poort klaar is. De UI
+# leest dit via /api/catalog_job/status — je ziet de lijst groeien in plaats
+# van 10 minuten naar 'Discovering…' te kijken.
+def _job_live_init(jid):
+    _job_set(jid, live={'found': [], 'sources': {}, 'results': 0, 'known_or_seen': 0, 'candidates': 0})
+
+
+def _job_live_push(jid, row):
+    with _JOBS_LOCK:
+        j = _JOBS.get(jid)
+        if j and isinstance(j.get('live'), dict):
+            j['live']['found'].append(dict(row))
+
+
+def _job_live_update(jid, domain, **fields):
+    with _JOBS_LOCK:
+        j = _JOBS.get(jid)
+        if j and isinstance(j.get('live'), dict):
+            for r in j['live']['found']:
+                if r.get('domain') == domain:
+                    r.update(fields)
+
+
+def _job_live_set(jid, **fields):
+    with _JOBS_LOCK:
+        j = _JOBS.get(jid)
+        if j and isinstance(j.get('live'), dict):
+            j['live'].update(fields)
+
+
+_WTL_EXTRA_LOCK = threading.Lock()
+
+
+def _gd_extra_change(add=None, remove=None):
+    """Atomic edit of wtl_extra_stores.json (several verdict workers write)."""
+    with _WTL_EXTRA_LOCK:
+        cur = _wtl_extra_stores()
+        if add and add not in cur:
+            cur.append(add)
+        if remove and remove in cur:
+            cur = [d for d in cur if d != remove]
+        try:
+            tmp = WTL_EXTRA_STORES_PATH + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(cur, f)
+            os.replace(tmp, WTL_EXTRA_STORES_PATH)
+        except Exception as e:
+            print(f'[wtl-disc] extra-stores save failed: {e}')
 
 
 def _gd_domain(url):
@@ -12026,218 +12773,264 @@ def _gd_google(queries_by_market):
 
 
 def _wtl_discover(markets, jid=None, ignore_seen=False):
-    """Run the discovery pipeline for the given markets; passers are added to the
-    extra-stores list (+ traffic cache) and show up in the stores tab immediately."""
-    import statistics
+    """Run the discovery pipeline for the given markets. Passers land in the
+    extra-stores list (+ verdict cache) the moment they pass, and in the job's
+    `live.found` list with a status that updates as the checks complete.
+
+    Order of work (see the patch note at the top of this block):
+      competitors-of-known-stores (DataForSEO, seconds) → Google SERP (DataForSEO
+      live, parallel; Apify fallback) → per candidate ONE products.json call
+      (Shopify + locality + niche) in a 10-wide pool → dropship gate in a 4-wide
+      pool → SimilarWeb life-check at the end."""
+    import collections as _c
+    import concurrent.futures as _cf
     markets = [m for m in (markets or []) if m in _GD_TERMS]
     if not markets:
         return {'error': 'geen geldige markten'}
     known = _wtl_all_domains() | _load_blocked_sources()
     seen = {} if ignore_seen else _gd_seen_load()
-    queries = {}
-    for m in markets:
-        qs = _gd_build_queries(m, limit=26)
-        qs += [t for t in _gd_wtl_terms(m) if t not in qs]
-        queries[m] = qs[:30]      # elke query geeft maar ~10 rijen
-    if jid:
-        _job_set(jid, phase='Google doorzoeken', total=None)
-    results = _gd_google(queries)
-
-    cand = {}
-    for m, term, url in results:
-        d = _gd_domain(url)
-        if (not d or d in known or d in cand
-                or any(s in d for s in _GD_SKIP) or any(s in d for s in _GD_RETAILERS)):
-            continue
-        if _gd_seen_fresh(seen, d):
-            continue          # recent al beoordeeld — niet opnieuw bevragen
-        cand[d] = (m, term)
-    print(f'[wtl-disc] {len(results)} results -> {len(cand)} unknown candidates')
-
-    # Begrens de pool: met de bredere zoekopdrachten komen er 700+ kandidaten uit,
-    # en die allemaal bevragen kost uren. SERP-volgorde = relevantievolgorde, dus
-    # we nemen de bovenste. De rest komt bij een volgende run — afgewezen
-    # kandidaten worden onthouden, dus je loopt niet dezelfde lijst opnieuw af.
-    # PER MARKT begrenzen. Eerst nam ik simpelweg de eerste 300 uit de lijst, maar
-    # die staat op marktvolgorde — dus DK vulde de hele quota en FR/FI kwamen niet
-    # eens aan de beurt (gemeten: alle 11 vondsten waren .dk).
+    state = _gd_state_load()
+    lock = threading.Lock()
+    cand, per_m = {}, _c.Counter()
+    skipped, scanned, added, gated, rejected, uncertain = [], {}, [], [], [], []
+    rows = {}
+    per_market_added, per_market_scanned, sources = _c.Counter(), _c.Counter(), _c.Counter()
+    tally = {'results': 0, 'known_or_seen': 0}
     _GD_MAX_PER_MARKET = 120
-    trimmed, per_m = {}, {}
-    for _d, (_m, _t) in cand.items():
-        if per_m.get(_m, 0) >= _GD_MAX_PER_MARKET:
-            continue
-        per_m[_m] = per_m.get(_m, 0) + 1
-        trimmed[_d] = (_m, _t)
-    if len(trimmed) < len(cand):
-        print(f'[wtl-disc] {len(cand)} kandidaten -> {len(trimmed)} deze run '
-              f'(max {_GD_MAX_PER_MARKET} per markt: {per_m})')
-    cand = trimmed
-
-    scanned, skipped = {}, []
     if jid:
-        _job_set(jid, phase='Kandidaten checken (Shopify/lokaal/mode)', total=len(cand), processed=0)
+        _job_live_init(jid)
+        _job_set(jid, phase='Kandidaten verzamelen', total=0, processed=0)
+    check_pool = _cf.ThreadPoolExecutor(max_workers=10)
+    verdict_pool = _cf.ThreadPoolExecutor(max_workers=4)
 
-    def _check_one(item):
-        """Eén kandidaat: Shopify -> lokaal -> damesmode. Puur wachten op HTTP,
-        dus veilig parallel. Geeft (domein, markt, term, payload, afwijsreden)."""
-        d, (m, term) = item
-        try:
-            if not _gd_is_shopify(d):
-                return d, m, term, None, 'geen Shopify'
-            if not _gd_is_local(d, m):
-                return d, m, term, None, 'niet lokaal'
-            payload, blocked = _bs_scan_cached(d)
-            n = len((payload or {}).get('products') or [])
-            if blocked or n < _GD_MIN_WOMENS:
-                return d, m, term, None, (blocked or f'maar {n} vrouwenmode-bestsellers')
-            return d, m, term, payload, None
-        except Exception as e:
-            return d, m, term, None, f'check mislukt: {str(e)[:50]}'
-        finally:
-            if jid:
-                _job_inc(jid, processed=1)
-
-    import concurrent.futures as _cf
-    results_c = []
-    with _cf.ThreadPoolExecutor(max_workers=8) as pool:
-        for res in pool.map(_check_one, list(cand.items())):
-            results_c.append(res)
-
-    # Caps PAS NA het verzamelen toepassen, zodat de uitkomst niet afhangt van
-    # welke werker toevallig eerst klaar was.
-    per_market_scanned = {}
-    for d, m, term, payload, reason in results_c:
-        if reason:
-            _gd_remember(seen, d, m, 'te weinig bestsellers' if 'bestsellers' in reason else reason)
-            skipped.append({'domain': d, 'market': m,
-                            'reason': f'niet lokaal voor {m.upper()}' if reason == 'niet lokaal' else reason})
-            continue
-        if per_market_scanned.get(m, 0) >= _GD_MAX_NEW * 3:
-            continue          # genoeg voor deze markt; niet onthouden, mag volgende run
-        per_market_scanned[m] = per_market_scanned.get(m, 0) + 1
-        scanned[d] = (m, term, payload)
-    print(f'[wtl-disc] {len(scanned)} local Shopify womens stores found')
-
-    added, gated, rejected, uncertain = [], [], [], []
-    if scanned:
+    def _publish_counts():
         if jid:
-            _job_set(jid, phase='SimilarWeb marktgrootte-gate')
-        fresh = _similarweb_bulk(list(scanned))
-        cache = _wtl_traffic_load()
-        cache.update(fresh)
-        _wtl_traffic_save(cache)
-        extra = _wtl_extra_stores()
-        per_market_added = {}
-        for d, (m, term, payload) in scanned.items():
-            visits = (fresh.get(d) or {}).get('total_visits') or 0
-            prices = [_price_eur_for_host(p.get('price'), d) for p in payload['products']]
-            prices = [p for p in prices if p]
-            aov = min(statistics.median(prices) if prices else TRAFFIC_AOV_FALLBACK,
-                      TRAFFIC_AOV_CAP) * TRAFFIC_BASKET
-            est = visits * TRAFFIC_CONV * aov
-            ratio = min(1.0, (_TRAFFIC_POP_M.get(m) or _TRAFFIC_ANCHOR_POP_M) / _TRAFFIC_ANCHOR_POP_M)
-            # Discovery-drempels, NIET de sourcing-lat (zie GD_MIN_* hierboven).
-            bar, floor = GD_MIN_EST_EUR * ratio, GD_MIN_VISITS * ratio
-            unknown_traffic = visits == 0
-            # Onbekende traffic mag door (SimilarWeb kent jonge winkels niet), maar
-            # een winkel met BEWEZEN bezoekers mag daar nooit onder vallen.
-            ok = (visits >= floor) or (unknown_traffic and GD_ALLOW_UNKNOWN_TRAFFIC)
-            row = {'domain': d, 'market': m, 'term': term, 'visits': visits,
-                   'est_eur': round(est), 'bar_eur': round(bar), 'floor': round(floor),
-                   'traffic_unknown': unknown_traffic,
-                   'bestsellers': len(payload['products'])}
-            if not ok:
-                _gd_remember(seen, d, m, 'onder de marktgrootte-lat')
-                gated.append({**row, 'reason': 'onder de marktgrootte-lat'})
-                continue
-            if per_market_added.get(m, 0) >= _GD_MAX_NEW:
-                gated.append({**row, 'reason': 'cap bereikt'})   # NIET onthouden: volgende run mag
-                continue
-            # ── DROPSHIP-POORT ──────────────────────────────────────────────
-            # Vroeger draaide dit NA het toevoegen: een etiketje, geen poort, dus
-            # er hield nooit iets een merk tegen (bug #22). Nu beslist het, en het
-            # eist POSITIEF bewijs — 'Onbekend' liet eerder finlayson.fi binnen,
-            # een groot Fins merk met een B2B-signaal.
+            _job_live_set(jid, sources=dict(sources), results=tally['results'],
+                          known_or_seen=tally['known_or_seen'], candidates=len(cand))
+
+    def _verdict_worker(d, m, term, row):
+        """Dropship gate for one passer (slow: policy pages + brand signals)."""
+        try:
             verdict = _wtl_classify_store(d) or {}
             label = verdict.get('label')
-            # Catalogus-overlap = leverancierscatalogus = dropshipper, ook bij snelle
-            # levering (regel designbysi, 2026-07-13). Sterkste positieve bewijs.
-            overlap, _of = _wtl_catalog_overlap(d)
+            overlap = int(verdict.get('overlap_matches') or 0)
+            decision, why, unverified = 'added', None, False
             if overlap >= 2:
+                # Leverancierscatalogus = dropshipper, ook bij snelle levering
+                # (regel designbysi, 2026-07-13). Sterkste positieve bewijs.
                 verdict['override'] = 'catalog-overlap'
                 row['overlap_matches'] = overlap
             elif label in ('Eigen voorraad', 'Mogelijk eigen merk'):
-                _gd_remember(seen, d, m, 'merk/eigen voorraad')
-                rejected.append({**row, 'verdict': label, 'detail': verdict.get('detail'),
-                                 'reason': f'{label} — geen dropshipper'})
-                continue
+                decision, why = 'rejected', f'{label} — geen dropshipper'
             else:
-                # Onafhankelijk merk-signaal (wholesale/B2B, eigen fabricage, ...).
                 try:
                     from shipping_check import looks_like_brand
                     is_brand, sigs = looks_like_brand(d)
                 except Exception:
                     is_brand, sigs = False, []
                 if is_brand:
+                    decision, why = 'rejected', 'merksignalen — geen dropshipper'
+                    verdict['detail'] = ', '.join(sigs or [])[:120] or verdict.get('detail')
+                elif label != 'Dropshipper':
+                    # Geen bewijs voor of tegen -- de NORMALE uitkomst (11 van 11
+                    # 'Onbekend', gemeten). Warn-never-block: erin met een
+                    # 'niet gecheckt'-chip.
+                    unverified = True
+            with lock:
+                if decision == 'added' and per_market_added[m] >= _GD_MAX_NEW:
+                    decision, why = 'gated', 'cap bereikt'      # niet onthouden: volgende run mag
+                if decision == 'added':
+                    per_market_added[m] += 1
+                if decision == 'rejected':
                     _gd_remember(seen, d, m, 'merk/eigen voorraad')
-                    rejected.append({**row, 'verdict': label or 'merk-signaal',
-                                     'detail': ', '.join(sigs or [])[:120],
-                                     'reason': 'merksignalen — geen dropshipper'})
-                    continue
-                if label != 'Dropshipper':
-                    # Geen bewijs voor OF tegen — en dat is de NORMALE uitkomst:
-                    # gemeten kregen 11 van de 11 winkels 'Onbekend', omdat het
-                    # verzendbeleid zelden leesbaar is. Ze daarom weigeren gaf 0
-                    # resultaten. Warn-never-block: ze komen binnen met een
-                    # 'niet gecheckt'-chip, zichtbaar als onbevestigd, en de
-                    # medewerker kan ze met 'Verify dropshippers' alsnog toetsen.
-                    row['unverified'] = True
-                    uncertain.append({**row, 'verdict': label or 'onbekend',
-                                      'reason': 'verzendbeleid onduidelijk — nog niet bevestigd'})
-            # Verdict bewaren, anders toont de lijst 'niet gecheckt' en doet de
-            # classify-taak straks hetzelfde werk nog eens.
-            try:
-                _vc = _wtl_verdicts_load()
-                _vc[d.replace('www.', '')] = verdict
-                _wtl_verdicts_save(_vc)
-            except Exception as _ve:
-                print(f'[wtl-disc] verdict save failed for {d}: {_ve}')
-            row['verdict'] = verdict
-            if d not in extra:
-                extra.append(d)
-            per_market_added[m] = per_market_added.get(m, 0) + 1
-            added.append(row)
-        try:
-            tmp = WTL_EXTRA_STORES_PATH + '.tmp'
-            with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump(extra, f)
-            os.replace(tmp, WTL_EXTRA_STORES_PATH)
+            if decision == 'added':
+                _gd_extra_change(add=d)
+                try:
+                    with lock:
+                        vc = _wtl_verdicts_load()
+                        vc[d.replace('www.', '')] = verdict
+                        _wtl_verdicts_save(vc)
+                except Exception as _ve:
+                    print(f'[wtl-disc] verdict save failed for {d}: {_ve}')
+            row.update({'status': ('added_unverified' if (decision == 'added' and unverified) else decision),
+                        'verdict': label or 'Onbekend', 'unverified': unverified, 'reason': why,
+                        'verdict_detail': (verdict.get('detail') or '')[:120]})
+            with lock:
+                if decision == 'added':
+                    added.append(dict(row))          # alle toegevoegde
+                    if unverified:
+                        uncertain.append(dict(row))  # ...waarvan nog te bevestigen
+                elif decision == 'rejected':
+                    rejected.append(dict(row))
+                else:
+                    gated.append(dict(row))
         except Exception as e:
-            print(f'[wtl-disc] extra-stores save failed: {e}')
+            row.update({'status': 'error', 'reason': f'dropship-check mislukt: {str(e)[:60]}'})
+            with lock:
+                gated.append(dict(row))
+        if jid:
+            _job_live_update(jid, d, **{k: row.get(k) for k in
+                                        ('status', 'verdict', 'unverified', 'reason', 'overlap_matches',
+                                         'verdict_detail')})
 
-    # (Het verdict is al bij de poort bepaald — geen tweede ronde nodig.)
+    def _check_worker(d, m, term, source):
+        """One candidate: Shopify → local → womenswear, from ONE products.json
+        call. Passers are shown at once and handed to the dropship gate."""
+        reason, niche, sample = None, None, None
+        try:
+            sample, http, err = _gd_products_sample(d)
+            if sample is None:
+                if http in (401, 403, 404, 410) or (http == 200):
+                    reason = 'geen Shopify'
+                else:
+                    reason = f'check mislukt: {err or http}'
+            elif not _gd_is_local(d, m):
+                reason = 'niet lokaal'
+            else:
+                niche = _wtl_niche_check(d, products=sample, http_status=200)
+                if niche.get('status') == 'no':
+                    reason = f"geen damesmode ({niche.get('kind')}: {niche.get('reason')})"
+                elif niche.get('status') == 'unknown':
+                    reason = f"check mislukt: {niche.get('reason')}"
+        except Exception as e:
+            reason = f'check mislukt: {str(e)[:50]}'
+        finally:
+            if jid:
+                _job_inc(jid, processed=1)
+        if reason:
+            with lock:
+                _gd_remember(seen, d, m, reason)
+                skipped.append({'domain': d, 'market': m, 'source': source,
+                                'reason': f'niet lokaal voor {m.upper()}' if reason == 'niet lokaal' else reason})
+            return
+        row = {'domain': d, 'market': m, 'term': term, 'source': source, 'status': 'checking',
+               'niche': _wtl_niche_public(niche), 'catalogue': len(sample or [])}
+        with lock:
+            if per_market_scanned[m] >= _GD_MAX_NEW * 3:
+                return                      # genoeg voor deze markt; niet onthouden
+            per_market_scanned[m] += 1
+            scanned[d] = (m, term)
+            rows[d] = row
+        if jid:
+            _job_live_push(jid, row)
+        verdict_pool.submit(_verdict_worker, d, m, term, row)
+
+    def _consider(m, term, url, source):
+        d = _gd_domain(url) or _gd_domain('https://' + str(url or ''))
+        tally['results'] += 1
+        if not d or any(s in d for s in _GD_SKIP) or any(s in d for s in _GD_RETAILERS):
+            return
+        if d in known or _gd_seen_fresh(seen, d):
+            tally['known_or_seen'] += 1
+            return
+        with lock:
+            if d in cand or per_m[m] >= _GD_MAX_PER_MARKET:
+                return
+            per_m[m] += 1
+            cand[d] = (m, term, source)
+            sources[source] += 1
+        if jid:
+            _job_inc(jid, total=1)
+        check_pool.submit(_check_worker, d, m, term, source)
+
+    # ── bron 1: 'lijkt op' bekende dropshippers (DataForSEO) — seconden ──
+    dfs = _dfs_configured()
+    if dfs:
+        if jid:
+            _job_set(jid, phase='Similar stores to your proven sources (DataForSEO)')
+        for m in markets:
+            for seed, offset in _gd_pick_seed_stores(m, state):
+                items = _dfs_competitor_domains(seed, m, limit=100, offset=offset)
+                for it in items:
+                    _consider(m, f'similar to {seed}', 'https://' + it['domain'], 'competitors')
+        _publish_counts()
+
+    # ── bron 2: Google SERP met roulerende zoekbank ──
+    queries = {m: _gd_pick_queries(m, state) for m in markets}
+    if jid:
+        _job_set(jid, phase='Google search + checking candidates as they arrive')
+    if dfs:
+        with _cf.ThreadPoolExecutor(max_workers=6) as spool:
+            futs = {spool.submit(_dfs_serp_results, q, m, 30): (m, q)
+                    for m, qs in queries.items() for q in qs}
+            for f in _cf.as_completed(futs):
+                m, q = futs[f]
+                try:
+                    items = f.result()
+                except Exception as e:
+                    print(f'[wtl-disc] serp {m} {q!r}: {str(e)[:80]}')
+                    continue
+                for it in items:
+                    _consider(m, q, it.get('url'), 'google')
+                _publish_counts()
+    else:
+        for m, term, url in _gd_google(queries):
+            _consider(m, term, url, 'google')
+        _publish_counts()
+    print(f"[wtl-disc] {tally['results']} results -> {len(cand)} unknown candidates "
+          f"({tally['known_or_seen']} already known/seen; sources {dict(sources)})")
+
+    check_pool.shutdown(wait=True)
+    if jid:
+        _job_set(jid, phase='Dropship gate (shipping policy + brand signals)')
+    verdict_pool.shutdown(wait=True)
+    print(f'[wtl-disc] {len(scanned)} local Shopify womenswear stores found, {len(added)} added')
+
+    # ── levenscheck (SimilarWeb) pas aan het eind: verandert niets aan het
+    # eerste resultaat, en één bulk-run is goedkoper dan per winkel ──
+    if added:
+        if jid:
+            _job_set(jid, phase='SimilarWeb life-check')
+        fresh = _similarweb_bulk([a['domain'] for a in added])
+        if fresh:
+            cache = _wtl_traffic_load()
+            cache.update(fresh)
+            _wtl_traffic_save(cache)
+        still = []
+        for a in added:
+            m = a['market']
+            visits = (fresh.get(a['domain']) or {}).get('total_visits') or 0
+            ratio = min(1.0, (_TRAFFIC_POP_M.get(m) or _TRAFFIC_ANCHOR_POP_M) / _TRAFFIC_ANCHOR_POP_M)
+            floor = GD_MIN_VISITS * ratio
+            a['visits'] = visits
+            a['traffic_unknown'] = visits == 0
+            # Onbekende traffic mag door (SimilarWeb kent jonge winkels niet); een
+            # winkel met BEWEZEN te weinig bezoekers is dood en gaat er weer uit.
+            if visits and visits < floor:
+                _gd_extra_change(remove=a['domain'])
+                _gd_remember(seen, a['domain'], m, 'onder de marktgrootte-lat')
+                a['status'], a['reason'] = 'gated', 'onder de marktgrootte-lat'
+                gated.append(dict(a))
+                if jid:
+                    _job_live_update(jid, a['domain'], status='gated', reason='too little traffic (dead store)',
+                                     visits=visits)
+                continue
+            if jid:
+                _job_live_update(jid, a['domain'], visits=visits)
+            still.append(a)
+        added = still
+        uncertain = [u for u in uncertain if any(a['domain'] == u['domain'] for a in added)]
+
     _gd_seen_save(seen)
+    for m in markets:
+        state[m] = datetime.datetime.utcnow().isoformat() + 'Z'
+    _gd_state_save(state)
 
-    # Waarom vond deze run weinig? De medewerker moet dat kunnen ZIEN, anders
-    # blijft 'er gebeurt niks' het enige signaal (bugs #21/#22).
+    # Waarom vond deze run weinig? De medewerker moet dat kunnen ZIEN.
     why = []
     if not cand:
-        why.append('alle zoekresultaten waren al bekend of eerder beoordeeld — '
-                   'probeer "opnieuw beoordelen" om het geheugen te negeren')
+        why.append('every search result was already known or judged before — '
+                   'next run rotates to other queries; "re-judge" ignores the memory')
     if rejected:
-        why.append(f'{len(rejected)} winkel(s) afgewezen: geen dropshipper (merk/eigen voorraad)')
+        why.append(f'{len(rejected)} store(s) rejected: not a dropshipper (brand / own stock)')
     if uncertain:
-        why.append(f'{len(uncertain)} winkel(s) toegevoegd maar NIET bevestigd als dropshipper '
-                   '(verzendbeleid onleesbaar) — check ze met "Verify dropshippers"')
+        why.append(f'{len(uncertain)} store(s) added but NOT confirmed as dropshipper '
+                   '(shipping policy unreadable) — check them with "Verify dropshippers"')
     if gated:
-        why.append(f'{len(gated)} winkel(s) onder de lat of over de cap')
+        why.append(f'{len(gated)} store(s) dead or over the cap')
     if skipped:
-        why.append(f'{len(skipped)} kandidaat viel af op Shopify/land/te weinig damesmode')
+        why.append(f'{len(skipped)} candidate(s) dropped: not Shopify / not local / not womenswear')
 
-    # Trechter PER MARKT. Zonder dit zag je alleen een totaal, en toen alle
-    # vondsten .dk bleken kon ik niet zien waar FR/FI omviel (de afvallijst werd
-    # op 40 afgekapt en die waren toevallig allemaal DK).
-    import collections as _c
     funnel = {}
     for m in markets:
         reasons = _c.Counter(s.get('reason', '')[:40] for s in skipped if s.get('market') == m)
@@ -12249,6 +13042,8 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
             'top_drop_reasons': dict(reasons.most_common(4)),
         }
     return {'markets': markets, 'candidates': len(cand), 'scanned': len(scanned),
+            'results': tally['results'], 'known_or_seen': tally['known_or_seen'],
+            'sources': dict(sources), 'queries': {m: len(q) for m, q in queries.items()},
             'added': added, 'gated': gated, 'rejected': rejected,
             'uncertain': uncertain, 'skipped': skipped[:120], 'funnel': funnel, 'why': why}
 
@@ -12274,10 +13069,12 @@ def api_wtl_discover():
             n_add = len(res.get('added') or [])
             n_rej = len(res.get('rejected') or [])
             n_unv = sum(1 for a in (res.get('added') or []) if a.get('unverified'))
-            _job_summary(jid, f"{n_add} store(s) toegevoegd"
-                              + (f" ({n_add - n_unv} bevestigd dropshipper, {n_unv} nog te checken)"
+            _job_summary(jid, f"{n_add} new store(s) added"
+                              + (f" ({n_add - n_unv} confirmed dropshipper, {n_unv} still to verify)"
                                  if n_unv else "")
-                              + (f", {n_rej} merk afgewezen" if n_rej else "")
+                              + (f", {n_rej} brand(s) rejected" if n_rej else "")
+                              + f" — {res.get('candidates', 0)} new candidates checked, "
+                                f"{res.get('known_or_seen', 0)} results already known"
                               + (f" — {res['why'][0]}" if n_add == 0 and res.get('why') else ""))
         except Exception as e:
             _job_error(jid, str(e))
@@ -12346,6 +13143,14 @@ def _wtl_traffic_loop():
                 print(f"[wtl] weekly verdicts: {res}")
         except Exception as e:
             print(f'[wtl] verdict loop error: {e}')
+        try:
+            # Niche voor de bestaande pool (460 domeinen): 60 per 12 uur, dus in
+            # een paar dagen is alles gelabeld zonder een winkel te bestoken.
+            res = _wtl_niche_missing(sorted(_wtl_all_domains()), cap=60)
+            if res.get('checked'):
+                print(f"[wtl] niche pass: {res}")
+        except Exception as e:
+            print(f'[wtl] niche loop error: {e}')
         time.sleep(12 * 3600)
 
 
