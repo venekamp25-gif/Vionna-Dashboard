@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { api, WtlStore, WtlStoresResponse } from "@/lib/api";
+import { api, DiscoverLive, WtlStore, WtlStoresResponse } from "@/lib/api";
 import { StoreKey, STORE_CONFIG, STORE_KEYS } from "@/lib/store";
 import { Button } from "@/components/ui/Button";
 
@@ -15,6 +15,10 @@ type StoreResult = {
   recentWindowDays?: number;
   cacheAgeSeconds?: number;
   fromCache?: boolean;
+  /** false = the brand/menswear cleaner fell open; the keyword pills are raw. */
+  cleanOk?: boolean;
+  cleanWhy?: string;
+  audienceDropped?: number;
   error?: string;
   notConfigured?: boolean;
 };
@@ -124,6 +128,8 @@ export function WhatToListWorkbench() {
   const [selectedStores, setSelectedStores] = useState<StoreKey[]>(["dk", "fr", "fi"]);
   const [busy, setBusy] = useState(false);
   const [results, setResults] = useState<Partial<Record<StoreKey, StoreResult>> | null>(null);
+  // Markets whose what-to-list call is still running (results land per market).
+  const [pendingStores, setPendingStores] = useState<StoreKey[]>([]);
   const [viewStore, setViewStore] = useState<StoreKey>("dk");
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
@@ -154,6 +160,15 @@ export function WhatToListWorkbench() {
   const [trafficRefreshing, setTrafficRefreshing] = useState(false);
   const [discovering, setDiscovering] = useState(false);
   const [discoverMsg, setDiscoverMsg] = useState<string | null>(null);
+  // Live progress of a discovery run: found stores appear here one by one while
+  // the job runs (the old version showed nothing for up to 10 minutes).
+  const [discoverLive, setDiscoverLive] = useState<DiscoverLive | null>(null);
+  const [discoverPhase, setDiscoverPhase] = useState<string | null>(null);
+  // ON by default: a store the niche check says is NOT womenswear (home, sport,
+  // beauty…) is hidden. Unchecked stores stay visible — unknown ≠ no.
+  const [hideNonFashion, setHideNonFashion] = useState(true);
+  const [nicheChecking, setNicheChecking] = useState(false);
+  const [nicheMsg, setNicheMsg] = useState<string | null>(null);
   const [addDomain, setAddDomain] = useState("");
   const [addMsg, setAddMsg] = useState<string | null>(null);
   const [scanStore, setScanStore] = useState<WtlStore | null>(null);
@@ -248,32 +263,40 @@ export function WhatToListWorkbench() {
     setError(null);
     setResults(null);
     setShowAll(false);
+    setPendingStores(selectedStores);
     try {
-      const entries = await Promise.all(
-        selectedStores.map(async (s): Promise<[StoreKey, StoreResult]> => {
+      // Each market lands as soon as ITS call returns — DK no longer waits for
+      // the slowest of FR/FI before anything is shown.
+      let first = true;
+      await Promise.all(
+        selectedStores.map(async (s) => {
+          let v: StoreResult;
           try {
             const r = await api.whatToList({ store: s, force });
-            if (!r.configured) return [s, { notConfigured: true }];
-            return [
-              s,
-              {
-                count: r.count ?? 0,
-                types: r.types ?? [],
-                recentTotal: r.recent_total,
-                recentWindowDays: r.recent_window_days,
-                fromCache: r.from_cache,
-                cacheAgeSeconds: r.cache_age_seconds,
-              },
-            ];
+            v = !r.configured
+              ? { notConfigured: true }
+              : {
+                  count: r.count ?? 0,
+                  types: r.types ?? [],
+                  recentTotal: r.recent_total,
+                  recentWindowDays: r.recent_window_days,
+                  fromCache: r.from_cache,
+                  cacheAgeSeconds: r.cache_age_seconds,
+                  cleanOk: r.clean_ok,
+                  cleanWhy: r.clean_why,
+                  audienceDropped: r.audience_dropped,
+                };
           } catch (e) {
-            return [s, { error: e instanceof Error ? e.message : "failed" }];
+            v = { error: e instanceof Error ? e.message : "failed" };
+          }
+          setResults((prev) => ({ ...(prev ?? {}), [s]: v }));
+          setPendingStores((prev) => prev.filter((x) => x !== s));
+          if (first) {
+            first = false;
+            setViewStore(s);
           }
         })
       );
-      const res: Partial<Record<StoreKey, StoreResult>> = {};
-      entries.forEach(([s, v]) => (res[s] = v));
-      setResults(res);
-      setViewStore(selectedStores[0]);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Research failed");
     } finally {
@@ -340,28 +363,78 @@ export function WhatToListWorkbench() {
     }
   };
 
-  /** Google hunt for UNKNOWN local stores (the research scraper's method, server-side). */
+  /** Hunt for UNKNOWN local womenswear stores, server-side: stores similar to
+   *  your proven sources (DataForSEO) + rotating Google searches → one
+   *  products.json check per candidate → dropship gate. Found stores stream
+   *  into `discoverLive` while the job runs; the stores list reloads as they
+   *  get added. */
   const discoverStores = async () => {
     setDiscovering(true);
     setDiscoverMsg(null);
+    setDiscoverLive(null);
+    setDiscoverPhase("starting…");
     try {
       const start = await api.wtlDiscover(storeMarkets);
       if (!start.job_id) throw new Error(start.error || "could not start");
       let summary = "";
-      for (let i = 0; i < 200; i++) {
-        await new Promise((r) => setTimeout(r, 3000));
+      let finished = false;
+      let lastAdded = 0;
+      // Up to 40 min (the dropship gate is ~1 min per found store, 4 in
+      // parallel). Poll every 2.5 s; the list below fills as rows arrive.
+      for (let i = 0; i < 960; i++) {
+        await new Promise((r) => setTimeout(r, 2500));
         const j = await api.metaJobStatus(start.job_id).catch(() => null);
-        if (j && j.status !== "running") {
+        if (!j) continue;
+        if (j.live) setDiscoverLive(j.live);
+        setDiscoverPhase(j.phase ?? null);
+        const added = (j.live?.found ?? []).filter((r) => r.status.startsWith("added")).length;
+        if (added > lastAdded) {
+          lastAdded = added;
+          void loadStores(storeMarkets); // new store → show it in the list right away
+        }
+        if (j.status !== "running") {
           summary = j.summary || "";
+          finished = true;
           break;
         }
       }
-      setDiscoverMsg(summary ? `✓ ${summary}` : "✓ done");
+      setDiscoverMsg(
+        finished ? (summary ? `✓ ${summary}` : "✓ done") : "⏳ Still running — found stores keep appearing in the list"
+      );
       await loadStores(storeMarkets);
     } catch (e) {
       setDiscoverMsg(e instanceof Error ? e.message : "failed");
     } finally {
       setDiscovering(false);
+      setDiscoverPhase(null);
+    }
+  };
+
+  /** Niche check (womenswear or not) for stores without a fresh verdict — one
+   *  products.json call per store, a few minutes for the whole pool. */
+  const checkNiche = async () => {
+    setNicheChecking(true);
+    setNicheMsg(null);
+    try {
+      const start = await api.wtlStoresNiche(150);
+      if (!start.job_id) throw new Error(start.error || "could not start");
+      let summary = "";
+      let finished = false;
+      for (let i = 0; i < 240; i++) {
+        await new Promise((r) => setTimeout(r, 2500));
+        const j = await api.metaJobStatus(start.job_id).catch(() => null);
+        if (j && j.status !== "running") {
+          summary = j.summary || "";
+          finished = true;
+          break;
+        }
+      }
+      setNicheMsg(finished ? `✓ ${summary || "done"}` : "⏳ Still running — reload in a minute");
+      await loadStores(storeMarkets);
+    } catch (e) {
+      setNicheMsg(e instanceof Error ? e.message : "failed");
+    } finally {
+      setNicheChecking(false);
     }
   };
 
@@ -376,7 +449,11 @@ export function WhatToListWorkbench() {
         return;
       }
       setAddDomain("");
-      setAddMsg(`✓ ${r.domain} added — press "Update traffic" to fetch its visitors`);
+      setAddMsg(
+        r.warning
+          ? `⚠ ${r.warning}`
+          : `✓ ${r.domain} added${r.niche?.status === "yes" ? " (womenswear ✓)" : ""} — press "Update traffic" to fetch its visitors`
+      );
       await loadStores(storeMarkets);
     } catch (e) {
       setAddMsg(e instanceof Error ? e.message : "failed");
@@ -582,10 +659,10 @@ export function WhatToListWorkbench() {
           }
         >
           {error && <p className="text-[13px] text-danger">{error}</p>}
-          {busy && (
+          {busy && pendingStores.length > 0 && (
             <p className="text-[13px] text-text-faint">
-              Checking {selectedStores.map((s) => STORE_CONFIG[s].label).join(", ")} — demand, season and recent
-              listings…
+              Checking {pendingStores.map((s) => STORE_CONFIG[s].label).join(", ")} — demand, season and recent
+              listings… each market shows up as soon as it is done.
             </p>
           )}
           {!results && !busy && !error && (
@@ -594,7 +671,7 @@ export function WhatToListWorkbench() {
             </p>
           )}
 
-          {results && !busy && (
+          {results && resultStores.length > 0 && (
             <>
               {resultStores.length > 1 && (
                 <div className="flex items-center gap-1 mb-5 border-b border-border">
@@ -645,6 +722,13 @@ export function WhatToListWorkbench() {
                     </button>
                   </div>
 
+                  {active.cleanOk === false && (
+                    <p className="text-[11.5px] text-amber-600 dark:text-amber-400 mb-3 leading-relaxed">
+                      ⚠ The brand / menswear filter could not run for this market ({active.cleanWhy || "unknown"}),
+                      so the keyword pills below are unfiltered — brand names and men&apos;s items may be in. Press
+                      ↻ Refresh to retry.
+                    </p>
+                  )}
                   <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
                     {recommended.map((t, i) => {
                       const w = why(t);
@@ -907,6 +991,17 @@ export function WhatToListWorkbench() {
                 Hide proven brands
               </span>
             </label>
+            <label className="flex items-center gap-1.5 text-text-dim cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={hideNonFashion}
+                onChange={(e) => setHideNonFashion(e.target.checked)}
+                className="h-3.5 w-3.5 accent-[var(--accent)]"
+              />
+              <span title="Hides stores whose catalogue sample PROVED they don't sell womenswear (home, sport, beauty, menswear…). Unchecked stores stay visible with a 'niche not checked' chip — press “🧵 Check niche” to classify them.">
+                Hide non-fashion
+              </span>
+            </label>
             <span className="flex items-center gap-1 text-text-dim">
               Markets
               {(["dk", "fr", "fi"] as StoreKey[]).map((m) => {
@@ -968,9 +1063,9 @@ export function WhatToListWorkbench() {
                   onClick={() => void discoverStores()}
                   disabled={discovering}
                   className="text-accent hover:underline disabled:opacity-50"
-                  title="Google-hunt for local fashion stores we DON'T know yet (the research scraper's method): localized searches → Shopify + locality + womens-fashion checks → market-size gate. Passers appear in this list. ~3-5 min."
+                  title="Hunt for local womenswear stores we DON'T know yet: stores similar to your proven sources (DataForSEO) + rotating Google searches → one catalogue check per candidate (Shopify + locality + womenswear) → dropship gate. Found stores appear below as they pass, usually within a minute; the full run takes longer because the dropship check is ~1 min per store."
                 >
-                  {discovering ? "Discovering… (~4 min)" : "🔍 Discover new stores"}
+                  {discovering ? "Discovering… (first results in ~1 min)" : "🔍 Discover new stores"}
                 </button>
               </>
             )}
@@ -984,6 +1079,17 @@ export function WhatToListWorkbench() {
               {classifying
                 ? "Verifying dropshippers…"
                 : `🛡 Verify dropshippers${(wtlStores?.verdicts_missing ?? 0) > 0 ? ` (${wtlStores?.verdicts_missing})` : ""}`}
+            </button>
+            <button
+              type="button"
+              onClick={() => void checkNiche()}
+              disabled={nicheChecking}
+              className="text-accent hover:underline disabled:opacity-50"
+              title="Check what each unchecked store actually sells (one catalogue sample per store): womenswear, or home / sport / beauty / menswear… Non-fashion stores get a red chip and are hidden by the “hide non-fashion” filter. A few minutes for the whole list, runs in the background."
+            >
+              {nicheChecking
+                ? "Checking niche…"
+                : `🧵 Check niche${(wtlStores?.niche_missing ?? 0) > 0 ? ` (${wtlStores?.niche_missing})` : ""}`}
             </button>
             <a
               href={api.wtlExportUrl("stores", funnelMarket, { onlyOk: false })}
@@ -1005,6 +1111,87 @@ export function WhatToListWorkbench() {
           </div>
 
           {discoverMsg && <p className="text-[11.5px] text-text-dim mb-3">{discoverMsg}</p>}
+          {nicheMsg && <p className="text-[11.5px] text-text-dim mb-3">{nicheMsg}</p>}
+          {(discovering || discoverLive) && (
+            <div className="mb-4 rounded-[12px] border border-border bg-bg-elev-2 px-4 py-3">
+              <div className="flex items-baseline gap-2 flex-wrap text-[11.5px] text-text-dim">
+                <strong className="text-text">
+                  {discovering ? "Discovering…" : "Last discovery run"}
+                </strong>
+                {discovering && discoverPhase && <span>· {discoverPhase}</span>}
+                {discoverLive && (
+                  <span>
+                    · {discoverLive.candidates} new candidates checked
+                    {discoverLive.known_or_seen > 0 && <> · {discoverLive.known_or_seen} results already known</>}
+                    {Object.keys(discoverLive.sources).length > 0 && (
+                      <>
+                        {" "}
+                        · from{" "}
+                        {Object.entries(discoverLive.sources)
+                          .map(([k, n]) => `${k === "competitors" ? "similar stores" : "Google"} ${n}`)
+                          .join(", ")}
+                      </>
+                    )}
+                  </span>
+                )}
+              </div>
+              {discoverLive && discoverLive.found.length === 0 ? (
+                <p className="text-[11.5px] text-text-faint mt-1.5">
+                  {discovering
+                    ? "Checking candidates — a store appears here the moment it passes the Shopify, locality and womenswear checks."
+                    : "No new womenswear stores passed the checks this run."}
+                </p>
+              ) : discoverLive ? (
+                <ul className="mt-2 space-y-1">
+                  {discoverLive.found.map((r) => {
+                    const tone =
+                      r.status === "added"
+                        ? "text-green-600 dark:text-green-400"
+                        : r.status === "added_unverified"
+                          ? "text-amber-500"
+                          : r.status === "checking"
+                            ? "text-text-dim"
+                            : "text-text-faint line-through";
+                    const label =
+                      r.status === "checking"
+                        ? "checking shipping policy…"
+                        : r.status === "added"
+                          ? `added ✓ dropshipper${r.overlap_matches ? " (supplier-catalog overlap)" : ""}`
+                          : r.status === "added_unverified"
+                            ? "added — dropship status unconfirmed"
+                            : r.status === "rejected"
+                              ? `rejected: ${r.reason ?? "brand / own stock"}`
+                              : r.status === "gated"
+                                ? `not added: ${r.reason ?? "cap"}`
+                                : `error: ${r.reason ?? ""}`;
+                    return (
+                      <li key={`${r.domain}|${r.market}`} className="text-[11.5px] flex items-baseline gap-2 flex-wrap">
+                        <a
+                          href={`https://${r.domain}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-accent hover:underline"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          {r.domain}
+                        </a>
+                        <span className="text-text-faint uppercase text-[10px]">{r.market}</span>
+                        <span className={tone}>{label}</span>
+                        {r.niche?.reason && (
+                          <span className="text-text-faint" title={r.niche.reason}>
+                            · {r.niche.reason}
+                          </span>
+                        )}
+                        <span className="text-text-faint" title={`Found via: ${r.term}`}>
+                          · {r.source === "competitors" ? "similar to a known store" : "Google"}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : null}
+            </div>
+          )}
           {classifyMsg && <p className="text-[11.5px] text-text-dim mb-3">{classifyMsg}</p>}
 
           {storesLoading ? (
@@ -1028,7 +1215,9 @@ export function WhatToListWorkbench() {
                 // never-scanned ones (bs_new_count === null) always stay visible.
                 (!hideEmpty || s.bs_new_count === null || s.bs_new_count > 0) &&
                 (!hideMarked || !s.mark) &&
-                (!onlyDropshippers || !isConfirmedNotDropshipper(s));
+                (!onlyDropshippers || !isConfirmedNotDropshipper(s)) &&
+                // Only a PROVEN non-fashion store is hidden; unchecked/unknown stays.
+                (!hideNonFashion || s.niche?.status !== "no");
               const sortStores = (arr: WtlStore[]) =>
                 arr.slice().sort((a, b) => {
                   // Marked stores always sink, whatever the sort.
@@ -1235,6 +1424,41 @@ export function WhatToListWorkbench() {
                           );
                         })()}
                       </div>
+                      {(() => {
+                        const nc = s.niche;
+                        const cls = !nc
+                          ? "bg-bg-elev text-text-faint border-border"
+                          : nc.status === "yes"
+                            ? "bg-green-600/15 text-green-600 dark:text-green-400 border-green-600/40"
+                            : nc.status === "no"
+                              ? "bg-danger/15 text-danger border-danger/40"
+                              : "bg-bg-elev text-text-dim border-border";
+                        const txt = !nc
+                          ? "niche not checked"
+                          : nc.status === "yes"
+                            ? `womenswear${nc.unverified ? " (unconfirmed)" : ""}`
+                            : nc.status === "no"
+                              ? `not fashion — ${nc.kind ?? "other"}`
+                              : "niche unknown";
+                        return (
+                          <div className="mt-1 flex items-center gap-1.5 flex-wrap">
+                            <span
+                              className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold border ${cls}`}
+                              title={
+                                nc
+                                  ? `What this store sells, from a sample of its catalogue: ${nc.reason ?? ""}${
+                                      typeof nc.fashion_share === "number"
+                                        ? ` (${Math.round(nc.fashion_share * 100)}% fashion)`
+                                        : ""
+                                    }. Warn-only: you decide.`
+                                  : "Not checked yet — press “🧵 Check niche”. Unknown is never treated as “not fashion”."
+                              }
+                            >
+                              {txt}
+                            </span>
+                          </div>
+                        );
+                      })()}
                       <div className="text-[10.5px] text-text-faint mt-1 tabular-nums">
                         {s.has_traffic_data && <>total {n(s.total_visits)}/mo · {Math.round(s.local_share * 100)}% local</>}
                         {s.trend_pct !== null && s.trend_pct !== undefined && (
@@ -1480,6 +1704,19 @@ export function WhatToListWorkbench() {
                   ↻ Rescan
                 </button>
               </div>
+              {scan.dropped && Object.keys(scan.dropped).length > 0 && (
+                <p
+                  className="text-[11.5px] text-text-faint -mt-2"
+                  title={`Left out: ${(scan.dropped_examples ?? []).join(" · ")}`}
+                >
+                  {Object.values(scan.dropped).reduce((a, b) => a + b, 0)} non-fashion item
+                  {Object.values(scan.dropped).reduce((a, b) => a + b, 0) === 1 ? "" : "s"} hidden (
+                  {Object.entries(scan.dropped)
+                    .map(([c, n]) => `${c} ${n}`)
+                    .join(", ")}
+                  ) — this store sells more than womenswear.
+                </p>
+              )}
 
               {recommended.length > 0 && (
                 <p className="text-[11.5px] text-text-dim leading-relaxed max-w-3xl">

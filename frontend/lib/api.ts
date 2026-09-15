@@ -766,6 +766,11 @@ export const api = {
       recent_window_days?: number;
       recent_counts?: Record<string, number>;
       live_counts?: Record<string, number>;
+      /** Keywords dropped by the deterministic men/kids guard. */
+      audience_dropped?: number;
+      /** false = the brand/menswear LLM cleaner fell open; this list is RAW. */
+      clean_ok?: boolean;
+      clean_why?: string;
       types?: {
         seed: string;
         label: string;
@@ -907,6 +912,11 @@ export const api = {
       cache_age_seconds?: number;
       count?: number;
       by_category?: Record<string, number>;
+      /** Non-fashion items the scan left OUT (beauty, home, hosiery…), by bucket,
+       *  with a few example titles — so "top 19" never silently contains lipstick. */
+      dropped?: Record<string, number>;
+      dropped_examples?: string[];
+      fashion_share?: number | null;
       products?: {
         position: number;
         handle: string;
@@ -969,11 +979,20 @@ export const api = {
       body: { force },
     }),
 
-  /** Add a competitor store (domain or URL) to the funnel's store list. */
+  /** Add a competitor store (domain or URL) to the funnel's store list. The
+   *  backend niche-checks it on the spot; a non-fashion store is still added
+   *  (warn, never block) but comes back with a `warning`. */
   wtlStoreAdd: (domain: string) =>
-    call<{ ok?: boolean; domain?: string; error?: string }>("/api/wtl_stores/add", {
+    call<{ ok?: boolean; domain?: string; error?: string; niche?: WtlNiche | null; warning?: string | null }>(
+      "/api/wtl_stores/add",
+      { method: "POST", body: { domain } }
+    ),
+
+  /** Kick the niche-check job (womenswear or not) for stores without a fresh verdict. */
+  wtlStoresNiche: (max = 150) =>
+    call<{ job_id?: string; status?: string; error?: string }>("/api/wtl_stores/niche", {
       method: "POST",
-      body: { domain },
+      body: { max },
     }),
 
   /** Mark a store: 'skip' (not for us), 'later' (snooze `days`, default 14), or
@@ -1250,6 +1269,45 @@ export const api = {
   }) => call<MetaFixLinksResponse>("/api/meta/fix_links", { method: "POST", body: params, authed: true }),
 };
 
+/** Niche verdict: is this a WOMEN'S FASHION store? From one products.json
+ *  sample + the bucketer (LLM only for ties). 'unknown' = could not read the
+ *  catalogue (transient) — never treat it as 'no'. */
+export interface WtlNiche {
+  status: "yes" | "no" | "unknown";
+  /** For a 'no': what it sells instead (home, beauty, sport, menswear, jewelry…). */
+  kind: string | null;
+  reason: string | null;
+  fashion_share: number | null;
+  /** 'yes' without proof (tie the LLM couldn't break) — shown, flagged. */
+  unverified: boolean;
+  fresh: boolean;
+}
+
+/** One row of a running discovery job: a store that passed the Shopify +
+ *  locality + womenswear checks. `status` moves as the dropship gate finishes. */
+export interface DiscoverFoundRow {
+  domain: string;
+  market: string;
+  term: string;
+  source: "competitors" | "google";
+  status: "checking" | "added" | "added_unverified" | "rejected" | "gated" | "error";
+  niche: WtlNiche | null;
+  catalogue?: number;
+  verdict?: string;
+  verdict_detail?: string;
+  unverified?: boolean;
+  reason?: string | null;
+  overlap_matches?: number;
+  visits?: number;
+}
+export interface DiscoverLive {
+  found: DiscoverFoundRow[];
+  sources: Record<string, number>;
+  results: number;
+  known_or_seen: number;
+  candidates: number;
+}
+
 /** One competitor store in the What-to-list funnel (step 2). */
 /** One market's store list. The stores step merges several of these — a store
  *  can exist in more than one market with its own local visitor count. */
@@ -1259,6 +1317,8 @@ export interface WtlStoresResponse {
   min_local: number;
   traffic_missing: number;
   verdicts_missing: number;
+  /** Stores without a fresh niche verdict (womenswear or not). */
+  niche_missing?: number;
   /** Split out of verdicts_missing: "never looked at" is a different problem from
    *  "looked at, found nothing" — merged into one number, a stalled queue hides. */
   never_checked?: number;
@@ -1317,6 +1377,8 @@ export interface WtlStore {
     overlap_matches?: number | null;
     overlap_of?: number | null;
   } | null;
+  /** Womenswear or not; null = not checked yet (never read as 'no'). */
+  niche: WtlNiche | null;
   market_ok: boolean;
 }
 
@@ -1373,6 +1435,8 @@ export interface MetaDraftJob {
   processed: number;
   summary: string;
   errors: string[];
+  /** Discovery jobs: the stores found SO FAR, updated while the job runs. */
+  live?: DiscoverLive;
   result?: MetaDraftResult[];
   pixel_used?: string | null;
   error?: string;
