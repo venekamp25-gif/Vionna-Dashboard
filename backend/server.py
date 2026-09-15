@@ -10988,7 +10988,7 @@ def _bs_scan(host, limit=20):
     # (beauty 4, hosiery 3)" in plaats van een lijst vol junk.
     # Alleen BENOEMDE niet-mode weglaten. 'other' (onherkend) blijft staan:
     # dropshippers noemen producten 'Livia' -- die wegfilteren maakte zo'n
-    # winkel bestseller-loos (review van #52, hersteld in #55).
+    # winkel bestseller-loos (review van #52, hersteld in #56).
     non_fashion = [p for p in products if p['category'] in _BS_NON_FASHION_BUCKETS]
     products = [p for p in products if p['category'] not in _BS_NON_FASHION_BUCKETS]
     dropped = Counter(p['category'] for p in non_fashion)
