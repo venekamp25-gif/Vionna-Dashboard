@@ -1,6 +1,6 @@
 import type { ScrapedProduct } from "./api";
 import { isColorLike } from "./colors";
-import { NB_TYPE_RES, stripTypeNoise } from "./nbCategory";
+import { BAG_OVERRIDE_RE, NB_TYPE_RES, stripTypeNoise } from "./nbCategory";
 
 // Recognise the full Shopify-ish size lexicon so an option like
 // ["XXS","XS","S","M","L","XL","XXL","3XL"] is correctly identified as
@@ -83,6 +83,8 @@ function titleCase(s: string): string {
 // generic "jewellery" fallback. The regexes expect lower-cased text that went
 // through stripTypeNoise() ("cap sleeve", "scarf print", "jewel neck" …).
 const TYPE_MAP: [string, RegExp][] = [
+  // compound bags first: "bæltetaske" / "belt bag" is a bag, not a belt
+  ["bag",            BAG_OVERRIDE_RE],
   ["sunglasses",     NB_TYPE_RES.eyewear],
   ["bag",            /handbag|handtas|\btas(je|se)?\b|\bbag\b|\bsac\b|clutch|tote|laukku|purse/i],
   ["watch",          NB_TYPE_RES.watch],

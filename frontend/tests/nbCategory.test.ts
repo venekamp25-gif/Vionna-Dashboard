@@ -45,8 +45,8 @@ const CASES: [string, NbCategory, AccessoryKind | null][] = [
   ["skoletaske", "bag", null],                // contains 'sko' and 'taske'
   ["baguette bag", "bag", null],
   // jewellery
-  ["bague", "accessory", "jewelry"],          // FR ring — contains "bag"
-  ["ring", "accessory", "jewelry"],
+  ["bague", "accessory", "ring"],             // FR ring — contains "bag"
+  ["ring", "accessory", "ring"],
   ["earrings", "accessory", "jewelry"],
   ["earring", "accessory", "jewelry"],        // not the whole-word "ring"
   ["øreringe", "accessory", "jewelry"],
@@ -55,7 +55,15 @@ const CASES: [string, NbCategory, AccessoryKind | null][] = [
   ["kaulakoru", "accessory", "jewelry"],
   ["ketting", "accessory", "jewelry"],
   ["Halskette", "accessory", "jewelry"],
-  ["sormus", "accessory", "jewelry"],
+  ["sormus", "accessory", "ring"],
+  ["guldring", "accessory", "ring"],          // DK compound
+  ["Armbånd guld", "accessory", "bracelet"],
+  ["bracelet", "accessory", "bracelet"],
+  ["ring-spun cotton tee", "garment", null],  // noise, not a ring
+  ["toe ring sandals", "shoes", null],
+  ["d-ring belt", "accessory", "belt"],
+  ["chain strap bag", "bag", null],
+  ["cœur pendant", "accessory", "jewelry"],   // œ must not split the word (was: "watch")
   // eyewear
   ["sunglasses", "accessory", "eyewear"],
   ["solbriller", "accessory", "eyewear"],

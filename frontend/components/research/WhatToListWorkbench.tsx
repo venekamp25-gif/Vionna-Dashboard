@@ -192,8 +192,10 @@ export function WhatToListWorkbench() {
   /** Haalt de gekozen markten op en voegt ze samen op domein. Dezelfde winkel
    *  kan in meerdere landen bestaan met eigen lokale bezoekersaantallen; we
    *  tonen 'm één keer, op zijn STERKSTE markt, met de andere als chip. */
-  const loadStores = useCallback(async (markets: StoreKey[]) => {
-    setStoresLoading(true);
+  const loadStores = useCallback(async (markets: StoreKey[], opts?: { quiet?: boolean }) => {
+    // quiet = background refresh (a discovery run just added a store): keep the
+    // list on screen instead of flashing it to "Loading stores…" every poll.
+    if (!opts?.quiet) setStoresLoading(true);
     try {
       const per = await Promise.all(
         markets.map((m) =>
@@ -250,6 +252,7 @@ export function WhatToListWorkbench() {
   const canRun = selectedStores.length > 0 && !busy;
 
   const toggleStore = (s: StoreKey) => {
+    if (busy) return; // a mid-run toggle would wipe the markets that already landed
     setSelectedStores((prev) => (prev.includes(s) ? prev.filter((x) => x !== s) : [...prev, s]));
     if (results) {
       setResults(null);
@@ -350,6 +353,8 @@ export function WhatToListWorkbench() {
       // round that resolved nothing as "warning" — surface that too.
       if (!finished) {
         setClassifyMsg("⏳ Still running — check back in a minute");
+      } else if (status === "error") {
+        setClassifyMsg(`⚠ ${summary || "verification failed"}`);
       } else {
         setClassifyMsg(
           summary ? `${status === "warning" ? "⚠" : "✓"} ${summary}` : "✓ done",
@@ -378,6 +383,7 @@ export function WhatToListWorkbench() {
       if (!start.job_id) throw new Error(start.error || "could not start");
       let summary = "";
       let finished = false;
+      let failed = false;
       let lastAdded = 0;
       // Up to 40 min (the dropship gate is ~1 min per found store, 4 in
       // parallel). Poll every 2.5 s; the list below fills as rows arrive.
@@ -390,16 +396,23 @@ export function WhatToListWorkbench() {
         const added = (j.live?.found ?? []).filter((r) => r.status.startsWith("added")).length;
         if (added > lastAdded) {
           lastAdded = added;
-          void loadStores(storeMarkets); // new store → show it in the list right away
+          void loadStores(storeMarkets, { quiet: true }); // new store → show it, without flashing the list
         }
         if (j.status !== "running") {
-          summary = j.summary || "";
+          summary = j.summary || j.errors?.[0] || "";
           finished = true;
+          failed = j.status === "error";
           break;
         }
       }
       setDiscoverMsg(
-        finished ? (summary ? `✓ ${summary}` : "✓ done") : "⏳ Still running — found stores keep appearing in the list"
+        !finished
+          ? "⏳ Still running — found stores keep appearing in the list"
+          : failed
+            ? `⚠ ${summary || "discovery failed"}`
+            : summary
+              ? `✓ ${summary}`
+              : "✓ done"
       );
       await loadStores(storeMarkets);
     } catch (e) {
@@ -420,16 +433,24 @@ export function WhatToListWorkbench() {
       if (!start.job_id) throw new Error(start.error || "could not start");
       let summary = "";
       let finished = false;
+      let failed = false;
       for (let i = 0; i < 240; i++) {
         await new Promise((r) => setTimeout(r, 2500));
         const j = await api.metaJobStatus(start.job_id).catch(() => null);
         if (j && j.status !== "running") {
-          summary = j.summary || "";
+          summary = j.summary || j.errors?.[0] || "";
           finished = true;
+          failed = j.status === "error";
           break;
         }
       }
-      setNicheMsg(finished ? `✓ ${summary || "done"}` : "⏳ Still running — reload in a minute");
+      setNicheMsg(
+        !finished
+          ? "⏳ Still running — reload in a minute"
+          : failed
+            ? `⚠ ${summary || "niche check failed"}`
+            : `✓ ${summary || "done"}`
+      );
       await loadStores(storeMarkets);
     } catch (e) {
       setNicheMsg(e instanceof Error ? e.message : "failed");
@@ -449,9 +470,10 @@ export function WhatToListWorkbench() {
         return;
       }
       setAddDomain("");
+      // The store IS added in every case — a warning only qualifies it.
       setAddMsg(
         r.warning
-          ? `⚠ ${r.warning}`
+          ? `✓ ${r.domain} added — ⚠ ${r.warning}`
           : `✓ ${r.domain} added${r.niche?.status === "yes" ? " (womenswear ✓)" : ""} — press "Update traffic" to fetch its visitors`
       );
       await loadStores(storeMarkets);
