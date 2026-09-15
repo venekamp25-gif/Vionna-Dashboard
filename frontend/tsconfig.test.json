@@ -14,5 +14,11 @@
     "types": ["node"],
     "plugins": []
   },
-  "include": ["lib/publishChecks.ts", "lib/cogsStores.ts", "tests/**/*.ts"]
+  "include": [
+    "lib/publishChecks.ts",
+    "lib/cogsStores.ts",
+    "lib/nbCategory.ts",
+    "lib/scrape-utils.ts",
+    "tests/**/*.ts"
+  ]
 }
