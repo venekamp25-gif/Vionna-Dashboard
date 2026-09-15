@@ -4892,26 +4892,58 @@ def _classify_taxonomy_llm(title, description, image_url=None, category=None):
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        prompt = _taxonomy_prompt(title, description, category=category, has_image=has_image)
-        if has_image:
-            content = [{'type': 'image', 'source': {'type': 'url', 'url': image_url}},
-                       {'type': 'text', 'text': prompt}]
-        else:
-            content = prompt
-        msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=140,
-                                     messages=[{'role': 'user', 'content': content}])
-        out = (msg.content[0].text if msg.content else '') or ''
-        m = re.search(r'\{.*\}', out, re.S)
-        if not m:
+
+        def _ask(with_image):
+            prompt = _taxonomy_prompt(title, description, category=category, has_image=with_image)
+            if with_image:
+                content = [{'type': 'image', 'source': {'type': 'url', 'url': image_url}},
+                           {'type': 'text', 'text': prompt}]
+            else:
+                content = prompt
+            msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=140,
+                                         messages=[{'role': 'user', 'content': content}])
+            return (msg.content[0].text if msg.content else '') or ''
+
+        try:
+            out = _ask(has_image)
+        except Exception as e:
+            if not has_image:
+                raise
+            # The API fetches the URL itself; competitor/Higgsfield URLs expire or
+            # hotlink-block and oversized images are refused (400). A text-only
+            # verdict still beats the deterministic keyword fallback, so retry
+            # once without the photo — the length gate then stays shut.
+            print(f"[taxonomy] image rejected for '{title}' ({str(e)[:80]}), retrying text-only")
+            has_image = False
+            out = _ask(False)
+        obj = _taxonomy_extract_json(out)
+        if obj is None:
             print(f"[taxonomy] no JSON in reply for '{title}': {out[:80]!r}")
             return None
-        res = _taxonomy_validate(json.loads(m.group(0)), category=category, has_image=has_image)
+        res = _taxonomy_validate(obj, category=category, has_image=has_image)
         if not res:
             print(f"[taxonomy] no usable category for '{title}': {out[:80]!r}")
         return res
     except Exception as e:
         print(f"[taxonomy] LLM classify failed for '{title}': {e}")
         return None
+
+
+def _taxonomy_extract_json(text):
+    """First JSON object in a model reply → dict, else None. Greedy span first
+    (nested braces), then the shortest span in case the model echoed a second
+    brace pair (e.g. the JSON shape from the prompt) after the real answer."""
+    text = text or ''
+    for pattern in (r'\{.*\}', r'\{.*?\}'):
+        m = re.search(pattern, text, re.S)
+        if not m:
+            return None
+        try:
+            obj = json.loads(m.group(0))
+        except (ValueError, TypeError):
+            continue
+        return obj if isinstance(obj, dict) else None
+    return None
 
 
 def _classify_category_llm(title, description):
@@ -10469,7 +10501,9 @@ _TX_Q_PRODS = ('{ products(first:250%s, query:"status:active"){ '
                'description(truncateAt:900) } } } }')
 # Shopify's `tag:new` search matches by WORD ("NEW IN", "New Arrivals" count too —
 # 88 legacy DK drafts, measured 2026-09-15), so the exact tag is re-checked in code.
-_TX_Q_NEW = ('{ products(first:250%s, query:"tag:new"){ pageInfo{hasNextPage endCursor} '
+# ACTIVE only: 42 legacy DK drafts (2024-12) carry the exact tag 'new' that this
+# module never wrote — the expiry must not touch products it does not own.
+_TX_Q_NEW = ('{ products(first:250%s, query:"status:active AND tag:new"){ pageInfo{hasNextPage endCursor} '
              'edges{ node{ id title status createdAt tags } } } }')
 _TX_M_ADD = ('mutation($id:ID!,$t:[String!]!){ tagsAdd(id:$id,tags:$t)'
              '{ userErrors{ field message } } }')
@@ -10523,16 +10557,26 @@ def _taxonomy_family_inputs(fam):
 
 
 def _taxonomy_member_plan(node, tags):
-    """One product → (add, remove). Never touches an existing cat:<x>; removes an
-    older value of a dimension we own (len:midi when the verdict is len:maxi, or a
-    stale tx:<n>) before the new tags go on."""
+    """One product → (add, remove). NEVER writes cat:<x> — the backfill is additive
+    to the category machinery (api_apply_category_tags owns cat:), so a member
+    without cat: is left for that route rather than given the family majority.
+    Removes an older value of a dimension we own (len:midi when the verdict is
+    len:maxi, or a stale tx:<n>) before the new tags go on."""
     have = [str(t) for t in (node.get('tags') or [])]
     have_l = {t.lower() for t in have}
-    has_cat = any(t.startswith('cat:') for t in have_l)
     new_l = {t.lower() for t in tags}
-    add = [t for t in tags if t.lower() not in have_l and not (has_cat and t.startswith('cat:'))]
+    add = [t for t in tags if not t.lower().startswith('cat:') and t.lower() not in have_l]
     remove = [t for t in have if _taxonomy_owned_tag(t) and t.lower() not in new_l]
     return add, remove
+
+
+def _taxonomy_retry_delay(err, attempt):
+    """Backoff before retry `attempt` (0-based): Shopify THROTTLED answers need
+    the cost bucket to refill (100 pts/s; remove+add ≈ 20 pts, 5 workers), so
+    they wait 5 s / 10 s instead of the 1.5 s / 3 s used for other errors."""
+    if 'throttl' in str(err or '').lower():
+        return 5.0 * (attempt + 1)
+    return 1.5 * (attempt + 1)
 
 
 def _taxonomy_apply_member(store, gid, add, remove):
@@ -10552,7 +10596,7 @@ def _taxonomy_apply_member(store, gid, add, remove):
         except Exception as e:
             last = e
             if attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(_taxonomy_retry_delay(e, attempt))
     return str(last)[:120]
 
 
@@ -10569,17 +10613,23 @@ def _taxonomy_save_state(path, state):
 
 
 def _taxonomy_backfill_run(stores, dry_run=True, only_missing=True, limit=None, families=None,
-                           state_path=None, label='backfill'):
+                           state_path=None, label='backfill', defer=None):
     """Classify colour families once and tag every member in every store.
     dry_run → NO Shopify writes; still classifies up to `limit` families (default 25)
-    and returns the plan + a tag histogram. Returns (and persists) the state dict."""
+    and returns the plan + a tag histogram. `defer` = family keys that failed last
+    time: they go to the END of the queue (stable, still alphabetical within each
+    half) so a permanently failing family never starves the ones behind it under
+    `limit`. Returns (and persists) the state dict; `failed_families` lists the
+    keys that produced no tags this run."""
     if dry_run and limit is None:
         limit = TAXONOMY_DRY_RUN_DEFAULT_LIMIT
     stores = [s for s in (stores or []) if s in tokens]
+    defer = {str(k) for k in (defer or []) if k}
     state = {'status': 'running', 'label': label, 'dry_run': bool(dry_run),
              'only_missing': bool(only_missing), 'limit': limit, 'stores': stores,
              'started': datetime.datetime.utcnow().isoformat() + 'Z', 'finished': None,
              'families_total': 0, 'families_done': 0, 'families_skipped': 0, 'families_failed': 0,
+             'families_deferred': 0, 'failed_families': [],
              'products_seen': {s: 0 for s in stores}, 'products_tagged': {s: 0 for s in stores},
              'llm_calls': 0, 'errors': [], 'sample': [], 'histogram': {}}
     _taxonomy_save_state(state_path, state)
@@ -10600,6 +10650,9 @@ def _taxonomy_backfill_run(stores, dry_run=True, only_missing=True, limit=None, 
                 state['families_skipped'] += 1
                 continue
             todo.append(fam)
+        if defer:
+            state['families_deferred'] = sum(1 for f in todo if f['key'] in defer)
+            todo.sort(key=lambda f: f['key'] in defer)     # stable: failed-last
         if limit is not None:
             todo = todo[:int(limit)]
         state['families_total'] = len(todo)
@@ -10618,7 +10671,9 @@ def _taxonomy_backfill_run(stores, dry_run=True, only_missing=True, limit=None, 
                 tags = _taxonomy_tags(res, category=hint) if res else []
                 if not tags:
                     state['families_failed'] += 1
-                    state['errors'].append({'family': fam['title'], 'error': 'no classification'})
+                    state['failed_families'].append(key)
+                    if len(state['errors']) < 50:
+                        state['errors'].append({'family': fam['title'], 'error': 'no classification'})
                     continue
                 jobs, members = [], {}
                 for st, n in fam['members']:
@@ -10649,6 +10704,7 @@ def _taxonomy_backfill_run(stores, dry_run=True, only_missing=True, limit=None, 
                       f"{' (dry run)' if dry_run else ''}")
             except Exception as e:
                 state['families_failed'] += 1
+                state['failed_families'].append(fam.get('key'))
                 if len(state['errors']) < 50:
                     state['errors'].append({'family': fam.get('title'), 'error': str(e)[:150]})
                 print(f"[taxonomy] {label} family '{fam.get('title')}' failed: {e}")
@@ -10665,13 +10721,16 @@ def _taxonomy_backfill_run(stores, dry_run=True, only_missing=True, limit=None, 
 
 
 def _taxonomy_expire_new(store, now=None):
-    """Remove the exact tag 'new' from products created more than NEW_TAG_DAYS ago.
-    → {checked, expired, errors}. Read-only when nothing is due."""
+    """Remove the exact tag 'new' from ACTIVE products created more than
+    NEW_TAG_DAYS ago (drafts/archived are skipped even if the search returns
+    them). → {checked, expired, errors}. Read-only when nothing is due."""
     now = now or datetime.datetime.utcnow()
     cutoff = now - datetime.timedelta(days=NEW_TAG_DAYS)
     prods = _sib_page(store, _TX_Q_NEW, 'products') or []
     rep = {'checked': len(prods), 'expired': 0, 'errors': []}
     for n in prods:
+        if str(n.get('status') or '').upper() != 'ACTIVE':
+            continue
         exact = [t for t in (n.get('tags') or []) if str(t).lower() == NEW_TAG]
         if not exact:
             continue
@@ -10690,11 +10749,31 @@ def _taxonomy_expire_new(store, now=None):
     return rep
 
 
+def _taxonomy_load_state(path):
+    """State file → dict, or None when absent/unreadable."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f) or {}
+    except Exception:
+        return None
+
+
+def _taxonomy_live_backfill_done():
+    """True once a NON-dry-run backfill has completed (taxonomy_backfill.json
+    status=='done' and dry_run false). The daily fill only writes after that, so
+    the first live tagging is always the operator's reviewed backfill — never a
+    loop that fired 300 s after a self-update restart."""
+    st = _taxonomy_load_state(TAXONOMY_BACKFILL_STATE_PATH) or {}
+    return st.get('status') == 'done' and st.get('dry_run') is False
+
+
 def _taxonomy_fill_loop():
     """Daily self-heal (mirrors _size_chart_fill_loop): after 300 s, then every 24 h:
     (1) active products without tx:<n> → classify + tag, family-grouped, max 60
-    families per run; (2) 'new' older than NEW_TAG_DAYS → tagsRemove. Only the
-    fashion `tokens` — never LIGHT_TOKENS. Kill switch TAXONOMY_FILL=0."""
+    families per run, families that failed last run queued last; (2) 'new' older
+    than NEW_TAG_DAYS → tagsRemove. Only the fashion `tokens` — never
+    LIGHT_TOKENS. Kill switch TAXONOMY_FILL=0; DEV_LOCAL=1 and pytest never start
+    it. Step (1) waits until a live (non-dry-run) backfill has completed."""
     time.sleep(300)
     while True:
         state = {'at': datetime.datetime.utcnow().isoformat() + 'Z'}
@@ -10704,15 +10783,23 @@ def _taxonomy_fill_loop():
             time.sleep(3600)
             continue
         try:
-            try:
-                rep = _taxonomy_backfill_run(stores, dry_run=False, only_missing=True,
-                                             limit=TAXONOMY_FILL_MAX_FAMILIES, label='daily-fill')
-                state['fill'] = {k: v for k, v in rep.items() if k != 'sample'}
-                print(f"[taxonomy] daily fill: {rep['families_done']}/{rep['families_total']} families, "
-                      f"tagged {rep['products_tagged']}, errors {len(rep['errors'])}")
-            except Exception as e:
-                state['fill'] = {'error': str(e)[:150]}
-                print(f'[taxonomy] daily fill failed: {e}')
+            if not _taxonomy_live_backfill_done():
+                state['fill'] = {'skipped': 'no completed live backfill yet — '
+                                            'POST /api/backfill_taxonomy {dry_run:false} first'}
+                print('[taxonomy] daily fill waiting: no completed live backfill yet')
+            else:
+                prev = (_taxonomy_load_state(TAXONOMY_FILL_STATE_PATH) or {}).get('fill') or {}
+                defer = prev.get('failed_families') if isinstance(prev, dict) else None
+                try:
+                    rep = _taxonomy_backfill_run(stores, dry_run=False, only_missing=True,
+                                                 limit=TAXONOMY_FILL_MAX_FAMILIES, label='daily-fill',
+                                                 defer=defer)
+                    state['fill'] = {k: v for k, v in rep.items() if k != 'sample'}
+                    print(f"[taxonomy] daily fill: {rep['families_done']}/{rep['families_total']} families, "
+                          f"tagged {rep['products_tagged']}, errors {len(rep['errors'])}")
+                except Exception as e:
+                    state['fill'] = {'error': str(e)[:150], 'failed_families': list(defer or [])}
+                    print(f'[taxonomy] daily fill failed: {e}')
             state['new_expired'] = {}
             for st in stores:
                 try:
@@ -10728,7 +10815,10 @@ def _taxonomy_fill_loop():
         time.sleep(24 * 3600)
 
 
-if os.getenv('TAXONOMY_FILL') != '0' and 'pytest' not in sys.modules:
+# Same guard as the self-updater / fix-watch: a dev machine (start.bat sets
+# DEV_LOCAL=1, tokens.json is local) must never tag the live stores or spend
+# Haiku calls concurrently with the droplet.
+if os.getenv('TAXONOMY_FILL') != '0' and os.getenv('DEV_LOCAL') != '1' and 'pytest' not in sys.modules:
     threading.Thread(target=_taxonomy_fill_loop, daemon=True, name='taxonomy-fill').start()
 
 
@@ -10778,7 +10868,10 @@ def api_backfill_taxonomy():
 @app.route('/api/taxonomy_backfill_status')
 def api_taxonomy_backfill_status():
     """Read-only: last/current backfill run (plan + histogram in dry runs) plus the
-    last daily self-heal under `daily_fill`. Ungated like the other status routes."""
+    last daily self-heal under `daily_fill`. The route stays open like the other
+    status routes, but the catalogue-shaped parts (`sample` with family titles +
+    tags, raw `errors` strings) are only returned to a caller holding a valid
+    X-Droplet-Token (or local dev); anonymous callers get the counters only."""
     def _load(path):
         try:
             with open(path, encoding='utf-8') as f:
@@ -10787,8 +10880,20 @@ def api_taxonomy_backfill_status():
             return None
         except Exception as e:
             return {'error': str(e)[:150]}
+    trusted = bool(_verify_droplet_token(request.headers.get('X-Droplet-Token', ''))) \
+        or (not DROPLET_TOKEN_SECRET and os.getenv('DEV_LOCAL') == '1')
     out = _load(TAXONOMY_BACKFILL_STATE_PATH) or {'status': 'not run yet'}
     out['daily_fill'] = _load(TAXONOMY_FILL_STATE_PATH)
+    if not trusted:
+        for k in ('sample', 'errors', 'failed_families'):
+            if k in out:
+                out[k] = len(out[k]) if isinstance(out[k], list) else out[k]
+        fill = (out.get('daily_fill') or {}).get('fill') if isinstance(out.get('daily_fill'), dict) else None
+        if isinstance(fill, dict):
+            for k in ('errors', 'failed_families'):
+                if isinstance(fill.get(k), list):
+                    fill[k] = len(fill[k])
+        out['redacted'] = True
     return jsonify(out)
 
 

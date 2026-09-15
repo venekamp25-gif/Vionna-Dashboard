@@ -47,13 +47,18 @@ def _fake_classifier(monkeypatch, verdict, calls=None):
 
 
 def _fake_anthropic(monkeypatch, reply):
-    """Fake `anthropic` module: records messages.create kwargs, answers `reply`."""
+    """Fake `anthropic` module: records messages.create kwargs, answers `reply`.
+    `reply` may be a list consumed call by call; an Exception entry is raised."""
     calls = []
+    script = list(reply) if isinstance(reply, list) else None
 
     class _Messages:
         def create(self, **kw):
             calls.append(kw)
-            return types.SimpleNamespace(content=[types.SimpleNamespace(text=reply)])
+            ans = script.pop(0) if script else reply
+            if isinstance(ans, Exception):
+                raise ans
+            return types.SimpleNamespace(content=[types.SimpleNamespace(text=ans)])
 
     class _Anthropic:
         def __init__(self, api_key=None):
@@ -201,6 +206,49 @@ def test_llm_call_failures_return_none(monkeypatch):
     assert server._classify_taxonomy_llm('Zoé', 'x') is None
     monkeypatch.setattr(server, 'ANTHROPIC_KEY', None)           # no key → no call
     assert server._classify_taxonomy_llm('Zoé', 'x') is None
+
+
+def test_llm_call_retries_text_only_when_the_image_is_rejected(monkeypatch):
+    """Anthropic fetches the URL itself; an expired Higgsfield/competitor URL or an
+    oversized photo answers 400. The verdict must then come from the text (length
+    gate shut) instead of falling through to the keyword classifier."""
+    calls = _fake_anthropic(monkeypatch, [
+        RuntimeError('400 Could not process image'),
+        '{"category":"dress","sub":"wrap-dress","seasons":["summer"],"length":"maxi",'
+        '"hemline_visible":true,"length_confidence":"high","pattern":"floral"}'])
+    res = server._classify_taxonomy_llm('Zoé', 'Smuk kjole', image_url='https://cdn.example/expired.jpg')
+    assert res['category'] == 'dress' and res['sub'] == 'wrap-dress' and res['pattern'] == 'floral'
+    assert res['length'] is None and res['hemline_visible'] is False, 'no photo → no length'
+    assert len(calls) == 2
+    assert isinstance(calls[0]['messages'][0]['content'], list), 'first attempt carried the image'
+    assert isinstance(calls[1]['messages'][0]['content'], str), 'retry is text-only'
+    assert 'no photo' in calls[1]['messages'][0]['content'].lower()
+    # a text-only call that fails is NOT retried (nothing to strip), still returns None
+    calls = _fake_anthropic(monkeypatch, [RuntimeError('boom'), '{"category":"dress"}'])
+    assert server._classify_taxonomy_llm('Zoé', 'x') is None
+    assert len(calls) == 1
+    # and the publish category resolver now gets the LLM category, not the keyword tier
+    _fake_anthropic(monkeypatch, [RuntimeError('400 image'), '{"category":"knitwear","seasons":["winter"]}'])
+    assert server._category_for_publish({'description': 'Smuk kjole'}, 'Zoé',
+                                        image_url='https://cdn.example/expired.jpg') == 'knitwear'
+
+
+def test_json_extractor_falls_back_when_the_model_echoes_a_second_brace_pair():
+    good = '{"category":"dress","seasons":["summer"]}'
+    assert server._taxonomy_extract_json(good) == {'category': 'dress', 'seasons': ['summer']}
+    echoed = good + '\nJSON shape: {"category":"...","sub":"..."}'
+    assert server._taxonomy_extract_json(echoed) == {'category': 'dress', 'seasons': ['summer']}
+    assert server._taxonomy_extract_json('no braces here') is None
+    assert server._taxonomy_extract_json('{"category":"dress", broken') is None
+    assert server._taxonomy_extract_json('[1, 2] {"a":') is None
+    assert server._taxonomy_extract_json('') is None and server._taxonomy_extract_json(None) is None
+
+
+def test_classifier_survives_an_echoed_prompt_shape(monkeypatch):
+    _fake_anthropic(monkeypatch, '{"category":"dress","seasons":["summer"]}\n'
+                                 'JSON shape: {"category":"...","sub":"..."}')
+    res = server._classify_taxonomy_llm('Zoé', 'x')
+    assert res and res['category'] == 'dress' and res['seasons'] == ['summer']
 
 
 def test_category_wrapper_keeps_working(monkeypatch):
@@ -358,6 +406,39 @@ def test_backfill_tags_every_member_in_every_store(monkeypatch):
     assert all('Women' not in t for t in removes.values())
 
 
+def test_member_plan_never_writes_cat_even_when_the_member_has_none():
+    """The backfill is additive to cat:<x>; an uncategorised member is left to
+    api_apply_category_tags instead of receiving the family majority category."""
+    tags = server._taxonomy_tags(_verdict())
+    add, remove = server._taxonomy_member_plan({'tags': []}, tags)
+    assert add and not any(t.startswith('cat:') for t in add)
+    assert 'tx:1' in add and remove == []
+    add, remove = server._taxonomy_member_plan({'tags': ['cat:top', 'CAT:Dress']}, tags)
+    assert not any(t.lower().startswith('cat:') for t in add + remove)
+    # idempotent: a fully tagged member plans nothing
+    add, remove = server._taxonomy_member_plan({'tags': ['cat:dress'] + tags[1:]}, tags)
+    assert add == [] and remove == []
+
+
+def test_throttled_shopify_answers_wait_longer_before_the_retry(monkeypatch):
+    assert server._taxonomy_retry_delay(RuntimeError('[{"message": "Throttled"}]'), 0) == 5.0
+    assert server._taxonomy_retry_delay(RuntimeError('THROTTLED'), 1) == 10.0
+    assert server._taxonomy_retry_delay(RuntimeError('userErrors'), 0) == 1.5
+    assert server._taxonomy_retry_delay(None, 1) == 3.0
+    sleeps = []
+    monkeypatch.setattr(server.time, 'sleep', lambda s: sleeps.append(s))
+    seen = []
+
+    def gql(store, query, variables=None):
+        seen.append(query)
+        if len(seen) < 3:
+            raise RuntimeError('Throttled')
+        return {'tagsAdd': {'userErrors': []}}
+    monkeypatch.setattr(server, '_sib_gql', gql)
+    assert server._taxonomy_apply_member('dk', 'gid://shopify/Product/1', ['tx:1'], []) is None
+    assert sleeps == [5.0, 10.0]
+
+
 def test_backfill_dry_run_makes_no_shopify_writes(monkeypatch, tmp_path):
     _, gql = _install_catalogue(monkeypatch)
     calls = _fake_classifier(monkeypatch, _verdict())
@@ -391,6 +472,37 @@ def test_backfill_limit_and_family_filter(monkeypatch):
     assert calls == [] and state['llm_calls'] == 0 and state['families_done'] == 1
 
 
+def test_backfill_defers_previously_failed_families_and_caps_errors(monkeypatch):
+    """A family that never classifies must not sit at the head of the alphabetical
+    queue and eat the daily slot forever: `defer` pushes it behind the others."""
+    _install_catalogue(monkeypatch)
+    # Amélie (alphabetically first) fails, Zoé succeeds
+    calls = _fake_classifier(monkeypatch, lambda t: None if server._norm_name(t) == 'amelie' else _verdict())
+    state = server._taxonomy_backfill_run(['dk', 'fr', 'fi'], dry_run=False, only_missing=True)
+    assert state['failed_families'] == ['amelie'] and state['families_failed'] == 1
+    assert state['families_deferred'] == 0
+    # next daily run with limit=1 and the previous failures deferred → Zoé gets the slot
+    server._TAXONOMY_MEMO.clear()
+    calls = _fake_classifier(monkeypatch, lambda t: None if server._norm_name(t) == 'amelie' else _verdict())
+    state = server._taxonomy_backfill_run(['dk', 'fr', 'fi'], dry_run=False, only_missing=True, limit=1,
+                                          defer=['amelie'])
+    assert [server._norm_name(c[0]) for c in calls] == ['zoe']
+    assert state['families_deferred'] == 1 and state['failed_families'] == []
+    # without `defer` the same limit would have picked Amélie again
+    server._TAXONOMY_MEMO.clear()
+    calls = _fake_classifier(monkeypatch, lambda t: None if server._norm_name(t) == 'amelie' else _verdict())
+    server._taxonomy_backfill_run(['dk', 'fr', 'fi'], dry_run=False, only_missing=True, limit=1)
+    assert [server._norm_name(c[0]) for c in calls] == ['amelie']
+    # the 'no classification' branch respects the 50-entry cap like the others
+    many = {'dk': [_node(i, 'Fam%03d' % i, 'dk', ['cat:dress']) for i in range(70)]}
+    monkeypatch.setattr(server, '_sib_page', lambda store, query, key: list(many.get(store) or []))
+    _fake_classifier(monkeypatch, None)
+    state = server._taxonomy_backfill_run(['dk'], dry_run=False, only_missing=True, limit=None)
+    assert state['families_total'] == 70 and state['families_failed'] == 70
+    assert len(state['failed_families']) == 70
+    assert len(state['errors']) == 50, 'the no-classification branch respects the cap'
+
+
 def test_backfill_family_key_falls_back_to_siblings_value():
     n = _node(1, '', 'dk')
     n['sib'] = {'value': 'Zoe-Siblings'}
@@ -414,14 +526,24 @@ def test_new_tag_expires_after_45_days_exact_tag_only(monkeypatch):
              _node(3, 'Legacy', 'dk', ['NEW IN', 'New Arrivals'], created='2025-01-01T10:00:00Z'),
              _node(4, 'Edge', 'dk', ['new'], created='2026-08-01T12:00:01Z'),   # 44d 23h 59m 59s
              _node(5, 'Broken', 'dk', ['new'], created='')]
-    monkeypatch.setattr(server, '_sib_page', lambda store, query, key: prods)
+    # 42 legacy DK drafts (2024-12) carry the exact tag 'new' that we never wrote
+    draft = _node(6, 'LegacyDraft', 'dk', ['new'], created='2024-12-01T10:00:00Z')
+    draft['status'] = 'DRAFT'
+    prods.append(draft)
+    queries = []
+
+    def page(store, query, key):
+        queries.append(query)
+        return prods
+    monkeypatch.setattr(server, '_sib_page', page)
     gql = _Gql()
     monkeypatch.setattr(server, '_sib_gql', gql)
     rep = server._taxonomy_expire_new('dk', now=now)
     removed = [(v['id'], v['t']) for s, q, v in gql.calls if 'tagsRemove' in q]
     assert removed == [('gid://shopify/Product/dk-1', ['new'])]
-    assert rep == {'checked': 5, 'expired': 1, 'errors': []}
+    assert rep == {'checked': 6, 'expired': 1, 'errors': []}
     assert not any('tagsAdd' in q for s, q, v in gql.calls)
+    assert 'status:active' in queries[0] and 'tag:new' in queries[0]
 
 
 def test_daily_loop_is_not_started_under_pytest_and_state_files_are_backed_up():
@@ -429,6 +551,32 @@ def test_daily_loop_is_not_started_under_pytest_and_state_files_are_backed_up():
     import inspect
     src = inspect.getsource(server._run_backup)
     assert 'taxonomy_backfill.json' in src and 'taxonomy_fill.json' in src
+
+
+def test_daily_loop_skips_dev_local_and_waits_for_a_live_backfill(monkeypatch, tmp_path):
+    # the start guard mirrors the self-updater: TAXONOMY_FILL=0, DEV_LOCAL=1 and pytest all skip it
+    with open(server.__file__, encoding='utf-8') as f:
+        src = f.read()
+    guard = next(l for l in src.splitlines() if 'target=_taxonomy_fill_loop' in l)
+    cond = src.splitlines()[src.splitlines().index(guard) - 1]
+    assert "os.getenv('TAXONOMY_FILL') != '0'" in cond
+    assert "os.getenv('DEV_LOCAL') != '1'" in cond and "'pytest' not in sys.modules" in cond
+    # the write phase waits for a completed NON-dry-run backfill
+    import json
+    path = str(tmp_path / 'b.json')
+    monkeypatch.setattr(server, 'TAXONOMY_BACKFILL_STATE_PATH', path)
+    assert server._taxonomy_live_backfill_done() is False, 'no state file yet'
+    for st, ok in (({'status': 'done', 'dry_run': True}, False),
+                   ({'status': 'running', 'dry_run': False}, False),
+                   ({'status': 'error', 'dry_run': False}, False),
+                   ({'status': 'done', 'dry_run': False}, True)):
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(st, f)
+        assert server._taxonomy_live_backfill_done() is ok, st
+    import inspect
+    loop_src = inspect.getsource(server._taxonomy_fill_loop)
+    assert 'if not _taxonomy_live_backfill_done()' in loop_src
+    assert 'defer=defer' in loop_src, 'previous failures are queued last'
 
 
 # ── collections ──────────────────────────────────────────────────────────────
@@ -583,3 +731,22 @@ def test_backfill_route_is_gated_and_status_is_open(monkeypatch, tmp_path):
     r = client.get('/api/taxonomy_backfill_status')
     assert r.status_code == 200 and r.get_json()['status'] == 'not run yet'
     assert r.get_json()['daily_fill'] is None
+    # catalogue-shaped parts (sample titles+tags, raw error strings) only with a valid token
+    import json
+    with open(str(tmp_path / 'b.json'), 'w', encoding='utf-8') as f:
+        json.dump({'status': 'done', 'dry_run': True, 'families_done': 1,
+                   'sample': [{'family': 'Zoé', 'tags': ['cat:dress']}],
+                   'errors': [{'family': 'Amélie', 'error': 'boom'}], 'failed_families': ['amelie']}, f)
+    with open(str(tmp_path / 'f.json'), 'w', encoding='utf-8') as f:
+        json.dump({'at': 'x', 'fill': {'families_done': 2, 'errors': [{'error': 'e'}],
+                                       'failed_families': ['k']}}, f)
+    anon = client.get('/api/taxonomy_backfill_status').get_json()
+    assert anon['redacted'] is True and anon['families_done'] == 1
+    assert anon['sample'] == 1 and anon['errors'] == 1 and anon['failed_families'] == 1
+    assert anon['daily_fill']['fill']['errors'] == 1 and anon['daily_fill']['fill']['families_done'] == 2
+    assert 'Zoé' not in json.dumps(anon, ensure_ascii=False) and 'boom' not in json.dumps(anon)
+    full = client.get('/api/taxonomy_backfill_status',
+                      headers={'X-Droplet-Token': server._mint_droplet_token()}).get_json()
+    assert 'redacted' not in full
+    assert full['sample'] == [{'family': 'Zoé', 'tags': ['cat:dress']}]
+    assert full['daily_fill']['fill']['failed_families'] == ['k']
