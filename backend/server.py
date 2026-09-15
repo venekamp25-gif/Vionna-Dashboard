@@ -4679,9 +4679,9 @@ CAT_TO_COLLECTION_HANDLE = {
 SHOES_HANDLE = {'dk': 'fodtoj', 'fr': 'chaussures', 'fi': 'fodtoj'}
 OUTERWEAR_HANDLE = 'overtoj'
 # clearer "jackets & coats" style names (matches the store's other collections)
-OUTERWEAR_TITLE = {'dk': 'JAKKER / FRAKKER', 'fr': 'VESTES / MANTEAUX', 'fi': 'TAKIT'}
+OUTERWEAR_TITLE = {'dk': 'JAKKER & FRAKKER', 'fr': 'MANTEAUX & VESTES', 'fi': 'TAKIT'}
 SWIM_HANDLE = 'badetoj'
-SWIM_TITLE = {'dk': 'BADETØJ', 'fr': 'MAILLOTS DE BAIN', 'fi': 'UIMAPUVUT'}
+SWIM_TITLE = {'dk': 'BADETØJ', 'fr': 'MAILLOTS DE BAIN', 'fi': 'UIMA-ASUT'}
 
 # per-store category-collection handles (DK/FI share; FR is localised)
 CAT_COLLECTION_HANDLES = {
@@ -10511,6 +10511,7 @@ TAXONOMY_BACKFILL_STATE_PATH = os.path.join(_BASE_DIR, 'taxonomy_backfill.json')
 TAXONOMY_FILL_STATE_PATH = os.path.join(_BASE_DIR, 'taxonomy_fill.json')
 TAXONOMY_FILL_MAX_FAMILIES = 60        # per daily run
 TAXONOMY_DRY_RUN_DEFAULT_LIMIT = 25    # families classified in a dry run when no limit given
+TAXONOMY_LIVE_MIN_TAGGED = 100         # active tx:<n> products on a store that prove a live backfill happened
 _TAXONOMY_RUN_LOCK = threading.Lock()  # manual backfill and daily loop never overlap
 
 _TX_Q_PRODS = ('{ products(first:250%s, query:"status:active"){ '
@@ -10777,20 +10778,38 @@ def _taxonomy_load_state(path):
         return None
 
 
+def _taxonomy_count_tx_active(store):
+    """ACTIVE products already carrying the taxonomy marker tag (tx:<n>) — one productsCount query."""
+    d = _sib_gql(store, '{ c: productsCount(query:"%s"){ count } }' % _taxonomy_count_query({'all': [TX_TAG]})) or {}
+    return int(((d.get('c') or {}).get('count')) or 0)
+
+
 def _taxonomy_live_backfill_done():
-    """True once a NON-dry-run backfill has completed (taxonomy_backfill.json
-    status=='done' and dry_run false). The daily fill only writes after that, so
-    the first live tagging is always the operator's reviewed backfill — never a
-    loop that fired 300 s after a self-update restart."""
+    """True once a live (non-dry-run) backfill has happened: either this process
+    recorded one (taxonomy_backfill.json status=='done', dry_run false) or the
+    catalogue itself shows it (≥ TAXONOMY_LIVE_MIN_TAGGED active products with
+    tx:<n> on any store — the 2026-09-15 backfill ran from the laptop, so the
+    droplet has no state file). The daily fill only writes after that, so the
+    first live tagging is always a reviewed one — never a loop that fired 300 s
+    after a self-update restart."""
     st = _taxonomy_load_state(TAXONOMY_BACKFILL_STATE_PATH) or {}
-    return st.get('status') == 'done' and st.get('dry_run') is False
+    if st.get('status') == 'done' and st.get('dry_run') is False:
+        return True
+    for store in [s for s in ('dk', 'fr', 'fi') if s in tokens]:
+        try:
+            if _taxonomy_count_tx_active(store) >= TAXONOMY_LIVE_MIN_TAGGED:
+                return True
+        except Exception as e:
+            print(f'[taxonomy] {store}: tx:<n> count failed: {e}')
+    return False
 
 
 def _taxonomy_fill_loop():
     """Daily self-heal (mirrors _size_chart_fill_loop): after 300 s, then every 24 h:
     (1) active products without tx:<n> → classify + tag, family-grouped, max 60
     families per run, families that failed last run queued last; (2) 'new' older
-    than NEW_TAG_DAYS → tagsRemove. Only the fashion `tokens` — never
+    than NEW_TAG_DAYS → tagsRemove; (3) the new-arrivals collection is repointed
+    to TAG EQUALS new once enough products carry it. Only the fashion `tokens` — never
     LIGHT_TOKENS. Kill switch TAXONOMY_FILL=0; DEV_LOCAL=1 and pytest never start
     it. Step (1) waits until a live (non-dry-run) backfill has completed."""
     time.sleep(300)
@@ -10828,6 +10847,19 @@ def _taxonomy_fill_loop():
                 except Exception as e:
                     state['new_expired'][st] = {'error': str(e)[:150]}
                     print(f'[taxonomy] {st} new-expiry failed: {e}')
+            # New arrivals: once ≥ NEW_ARRIVALS_MIN active products carry 'new', the
+            # collection switches from the price rule to TAG EQUALS new by itself.
+            state['new_arrivals'] = {}
+            for st in stores:
+                try:
+                    ent = _taxonomy_repoint_new_arrivals(st, dry_run=False)
+                    state['new_arrivals'][st] = ent.get('action')
+                    if ent.get('action') == 'repointed_to_tag_new':
+                        print(f"[taxonomy] {st}: new-arrivals collection now TAG EQUALS new "
+                              f"({ent.get('active_count')} products)")
+                except Exception as e:
+                    state['new_arrivals'][st] = 'error: ' + str(e)[:120]
+                    print(f'[taxonomy] {st} new-arrivals repoint failed: {e}')
         finally:
             _TAXONOMY_RUN_LOCK.release()
         _taxonomy_save_state(TAXONOMY_FILL_STATE_PATH, state)
@@ -10946,10 +10978,10 @@ TAXONOMY_COLLECTIONS = [
     _txc('aw-2026', {'any': ['season:autumn', 'season:winter']},
          ('efteraar-vinter-2026', 'EFTERÅR/VINTER 2026',
           'Sæsonens kjoler, strik og overtøj til de kølige måneder.',
-          'Efterår/vinter 2026 – dametøj', 'Opdag efterår/vinter 2026-kollektionen: kjoler, strik, jakker og frakker til kvinder.'),
+          'Efterår/vinter 2026 – dametøj', 'Opdag kollektionen til efterår/vinter 2026: kjoler, strik, jakker og frakker til kvinder.'),
          ('automne-hiver-2026', 'AUTOMNE-HIVER 2026',
-          'Robes, mailles et manteaux de la saison pour les mois frais.',
-          'Automne-hiver 2026 – mode femme', 'Découvrez la collection automne-hiver 2026 : robes, pulls, vestes et manteaux pour femme.'),
+          'Robes, pulls et manteaux de la saison pour les mois frais.',
+          'Automne-hiver 2026 – mode femme', 'Découvrez la collection automne-hiver 2026 : robes, pulls, vestes et manteaux pour femme.'),
          ('syksyn-uutuudet', 'SYKSYN UUTUUDET',
           'Kauden mekot, neuleet ja takit viileisiin kuukausiin.',
           'Syksyn uutuudet – naisten muoti', 'Tutustu syksyn ja talven uutuuksiin: mekot, neuleet ja takit naisille.')),
@@ -10958,8 +10990,8 @@ TAXONOMY_COLLECTIONS = [
           'Lette jakker og overgangsjakker til efteråret.',
           'Efterårsjakker til kvinder', 'Efterårsjakker og overgangsjakker til kvinder – find din nye jakke til sæsonen.'),
          ('vestes-de-mi-saison', 'VESTES DE MI-SAISON',
-          'Vestes légères et manteaux de transition pour l’automne.',
-          'Vestes de mi-saison femme', 'Vestes de mi-saison et manteaux de transition pour femme – trouvez votre veste d’automne.'),
+          'Vestes légères et manteaux de mi-saison pour l’automne.',
+          'Vestes de mi-saison femme', 'Vestes de mi-saison et manteaux légers pour femme – trouvez votre veste d’automne.'),
          ('syystakit', 'SYYSTAKIT',
           'Kevyet takit ja välikausitakit syksyyn.',
           'Syystakit naisille', 'Syystakit ja välikausitakit naisille – löydä uusi takkisi syksyyn.')),
@@ -10967,22 +10999,22 @@ TAXONOMY_COLLECTIONS = [
          ('vinterjakker-frakker', 'VINTERJAKKER & FRAKKER',
           'Varme vinterjakker og frakker til de kolde måneder.',
           'Vinterjakker & frakker til kvinder', 'Vinterjakker og frakker til kvinder – varme modeller til de kolde måneder.'),
-         ('manteaux-d-hiver', "MANTEAUX D'HIVER",
-          'Manteaux et vestes chaudes pour les mois d’hiver.',
+         ('manteaux-d-hiver', 'MANTEAUX D’HIVER',
+          'Manteaux chauds et vestes d’hiver pour les mois froids.',
           'Manteaux d’hiver femme', 'Manteaux et vestes d’hiver pour femme – des modèles chauds pour les mois froids.'),
          ('talvitakit', 'TALVITAKIT',
           'Lämpimät talvitakit kylmiin kuukausiin.',
           'Talvitakit naisille', 'Talvitakit naisille – lämpimät mallit kylmiin kuukausiin.')),
     _txc('season-knits', {'all': ['cat:knitwear', 'season:aw']},
          ('saesonens-strik', 'SÆSONENS STRIK',
-          'Sweatre, cardigans og strik til efterår og vinter.',
+          'Striktrøjer, sweatre og cardigans til efterår og vinter.',
           'Sæsonens strik til kvinder', 'Sæsonens strik: sweatre, cardigans og trøjer til efterår og vinter.'),
-         ('pulls-de-saison', 'PULLS DE SAISON',
-          'Pulls, cardigans et mailles pour l’automne et l’hiver.',
-          'Pulls de saison femme', 'Pulls de saison : pulls, cardigans et mailles pour l’automne et l’hiver.'),
+         ('pulls-de-saison', 'PULLS DE LA SAISON',
+          'Pulls, gilets et maille pour l’automne et l’hiver.',
+          'Pulls de la saison – femme', 'Pulls de la saison : pulls, gilets et maille pour l’automne et l’hiver.'),
          ('kauden-neuleet', 'KAUDEN NEULEET',
-          'Neuleet, neuletakit ja villapaidat syksyyn ja talveen.',
-          'Kauden neuleet naisille', 'Kauden neuleet: villapaidat, neuletakit ja neuleet syksyyn ja talveen.')),
+          'Neulepuserot, neuletakit ja villapaidat syksyyn ja talveen.',
+          'Kauden neuleet naisille', 'Kauden neuleet: villapaidat, neuletakit ja neulepuserot syksyyn ja talveen.')),
     # ── occasion ──
     _txc('party', {'all': ['occ:party']},
          ('festtoj', 'FESTTØJ',
@@ -10990,27 +11022,27 @@ TAXONOMY_COLLECTIONS = [
           'Festtøj til kvinder', 'Festtøj til kvinder: kjoler og outfits til fest, byture og særlige aftener.'),
          ('tenues-de-fete', 'TENUES DE FÊTE',
           'Robes et tenues pour les soirées et les grandes occasions.',
-          'Tenues de fête femme', 'Tenues de fête pour femme : robes et ensembles pour les soirées et les grandes occasions.'),
+          'Tenues de fête femme', 'Tenues de fête pour femme : robes et ensembles pour les soirées et les grandes occasions.'),
          ('juhlavaatteet', 'JUHLAVAATTEET',
-          'Mekot ja asut juhliin, iltoihin ja erityisiin tilaisuuksiin.',
+          'Mekot ja asut juhliin, iltamenoihin ja erityisiin tilaisuuksiin.',
           'Juhlavaatteet naisille', 'Juhlavaatteet naisille: mekot ja asut juhliin ja erityisiin tilaisuuksiin.')),
     _txc('wedding', {'all': ['occ:wedding']},
          ('bryllupsgaest', 'BRYLLUPSGÆST',
           'Kjoler og sæt til dig, der er gæst til bryllup.',
-          'Bryllupsgæst – kjoler & sæt', 'Kjoler og sæt til bryllupsgæster – find dit outfit til den store dag.'),
+          'Bryllupsgæst – kjoler & sæt', 'Kjoler og sæt til bryllupsgæster – find dit outfit til brylluppet.'),
          ('mariage-ceremonie', 'MARIAGE & CÉRÉMONIE',
           'Robes et ensembles pour les invitées de mariage et les cérémonies.',
-          'Tenues d’invitée de mariage', 'Robes et ensembles pour invitée de mariage et cérémonies – trouvez votre tenue.'),
-         ('haihin', 'HÄIHIN',
+          'Tenues d’invitée de mariage', 'Robes et ensembles pour les invitées de mariage et les cérémonies – trouvez votre tenue.'),
+         ('haihin', 'HÄÄVIERAALLE',
           'Mekot ja asut häävieraalle ja juhlatilaisuuksiin.',
-          'Hääasut vieraalle', 'Mekot ja asut häävieraalle – löydä asusi juhlapäivään.')),
+          'Mekot häihin – asut häävieraalle', 'Mekot ja asut häävieraalle – löydä asusi juhlapäivään.')),
     _txc('office', {'all': ['occ:office']},
          ('kontortoj', 'KONTORTØJ',
           'Smarte hverdagsstyles til kontoret og arbejdsdagen.',
           'Kontortøj til kvinder', 'Kontortøj til kvinder: smarte styles til kontoret og arbejdsdagen.'),
          ('tenues-de-bureau', 'TENUES DE BUREAU',
           'Des pièces élégantes pour le bureau et la journée de travail.',
-          'Tenues de bureau femme', 'Tenues de bureau pour femme : des pièces élégantes pour la journée de travail.'),
+          'Tenues de bureau femme', 'Tenues de bureau pour femme : des pièces élégantes pour la journée de travail.'),
          ('toimistovaatteet', 'TOIMISTOVAATTEET',
           'Tyylikkäät vaatteet toimistoon ja työpäivään.',
           'Toimistovaatteet naisille', 'Toimistovaatteet naisille: tyylikkäät vaatteet toimistoon ja työpäivään.')),
@@ -11020,7 +11052,7 @@ TAXONOMY_COLLECTIONS = [
           'Hverdagstøj til kvinder', 'Hverdagstøj til kvinder: afslappede styles til hver dag.'),
          ('les-essentiels', 'LES ESSENTIELS',
           'Les pièces faciles à porter au quotidien.',
-          'Les essentiels du quotidien', 'Les essentiels pour femme : des pièces faciles à porter au quotidien.'),
+          'Les essentiels du quotidien', 'Les essentiels pour femme : des pièces faciles à porter au quotidien.'),
          ('arkivaatteet', 'ARKIVAATTEET',
           'Rennot vaatteet arkeen.',
           'Arkivaatteet naisille', 'Arkivaatteet naisille: rennot vaatteet jokaiseen päivään.')),
@@ -11031,10 +11063,10 @@ TAXONOMY_COLLECTIONS = [
           'Festkjoler til kvinder', 'Festkjoler til kvinder – kjoler til fest, byture og særlige aftener.'),
          ('robes-de-soiree', 'ROBES DE SOIRÉE',
           'Robes pour les soirées et les grandes occasions.',
-          'Robes de soirée femme', 'Robes de soirée pour femme – pour les soirées et les grandes occasions.'),
+          'Robes de soirée femme', 'Robes de soirée pour femme – pour les grandes occasions et les événements élégants.'),
          ('juhlamekot', 'JUHLAMEKOT',
-          'Mekot juhliin ja erityisiin iltoihin.',
-          'Juhlamekot naisille', 'Juhlamekot naisille – mekot juhliin ja erityisiin iltoihin.')),
+          'Mekot juhliin ja erityisiin tilaisuuksiin.',
+          'Juhlamekot naisille', 'Juhlamekot naisille – mekot juhliin ja erityisiin tilaisuuksiin.')),
     _txc('everyday-dresses', {'all': ['cat:dress', 'occ:everyday']},
          ('hverdagskjoler', 'HVERDAGSKJOLER',
           'Afslappede kjoler til hverdagen.',
@@ -11054,7 +11086,7 @@ TAXONOMY_COLLECTIONS = [
           'Robes longues femme', 'Robes longues pour femme – des robes maxi pour toutes les occasions.'),
          ('maksimekot', 'MAKSIMEKOT',
           'Pitkät maksimekot.',
-          'Maksimekot naisille', 'Maksimekot naisille – pitkät mekot juhlaan ja arkeen.')),
+          'Maksimekot naisille', 'Maksimekot naisille – pitkät mekot arkeen ja juhlaan.')),
     _txc('midi-dresses', {'all': ['cat:dress', 'len:midi']},
          ('midikjoler', 'MIDIKJOLER',
           'Kjoler i midilængde – under knæet.',
@@ -11064,7 +11096,7 @@ TAXONOMY_COLLECTIONS = [
           'Robes midi femme', 'Robes midi pour femme – des robes mi-longues pour toutes les occasions.'),
          ('midimekot', 'MIDIMEKOT',
           'Polven alle ulottuvat midimekot.',
-          'Midimekot naisille', 'Midimekot naisille – polven alle ulottuvat mekot juhlaan ja arkeen.')),
+          'Midimekot naisille', 'Midimekot naisille – polven alle ulottuvat mekot arkeen ja juhlaan.')),
     _txc('mini-dresses', {'all': ['cat:dress', 'len:mini']},
          ('korte-kjoler', 'KORTE KJOLER',
           'Korte kjoler over knæet.',
@@ -11074,7 +11106,7 @@ TAXONOMY_COLLECTIONS = [
           'Robes courtes femme', 'Robes courtes pour femme – des robes mini pour toutes les occasions.'),
          ('lyhyet-mekot', 'LYHYET MEKOT',
           'Polven yläpuolelle ulottuvat lyhyet mekot.',
-          'Lyhyet mekot naisille', 'Lyhyet mekot naisille – minimekot juhlaan ja arkeen.')),
+          'Lyhyet mekot naisille', 'Lyhyet mekot naisille – minimekot arkeen ja juhlaan.')),
     _txc('knit-dresses', {'all': ['cat:dress', 'sub:knit-dress']},
          ('strikkjoler', 'STRIKKJOLER',
           'Strikkede kjoler til de kølige dage.',
@@ -11093,8 +11125,8 @@ TAXONOMY_COLLECTIONS = [
           'Robes chemises à col et boutons.',
           'Robes chemises femme', 'Robes chemises pour femme – des robes à col et boutons pour le quotidien et le bureau.'),
          ('paitamekot', 'PAITAMEKOT',
-          'Paitamekot kauluksella ja napeilla.',
-          'Paitamekot naisille', 'Paitamekot naisille – kauluksella ja napeilla arkeen ja toimistoon.')),
+          'Paitamekot, joissa on kaulus ja napitus.',
+          'Paitamekot naisille', 'Paitamekot naisille – kauluksella ja napituksella varustetut mekot arkeen ja toimistoon.')),
     _txc('floral-dresses', {'all': ['cat:dress', 'pat:floral']},
          ('blomstrede-kjoler', 'BLOMSTREDE KJOLER',
           'Kjoler med blomsterprint.',
@@ -11104,7 +11136,7 @@ TAXONOMY_COLLECTIONS = [
           'Robes fleuries femme', 'Robes fleuries pour femme – des robes à imprimé floral pour toutes les occasions.'),
          ('kukkamekot', 'KUKKAMEKOT',
           'Kukkakuvioiset mekot.',
-          'Kukkamekot naisille', 'Kukkamekot naisille – kukkakuvioiset mekot juhlaan ja arkeen.')),
+          'Kukkamekot naisille', 'Kukkamekot naisille – kukkakuvioiset mekot arkeen ja juhlaan.')),
 ]
 
 
@@ -11214,7 +11246,15 @@ def _manage_taxonomy_collections(store, dry_run=True, min_products=8):
             ent['errors'] = [str(e)[:150]]
         report.append(ent)
 
-    # New arrivals: TAG EQUALS new only once the tag has real coverage.
+    report.append(_taxonomy_repoint_new_arrivals(store, dry_run))
+    return {'store': store, 'dry_run': bool(dry_run), 'min_products': int(min_products), 'report': report}
+
+
+def _taxonomy_repoint_new_arrivals(store, dry_run=True):
+    """New arrivals: repoint the store's new-arrivals collection to TAG EQUALS new
+    only once the tag has real coverage (≥ NEW_ARRIVALS_MIN active products);
+    until then the price rule (newest-first sort) stays. Idempotent; used by the
+    collections endpoint and by the daily loop. → report entry dict."""
     nh = NEW_ARRIVALS_HANDLE.get(store)
     ent = {'handle': nh, 'key': 'new-arrivals', 'rules': {'all': [NEW_TAG]}}
     try:
@@ -11237,15 +11277,14 @@ def _manage_taxonomy_collections(store, dry_run=True, min_products=8):
             ent['action'] = 'would_repoint_to_tag_new'
         else:
             d = _sib_gql(store, _TXC_M_UPDATE, {'input': {'id': node['id'], 'ruleSet': _taxonomy_rule_set(ent['rules'])}})
-            ue = _ue(d, 'collectionUpdate')
+            ue = ((d or {}).get('collectionUpdate') or {}).get('userErrors') or []
             ent['action'] = 'repointed_to_tag_new' if not ue else 'ERROR'
             if ue:
                 ent['errors'] = ue
     except Exception as e:
         ent['action'] = 'ERROR'
         ent['errors'] = [str(e)[:150]]
-    report.append(ent)
-    return {'store': store, 'dry_run': bool(dry_run), 'min_products': int(min_products), 'report': report}
+    return ent
 
 
 @app.route('/api/manage_taxonomy_collections', methods=['POST'])
