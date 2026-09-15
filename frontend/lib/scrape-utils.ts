@@ -1,5 +1,6 @@
 import type { ScrapedProduct } from "./api";
 import { isColorLike } from "./colors";
+import { NB_TYPE_RES, stripTypeNoise } from "./nbCategory";
 
 // Recognise the full Shopify-ish size lexicon so an option like
 // ["XXS","XS","S","M","L","XL","XXL","3XL"] is correctly identified as
@@ -72,14 +73,29 @@ function titleCase(s: string): string {
 
 // Order matters: non-apparel (accessory/shoes/swim) and outerwear come BEFORE the
 // generic apparel words so a "solbriller" / "handtas" title is recognised instead
-// of silently falling through. Multilingual (EN/NL/DA/FR/FI).
+// of silently falling through. Multilingual (EN/NL/DA/FR/FI/DE).
+//
+// The accessory rows share their vocabulary with lib/nbCategory.ts (the Nano
+// Banana category logic), so a title recognised here lands in the accessory
+// image steps too. Row order inside that block matters: bag before the
+// jewellery rows ("ring handle bag", "baguette bag" are bags), watch before
+// bracelet ("armbåndsur" / "armbanduhr"), the specific pieces before the
+// generic "jewellery" fallback. The regexes expect lower-cased text that went
+// through stripTypeNoise() ("cap sleeve", "scarf print", "jewel neck" …).
 const TYPE_MAP: [string, RegExp][] = [
-  ["sunglasses", /sunglass|zonnebril|solbrille|lunettes|aurinkolasi/i],
-  ["bag",        /handbag|handtas|\btas(je|se)?\b|\bbag\b|\bsac\b|clutch|tote|laukku|purse/i],
-  ["jewellery",  /necklace|earring|bracelet|jewel|halsk(æ|ae)de|(ø|o)rering|armb(å|a)nd|collier|boucle|bijoux|koru|smykke/i],
-  ["scarf",      /scarf|sjaal|t(ø|o)rkl(æ|ae)de|foulard|huivi/i],
-  ["belt",       /\bbelt\b|\briem\b|b(æ|ae)lte|ceinture|vy(ö|o)/i],
-  ["hat",        /\bhat\b|\bcap\b|hoed|\bhue\b|chapeau|hattu/i],
+  ["sunglasses",     NB_TYPE_RES.eyewear],
+  ["bag",            /handbag|handtas|\btas(je|se)?\b|\bbag\b|\bsac\b|clutch|tote|laukku|purse/i],
+  ["watch",          NB_TYPE_RES.watch],
+  ["hair accessory", NB_TYPE_RES.hair],
+  ["necklace",       NB_TYPE_RES.necklace],
+  ["earrings",       NB_TYPE_RES.earrings],
+  ["bracelet",       NB_TYPE_RES.bracelet],
+  ["ring",           NB_TYPE_RES.ring],
+  ["gloves",         NB_TYPE_RES.gloves],
+  ["jewellery",      NB_TYPE_RES.jewellery],
+  ["scarf",          NB_TYPE_RES.scarf],
+  ["belt",           NB_TYPE_RES.belt],
+  ["hat",            NB_TYPE_RES.headwear],
   ["shoes",      /shoe|boot|sandal|sneaker|loafer|espadrille|\bmule\b|\bheel|pump|schoen|st(ø|o)vle|\bsko\b|chaussure|kenk|jalkine|saapas/i],
   ["swimsuit",   /swim|bikini|badpak|badedragt|maillot|uimapuku/i],
   ["jacket",   /jacket|jas|veste|jakke/i],
@@ -102,10 +118,12 @@ const TYPE_MAP: [string, RegExp][] = [
  * authoritative Shopify product_type is now set at publish from the description-
  * driven LLM category (backend _product_type_for_publish); this title guess is
  * only a hint for image-gen and the editable field, so an empty guess is safer
- * than a wrong one. Image-gen callers already fall back with `|| "dress"`.
+ * than a wrong one. Image-gen callers fall back with `|| "garment"`.
  */
 export function guessProductType(product: ScrapedProduct["product"]): string {
-  const text = `${product?.title ?? ""} ${product?.handle ?? ""}`.toLowerCase();
+  // Lower-cased, minus the garment descriptors that contain an accessory word
+  // ("cap sleeve", "scarf print", "jewel neck", "o-ring" …) — see nbCategory.ts.
+  const text = stripTypeNoise(`${product?.title ?? ""} ${product?.handle ?? ""}`);
   for (const [type, re] of TYPE_MAP) {
     if (re.test(text)) return type;
   }

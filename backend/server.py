@@ -14238,55 +14238,302 @@ NANO_BANANA_PROMPTS_BAGS = {
 }
 
 
-def _nb_category(product_type):
-    """'bag' | 'shoes' | 'garment' voor een vrije product_type-string (EN/DK/FR/FI).
+# Accessoires: sieraden, zonnebrillen, riemen, hoeden, sjaals, horloges,
+# handschoenen, haaraccessoires. Het model DRAAGT het accessoire, met een
+# framing per soort (portret voor sieraden, pols in beeld voor een horloge, …
+# zie _nb_accessory_framing) — een "rugaanzicht" of "full-body shot" verbergt
+# juist het product, en "stof/textuur" slaat nergens op bij metaal, glas of
+# leer. Stap 3 is, net als bij tassen, een styled product shot zonder model;
+# stap 4 een macro van het materiaal. De kleurstappen spreken van colourway /
+# finish (goud, zilver, tortoise, …), nooit van stof of outfit.
+# Placeholders: {product_type}, {color} en {framing} — zie _nb_render_prompt.
+NANO_BANANA_PROMPTS_ACCESSORY = {
+    1: ("I've added a photo of a woman wearing a dress. I only want to use the background "
+        "from this photo. Then, I want you to show a realistic woman model in that background "
+        "WEARING the {product_type}, styled as intended. Use {framing}. Make the "
+        "{product_type} the HERO of the shot: fully visible, at true size and proportions, "
+        "sharply in focus. It should be completely unnoticeable that it's an AI-generated "
+        "model — it must look fully natural and real."),
+    2: ("I've uploaded a photo of OUR model wearing the {product_type}. Keep the SAME model — "
+        "same face, hair, skin tone and body — and the SAME background, lighting and styling. "
+        "Keep every detail of the {product_type} (shape, colourway, materials, finish, clasp "
+        "and hardware) identical to the reference. Generate a new detailed shot with {framing}, "
+        "her face clearly visible and the {product_type} prominent and sharply in focus — the "
+        "{product_type} leads the frame. CRITICAL: use a clearly DIFFERENT pose, head angle and "
+        "hand position than the reference so it is visibly a new photo, NOT a copy. Same "
+        "{product_type}, same setting — new pose."),
+    3: ("I've added a photo of our model wearing the {product_type}. Do not change the product "
+        "or the style of the setting. Now generate a styled PRODUCT SHOT of the same "
+        "{product_type} on its own, laid out or displayed on an elegant surface in the same "
+        "setting and lighting — three-quarter angle, with the full shape, proportions and "
+        "details clearly visible, no model in frame. Keep it photorealistic."),
+    4: ("I've added a photo of our model wearing the {product_type}. We don't want any changes "
+        "to the background, model, or the product. Now generate a macro close-up of the "
+        "{product_type} itself: the metal, stones, clasp, frame, lenses, hinges, buckle, weave "
+        "— whatever the {product_type} is made of — with the finish, engraving and "
+        "construction crisp and realistic. Match the original style and lighting."),
+    5: ("I've uploaded multiple reference images. The FIRST image is our model wearing the "
+        "{product_type} — keep this model, the background, the lighting, the styling and the "
+        "framing EXACTLY identical. The remaining images are colour references from the "
+        "competitor showing the same {product_type} in {color}; use them only to match the "
+        "exact {color} colourway / finish (e.g. gold, silver, tortoise, black), materials and "
+        "stones. Generate the same model in a slightly different pose, wearing the "
+        "{product_type} in {color}. Do not copy the competitor's model or background — only "
+        "mirror the colourway onto the {product_type}."),
+    11: ("I've uploaded reference images with TWO different roles:\n"
+         "- IMAGE 1: our existing model wearing the {product_type} — use her face, body, the "
+         "framing, background, lighting and styling. A slightly different pose is allowed.\n"
+         "- IMAGES 2+: competitor colour references. These define the EXACT colourway / finish "
+         "(e.g. gold, silver, tortoise, black), shade, materials and stones for the new "
+         "variant. Use them ONLY for colour information.\n\n"
+         "Task: generate a shot of OUR model (from IMAGE 1) wearing the {product_type} in the "
+         "EXACT colourway shown in IMAGES 2+, using {framing}. Critical: do NOT guess the "
+         "colour from the label '{color}' — match precisely what you see in the reference "
+         "images, including subtle tints and metal tones. Ignore the competitor's model and "
+         "background entirely — only mirror the colourway of the {product_type}."),
+    12: ("I've uploaded reference images with TWO different roles:\n"
+         "- IMAGE 1: our existing model wearing the {product_type} with her face clearly "
+         "visible.\n"
+         "- IMAGES 2+: competitor colour references — EXACT colourway / finish ground truth.\n\n"
+         "Task: generate a detailed shot of OUR model with her face clearly visible and the "
+         "{product_type} prominent and sharply in focus, using {framing}, in the EXACT "
+         "colourway shown in IMAGES 2+. Critical: match the precise shade and finish from the "
+         "reference photos, not your prior idea of '{color}'. Keep our model, background and "
+         "styling identical to IMAGE 1, but use a different pose and angle than in IMAGE 1."),
+    13: ("I've uploaded reference images with TWO different roles:\n"
+         "- IMAGE 1: our model wearing the {product_type} (same setting and lighting).\n"
+         "- IMAGES 2+: competitor colour references — EXACT colourway / finish ground truth.\n\n"
+         "Task: generate a styled PRODUCT SHOT of the {product_type} on its own, displayed on "
+         "an elegant surface in the same setting — three-quarter angle, full shape, "
+         "proportions and details clearly visible, no model in frame — in the EXACT colourway "
+         "shown in IMAGES 2+. Critical: copy the precise shade, finish and materials you see "
+         "in the references."),
+    14: ("I've uploaded reference images with TWO different roles:\n"
+         "- IMAGE 1: our model wearing the {product_type} (for style + lighting reference).\n"
+         "- IMAGES 2+: competitor colour references — EXACT colourway / finish ground truth.\n\n"
+         "Task: generate a macro close-up of the {product_type} in the EXACT colourway shown "
+         "in IMAGES 2+: the metal, stones, clasp, frame, lenses, hinges, buckle, weave — "
+         "whatever the {product_type} is made of. Critical: match the precise shade and "
+         "finish, not your idea of '{color}'. Reproduce the lighting style from IMAGE 1."),
+}
 
-    Substring-matching met opzet: Deens/Fins plakken samenstellingen
-    ("skuldertaske", "käsilaukku"), dus woordgrenzen zouden die missen.
-    Tassen EERST: "skoletaske" bevat zowel 'sko' als 'taske' en is een tas.
-    """
-    pt = (product_type or '').lower()
-    pt = pt.replace('bootcut', '')          # bootcut jeans zijn een broek, geen laars
-    bag_words = (
-        'bag', 'handbag', 'tote', 'shopper', 'crossbody', 'cross-body', 'clutch',
-        'satchel', 'purse', 'backpack', 'rucksack', 'weekender', 'duffel', 'pouch',
-        'wallet',
+
+# --- Nano Banana: welke template-set hoort bij dit producttype? ----------------
+# SPIEGEL van frontend/lib/nbCategory.ts — zelfde woordenlijst, zelfde volgorde.
+# De frontend gebruikt 'm alleen voor de staplabels; dít kiest de prompts.
+# tests/test_nb_category.py en frontend/tests/nbCategory.test.ts draaien
+# dezelfde gevallenlijst tegen beide kanten, zodat ze niet stil uit elkaar
+# kunnen lopen. Woord hier erbij → ook daar.
+#
+# Matching:
+#   - lange woorden als SUBSTRING: Deens/Fins plakken samenstellingen
+#     ("skuldertaske", "käsilaukku", "kaulakoru"), woordgrenzen missen die;
+#   - korte/dubbelzinnige woorden als HEEL WOORD: "ring" (spring, earring),
+#     "ur" (DK horloge), "hat", "cap", "pet", "tas", "belt" (belted), "watch"
+#     (swatch), "kello" (kellohame = FI klokrok), "sac" …;
+#   - kledingtermen die een accessoire-woord BEVATTEN worden eerst gestript
+#     ("cap sleeve", "scarf print", "jewel neck", "o-ring", "bootcut", "baggy");
+#     samengestelde TASSEN met zo'n woord ("belt bag", "bæltetaske",
+#     "vyölaukku") worden vóór de accessoire-check beslist;
+#   - accessoires VÓÓR tassen: FR "bague" (ring) bevat "bag".
+# Python's \b is Unicode-bewust ("\bvyö\b" werkt); de .ts-kant bouwt de grens
+# zelf omdat JS' \b alleen ASCII kent.
+
+def _nb_re(word=(), sub=()):
+    parts = []
+    if word:
+        parts.append(r'\b(?:' + '|'.join(word) + r')\b')
+    if sub:
+        parts.append('|'.join(sub))
+    return re.compile('|'.join(parts))
+
+
+_NB_NOISE_RE = re.compile(
+    r'cap[- ]?sleeves?|cap[- ]?toe|scarf[- ]?print|jewel[- ]?neck(?:line)?'
+    r'|\bo[- ]rings?|ring[- ]?(?:details?|handles?)|bootcut|baggy|skorts?'
+)
+_NB_BAG_OVERRIDE_RE = _nb_re(
+    word=('belt[- ]?bags?', 'bum[- ]?bags?', 'fanny[- ]?packs?', 'sac[- ]ceinture', 'sac[- ]banane'),
+    sub=('bæltetaske', 'baeltetaske', 'vyölaukku', 'vyolaukku', 'gürteltasche', 'guerteltasche', 'heuptas'),
+)
+_NB_BAG_RE = _nb_re(
+    # 'sac' alleen als heel woord: zit in te veel andere woorden
+    word=('sacs?', 'tas(?:je|jes|sen)?'),
+    sub=(
+        'bag', 'handbag', 'tote', 'shopper', 'crossbody', 'cross-body', 'clutch', 'satchel', 'purse',
+        'backpack', 'rucksack', 'weekender', 'duffel', 'pouch', 'wallet',
         # DK
         'taske', 'håndtaske', 'haandtaske', 'skuldertaske', 'rygsæk', 'rygsaek', 'pung',
-        # FR ('sac' los via woordgrens hieronder: 'sac' zit in te veel andere woorden)
+        # FR
         'bandoulière', 'bandouliere', 'pochette', 'cabas', 'sacoche', 'portefeuille',
         # FI
         'laukku', 'käsilaukku', 'kasilaukku', 'olkalaukku', 'reppu', 'lompakko',
-    )
-    if any(w in pt for w in bag_words) or re.search(r'\bsacs?\b', pt):
-        return 'bag'
-    shoe_words = (
-        'shoe', 'sneaker', 'trainer', 'boot', 'loafer', 'sandal', 'heel', 'pump',
-        'stiletto', 'espadrille', 'slipper', 'flip-flop', 'flip flop', 'ballet flat',
-        'oxford', 'brogue', 'clog', 'mule',
+        # NL
+        'handtas', 'schoudertas', 'rugzak',
+    ),
+)
+_NB_SHOES_RE = _nb_re(
+    word=('oxfords', 'oxford shoes?'),        # een "oxford shirt" is een overhemd
+    sub=(
+        'shoe', 'sneaker', 'trainer', 'boot', 'loafer', 'sandal', 'heel', 'pump', 'stiletto',
+        'espadrille', 'slipper', 'flip-flop', 'flip flop', 'ballet flat', 'brogue', 'clog', 'mule',
         # DK
         'sko', 'støvle', 'stovle', 'hjemmesko', 'træsko', 'traesko', 'hæl', 'hael',
         # FR (géén 'talon': zit letterlijk in 'pantalon(s)')
-        'chaussure', 'basket', 'botte', 'bottine', 'escarpin', 'mocassin', 'ballerine',
-        'sabot', 'chausson',
+        'chaussure', 'basket', 'botte', 'bottine', 'escarpin', 'mocassin', 'ballerine', 'sabot', 'chausson',
         # FI
-        'kengät', 'kengat', 'kenkä', 'kenka', 'lenkkarit', 'tennarit', 'saappaat',
-        'saapas', 'nilkkurit', 'nilkkuri', 'sandaalit', 'korkokengät', 'korkokengat',
-        'mokkasiini', 'tossut', 'ballerinat',
-    )
-    if any(w in pt for w in shoe_words):
+        'keng', 'kenk', 'lenkkarit', 'tennarit', 'saappaat', 'saapas', 'nilkkuri', 'sandaalit',
+        'korkokeng', 'mokkasiini', 'tossut', 'ballerinat',
+        # NL
+        'schoen', 'laars',
+    ),
+)
+# Accessoire-soorten, in de volgorde van _NB_KIND_ORDER — die telt waar een
+# woord in een ander zit ("armbåndsur"/"armbanduhr" = horloge, geen armband;
+# "haarschmuck" = haar, geen los sieraad).
+_NB_WATCH_RE = _nb_re(
+    word=('watch(?:es)?', 'ure?', 'uhr(?:en)?', 'kellot?'),
+    sub=('wristwatch', 'smartwatch', 'armbåndsur', 'armbaandsur', 'armbanduhr', 'montre', 'rannekello', 'horloge'),
+)
+_NB_EYEWEAR_RE = _nb_re(
+    word=('bril(?:len)?',),
+    sub=('sunglass', 'glasses', 'eyewear', 'solbrille', 'brille', 'lunette',
+         'aurinkolasi', 'silmälasi', 'silmalasi', 'zonnebril', 'sonnenbrille'),
+)
+_NB_HAIR_RE = _nb_re(
+    word=('hair[- ]?(?:clips?|bands?|ties?|claws?|slides?|pins?|accessor(?:y|ies))',
+          'claw[- ]?clips?', 'head[- ]?bands?',
+          'pinces?[- ]?(?:à|a)?[- ]?cheveux', 'pinces?[- ]?crabe', 'serre[- ]?t(?:ê|e)te'),
+    sub=('scrunchie', 'barrette', 'chouchou',
+         'hårspænde', 'haarspaende', 'hårbånd', 'haarbaand', 'hårklemme', 'hårelastik',
+         'hiuspinni', 'hiuspanta', 'hiusklipsi', 'hiusdonitsi', 'hiuskoriste',
+         'haarclip', 'haarband', 'haarspeld', 'haarelastiek', 'haarspange', 'haarreif', 'haargummi', 'haarschmuck'),
+)
+_NB_HEADWEAR_RE = _nb_re(
+    word=('hats?', 'caps?', 'huer?', 'bonnets?', 'hoed(?:en|je)?', 'pet(?:je|ten)?', 'kasket(?:ter)?', 'lippis', 'lippalakki'),
+    sub=('beanie', 'fedora', 'chapeau', 'casquette', 'béret', 'beret', 'hattu', 'pipo', 'mütze', 'muetze', 'mutze'),
+)
+_NB_GLOVES_RE = _nb_re(
+    word=('gants?', 'vanter?'),
+    sub=('glove', 'mitten', 'handske', 'käsine', 'kasine', 'handschoen', 'handschuh', 'moufle'),
+)
+_NB_BELT_RE = _nb_re(
+    word=('belts?', 'ceintures?', 'vyö[tn]?', 'riem(?:en)?'),
+    sub=('bælte', 'baelte', 'gürtel', 'guertel', 'gurtel'),
+)
+_NB_SCARF_RE = _nb_re(
+    word=('schals?',),
+    sub=('scarf', 'scarves', 'tørklæde', 'toerklaede', 'torklaede', 'tørklaede', 'écharpe', 'echarpe', 'foulard', 'huivi', 'sjaal'),
+)
+_NB_NECKLACE_RE = _nb_re(
+    sub=('necklace', 'choker', 'halskæde', 'halskaede', 'halskette', 'collier', 'kaulakoru', 'kaulaketju', 'ketting'),
+)
+_NB_EARRINGS_RE = _nb_re(
+    sub=('earring', 'ørering', 'orering', "boucles? d['’]oreilles?", 'korvakoru', 'oorbel', 'ohrring', 'ohrstecker'),
+)
+_NB_BRACELET_RE = _nb_re(
+    sub=('bracelet', 'bangle', 'armbånd', 'armbaand', 'armband', 'rannekoru', 'ranneketju'),
+)
+_NB_RING_RE = _nb_re(
+    word=('rings?', 'bagues?'),
+    sub=('sormus', 'sormuks'),
+)
+_NB_JEWELLERY_RE = _nb_re(          # generieke sieraadwoorden — vangnet
+    sub=('jewel', 'juwe', 'smykke', 'bijou', 'koru', 'sieraad', 'sieraden', 'schmuck',
+         'pendant', 'vedhæng', 'vedhaeng', 'pendentif', 'riipus', 'brooch', 'broche', 'anklet'),
+)
+_NB_OTHER_RE = _nb_re(              # generiek "accessoire" — categorie ja, soort onbekend
+    sub=('accessor', 'accessoire', 'asuste', 'tilbehør', 'tilbehoer'),
+)
+_NB_KIND_ORDER = (
+    ('watch',    (_NB_WATCH_RE,)),
+    ('eyewear',  (_NB_EYEWEAR_RE,)),
+    ('hair',     (_NB_HAIR_RE,)),
+    ('headwear', (_NB_HEADWEAR_RE,)),
+    ('gloves',   (_NB_GLOVES_RE,)),
+    ('belt',     (_NB_BELT_RE,)),
+    ('scarf',    (_NB_SCARF_RE,)),
+    ('jewelry',  (_NB_NECKLACE_RE, _NB_EARRINGS_RE, _NB_BRACELET_RE, _NB_RING_RE, _NB_JEWELLERY_RE)),
+    ('other',    (_NB_OTHER_RE,)),
+)
+
+
+def _nb_normalise(product_type):
+    """lower-case + de kledingtermen strippen die een accessoire-woord bevatten."""
+    return _NB_NOISE_RE.sub(' ', (product_type or '').lower())
+
+
+def _nb_kind_of(pt):
+    for kind, res in _NB_KIND_ORDER:
+        if any(r.search(pt) for r in res):
+            return kind
+    return None
+
+
+def _nb_category(product_type):
+    """'accessory' | 'bag' | 'shoes' | 'garment' voor een vrije product_type-string
+    (EN/DK/FR/FI/NL/DE). Zie het blok hierboven voor de matching-regels."""
+    pt = _nb_normalise(product_type)
+    if _NB_BAG_OVERRIDE_RE.search(pt):
+        return 'bag'
+    if _nb_kind_of(pt):
+        return 'accessory'
+    if _NB_BAG_RE.search(pt):
+        return 'bag'
+    if _NB_SHOES_RE.search(pt):
         return 'shoes'
     return 'garment'
 
 
+def _nb_accessory_kind(product_type):
+    """'jewelry' | 'eyewear' | 'headwear' | 'scarf' | 'belt' | 'watch' | 'gloves' |
+    'hair' | 'other' — 'other' ook voor alles wat geen accessoire is."""
+    return _nb_kind_of(_nb_normalise(product_type)) or 'other'
+
+
+_NB_ACCESSORY_FRAMING = {
+    'jewelry':  "portrait framing from the chest up, the {product_type} clearly visible, centred and in sharp focus",
+    'eyewear':  "front-facing head-and-shoulders portrait, the {product_type} worn on her face, frame and lenses sharp",
+    'headwear': "head-and-shoulders framing, the {product_type} fully visible",
+    'scarf':    "upper-body framing showing how the {product_type} is styled",
+    'belt':     "mid-body framing from chest to hips so the {product_type} and buckle are the focal point",
+    'watch':    "upper-body framing with her wrist raised naturally into frame, the {product_type} sharp",
+    'gloves':   "framing on her hands and forearms, the {product_type} sharp",
+    'hair':     "head-and-shoulders portrait with the {product_type} clearly visible in her hair",
+    'other':    "framing that keeps the {product_type} large, centred and in sharp focus",
+}
+
+
+def _nb_accessory_framing(kind):
+    """Framing-zin voor een accessoire-soort. Bevat nog {product_type}: de
+    aanroeper formatteert 'm (str.format doet geen recursie)."""
+    return _NB_ACCESSORY_FRAMING.get(kind) or _NB_ACCESSORY_FRAMING['other']
+
+
+_NB_PROMPT_SETS = {
+    'garment':   NANO_BANANA_PROMPTS,
+    'shoes':     NANO_BANANA_PROMPTS_SHOES,
+    'bag':       NANO_BANANA_PROMPTS_BAGS,
+    'accessory': NANO_BANANA_PROMPTS_ACCESSORY,
+}
+
+
 def _nb_prompts_for(product_type):
     """De juiste template-set voor dit producttype. Zelfde sleutels in alle sets."""
+    return _NB_PROMPT_SETS[_nb_category(product_type)]
+
+
+def _nb_render_prompt(prompt_type, product_type, color=''):
+    """De kant-en-klare prompt voor één stap: de template van de categorie,
+    geformatteerd. Alleen de accessoire-set kent {framing} (per soort); de andere
+    sets hebben die placeholder niet en krijgen product_type + color."""
     cat = _nb_category(product_type)
-    if cat == 'bag':
-        return NANO_BANANA_PROMPTS_BAGS
-    if cat == 'shoes':
-        return NANO_BANANA_PROMPTS_SHOES
-    return NANO_BANANA_PROMPTS
+    template = _NB_PROMPT_SETS[cat][prompt_type]
+    kwargs = {'product_type': product_type, 'color': color}
+    if cat == 'accessory':
+        kind = _nb_accessory_kind(product_type)
+        kwargs['framing'] = _nb_accessory_framing(kind).format(product_type=product_type)
+    return template.format(**kwargs)
 
 
 @app.route('/api/theme_export')
@@ -14648,12 +14895,9 @@ def higgsfield_generate():
 
     # Build prompt from template or use custom
     if prompt_type and prompt_type in NANO_BANANA_PROMPTS:
-        # Template-set per categorie (kleding/schoenen/tassen) — zelfde sleutels,
-        # passende shots. Frontend blijft gewoon 1-5/11-14 sturen.
-        prompt = _nb_prompts_for(product_type)[prompt_type].format(
-            product_type=product_type,
-            color=color,
-        )
+        # Template-set per categorie (kleding/schoenen/tassen/accessoires) —
+        # zelfde sleutels, passende shots. Frontend blijft gewoon 1-5/11-14 sturen.
+        prompt = _nb_render_prompt(prompt_type, product_type, color)
     else:
         prompt = data.get('prompt', 'fashion product photo, realistic woman model, professional lighting')
 
@@ -15672,6 +15916,15 @@ def _lifestyle_prompt(product_type, season=None):
         framing = ("a natural, relaxed candid pose with full-body or knee-down framing in which "
                    "BOTH shoes are clearly visible and in focus")
         noun = "shoes"
+    elif cat == 'accessory':
+        # Worn, with the kind's own framing (portrait for jewellery, wrist in frame
+        # for a watch, …) — a full-body candid would shrink a ring to a few pixels.
+        kind = _nb_accessory_kind(ptl)
+        subject = f"our model wearing the {pt}"
+        keep = f"Keep the EXACT same {pt} — same shape, colour, materials and details —"
+        framing = ("a natural, relaxed candid pose with "
+                   + _nb_accessory_framing(kind).format(product_type=pt))
+        noun = "accessory"
     else:
         subject = f"our model wearing a {pt}"
         keep = f"Keep the EXACT same {pt} — same cut, colour, fabric and design details —"
