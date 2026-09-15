@@ -5496,16 +5496,24 @@ def _recommend_keywords(keywords, store, top_n=8):
 _DFS_CLEAN_LAST = {}
 
 
-def _dfs_clean_keywords_llm(keywords, store, max_tokens=2000):
+def _dfs_clean_note(store, status, ok, why):
+    """Record the outcome in the caller's own dict (race-free) AND the global."""
+    rec = {'ok': ok, 'why': why}
+    if isinstance(status, dict):
+        status.update(rec)
+    _DFS_CLEAN_LAST[store] = rec
+
+
+def _dfs_clean_keywords_llm(keywords, store, max_tokens=2000, status=None):
     """LLM cleanup: from a keyword list keep only ones relevant to a WOMEN'S fashion
     store (drop other brand names, menswear, kids, off-topic). Keeps the objects,
     just filters. Falls back to the input on any failure (recorded in
     _DFS_CLEAN_LAST[store] so callers can say so)."""
     if not keywords:
-        _DFS_CLEAN_LAST[store] = {'ok': True, 'why': ''}
+        _dfs_clean_note(store, status, True, '')
         return keywords
     if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
-        _DFS_CLEAN_LAST[store] = {'ok': False, 'why': 'no Anthropic key'}
+        _dfs_clean_note(store, status, False, 'no Anthropic key')
         return keywords
     try:
         import anthropic
@@ -5548,18 +5556,18 @@ def _dfs_clean_keywords_llm(keywords, store, max_tokens=2000):
         txt = (msg.content[0].text if msg.content else '') or ''
         m = re.search(r'\[.*\]', txt, re.S)
         if not m:
-            _DFS_CLEAN_LAST[store] = {'ok': False, 'why': 'no JSON array in the reply (truncated?)'}
+            _dfs_clean_note(store, status, False, 'no JSON array in the reply (truncated?)')
             return keywords
         keep = {str(x).strip().lower() for x in json.loads(m.group(0))}
         filtered = [k for k in keywords if (k.get('keyword') or '').strip().lower() in keep]
         if not filtered:
-            _DFS_CLEAN_LAST[store] = {'ok': False, 'why': 'model kept nothing — served unfiltered'}
+            _dfs_clean_note(store, status, False, 'model kept nothing — served unfiltered')
             return keywords
-        _DFS_CLEAN_LAST[store] = {'ok': True, 'why': ''}
+        _dfs_clean_note(store, status, True, '')
         return filtered
     except Exception as e:
         print(f"[keywords] clean failed: {e}")
-        _DFS_CLEAN_LAST[store] = {'ok': False, 'why': str(e)[:80]}
+        _dfs_clean_note(store, status, False, str(e)[:80])
         return keywords
 
 
@@ -5859,11 +5867,12 @@ def api_what_to_list():
     # Drop brand / off-topic keywords (Nike, Adidas, local labels…) in ONE LLM
     # pass over all candidates, THEN slice each type to its top-N clean keywords.
     all_cands = [kw for ranked in seed_ranked.values() for kw in ranked]
-    cleaned = all_cands if body.get('no_clean') else _dfs_clean_keywords_llm(all_cands, store, max_tokens=4000)
+    _cl = {'ok': True, 'why': ''}
+    cleaned = (all_cands if body.get('no_clean')
+               else _dfs_clean_keywords_llm(all_cands, store, max_tokens=4000, status=_cl))
     # Deterministische doelgroep-guard NA de LLM: 'pantalon homme' en 'lasten
     # mekko' kwamen door de cleaner heen (blog-pad had de guard al, dit pad niet).
     cleaned, audience_dropped = _wtl_filter_audience(cleaned)
-    _cl = _DFS_CLEAN_LAST.get(store) or {'ok': True, 'why': ''}
     clean_ok = bool(body.get('no_clean')) or bool(_cl.get('ok', True))
     clean_why = '' if clean_ok else str(_cl.get('why') or '')
     from collections import defaultdict as _dd
@@ -10544,32 +10553,41 @@ def _bs_rx(pattern):
 _BS_PRE_RULES = [
     ('kids', _bs_rx(r"\b(?:kids?|children|child|toddler|babies|b[ée]b[ée]s?|enfants?|gar[çc]ons?|filles?|"
                     r"b[øo]rn|b[øo]rne\w*|drenge\w*|piger?|pige\w*|lasten|lapsille|lapset|pojat|poikien|"
-                    r"tyt[öo]t|tyt[öo]n|tytt[öo]jen|vauva\w*|junior|girls?|boys?)\b|"
-                    r"\bbaby(?!\s?(?:blue|pink|rose|bleu|rosa|r[øo]d|lyser[øo]d|vaaleanpunainen|doll))")),
+                    r"tyt[öo]t|tyt[öo]n|tytt[öo]jen|junior|girls?|boys?)\b|"
+                    # 'baby'/'vauva' als KLEURWOORD (babyblå, baby pink, vauvansininen) is
+                    # geen doelgroep -- zonder deze uitzonderingen werd elke lichtblauwe
+                    # jurk 'kids'.
+                    r"\bbaby(?![- ]?(?:blue|pink|rose|bleu|rosa|bl[åa]|r[øo]d|lyser[øo]d|vaaleanpunainen|"
+                    r"sininen|doll|shower))|\bvauva(?!n?(?:sininen|vaaleanpunainen))\w*")),
     ('pet', _bs_rx(r"\b(?:dogs?|hund|hunde\w*|chiens?|koira\w*|puppy|hvalp\w*|chiot|pentu|"
                    r"cat (?:toy|bed|collar|tree|food)|katte\w*|kissan\w*|pets?|k[æa]ledyr|"
                    r"animal de compagnie|lemmikki\w*)\b")),
     ('home', _bs_rx(r"jewell?ery box|smykkeskrin|bo[îi]te [àa] bijoux|korurasia|jewell?ery stand|"
-                    r"smykkeholder|shoe rack|skostativ|kenk[äa]teline|\bhangers?\b|b[øo]jle\w*|\bcintres?\b|"
+                    r"smykkeholder|shoe rack|skostativ|kenk[äa]teline|\bhangers?\b|t[øo]jb[øo]jle\w*|\bcintres?\b|"
                     r"vaatepuu|garment bag|laundry|vasket[øo]j|lessive|pyykki|wine glass|vinglas|"
                     r"verres? [àa] vin|viinilasi|drinking glass|champagne glass|sleeping bag|sovepose|"
                     r"sac de couchage|makuupussi")),
     ('food', _bs_rx(r"tea ?bags?|tebreve|sachets? de th[ée]|teepussi|coffee beans|kaffeb[øo]nner|grains de caf[ée]|"
                     r"kahvipavut|protein ?powder|proteinpulver")),
     ('beauty', _bs_rx(r"lipstick|l[æa]bestift|rouge [àa] l[èe]vres|huulipuna|lip ?gloss|mascara|eyeliner|"
-                      r"foundation|concealer|\bblush\b|bronzer|highlighter|perfume|parfum|hajuvesi|eau de|"
+                      r"foundation|concealer|blush brush|bronzer|highlighter|perfume|parfum|hajuvesi|eau de|"
                       r"\bserum\b|s[ée]rum|seerumi|moisturi[sz]er|face cream|ansigtscreme|cr[èe]me visage|"
                       r"kasvovoide|skincare|hudpleje|soin de la peau|ihonhoito|make-?up|sminke|maquillage|"
                       r"meikki|self[- ]?tan\w*|selvbruner|autobronzant|itseruskettava|shampoo|conditioner|"
-                      r"h[åa]rpleje|hiustenhoito|nail polish|neglelak|\bvernis\b|kynsilakka|body (?:lotion|"
+                      r"h[åa]rpleje|hiustenhoito|nail polish|neglelak|vernis [àa] ongles|kynsilakka|body (?:lotion|"
                       r"oil|scrub|wash|cream|butter|mist|milk)|bodylotion|hair elastic\w*|h[åa]relastik\w*|"
                       r"hair ties?|hiuslenkki|hiusdonitsi|hair ?spray|eyelash\w*|\blashes\b|\bvipper\b|"
                       r"\bcils\b|\bripset\b|deodorant|toothbrush|tandb[øo]rste|hammasharja|\brazor\b|shaver")),
-    ('tech', _bs_rx(r"phone case|iphone|samsung|mobilcover|cover til|\bcoque\w*|puhelimen ?kuor\w*|\bkuoret\b|"
+    # 'cable'/'kabel'/'coque' alleen in een tech-context: 'cable knit',
+    # 'kabelstrik' en 'robe coquelicot' zijn mode.
+    ('tech', _bs_rx(r"phone case|iphone|samsung|airpods?|mobilcover|cover til|"
+                    r"\bcoques? (?:iphone|samsung|pour|de t[ée]l[ée]phone|smartphone|de protection)|"
+                    r"puhelimen ?kuor\w*|\bkuoret\b|"
                     r"charger|oplader|chargeur|\blaturi\b|powerbank|earbuds|earphones|headphones|"
                     r"h[øo]retelefon\w*|[ée]couteurs|casque audio|kuulokkeet|\bspeaker\w*|h[øo]jttaler\w*|"
-                    r"\benceinte\b|\bkaiutin\b|\busb\b|\bcables?\b|\bkabel\w*|c[âa]ble\w*|kaapeli|laptop|"
-                    r"\btablet\b|smartwatch|led[- ]strip|\bcamera\b|\bkamera\b|\bdrone\b|gadget")),
+                    r"\benceinte\b|\bkaiutin\b|\busb\b|(?:usb|charging|charger|lightning|hdmi|ethernet)[- ]cables?|"
+                    r"cable organi[sz]er|(?:usb|lade|oplader)-?kabel\w*|kabelholder|c[âa]ble (?:usb|de charge)|"
+                    r"latauskaapeli|laptop|\btablet\b|smartwatch|led[- ]strip|\bcamera\b|\bkamera\b|\bdrone\b|gadget")),
     ('bundle', _bs_rx(r"goodie ?bags?|lykkepose|mystery (?:box|bag)|lucky bag|surprise bag|pochette surprise|"
                       r"yll[äa]tys\w*|\bbundles?\b|bestillingsvare|gift ?box|gaves[æa]t|\bcoffret\w*|lahjapakkaus")),
     ('hosiery', _bs_rx(r"\btights\b|str[øo]mpebukser|\bcollants?\b|sukkahousut|\bpanty\b|pantyhose|\bsocks?\b|"
@@ -10584,7 +10602,8 @@ _BS_FASHION_RULES = [
     # (?!marimekko): het merk Marimekko bevat 'mekko' en is geen jurk.
     ('dress',     _bs_rx(r"\bdress(?:es)?\b|\w*kjole\w*|\brobes?\b(?! de chambre)|\b(?!marimekko)\w*mekko\w*|"
                          r"\bgowns?\b|\bjurk\w*|\bkleid\w*")),
-    ('jumpsuit',  _bs_rx(r"jumpsuit|playsuit|romper|combinaison|combishort|\boveralls?\b|buksedragt|\bhaalari\w*")),
+    ('jumpsuit',  _bs_rx(r"jumpsuit|playsuit|romper|combinaison(?! de (?:ski|plong[ée]e|travail))|combishort|"
+                         r"\boveralls?\b|buksedragt|\bhaalari\w*")),
     ('knitwear',  _bs_rx(r"\bknit\w*|sweater|cardigan|\bjumper|pullover|\w*strik\w*|\bpulls?\b|\btricot\w*|"
                          r"\w*neule\w*|\btrui\b|villapaita|villatakki|strickjacke")),
     ('outerwear', _bs_rx(r"jacket|\w*jakke\w*|\bcoats?\b|blazer|trench|parka|manteau|\bveste\b|\bjas\b|"
@@ -10612,12 +10631,14 @@ _BS_FASHION_RULES = [
                          r"foulard\w*|\bhuivi\w*|\bsjaal\w*|\bhats?\b|\bhue\b|kasket\w*|chapeau\w*|\bbonnet\w*|"
                          r"casquette\w*|b[ée]ret\w*|\bhattu\b|\bpipo\b|\blippis\b|\bcaps?\b|beanie\w*|\bgloves?\b|"
                          r"handsker|\bgants?\b|k[äa]sineet|wallet\w*|\bpung\b|portefeuille|lompakko|\bclutch\w*|"
-                         r"\bpurses?\b|backpack\w*|rygs[æa]k\w*|\breppu\b|scrunchie\w*|hair ?clips?|h[åa]rsp[æa]nde\w*|"
+                         r"\bpurses?\b|backpack\w*|rygs[æa]k\w*|\breppu\b|scrunchie\w*|"
+                         r"hair ?(?:clips?|claws?|claw clips?|slides?|pins?|bands?)|h[åa]rsp[æa]nde\w*|h[åa]rklemme\w*|"
                          r"headband\w*|h[åa]rb[åa]nd|hiuspanta|umbrella|paraply|parapluie|sateenvarjo|keychain|"
                          r"key ?rings?|n[øo]glering|porte-cl[ée]s|avaimenper[äa]")),
     ('jewelry',   _bs_rx(r"necklace\w*|halsk[æa]de\w*|collier\w*|kaulakoru\w*|\bketting\w*|earrings?|[øo]rering\w*|"
                          r"boucles? d'oreille\w*|korvakoru\w*|\boorbel\w*|bracelet\w*|armb[åa]nd\w*|rannekoru\w*|"
-                         r"\barmband\w*|\brings?\b|\bbague\w*|\bsormu\w*|\bjewel\w*|smykke\w*|bijou\w*|\w*koru\b|"
+                         r"\barmband\w*|\brings?\b|(?:guld|s[øo]lv|diamant|perle|signet|gold|silber|zegel)ring\w*|"
+                         r"\bbague\w*|\bsormu\w*|\bjewel\w*|smykke\w*|bijou\w*|\w*koru\b|"
                          r"\bkorut\b|pendant\w*|vedh[æa]ng|pendentif\w*|riipu\w*|\bcharms?\b|anklet\w*|"
                          r"ankelk[æa]de\w*|\bwatch(?:es)?\b|\bure?\b|\bmontres?\b|\bkello\b|\bkellot\b|horloge\w*|"
                          r"piercing\w*|brooch|\bbroche\w*|rintakoru")),
@@ -11389,7 +11410,10 @@ def _wtl_niche_fresh(n):
                - datetime.datetime.fromisoformat(str(n.get('ts', '')).rstrip('Z'))).total_seconds()
     except Exception:
         return False
-    return age < (_WTL_NICHE_TTL if n.get('status') in ('yes', 'no') else _WTL_NICHE_TRANSIENT_TTL)
+    # Een echt oordeel 30 dagen; 'unknown' én een onbevestigd 'yes' (de LLM gaf
+    # geen antwoord -- een storing) morgen opnieuw.
+    definitive = n.get('status') in ('yes', 'no') and not n.get('unverified')
+    return age < (_WTL_NICHE_TTL if definitive else _WTL_NICHE_TRANSIENT_TTL)
 
 
 def _gd_products_sample(domain, limit=_WTL_NICHE_SAMPLE, timeout=12):
@@ -11452,8 +11476,14 @@ def _niche_verdict(profile):
     een kledingmerk)."""
     n = int(profile.get('total') or 0)
     if n == 0:
-        return 'no', 'empty catalogue'
+        # Lege lijst = wachtwoordpagina, nieuwe winkel of storing -- geen oordeel.
+        return 'unknown', 'empty catalogue (locked or brand-new store?)'
     fs, cs = float(profile.get('fashion_share') or 0), float(profile.get('clothing_share') or 0)
+    other = int((profile.get('buckets') or {}).get('other') or 0) / n
+    if other >= 0.5:
+        # Naam-titels zonder type/tags ('Livia', 'Maeve') zeggen niets -- dat is
+        # juist de dropshipper-stijl. Laat de LLM naar de winkel zelf kijken.
+        return 'ambiguous', f'{round(other * 100)}% unrecognised titles'
     if int(profile.get('fashion') or 0) < _WTL_NICHE_MIN_FASHION:
         return 'no', f"only {profile.get('fashion')} womenswear products of {n}"
     if fs >= 0.6 and cs >= 0.4:
@@ -11464,14 +11494,41 @@ def _niche_verdict(profile):
     return 'ambiguous', f'{round(fs * 100)}% fashion, {round(cs * 100)}% clothing'
 
 
-def _niche_llm(domain, products, profile):
+def _gd_homepage_hint(domain, timeout=10):
+    """<title>, meta description and first h1 of the homepage -- the store's own
+    words about what it sells, for the LLM tie-break when product titles are
+    just names. '' on any failure."""
+    try:
+        r = _scrape_get(f'https://{domain}/', timeout=timeout)
+        if r.status_code != 200:
+            return ''
+        html = (r.text or '')[:200000]
+    except Exception:
+        return ''
+    bits = []
+    m = re.search(r'<title[^>]*>(.*?)</title>', html, re.S | re.I)
+    if m:
+        bits.append(re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', m.group(1))).strip()[:160])
+    m = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']*)', html, re.I)
+    if m:
+        bits.append(m.group(1).strip()[:300])
+    m = re.search(r'<h1[^>]*>(.*?)</h1>', html, re.S | re.I)
+    if m:
+        bits.append(re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', m.group(1))).strip()[:120])
+    return ' | '.join(b for b in bits if b)
+
+
+def _niche_llm(domain, products, profile, hint=''):
     """Tie-break for the ambiguous zone. Returns (True|False|None, kind)."""
     if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
         return None, None
     lines = []
     for p in (products or [])[:40]:
         if isinstance(p, dict):
-            lines.append(f"- {(p.get('title') or '')[:70]} [{(p.get('product_type') or '')[:30]}]")
+            tags = p.get('tags')
+            tags = ', '.join(str(t) for t in tags[:4]) if isinstance(tags, list) else str(tags or '')[:60]
+            lines.append(f"- {(p.get('title') or '')[:70]} [{(p.get('product_type') or '')[:30]}]"
+                         + (f" ({tags})" if tags else ''))
     if not lines:
         return None, None
     try:
@@ -11480,7 +11537,9 @@ def _niche_llm(domain, products, profile):
         msg = client.messages.create(
             model='claude-haiku-4-5-20251001', max_tokens=120,
             messages=[{'role': 'user', 'content':
-                f'Online store {domain}. Below is a sample of its products (title [type]). '
+                f'Online store {domain}.'
+                + (f' Its homepage says: "{hint[:500]}".' if hint else '')
+                + ' Below is a sample of its products (title [type] (tags)). '
                 'Is this primarily a WOMEN\'S FASHION store (women\'s clothing first; shoes, bags and '
                 'jewellery are fine as extras)? A store that is mainly menswear, kidswear, jewellery-only, '
                 'beauty, home, sport, electronics or a general mixed shop is NOT. Return ONLY JSON: '
@@ -11519,8 +11578,18 @@ def _wtl_niche_check(domain, products=None, http_status=None, error=None, save=T
         kind, source, unverified = ('womenswear' if status == 'yes' else None), 'rules', False
         if status == 'no':
             kind = _niche_kind_from_profile(prof)
+        if status == 'unknown':
+            entry = {'status': 'unknown', 'reason': reason, 'kind': None, 'fashion_share': prof['fashion_share'],
+                     'clothing_share': prof['clothing_share'], 'buckets': prof['buckets'],
+                     'total': prof['total'], 'source': 'rules', 'ts': ts}
+            if save:
+                with _WTL_NICHE_LOCK:
+                    cache = _wtl_niche_load()
+                    cache[bare] = entry
+                    _wtl_niche_save(cache)
+            return entry
         if status == 'ambiguous':
-            wf, k = _niche_llm(bare, products, prof)
+            wf, k = _niche_llm(bare, products, prof, hint=_gd_homepage_hint(bare))
             source = 'llm'
             if wf is True:
                 status, kind = 'yes', 'womenswear'
@@ -11541,6 +11610,15 @@ def _wtl_niche_check(domain, products=None, http_status=None, error=None, save=T
             cache[bare] = entry
             _wtl_niche_save(cache)
     return entry
+
+
+def _wtl_niche_cached_or_check(domain):
+    """Fresh cached verdict if we have one, else compute it."""
+    bare = (domain or '').replace('www.', '').strip().lower()
+    n = _wtl_niche_load().get(bare)
+    if _wtl_niche_fresh(n):
+        return n
+    return _wtl_niche_check(bare)
 
 
 def _wtl_niche_public(n):
@@ -11784,27 +11862,49 @@ def api_wtl_stores_add():
         return jsonify({'error': f'{dom} staat op de blokkadelijst'}), 400
     cur = _wtl_extra_stores()
     if dom not in cur and dom not in {c['domain'] for c in _known_comp_data()}:
-        cur.append(dom)
-        try:
-            tmp = WTL_EXTRA_STORES_PATH + '.tmp'
-            with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump(cur, f)
-            os.replace(tmp, WTL_EXTRA_STORES_PATH)
-        except Exception as e:
-            return jsonify({'error': f'opslaan mislukt: {e}'}), 500
+        _gd_extra_change(add=dom)          # zelfde lock als de discovery-workers
+        cur = _wtl_extra_stores()
     # Niche meteen bepalen (één HTTP-call): een lampenwinkel komt er wél in
     # (warn, never block) maar met een waarschuwing en een rode chip.
+    # Open endpoint: een cached oordeel is gratis; een nieuwe check (fetch +
+    # evt. LLM) hooguit _ADD_NICHE_PER_10MIN keer per 10 minuten.
     warning = None
     try:
-        niche = _wtl_niche_public(_wtl_niche_check(dom))
+        if _add_niche_allowed(dom):
+            niche = _wtl_niche_public(_wtl_niche_cached_or_check(dom))
+        else:
+            niche = _wtl_niche_public(_wtl_niche_load().get(dom))
+            if not niche:
+                warning = 'niche check skipped for now (rate limit) — press "Check niche" later.'
         if niche and niche.get('status') == 'no':
-            warning = (f"{dom} looks like a {niche.get('kind') or 'non-fashion'} store, not womenswear "
-                       f"({niche.get('reason')}). Added anyway — it shows with a warning chip.")
+            warning = (f"looks like a {niche.get('kind') or 'non-fashion'} store, not womenswear "
+                       f"({niche.get('reason')}) — added anyway, it shows with a warning chip.")
         elif niche and niche.get('status') == 'unknown':
-            warning = f"Could not read {dom}'s catalogue right now ({niche.get('reason')}); niche unchecked."
+            warning = f"could not read its catalogue right now ({niche.get('reason')}); niche unchecked."
     except Exception as e:
         niche, warning = None, f'niche check failed: {str(e)[:80]}'
     return jsonify({'ok': True, 'domain': dom, 'extra_total': len(cur), 'niche': niche, 'warning': warning})
+
+
+_ADD_NICHE_WINDOW = {'ts': [], 'known': set()}
+_ADD_NICHE_PER_10MIN = 20
+
+
+def _add_niche_allowed(domain):
+    """Token bucket for the open Add endpoint: a domain we already have a fresh
+    verdict for is always fine (no outbound work); otherwise max 20 fresh checks
+    per 10 minutes process-wide."""
+    if _wtl_niche_fresh(_wtl_niche_load().get(domain)):
+        return True
+    now = time.time()
+    _ADD_NICHE_WINDOW['ts'] = [t for t in _ADD_NICHE_WINDOW['ts'] if now - t < 600]
+    if len(_ADD_NICHE_WINDOW['ts']) >= _ADD_NICHE_PER_10MIN:
+        return False
+    _ADD_NICHE_WINDOW['ts'].append(now)
+    return True
+
+
+_WTL_NICHE_JOB_LOCK = threading.Lock()
 
 
 @app.route('/api/wtl_stores/niche', methods=['POST'])
@@ -11818,6 +11918,9 @@ def api_wtl_stores_niche():
         cap = max(1, min(int(body.get('max') or 150), 300))
     except Exception:
         cap = 150
+    # Single-flight: een tweede klik start niet nog eens 8 parallelle checks.
+    if not _WTL_NICHE_JOB_LOCK.acquire(blocking=False):
+        return jsonify({'error': 'niche check already running'}), 409
     jid = _job_new('wtl_niche', 'wtl')
 
     def _runner():
@@ -11832,6 +11935,8 @@ def api_wtl_stores_niche():
         except Exception as e:
             _job_error(jid, str(e))
             _job_set(jid, status='error', finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+        finally:
+            _WTL_NICHE_JOB_LOCK.release()
 
     threading.Thread(target=_runner, daemon=True).start()
     return jsonify({'job_id': jid, 'status': 'running'})
@@ -12005,6 +12110,18 @@ def _wtl_mark_active(m):
         except Exception:
             return True
     return True
+
+
+_WTL_VERDICT_FILE_LOCK = threading.Lock()
+
+
+def _wtl_verdict_put(bare, verdict):
+    """Load-modify-save ONE entry under a lock: the discovery workers, the
+    classify job and the override endpoint all write this file."""
+    with _WTL_VERDICT_FILE_LOCK:
+        cache = _wtl_verdicts_load()
+        cache[bare] = verdict
+        _wtl_verdicts_save(cache)
 
 
 def _wtl_verdicts_save(data):
@@ -12200,7 +12317,7 @@ def _wtl_classify_missing(domains, jid=None, cap=10, force=False):
                 v['attempts'] = 0
             cache[bare] = v
             out[bare] = v['label']
-            _wtl_verdicts_save(cache)
+            _wtl_verdict_put(bare, v)      # per winkel, onder het bestandsslot
             # Vooruitgang = KREEG DE WINKEL EEN BRUIKBAAR OORDEEL, niet 'label
             # veranderde'. Een herbevestiging is voortgang; 10x 'Onbekend' niet.
             is_resolved = v['label'] not in (None, '', 'Onbekend')
@@ -12295,8 +12412,7 @@ def api_wtl_stores_override():
     else:
         v.pop('override', None)
         v.pop('override_ts', None)
-    cache[dom] = v
-    _wtl_verdicts_save(cache)
+    _wtl_verdict_put(dom, v)
     return jsonify({'ok': True, 'domain': dom, 'override': v.get('override')})
 
 
@@ -12464,10 +12580,15 @@ WTL_DISCOVER_SEEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__))
                                       'wtl_discover_seen.json')
 # Per afwijsreden hoe lang we het onthouden. Een niet-Shopify-winkel wordt dat
 # niet snel; te weinig bestsellers kan over 2 weken anders zijn.
-_GD_SEEN_TTL_DAYS = {'check mislukt': 1,           # storing ≠ oordeel: morgen opnieuw
-                     'geen Shopify': 30, 'niet lokaal': 90, 'te weinig bestsellers': 14,
-                     'geen damesmode': 60, 'onder de marktgrootte-lat': 14,
-                     'merk/eigen voorraad': 60}
+# Reason PREFIX -> days remembered. English keys are what the code writes now;
+# the Dutch ones keep reading the entries that are already on the droplet.
+_GD_SEEN_TTL_DAYS = {'check failed': 1, 'check mislukt': 1,          # storing ≠ oordeel
+                     'not Shopify': 30, 'geen Shopify': 30,
+                     'not local': 90, 'niet lokaal': 90,
+                     'too few bestsellers': 14, 'te weinig bestsellers': 14,
+                     'not womenswear': 60, 'geen damesmode': 60,
+                     'too little traffic': 14, 'onder de marktgrootte-lat': 14,
+                     'brand / own stock': 60, 'merk/eigen voorraad': 60}
 _GD_SEEN_DEFAULT_TTL = 14
 _GD_QUERIES_PER_RUN = 24     # per markt per run, uit een roulerende bank van ~150
 _GD_SEEDS_PER_RUN = 3        # bekende dropshippers als 'lijkt op'-seed per markt
@@ -12715,7 +12836,9 @@ def _gd_is_shopify(domain):
 
 def _gd_is_local(domain, market):
     """Locality requirement: market TLD = yes; generic TLD only when the homepage
-    language is the market language; someone else's country TLD = no."""
+    language is the market language; someone else's country TLD = no.
+    Returns None when the homepage could not be read (timeout, 5xx, 429): that
+    is a storing, not a verdict -- the caller must not remember it for 90 days."""
     d = domain.lower()
     if any(d.endswith(t) for t in _GD_MARKET_TLDS.get(market, ())):
         return True
@@ -12723,11 +12846,13 @@ def _gd_is_local(domain, market):
         return False
     try:
         r = _scrape_get(f'https://{d}', timeout=10)
+        if r.status_code != 200:
+            return None
         m = re.search(r'<html[^>]*\slang=["\']?([a-zA-Z-]{2,7})', (r.text or '')[:4000])
         if m:
             return m.group(1).lower().split('-')[0] in _GD_MARKET_LANGS.get(market, ())
     except Exception:
-        pass
+        return None
     return False
 
 
@@ -12786,7 +12911,30 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
     import concurrent.futures as _cf
     markets = [m for m in (markets or []) if m in _GD_TERMS]
     if not markets:
-        return {'error': 'geen geldige markten'}
+        return {'error': 'no valid markets'}
+    # Single-flight: een handmatige run en de 12h-lus mogen niet tegelijk
+    # dezelfde kandidaten bevragen (en elkaars state/seen overschrijven).
+    if not _WTL_DISCOVER_LOCK.acquire(blocking=False):
+        return {'error': 'discovery already running — wait for it to finish'}
+    try:
+        return _wtl_discover_run(markets, jid, ignore_seen)
+    finally:
+        _WTL_DISCOVER_LOCK.release()
+
+
+_WTL_DISCOVER_LOCK = threading.Lock()
+
+
+def _pool_shutdown(pool):
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except TypeError:                       # Python < 3.9
+        pool.shutdown(wait=False)
+
+
+def _wtl_discover_run(markets, jid, ignore_seen):
+    import collections as _c
+    import concurrent.futures as _cf
     known = _wtl_all_domains() | _load_blocked_sources()
     seen = {} if ignore_seen else _gd_seen_load()
     state = _gd_state_load()
@@ -12795,11 +12943,12 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
     skipped, scanned, added, gated, rejected, uncertain = [], {}, [], [], [], []
     rows = {}
     per_market_added, per_market_scanned, sources = _c.Counter(), _c.Counter(), _c.Counter()
+    inflight = _c.Counter()
     tally = {'results': 0, 'known_or_seen': 0}
     _GD_MAX_PER_MARKET = 120
     if jid:
         _job_live_init(jid)
-        _job_set(jid, phase='Kandidaten verzamelen', total=0, processed=0)
+        _job_set(jid, phase='Collecting candidates', total=0, processed=0)
     check_pool = _cf.ThreadPoolExecutor(max_workers=10)
     verdict_pool = _cf.ThreadPoolExecutor(max_workers=4)
 
@@ -12811,6 +12960,13 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
     def _verdict_worker(d, m, term, row):
         """Dropship gate for one passer (slow: policy pages + brand signals)."""
         try:
+            _verdict_inner(d, m, term, row)
+        finally:
+            with lock:
+                inflight[m] -= 1
+
+    def _verdict_inner(d, m, term, row):
+        try:
             verdict = _wtl_classify_store(d) or {}
             label = verdict.get('label')
             overlap = int(verdict.get('overlap_matches') or 0)
@@ -12821,7 +12977,8 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
                 verdict['override'] = 'catalog-overlap'
                 row['overlap_matches'] = overlap
             elif label in ('Eigen voorraad', 'Mogelijk eigen merk'):
-                decision, why = 'rejected', f'{label} — geen dropshipper'
+                decision, why = 'rejected', ('own stock — not a dropshipper' if label == 'Eigen voorraad'
+                                             else 'looks like a real brand — not a dropshipper')
             else:
                 try:
                     from shipping_check import looks_like_brand
@@ -12829,7 +12986,7 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
                 except Exception:
                     is_brand, sigs = False, []
                 if is_brand:
-                    decision, why = 'rejected', 'merksignalen — geen dropshipper'
+                    decision, why = 'rejected', 'brand signals — not a dropshipper'
                     verdict['detail'] = ', '.join(sigs or [])[:120] or verdict.get('detail')
                 elif label != 'Dropshipper':
                     # Geen bewijs voor of tegen -- de NORMALE uitkomst (11 van 11
@@ -12838,18 +12995,15 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
                     unverified = True
             with lock:
                 if decision == 'added' and per_market_added[m] >= _GD_MAX_NEW:
-                    decision, why = 'gated', 'cap bereikt'      # niet onthouden: volgende run mag
+                    decision, why = 'gated', 'cap reached — next run'   # niet onthouden
                 if decision == 'added':
                     per_market_added[m] += 1
                 if decision == 'rejected':
-                    _gd_remember(seen, d, m, 'merk/eigen voorraad')
+                    _gd_remember(seen, d, m, 'brand / own stock')
             if decision == 'added':
                 _gd_extra_change(add=d)
                 try:
-                    with lock:
-                        vc = _wtl_verdicts_load()
-                        vc[d.replace('www.', '')] = verdict
-                        _wtl_verdicts_save(vc)
+                    _wtl_verdict_put(d.replace('www.', ''), verdict)
                 except Exception as _ve:
                     print(f'[wtl-disc] verdict save failed for {d}: {_ve}')
             row.update({'status': ('added_unverified' if (decision == 'added' and unverified) else decision),
@@ -12865,7 +13019,7 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
                 else:
                     gated.append(dict(row))
         except Exception as e:
-            row.update({'status': 'error', 'reason': f'dropship-check mislukt: {str(e)[:60]}'})
+            row.update({'status': 'error', 'reason': f'dropship check failed: {str(e)[:60]}'})
             with lock:
                 gated.append(dict(row))
         if jid:
@@ -12880,20 +13034,26 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
         try:
             sample, http, err = _gd_products_sample(d)
             if sample is None:
-                if http in (401, 403, 404, 410) or (http == 200):
-                    reason = 'geen Shopify'
+                if http in (401, 403, 404, 410):
+                    reason = 'not Shopify'
                 else:
-                    reason = f'check mislukt: {err or http}'
-            elif not _gd_is_local(d, m):
-                reason = 'niet lokaal'
+                    # 200 with an HTML body = password page / bot challenge;
+                    # 0 / 5xx / 429 = storing. Neither is a verdict.
+                    reason = f'check failed: {err or http}'
             else:
-                niche = _wtl_niche_check(d, products=sample, http_status=200)
-                if niche.get('status') == 'no':
-                    reason = f"geen damesmode ({niche.get('kind')}: {niche.get('reason')})"
-                elif niche.get('status') == 'unknown':
-                    reason = f"check mislukt: {niche.get('reason')}"
+                local = _gd_is_local(d, m)
+                if local is None:
+                    reason = 'check failed: homepage unreadable'
+                elif not local:
+                    reason = 'not local'
+                else:
+                    niche = _wtl_niche_check(d, products=sample, http_status=200)
+                    if niche.get('status') == 'no':
+                        reason = f"not womenswear ({niche.get('kind')}: {niche.get('reason')})"
+                    elif niche.get('status') == 'unknown':
+                        reason = f"check failed: {niche.get('reason')}"
         except Exception as e:
-            reason = f'check mislukt: {str(e)[:50]}'
+            reason = f'check failed: {str(e)[:50]}'
         finally:
             if jid:
                 _job_inc(jid, processed=1)
@@ -12901,7 +13061,7 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
             with lock:
                 _gd_remember(seen, d, m, reason)
                 skipped.append({'domain': d, 'market': m, 'source': source,
-                                'reason': f'niet lokaal voor {m.upper()}' if reason == 'niet lokaal' else reason})
+                                'reason': f'not local for {m.upper()}' if reason == 'not local' else reason})
             return
         row = {'domain': d, 'market': m, 'term': term, 'source': source, 'status': 'checking',
                'niche': _wtl_niche_public(niche), 'catalogue': len(sample or [])}
@@ -12911,6 +13071,15 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
             per_market_scanned[m] += 1
             scanned[d] = (m, term)
             rows[d] = row
+            # Cap VOOR de dure dropship-check (~1 min): wat de cap toch weggooit
+            # hoeft niet geclassificeerd te worden. In-flight telt mee.
+            if per_market_added[m] + inflight[m] >= _GD_MAX_NEW:
+                row.update({'status': 'gated', 'reason': 'cap reached — next run'})
+                gated.append(dict(row))
+                if jid:
+                    _job_live_push(jid, row)
+                return
+            inflight[m] += 1
         if jid:
             _job_live_push(jid, row)
         verdict_pool.submit(_verdict_worker, d, m, term, row)
@@ -12933,120 +13102,126 @@ def _wtl_discover(markets, jid=None, ignore_seen=False):
             _job_inc(jid, total=1)
         check_pool.submit(_check_worker, d, m, term, source)
 
-    # ── bron 1: 'lijkt op' bekende dropshippers (DataForSEO) — seconden ──
-    dfs = _dfs_configured()
-    if dfs:
-        if jid:
-            _job_set(jid, phase='Similar stores to your proven sources (DataForSEO)')
-        for m in markets:
-            for seed, offset in _gd_pick_seed_stores(m, state):
-                items = _dfs_competitor_domains(seed, m, limit=100, offset=offset)
-                for it in items:
-                    _consider(m, f'similar to {seed}', 'https://' + it['domain'], 'competitors')
-        _publish_counts()
-
-    # ── bron 2: Google SERP met roulerende zoekbank ──
-    queries = {m: _gd_pick_queries(m, state) for m in markets}
-    if jid:
-        _job_set(jid, phase='Google search + checking candidates as they arrive')
-    if dfs:
-        with _cf.ThreadPoolExecutor(max_workers=6) as spool:
-            futs = {spool.submit(_dfs_serp_results, q, m, 30): (m, q)
-                    for m, qs in queries.items() for q in qs}
-            for f in _cf.as_completed(futs):
-                m, q = futs[f]
-                try:
-                    items = f.result()
-                except Exception as e:
-                    print(f'[wtl-disc] serp {m} {q!r}: {str(e)[:80]}')
-                    continue
-                for it in items:
-                    _consider(m, q, it.get('url'), 'google')
-                _publish_counts()
-    else:
-        for m, term, url in _gd_google(queries):
-            _consider(m, term, url, 'google')
-        _publish_counts()
-    print(f"[wtl-disc] {tally['results']} results -> {len(cand)} unknown candidates "
-          f"({tally['known_or_seen']} already known/seen; sources {dict(sources)})")
-
-    check_pool.shutdown(wait=True)
-    if jid:
-        _job_set(jid, phase='Dropship gate (shipping policy + brand signals)')
-    verdict_pool.shutdown(wait=True)
-    print(f'[wtl-disc] {len(scanned)} local Shopify womenswear stores found, {len(added)} added')
-
-    # ── levenscheck (SimilarWeb) pas aan het eind: verandert niets aan het
-    # eerste resultaat, en één bulk-run is goedkoper dan per winkel ──
-    if added:
-        if jid:
-            _job_set(jid, phase='SimilarWeb life-check')
-        fresh = _similarweb_bulk([a['domain'] for a in added])
-        if fresh:
-            cache = _wtl_traffic_load()
-            cache.update(fresh)
-            _wtl_traffic_save(cache)
-        still = []
-        for a in added:
-            m = a['market']
-            visits = (fresh.get(a['domain']) or {}).get('total_visits') or 0
-            ratio = min(1.0, (_TRAFFIC_POP_M.get(m) or _TRAFFIC_ANCHOR_POP_M) / _TRAFFIC_ANCHOR_POP_M)
-            floor = GD_MIN_VISITS * ratio
-            a['visits'] = visits
-            a['traffic_unknown'] = visits == 0
-            # Onbekende traffic mag door (SimilarWeb kent jonge winkels niet); een
-            # winkel met BEWEZEN te weinig bezoekers is dood en gaat er weer uit.
-            if visits and visits < floor:
-                _gd_extra_change(remove=a['domain'])
-                _gd_remember(seen, a['domain'], m, 'onder de marktgrootte-lat')
-                a['status'], a['reason'] = 'gated', 'onder de marktgrootte-lat'
-                gated.append(dict(a))
-                if jid:
-                    _job_live_update(jid, a['domain'], status='gated', reason='too little traffic (dead store)',
-                                     visits=visits)
-                continue
+    try:
+        # ── bron 1: 'lijkt op' bekende dropshippers (DataForSEO) — seconden ──
+        dfs = _dfs_configured()
+        if dfs:
             if jid:
-                _job_live_update(jid, a['domain'], visits=visits)
-            still.append(a)
-        added = still
-        uncertain = [u for u in uncertain if any(a['domain'] == u['domain'] for a in added)]
+                _job_set(jid, phase='Similar stores to your proven sources (DataForSEO)')
+            for m in markets:
+                for seed, offset in _gd_pick_seed_stores(m, state):
+                    items = _dfs_competitor_domains(seed, m, limit=100, offset=offset)
+                    for it in items:
+                        _consider(m, f'similar to {seed}', 'https://' + it['domain'], 'competitors')
+            _publish_counts()
 
-    _gd_seen_save(seen)
-    for m in markets:
-        state[m] = datetime.datetime.utcnow().isoformat() + 'Z'
-    _gd_state_save(state)
+        # ── bron 2: Google SERP met roulerende zoekbank ──
+        queries = {m: _gd_pick_queries(m, state) for m in markets}
+        if jid:
+            _job_set(jid, phase='Google search + checking candidates as they arrive')
+        if dfs:
+            with _cf.ThreadPoolExecutor(max_workers=6) as spool:
+                futs = {spool.submit(_dfs_serp_results, q, m, 30): (m, q)
+                        for m, qs in queries.items() for q in qs}
+                for f in _cf.as_completed(futs):
+                    m, q = futs[f]
+                    try:
+                        items = f.result()
+                    except Exception as e:
+                        print(f'[wtl-disc] serp {m} {q!r}: {str(e)[:80]}')
+                        continue
+                    for it in items:
+                        _consider(m, q, it.get('url'), 'google')
+                    _publish_counts()
+        else:
+            for m, term, url in _gd_google(queries):
+                _consider(m, term, url, 'google')
+            _publish_counts()
+        print(f"[wtl-disc] {tally['results']} results -> {len(cand)} unknown candidates "
+              f"({tally['known_or_seen']} already known/seen; sources {dict(sources)})")
 
-    # Waarom vond deze run weinig? De medewerker moet dat kunnen ZIEN.
-    why = []
-    if not cand:
-        why.append('every search result was already known or judged before — '
-                   'next run rotates to other queries; "re-judge" ignores the memory')
-    if rejected:
-        why.append(f'{len(rejected)} store(s) rejected: not a dropshipper (brand / own stock)')
-    if uncertain:
-        why.append(f'{len(uncertain)} store(s) added but NOT confirmed as dropshipper '
-                   '(shipping policy unreadable) — check them with "Verify dropshippers"')
-    if gated:
-        why.append(f'{len(gated)} store(s) dead or over the cap')
-    if skipped:
-        why.append(f'{len(skipped)} candidate(s) dropped: not Shopify / not local / not womenswear')
+        check_pool.shutdown(wait=True)
+        if jid:
+            _job_set(jid, phase='Dropship gate (shipping policy + brand signals)')
+        verdict_pool.shutdown(wait=True)
+        print(f'[wtl-disc] {len(scanned)} local Shopify womenswear stores found, {len(added)} added')
 
-    funnel = {}
-    for m in markets:
-        reasons = _c.Counter(s.get('reason', '')[:40] for s in skipped if s.get('market') == m)
-        funnel[m] = {
-            'candidates': sum(1 for v in cand.values() if v[0] == m),
-            'passed_checks': sum(1 for v in scanned.values() if v[0] == m),
-            'added': sum(1 for a in added if a.get('market') == m),
-            'rejected': sum(1 for a in rejected if a.get('market') == m),
-            'top_drop_reasons': dict(reasons.most_common(4)),
-        }
-    return {'markets': markets, 'candidates': len(cand), 'scanned': len(scanned),
-            'results': tally['results'], 'known_or_seen': tally['known_or_seen'],
-            'sources': dict(sources), 'queries': {m: len(q) for m, q in queries.items()},
-            'added': added, 'gated': gated, 'rejected': rejected,
-            'uncertain': uncertain, 'skipped': skipped[:120], 'funnel': funnel, 'why': why}
+        # ── levenscheck (SimilarWeb) pas aan het eind: verandert niets aan het
+        # eerste resultaat, en één bulk-run is goedkoper dan per winkel ──
+        if added:
+            if jid:
+                _job_set(jid, phase='SimilarWeb life-check')
+            fresh = _similarweb_bulk([a['domain'] for a in added])
+            if fresh:
+                cache = _wtl_traffic_load()
+                cache.update(fresh)
+                _wtl_traffic_save(cache)
+            still = []
+            for a in added:
+                m = a['market']
+                visits = (fresh.get(a['domain']) or {}).get('total_visits') or 0
+                ratio = min(1.0, (_TRAFFIC_POP_M.get(m) or _TRAFFIC_ANCHOR_POP_M) / _TRAFFIC_ANCHOR_POP_M)
+                floor = GD_MIN_VISITS * ratio
+                a['visits'] = visits
+                a['traffic_unknown'] = visits == 0
+                # Onbekende traffic mag door (SimilarWeb kent jonge winkels niet); een
+                # winkel met BEWEZEN te weinig bezoekers is dood en gaat er weer uit.
+                if visits and visits < floor:
+                    _gd_extra_change(remove=a['domain'])
+                    _gd_remember(seen, a['domain'], m, 'too little traffic')
+                    a['status'], a['reason'] = 'gated', 'too little traffic (dead store)'
+                    gated.append(dict(a))
+                    if jid:
+                        _job_live_update(jid, a['domain'], status='gated', reason='too little traffic (dead store)',
+                                         visits=visits)
+                    continue
+                if jid:
+                    _job_live_update(jid, a['domain'], visits=visits)
+                still.append(a)
+            added = still
+            uncertain = [u for u in uncertain if any(a['domain'] == u['domain'] for a in added)]
 
+        _gd_seen_save(seen)
+        for m in markets:
+            state[m] = datetime.datetime.utcnow().isoformat() + 'Z'
+        _gd_state_save(state)
+
+        # Waarom vond deze run weinig? De medewerker moet dat kunnen ZIEN.
+        why = []
+        if not cand:
+            why.append('every search result was already known or judged before — '
+                       'next run rotates to other queries; "re-judge" ignores the memory')
+        if rejected:
+            why.append(f'{len(rejected)} store(s) rejected: not a dropshipper (brand / own stock)')
+        if uncertain:
+            why.append(f'{len(uncertain)} store(s) added but NOT confirmed as dropshipper '
+                       '(shipping policy unreadable) — check them with "Verify dropshippers"')
+        if gated:
+            why.append(f'{len(gated)} store(s) dead or over the cap')
+        if skipped:
+            why.append(f'{len(skipped)} candidate(s) dropped: not Shopify / not local / not womenswear')
+
+        funnel = {}
+        for m in markets:
+            reasons = _c.Counter(s.get('reason', '')[:40] for s in skipped if s.get('market') == m)
+            funnel[m] = {
+                'candidates': sum(1 for v in cand.values() if v[0] == m),
+                'passed_checks': sum(1 for v in scanned.values() if v[0] == m),
+                'added': sum(1 for a in added if a.get('market') == m),
+                'rejected': sum(1 for a in rejected if a.get('market') == m),
+                'top_drop_reasons': dict(reasons.most_common(4)),
+            }
+        return {'markets': markets, 'candidates': len(cand), 'scanned': len(scanned),
+                'results': tally['results'], 'known_or_seen': tally['known_or_seen'],
+                'sources': dict(sources), 'queries': {m: len(q) for m, q in queries.items()},
+                'added': added, 'gated': gated, 'rejected': rejected,
+                'uncertain': uncertain, 'skipped': skipped[:120], 'funnel': funnel, 'why': why}
+
+    finally:
+        # Ook bij een exception: geen weesworkers die minutenlang aan een
+        # 'error'-job blijven schrijven (normaal pad: al netjes gesloten).
+        _pool_shutdown(check_pool)
+        _pool_shutdown(verdict_pool)
 
 @app.route('/api/wtl_discover', methods=['POST'])
 @require_droplet_token
@@ -13064,6 +13239,11 @@ def api_wtl_discover():
     def _runner():
         try:
             res = _wtl_discover(markets, jid=jid, ignore_seen=ignore_seen)
+            if res.get('error'):
+                _job_error(jid, res['error'])
+                _job_set(jid, status='error', result=res, summary=res['error'],
+                         finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+                return
             _job_set(jid, status='done', result=res,
                      finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
             n_add = len(res.get('added') or [])
@@ -13130,11 +13310,10 @@ def _wtl_traffic_loop():
                         todo.append(m)
                 if todo:
                     print(f'[wtl] weekly discovery for thin markets: {todo}')
+                    # _wtl_discover stamps state[m] and saves the state file itself
+                    # (with the query/seed rotation). Re-saving our stale copy here
+                    # wiped that rotation every 12 h.
                     _wtl_discover(todo)
-                    for m in todo:
-                        st[m] = now.isoformat() + 'Z'
-                    with open(WTL_DISCOVER_STATE_PATH, 'w', encoding='utf-8') as f:
-                        json.dump(st, f)
         except Exception as e:
             print(f'[wtl] discovery loop error: {e}')
         try:
@@ -15063,7 +15242,7 @@ NANO_BANANA_PROMPTS_ACCESSORY = {
         "same face, hair, skin tone and body — and the SAME background, lighting and styling. "
         "Keep every detail of the {product_type} (shape, colourway, materials, finish, clasp "
         "and hardware) identical to the reference. Generate a new detailed shot with {framing}, "
-        "her face clearly visible and the {product_type} prominent and sharply in focus — the "
+        "{face} and the {product_type} prominent and sharply in focus — the "
         "{product_type} leads the frame. CRITICAL: use a clearly DIFFERENT pose, head angle and "
         "hand position than the reference so it is visibly a new photo, NOT a copy. Same "
         "{product_type}, same setting — new pose."),
@@ -15074,14 +15253,13 @@ NANO_BANANA_PROMPTS_ACCESSORY = {
         "details clearly visible, no model in frame. Keep it photorealistic."),
     4: ("I've added a photo of our model wearing the {product_type}. We don't want any changes "
         "to the background, model, or the product. Now generate a macro close-up of the "
-        "{product_type} itself: the metal, stones, clasp, frame, lenses, hinges, buckle, weave "
-        "— whatever the {product_type} is made of — with the finish, engraving and "
-        "construction crisp and realistic. Match the original style and lighting."),
+        "{product_type} itself: {materials} — with the finish and construction crisp and "
+        "realistic. Match the original style and lighting."),
     5: ("I've uploaded multiple reference images. The FIRST image is our model wearing the "
         "{product_type} — keep this model, the background, the lighting, the styling and the "
         "framing EXACTLY identical. The remaining images are colour references from the "
         "competitor showing the same {product_type} in {color}; use them only to match the "
-        "exact {color} colourway / finish (e.g. gold, silver, tortoise, black), materials and "
+        "exact {color} colourway / finish (e.g. {finish}), materials and "
         "stones. Generate the same model in a slightly different pose, wearing the "
         "{product_type} in {color}. Do not copy the competitor's model or background — only "
         "mirror the colourway onto the {product_type}."),
@@ -15089,7 +15267,7 @@ NANO_BANANA_PROMPTS_ACCESSORY = {
          "- IMAGE 1: our existing model wearing the {product_type} — use her face, body, the "
          "framing, background, lighting and styling. A slightly different pose is allowed.\n"
          "- IMAGES 2+: competitor colour references. These define the EXACT colourway / finish "
-         "(e.g. gold, silver, tortoise, black), shade, materials and stones for the new "
+         "(e.g. {finish}), shade, materials and stones for the new "
          "variant. Use them ONLY for colour information.\n\n"
          "Task: generate a shot of OUR model (from IMAGE 1) wearing the {product_type} in the "
          "EXACT colourway shown in IMAGES 2+, using {framing}. Critical: do NOT guess the "
@@ -15097,10 +15275,9 @@ NANO_BANANA_PROMPTS_ACCESSORY = {
          "images, including subtle tints and metal tones. Ignore the competitor's model and "
          "background entirely — only mirror the colourway of the {product_type}."),
     12: ("I've uploaded reference images with TWO different roles:\n"
-         "- IMAGE 1: our existing model wearing the {product_type} with her face clearly "
-         "visible.\n"
+         "- IMAGE 1: our existing model wearing the {product_type}.\n"
          "- IMAGES 2+: competitor colour references — EXACT colourway / finish ground truth.\n\n"
-         "Task: generate a detailed shot of OUR model with her face clearly visible and the "
+         "Task: generate a detailed shot of OUR model with {face} and the "
          "{product_type} prominent and sharply in focus, using {framing}, in the EXACT "
          "colourway shown in IMAGES 2+. Critical: match the precise shade and finish from the "
          "reference photos, not your prior idea of '{color}'. Keep our model, background and "
@@ -15117,8 +15294,7 @@ NANO_BANANA_PROMPTS_ACCESSORY = {
          "- IMAGE 1: our model wearing the {product_type} (for style + lighting reference).\n"
          "- IMAGES 2+: competitor colour references — EXACT colourway / finish ground truth.\n\n"
          "Task: generate a macro close-up of the {product_type} in the EXACT colourway shown "
-         "in IMAGES 2+: the metal, stones, clasp, frame, lenses, hinges, buckle, weave — "
-         "whatever the {product_type} is made of. Critical: match the precise shade and "
+         "in IMAGES 2+: {materials}. Critical: match the precise shade and "
          "finish, not your idea of '{color}'. Reproduce the lighting style from IMAGE 1."),
 }
 
@@ -15155,7 +15331,8 @@ def _nb_re(word=(), sub=()):
 
 _NB_NOISE_RE = re.compile(
     r'cap[- ]?sleeves?|cap[- ]?toe|scarf[- ]?print|jewel[- ]?neck(?:line)?'
-    r'|\bo[- ]rings?|ring[- ]?(?:details?|handles?)|bootcut|baggy|skorts?'
+    r'|\b(?:o|d|double|toe)[- ]rings?|ring[- ]?(?:details?|handles?|spun|buckles?)'
+    r'|chain[- ]?(?:details?|straps?)|bootcut|baggy|skorts?'
 )
 _NB_BAG_OVERRIDE_RE = _nb_re(
     word=('belt[- ]?bags?', 'bum[- ]?bags?', 'fanny[- ]?packs?', 'sac[- ]ceinture', 'sac[- ]banane'),
@@ -15241,7 +15418,10 @@ _NB_BRACELET_RE = _nb_re(
 )
 _NB_RING_RE = _nb_re(
     word=('rings?', 'bagues?'),
-    sub=('sormus', 'sormuks'),
+    # DK/DE/NL-samenstellingen: 'guldring', 'diamantring' (niet 'earring': die
+    # is al eerder als oorbel gevangen; 'spring' bevat geen van deze).
+    sub=('sormus', 'sormuks', 'guldring', 'sølvring', 'solvring', 'diamantring', 'perlering',
+         'signetring', 'goldring', 'silberring', 'zegelring'),
 )
 _NB_JEWELLERY_RE = _nb_re(          # generieke sieraadwoorden — vangnet
     sub=('jewel', 'juwe', 'smykke', 'bijou', 'koru', 'sieraad', 'sieraden', 'schmuck',
@@ -15258,7 +15438,11 @@ _NB_KIND_ORDER = (
     ('gloves',   (_NB_GLOVES_RE,)),
     ('belt',     (_NB_BELT_RE,)),
     ('scarf',    (_NB_SCARF_RE,)),
-    ('jewelry',  (_NB_NECKLACE_RE, _NB_EARRINGS_RE, _NB_BRACELET_RE, _NB_RING_RE, _NB_JEWELLERY_RE)),
+    # Armband en ring apart: die vragen om pols- resp. handkadrering, geen
+    # portret vanaf de borst.
+    ('bracelet', (_NB_BRACELET_RE,)),
+    ('ring',     (_NB_RING_RE,)),
+    ('jewelry',  (_NB_NECKLACE_RE, _NB_EARRINGS_RE, _NB_JEWELLERY_RE)),
     ('other',    (_NB_OTHER_RE,)),
 )
 
@@ -15291,13 +15475,16 @@ def _nb_category(product_type):
 
 
 def _nb_accessory_kind(product_type):
-    """'jewelry' | 'eyewear' | 'headwear' | 'scarf' | 'belt' | 'watch' | 'gloves' |
-    'hair' | 'other' — 'other' ook voor alles wat geen accessoire is."""
+    """'jewelry' (necklace/earrings/generic) | 'bracelet' | 'ring' | 'eyewear' |
+    'headwear' | 'scarf' | 'belt' | 'watch' | 'gloves' | 'hair' | 'other' —
+    'other' ook voor alles wat geen accessoire is."""
     return _nb_kind_of(_nb_normalise(product_type)) or 'other'
 
 
 _NB_ACCESSORY_FRAMING = {
     'jewelry':  "portrait framing from the chest up, the {product_type} clearly visible, centred and in sharp focus",
+    'bracelet': "upper-body framing with her wrist and forearm raised naturally into frame, the {product_type} sharp",
+    'ring':     "close framing on her hand with relaxed fingers, the {product_type} large and in sharp focus",
     'eyewear':  "front-facing head-and-shoulders portrait, the {product_type} worn on her face, frame and lenses sharp",
     'headwear': "head-and-shoulders framing, the {product_type} fully visible",
     'scarf':    "upper-body framing showing how the {product_type} is styled",
@@ -15313,6 +15500,50 @@ def _nb_accessory_framing(kind):
     """Framing-zin voor een accessoire-soort. Bevat nog {product_type}: de
     aanroeper formatteert 'm (str.format doet geen recursie)."""
     return _NB_ACCESSORY_FRAMING.get(kind) or _NB_ACCESSORY_FRAMING['other']
+
+
+# Een riem-, handschoen- of ringkadrering laat het gezicht (deels) buiten beeld;
+# 'her face clearly visible' eisen spreekt de framing dan tegen.
+_NB_ACCESSORY_FACE = {
+    'belt':     "her face may be partly out of frame",
+    'gloves':   "her face may be out of frame",
+    'ring':     "her face softly out of focus or out of frame",
+    'bracelet': "her face may be partly out of frame",
+    'watch':    "her face may be partly out of frame",
+}
+# Waar de macro naar moet kijken: een sjaal heeft geen scharnieren.
+_NB_ACCESSORY_MATERIALS = {
+    'jewelry':  "the metal, stones, clasp, links and engraving",
+    'bracelet': "the metal, stones, clasp, links and engraving",
+    'ring':     "the metal, stones, setting and engraving",
+    'watch':    "the dial, hands, case, crown and strap",
+    'eyewear':  "the frame, lenses, hinges and temple tips",
+    'belt':     "the leather grain, buckle, stitching and holes",
+    'scarf':    "the weave, print, texture and edges of the fabric",
+    'headwear': "the weave or knit, brim, band and stitching",
+    'gloves':   "the leather or knit, seams and cuffs",
+    'hair':     "the metal or resin, teeth, clasp and finish",
+    'other':    "whatever it is made of",
+}
+_NB_ACCESSORY_FINISH = {
+    'eyewear':  "tortoise, black, gold-rimmed, clear",
+    'belt':     "tan, black, cognac, with the buckle's metal tone",
+    'scarf':    "the exact shade and print",
+    'headwear': "the exact shade and knit or weave",
+    'gloves':   "the exact shade and material",
+}
+
+
+def _nb_accessory_face(kind):
+    return _NB_ACCESSORY_FACE.get(kind) or "her face clearly visible"
+
+
+def _nb_accessory_materials(kind):
+    return _NB_ACCESSORY_MATERIALS.get(kind) or _NB_ACCESSORY_MATERIALS['other']
+
+
+def _nb_accessory_finish(kind):
+    return _NB_ACCESSORY_FINISH.get(kind) or "gold, silver, rose gold, black"
 
 
 _NB_PROMPT_SETS = {
@@ -15338,6 +15569,9 @@ def _nb_render_prompt(prompt_type, product_type, color=''):
     if cat == 'accessory':
         kind = _nb_accessory_kind(product_type)
         kwargs['framing'] = _nb_accessory_framing(kind).format(product_type=product_type)
+        kwargs['face'] = _nb_accessory_face(kind)
+        kwargs['materials'] = _nb_accessory_materials(kind)
+        kwargs['finish'] = _nb_accessory_finish(kind)
     return template.format(**kwargs)
 
 
@@ -16702,7 +16936,11 @@ def _lifestyle_prompt(product_type, season=None):
         setting = "a sunny beach or seaside promenade with bright summer sunlight, relaxed and holiday-like"
     elif any(w in ptl for w in ('coat', 'jacket', 'puffer', 'knit', 'sweater', 'wool', 'cardigan',
                                 'trench', 'boot', 'støvle', 'stovle', 'botte', 'bottine',
-                                'saappaat', 'nilkkuri')):
+                                'saappaat', 'nilkkuri',
+                                # winteraccessoires horen niet op een zomerstrand
+                                'beanie', 'pipo', 'bonnet', 'hue', 'mütze', 'scarf', 'tørklæde',
+                                'écharpe', 'huivi', 'sjaal', 'glove', 'handske', 'gants', 'käsine',
+                                'mitten', 'moufle', 'handschoen')):
         setting = ("a crisp cool-weather outdoor scene — a European city street or park with soft "
                    "daylight and cosy, layered styling")
     else:

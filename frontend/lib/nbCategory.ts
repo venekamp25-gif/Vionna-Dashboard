@@ -31,7 +31,9 @@
 export type NbCategory = "garment" | "shoes" | "bag" | "accessory";
 
 export type AccessoryKind =
-  | "jewelry"
+  | "jewelry"   // necklace, earrings, generic jewellery words
+  | "bracelet"  // wrist in frame
+  | "ring"      // hand in frame
   | "eyewear"
   | "headwear"
   | "scarf"
@@ -44,7 +46,8 @@ export type AccessoryKind =
 // Lower-case Latin letters incl. æ ø å ä ö ü é … (input is lower-cased first).
 // JS "\b" is ASCII-only, so /\bvyö\b/ would never match — build the boundary
 // by hand. Python's "\b" is Unicode-aware; the backend mirror uses that.
-const L = "a-zà-öø-ÿ";
+// Includes œ and Latin Extended-A (ā ă ą ć … ž), so "cœur" is not split at the œ.
+const L = "a-zà-öø-ÿœĀ-ſ";
 
 interface Vocab {
   /** matched as whole words (regex fragments; may carry their own groups) */
@@ -69,8 +72,9 @@ const NOISE_RE = new RegExp(
     "cap[- ]?toe",                   // cap toe boots ≠ a cap
     "scarf[- ]?print",               // scarf print dress ≠ a scarf
     "jewel[- ]?neck(?:line)?",       // jewel neckline ≠ jewellery
-    `(?:^|[^${L}])o[- ]rings?`,      // o-ring belt / o-ring detail ≠ a ring
-    "ring[- ]?(?:details?|handles?)", // ring detail dress, ring handle bag
+    `(?:^|[^${L}])(?:o|d|double|toe)[- ]rings?`, // o-ring belt, d-ring, toe ring sandals ≠ a ring
+    "ring[- ]?(?:details?|handles?|spun|buckles?)", // ring detail dress, ring-spun cotton, ring buckle
+    "chain[- ]?(?:details?|straps?)", // chain strap bag ≠ a necklace
     "bootcut",                       // bootcut jeans ≠ boots
     "baggy",                         // baggy jeans ≠ a bag
     "skorts?",                       // skort ≠ sko (DK shoe)
@@ -80,7 +84,7 @@ const NOISE_RE = new RegExp(
 
 /** Compound bags that contain an accessory word — settled before the accessory
  *  check so a "belt bag" is a bag, not a belt. */
-const BAG_OVERRIDE_RE = build({
+export const BAG_OVERRIDE_RE = build({
   word: ["belt[- ]?bags?", "bum[- ]?bags?", "fanny[- ]?packs?", "sac[- ]ceinture", "sac[- ]banane"],
   sub: ["bæltetaske", "baeltetaske", "vyölaukku", "vyolaukku", "gürteltasche", "guerteltasche", "heuptas"],
 });
@@ -188,7 +192,9 @@ const BRACELET_RE = build({
 
 const RING_RE = build({
   word: ["rings?", "bagues?"],
-  sub: ["sormus", "sormuks"],
+  // DK/DE/NL compounds ("guldring", "diamantring"); "earring" is caught earlier.
+  sub: ["sormus", "sormuks", "guldring", "sølvring", "solvring", "diamantring", "perlering",
+        "signetring", "goldring", "silberring", "zegelring"],
 });
 
 /** Generic jewellery words — the fallback when no specific piece matched. */
@@ -212,7 +218,10 @@ const KIND_ORDER: [AccessoryKind, RegExp[]][] = [
   ["gloves",   [GLOVES_RE]],
   ["belt",     [BELT_RE]],
   ["scarf",    [SCARF_RE]],
-  ["jewelry",  [NECKLACE_RE, EARRINGS_RE, BRACELET_RE, RING_RE, JEWELLERY_RE]],
+  // Bracelets and rings get their own framing (wrist / hand), not a chest-up portrait.
+  ["bracelet", [BRACELET_RE]],
+  ["ring",     [RING_RE]],
+  ["jewelry",  [NECKLACE_RE, EARRINGS_RE, JEWELLERY_RE]],
   ["other",    [OTHER_RE]],
 ];
 

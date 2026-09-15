@@ -54,20 +54,25 @@ def test_mixed_store_is_ambiguous():
 
 def test_ambiguous_uses_the_llm_and_falls_open_on_no_answer(monkeypatch, tmp_path):
     monkeypatch.setattr(server, 'WTL_NICHE_PATH', str(tmp_path / 'niche.json'))
+    monkeypatch.setattr(server, '_gd_homepage_hint', lambda d, **kw: 'Mixed webshop')  # no HTTP
     mixed = _prods(5, 'Maxi dress', 'Dresses') + _prods(5, 'Candle', 'Home')
 
-    monkeypatch.setattr(server, '_niche_llm', lambda d, p, prof: (False, 'home'))
+    monkeypatch.setattr(server, '_niche_llm', lambda d, p, prof, hint='': (False, 'home'))
     n = server._wtl_niche_check('mixed.dk', products=mixed, http_status=200)
     assert (n['status'], n['kind'], n['source']) == ('no', 'home', 'llm')
 
-    monkeypatch.setattr(server, '_niche_llm', lambda d, p, prof: (True, 'womenswear'))
+    monkeypatch.setattr(server, '_niche_llm', lambda d, p, prof, hint='': (True, 'womenswear'))
     n = server._wtl_niche_check('mixed2.dk', products=mixed, http_status=200)
     assert (n['status'], n['kind']) == ('yes', 'womenswear') and not n.get('unverified')
 
-    # No verdict obtainable → let through, flagged (warn, never block).
-    monkeypatch.setattr(server, '_niche_llm', lambda d, p, prof: (None, None))
+    # No verdict obtainable → let through, flagged (warn, never block) — and
+    # re-tried tomorrow instead of pinned for 30 days.
+    monkeypatch.setattr(server, '_niche_llm', lambda d, p, prof, hint='': (None, None))
     n = server._wtl_niche_check('mixed3.dk', products=mixed, http_status=200)
     assert n['status'] == 'yes' and n['unverified'] is True
+    assert server._wtl_niche_fresh(n)
+    n['ts'] = _ago(2)
+    assert not server._wtl_niche_fresh(n)
 
     saved = json.load(open(tmp_path / 'niche.json', encoding='utf-8'))
     assert set(saved) == {'mixed.dk', 'mixed2.dk', 'mixed3.dk'}

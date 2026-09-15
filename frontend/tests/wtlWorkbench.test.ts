@@ -31,7 +31,7 @@ test("discovery polls the job's live list and reloads stores as they get added",
 });
 
 test("non-fashion stores are hidden only when PROVEN, never when unchecked", () => {
-  assert.match(wb, /useState\(true\)/); // hideNonFashion default on
+  assert.match(wb, /\[hideNonFashion, setHideNonFashion\] = useState\(true\)/); // default on
   assert.match(wb, /\(!hideNonFashion \|\| s\.niche\?\.status !== "no"\)/);
   assert.match(wb, /niche not checked/);
   assert.match(api, /wtlStoresNiche: \(max = 150\)/);

@@ -71,9 +71,9 @@ def test_pipeline_end_to_end(monkeypatch, tmp_path):
     assert [a['domain'] for a in res['added']] == ['newshop.dk']
     assert res['added'][0]['status'] == 'added' and res['added'][0]['verdict'] == 'Dropshipper'
     reasons = {s['domain']: s['reason'] for s in res['skipped']}
-    assert reasons['homeshop.dk'].startswith('geen damesmode (home')
-    assert reasons['serpshop.dk'].startswith('check mislukt')
-    assert reasons['notshop.dk'] == 'geen Shopify'
+    assert reasons['homeshop.dk'].startswith('not womenswear (home')
+    assert reasons['serpshop.dk'].startswith('check failed')
+    assert reasons['notshop.dk'] == 'not Shopify'
     assert 'known.dk' not in reasons and 'facebook.com' not in reasons
     assert res['candidates'] == 4 and res['known_or_seen'] == 1
     assert res['sources'] == {'competitors': 3, 'google': 1}
@@ -138,7 +138,11 @@ def test_brand_is_rejected_and_remembered(monkeypatch, tmp_path):
     extra = json.load(open(tmp_path / 'extra.json')) if (tmp_path / 'extra.json').exists() else []
     assert extra == []
     seen = json.load(open(tmp_path / 'seen.json'))
-    assert seen['newshop.dk']['reason'] == 'merk/eigen voorraad'
+    assert seen['newshop.dk']['reason'] == 'brand / own stock'
+    assert server._gd_seen_fresh(seen, 'newshop.dk')
+    # entries written by the previous (Dutch) version keep their long memory
+    seen['legacy.dk'] = {'reason': 'merk/eigen voorraad', 'market': 'dk', 'ts': seen['newshop.dk']['ts']}
+    assert server._gd_seen_fresh(seen, 'legacy.dk')
 
 
 def test_dead_store_is_removed_after_the_life_check(monkeypatch, tmp_path):
