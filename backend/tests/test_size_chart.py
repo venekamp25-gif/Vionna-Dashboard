@@ -309,3 +309,198 @@ def test_recheck_surfaces_a_connection_failure_as_502(recheck_client, monkeypatc
 
     assert r.status_code == 502
     assert 'size_chart_status' not in r.get_json()
+
+
+# ---------------------------------------------------------------------------
+# Bug #59: an app MARKER is not a size chart.
+#
+# chic-parisien.fr runs the Kiwi Sizing app, so every product page carries the
+# same `KiwiSizing.data = {…}` app block — including products the shop never
+# assigned a chart to. _kiwi_size_chart asks Kiwi's API and Kiwi answers for the
+# shop ("settings" comes back) with `"sizings": []`: this product has no chart.
+# The reader correctly returned None, but _detect_size_chart_hint then matched
+# the marker regex on the page HTML anyway and reported 'Kiwi Sizing app', so
+# size_chart_status became 'unread' and the review step offered "Notify — we
+# couldn't read this chart" for a chart that does not exist. That is how #59 was
+# filed ("Size chart reader needed: Kiwi Sizing app") against a reader that has
+# worked since v1.2xx — verified against the live API on the reported product
+# (9380528619844, no chart) and a sibling on the same shop (beatriz,
+# 9027392667972, one chart, read correctly).
+#
+# Only a positive "no chart for this product" answer clears the marker. A lookup
+# that FAILED (network, HTTP error, unparseable body) still reports 'unread'.
+# ---------------------------------------------------------------------------
+
+# The <div id> is the real one from the reported page. It matters: it contains
+# "kiwi_size_chart", which also matches the GENERIC 'size-guide widget' pattern
+# in _detect_size_chart_hint. Clearing only the app marker left the widget check
+# re-raising the same hint, so the first cut of this fix passed its unit tests
+# while the live page still reported 'unread'.
+KIWI_PRODUCT_PAGE = '''
+<html><body>
+<div id="shopify-block-AemsvNUZObURCR0NSb__kiwi_size_chart_recommender_kiwi_sizing_yh9wQh"
+     class="shopify-block shopify-app-block"><script>
+window.KiwiSizing = window.KiwiSizing === undefined ? {} : window.KiwiSizing;
+KiwiSizing.shop = "95fdbd-3.myshopify.com";
+KiwiSizing.data = {
+  collections: "644246962500,603919515972",
+  tags: "jeans women,Womens",
+  product: "9380528619844",
+  vendor: "Chic Parisien",
+  type: "Jeans Women",
+  title: "Lidochka | Les pantalons styles et uniques",
+};
+</script>
+<script src="https://app.kiwisizing.com/web/js/dist/kiwiSizing/plugin/SizingPlugin.prod.js"></script>
+</div>
+</body></html>
+'''
+
+# Shape copied from the live endpoint: Kiwi always echoes the shop's settings,
+# and 'sizings' is what says whether THIS product has a chart.
+KIWI_SETTINGS = {'id': 86818, 'isEnabled': True, 'buttonText': 'Tableau des tailles'}
+
+KIWI_NO_CHART = {'sizings': [], 'settings': KIWI_SETTINGS, 'plan': 1}
+
+KIWI_WITH_CHART = {
+    'sizings': [{
+        'name': 'Beatriz | Robe elegante',
+        'tables': {'NSkZYpz': {'data': [
+            [{'type': 'header', 'value': 'Taille'}, {'type': 'header', 'value': 'Poitrine (cm)'}],
+            [{'type': 'header', 'value': 'S'}, {'type': 'single', 'value': '85'}],
+            [{'type': 'header', 'value': 'M'}, {'type': 'single', 'value': '90'}],
+        ]}},
+    }],
+    'settings': KIWI_SETTINGS,
+    'plan': 1,
+}
+
+
+class _FakeJsonResponse(_FakeResponse):
+    def __init__(self, payload, status_code=200):
+        super().__init__(status_code, '')
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+def _serve_kiwi(monkeypatch, api_payload, api_status=200, api_error=None):
+    """Product page for the shop, `api_payload` for Kiwi's getSizingChart call."""
+    def fake_scrape_get(url, timeout=10, **kwargs):
+        if 'kiwisizing.com' in url:
+            if api_error:
+                raise api_error
+            return _FakeJsonResponse(api_payload, api_status)
+        return _FakeResponse(200, KIWI_PRODUCT_PAGE)
+
+    monkeypatch.setattr(server, '_scrape_get', fake_scrape_get)
+
+
+def test_kiwi_reader_reports_no_chart_for_an_unassigned_product(monkeypatch):
+    """The reader itself: None, plus the reason, so the hint can trust it."""
+    _serve_kiwi(monkeypatch, KIWI_NO_CHART)
+    verdict = {}
+    assert server._kiwi_size_chart(KIWI_PRODUCT_PAGE, verdict) is None
+    assert verdict == {'kiwi': 'no-chart'}
+
+
+def test_kiwi_reader_still_reads_a_chart_that_is_assigned(monkeypatch):
+    """The other half — the reader was never broken and must stay working."""
+    _serve_kiwi(monkeypatch, KIWI_WITH_CHART)
+    verdict = {}
+    assert server._kiwi_size_chart(KIWI_PRODUCT_PAGE, verdict) == {
+        'headers': ['Taille', 'Poitrine (cm)'],
+        'rows': [['S', '85'], ['M', '90']],
+    }
+    assert 'kiwi' not in verdict
+
+
+def test_kiwi_marker_is_not_an_unread_chart_once_kiwi_says_there_is_none():
+    """The reported bug, at the hint: marker present, Kiwi says no chart."""
+    assert server._detect_size_chart_hint(
+        KIWI_PRODUCT_PAGE, {'kiwi': 'no-chart'}) is None
+
+
+def test_kiwi_marker_still_reports_when_the_lookup_merely_failed():
+    """A failed lookup is not an answer — without a verdict the hint must fire,
+    or a Kiwi chart we couldn't fetch would silently stop being flagged."""
+    assert server._detect_size_chart_hint(KIWI_PRODUCT_PAGE) == 'Kiwi Sizing app'
+    assert server._detect_size_chart_hint(KIWI_PRODUCT_PAGE, {}) == 'Kiwi Sizing app'
+
+
+def test_cleared_kiwi_marker_does_not_hide_other_evidence():
+    """Clearing the marker must not swallow a chart the page shows some other
+    way — the scan carries on to the remaining markers and checks."""
+    page = KIWI_PRODUCT_PAGE + '<button class="sz"><span>Guide des tailles</span></button>'
+    assert server._detect_size_chart_hint(
+        page, {'kiwi': 'no-chart'}) == 'size-guide link/button'
+
+
+def test_recheck_reports_none_for_a_kiwi_product_without_a_chart(recheck_client, monkeypatch):
+    """End to end on the reported URL: the draft must come back 'none', with no
+    Notify button, instead of 'unread' + 'Kiwi Sizing app'."""
+    _serve_kiwi(monkeypatch, KIWI_NO_CHART)
+
+    r = recheck_client.post('/api/size_chart_recheck', json={
+        'url': 'https://www.chic-parisien.fr/collections/femme/products/lidochka'})
+
+    assert r.status_code == 200
+    assert r.get_json() == {
+        'size_chart': None, 'size_chart_status': 'none', 'size_chart_hint': None,
+    }
+
+
+def test_recheck_still_returns_a_kiwi_chart_when_the_product_has_one(recheck_client, monkeypatch):
+    _serve_kiwi(monkeypatch, KIWI_WITH_CHART)
+
+    r = recheck_client.post('/api/size_chart_recheck', json={
+        'url': 'https://www.chic-parisien.fr/products/beatriz'})
+
+    body = r.get_json()
+    assert body['size_chart_status'] == 'found'
+    assert body['size_chart']['headers'] == ['Taille', 'Poitrine (cm)']
+
+
+def test_recheck_keeps_unread_when_kiwis_api_is_unreachable(recheck_client, monkeypatch):
+    """Kiwi down must not be reported as 'this product has no size chart'."""
+    _serve_kiwi(monkeypatch, None, api_error=server.req.exceptions.ConnectionError('boom'))
+
+    r = recheck_client.post('/api/size_chart_recheck', json={
+        'url': 'https://www.chic-parisien.fr/collections/femme/products/lidochka'})
+
+    assert r.get_json() == {
+        'size_chart': None,
+        'size_chart_status': 'unread',
+        'size_chart_hint': 'Kiwi Sizing app',
+    }
+
+
+def test_recheck_keeps_unread_when_kiwis_api_errors(recheck_client, monkeypatch):
+    _serve_kiwi(monkeypatch, {}, api_status=500)
+
+    r = recheck_client.post('/api/size_chart_recheck', json={
+        'url': 'https://www.chic-parisien.fr/collections/femme/products/lidochka'})
+
+    assert r.get_json()['size_chart_hint'] == 'Kiwi Sizing app'
+
+
+def test_cleared_app_block_id_does_not_re_raise_as_a_size_guide_widget():
+    """Kiwi's Shopify app block is id="…kiwi_size_chart_recommender_kiwi_sizing…",
+    which matches the generic `siz*[-_](chart|guide)` widget pattern too. The same
+    app must not come back as independent evidence through that second door."""
+    assert 'kiwi_size_chart' in KIWI_PRODUCT_PAGE          # guard the fixture
+    assert server._detect_size_chart_hint(
+        KIWI_PRODUCT_PAGE, {'kiwi': 'no-chart'}) is None
+
+
+def test_a_real_size_guide_widget_is_still_reported():
+    """The widget check must keep working for markup that is NOT the cleared app."""
+    assert server._detect_size_chart_hint(
+        '<div class="product__size-guide">…</div>', {'kiwi': 'no-chart'}
+    ) == 'size-guide widget'
+
+
+def test_widget_check_is_unaffected_without_a_verdict():
+    assert server._detect_size_chart_hint(
+        '<div class="product__size-chart">…</div>') == 'size-guide widget'
