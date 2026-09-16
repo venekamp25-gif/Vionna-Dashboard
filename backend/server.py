@@ -2524,10 +2524,15 @@ def _extract_size_chart(html):
         return None
 
 
-def _kiwi_size_chart(page_html):
+def _kiwi_size_chart(page_html, verdict=None):
     """Competitors using the Kiwi Sizing app load the chart via JS (not in the
     HTML). Fetch it from Kiwi's API using the shop + product context embedded in
-    the page. Returns {headers, rows} or None. Best-effort, never raises."""
+    the page. Returns {headers, rows} or None. Best-effort, never raises.
+
+    `verdict` is an optional dict the caller passes to learn WHY a None came back.
+    We set verdict['kiwi'] = 'no-chart' only when Kiwi itself answered for this
+    shop and said this product has no chart assigned — see _detect_size_chart_hint
+    for why that distinction matters (bug #59)."""
     try:
         shop = re.search(r'KiwiSizing\.shop\s*=\s*"([^"]+)"', page_html)
         blk = re.search(r'KiwiSizing\.data\s*=\s*\{(.*?)\};', page_html, re.S)
@@ -2545,7 +2550,16 @@ def _kiwi_size_chart(page_html):
         if r.status_code != 200:
             return None
         api = r.json()
-        for s in (api.get('sizings') or []):
+        if not isinstance(api, dict):
+            return None
+        sizings = api.get('sizings') or []
+        if api.get('settings') and not sizings:
+            # Kiwi knows this shop (it returned its settings) and has no chart
+            # assigned to this product. That is an ANSWER, not a failed lookup.
+            if verdict is not None:
+                verdict['kiwi'] = 'no-chart'
+            return None
+        for s in sizings:
             for _tid, tbl in (s.get('tables') or {}).items():
                 grid = [[(c.get('value', '') if isinstance(c, dict) else str(c)) for c in row]
                         for row in (tbl.get('data') or []) if row]
@@ -2989,7 +3003,25 @@ def _has_visible_size_guide_trigger(page_html):
     return bool(hidden_depth == 0 and tail and _SIZE_LINK_LABEL_RE.match(tail))
 
 
-def _detect_size_chart_hint(page_html):
+# (regex marker, friendly app name, verdict key). Order = specificity; first
+# hit wins. The key ties a marker to the reader that can authoritatively clear
+# it — see _detect_size_chart_hint.
+_SIZE_APP_MARKERS = (
+    (r'sizechartsrelentless',                          'Relentless Size Charts app', 'relentless'),
+    (r'kiwisizing|kiwi_sizing|kiwi_size_chart',        'Kiwi Sizing app', 'kiwi'),
+    (r'sizefox',                                       'SizeFox / SmartSize app', 'smartsize'),
+    (r'\bsmartsize\b',                                 'SmartSize app', 'smartsize'),
+    (r'vitals\.app|vtlsliquiddata|vitals-size_chart',  'Vitals app', 'vitals'),
+    (r'(?<![a-z])pify(?![a-z])',                       'Pify Size Chart app', 'pify'),
+    (r'clothhei',                                      'Clothhei size app', 'clothhei'),
+    (r'\bsizify\b',                                    'Sizify app', 'sizify'),
+    (r'size-chart-app',                                'size-chart app', 'sizechartapp'),
+    (r'\bmysize\b',                                    'MySize app', 'mysize'),
+    (r'fitanalytics',                                  'Fit Analytics app', 'fitanalytics'),
+)
+
+
+def _detect_size_chart_hint(page_html, verdict=None):
     """When automatic extraction FAILS, sniff whether the page still clearly HAS a
     size chart (a known app / a size-chart image / a size-guide widget) so a human
     can flag it and we know which reader to add. Returns a short hint, or None when
@@ -3003,30 +3035,35 @@ def _detect_size_chart_hint(page_html):
     Likewise 'size-guide link/button' (bug #17) is now attempted by
     _linked_page_size_chart above and only surfaces here when that also fails —
     and only for a trigger the shopper can actually SEE, since a theme's hidden
-    size-guide button has no chart behind it to read (bug #57)."""
+    size-guide button has no chart behind it to read (bug #57).
+
+    An app MARKER is not a chart either. A shop that installs Kiwi Sizing ships
+    the same app block on every product page, whether or not that product has a
+    chart assigned, so the marker alone cannot tell the two apart — only the app's
+    API can, and _kiwi_size_chart already asked it. `verdict` carries that answer:
+    when Kiwi replied "no chart for this product" the marker is skipped and we
+    keep looking for other evidence (bug #59: chic-parisien.fr/products/lidochka,
+    a jeans product on a shop that assigns charts per product id). A lookup that
+    merely FAILED leaves the verdict unset, so the hint still fires."""
     try:
         h = (page_html or '').lower()
-        # (regex marker, friendly app name). Order = specificity; first hit wins.
-        for pat, name in (
-            (r'sizechartsrelentless',                          'Relentless Size Charts app'),
-            (r'kiwisizing|kiwi_sizing',                        'Kiwi Sizing app'),
-            (r'sizefox',                                       'SizeFox / SmartSize app'),
-            (r'\bsmartsize\b',                                 'SmartSize app'),
-            (r'vitals\.app|vtlsliquiddata|vitals-size_chart',  'Vitals app'),
-            (r'(?<![a-z])pify(?![a-z])',                       'Pify Size Chart app'),
-            (r'clothhei',                                      'Clothhei size app'),
-            (r'\bsizify\b',                                    'Sizify app'),
-            (r'size-chart-app',                                'size-chart app'),
-            (r'\bmysize\b',                                    'MySize app'),
-            (r'fitanalytics',                                  'Fit Analytics app'),
-        ):
+        cleared = {k for k, v in (verdict or {}).items() if v == 'no-chart'}
+        cleared_pats = [pat for pat, _n, key in _SIZE_APP_MARKERS if key in cleared]
+        for pat, name, key in _SIZE_APP_MARKERS:
+            if key in cleared:
+                continue          # the app itself said this product has no chart
             if re.search(pat, h):
                 return name
         for m in re.finditer(r'<img\b[^>]*>', page_html or '', re.I):
             if _SIZE_IMG_RE.search(m.group(0)):
                 return 'size-chart image'
-        if re.search(r'(class|id)\s*=\s*"[^"]*siz[a-z]*[\-_](chart|guide)[^"]*"', h):
-            return 'size-guide widget'
+        # A cleared app's own container counts as that app, not as separate
+        # evidence: Kiwi's Shopify app block is id="…kiwi_size_chart_recommender
+        # _kiwi_sizing…", which matches the generic widget pattern below and
+        # would re-raise the hint we just cleared (bug #59).
+        for m in re.finditer(r'(?:class|id)\s*=\s*"([^"]*siz[a-z]*[\-_](?:chart|guide)[^"]*)"', h):
+            if not any(re.search(p, m.group(1)) for p in cleared_pats):
+                return 'size-guide widget'
         if _has_visible_size_guide_trigger(page_html):
             return 'size-guide link/button'
         return None
@@ -3034,14 +3071,18 @@ def _detect_size_chart_hint(page_html):
         return None
 
 
-def _extract_size_chart_full(page_html, page_url=''):
+def _extract_size_chart_full(page_html, page_url='', verdict=None):
     """Size chart from a competitor page, trying in order: HTML <table> → Relentless
     app (inline JSON, no network) → SizeFox/SmartSize app API → Kiwi Sizing app API
-    → Vitals app → a linked size-guide page → image OCR. Returns {headers, rows}."""
+    → Vitals app → a linked size-guide page → image OCR. Returns {headers, rows}.
+
+    Pass a dict as `verdict` to also collect what each app API positively said, and
+    hand it to _detect_size_chart_hint so a "no chart for this product" answer
+    doesn't become an "unread chart" hint (bug #59)."""
     return (_extract_size_chart(page_html)
             or _relentless_size_chart(page_html)
             or _smartsize_size_chart(page_html)
-            or _kiwi_size_chart(page_html)
+            or _kiwi_size_chart(page_html, verdict)
             or _vitals_size_chart(page_html)
             or _linked_page_size_chart(page_html, page_url)
             or _ocr_size_chart(page_html, page_url))
@@ -3115,13 +3156,14 @@ def api_size_chart_recheck():
         }), 502
     html = r.text or ''
     chart = None
+    verdict = {}
     try:
-        chart = _extract_size_chart_full(html, url)
+        chart = _extract_size_chart_full(html, url, verdict)
     except Exception as e:
         # Same posture as the scrape itself: a reader that blows up must not cost
         # the caller its verdict — it just means we didn't manage to read one.
         print(f"[size-chart] recheck extraction failed: {e}")
-    hint = None if chart else _detect_size_chart_hint(html)
+    hint = None if chart else _detect_size_chart_hint(html, verdict)
     return jsonify({
         'size_chart': chart,
         'size_chart_status': 'found' if chart else ('unread' if hint else 'none'),
@@ -3337,13 +3379,15 @@ def scrape():
     # never fail the scrape over it. Caches the HTML into fallback_html so the
     # sibling discovery below reuses it instead of fetching the page twice.
     size_chart = None
+    size_chart_verdict = {}
     try:
         if fallback_html is None:
             sc_r = _scrape_get(html_url, timeout=10)
             if sc_r.status_code == 200:
                 fallback_html = sc_r.text
         if fallback_html:
-            size_chart = _extract_size_chart_full(fallback_html, html_url)
+            size_chart = _extract_size_chart_full(fallback_html, html_url,
+                                                  size_chart_verdict)
     except Exception as e:
         print(f"[scrape] size-chart fetch failed: {e}")
 
@@ -3351,7 +3395,7 @@ def scrape():
     # app etc.) so the worker can flag it — 'unread'. Genuinely chart-less → 'none'.
     size_chart_hint = None
     if not size_chart and fallback_html:
-        size_chart_hint = _detect_size_chart_hint(fallback_html)
+        size_chart_hint = _detect_size_chart_hint(fallback_html, size_chart_verdict)
     size_chart_status = 'found' if size_chart else ('unread' if size_chart_hint else 'none')
 
     # Detect the "one-product-per-colour" pattern (Billy J etc.) and merge sibling
