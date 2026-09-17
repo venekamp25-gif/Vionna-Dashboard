@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Card } from "@/components/ui/Card";
 import { Chip } from "@/components/ui/Chip";
 import { Field, Label, Input } from "@/components/ui/Field";
 import { useProduct, StoreContent } from "@/lib/product";
 import { StoreKey, STORE_CONFIG } from "@/lib/store";
-import { randomName } from "@/lib/names";
+import { poolStatus, randomName } from "@/lib/names";
+import { isNumberedName, slugName } from "@/lib/publishChecks";
 import { slugify } from "@/lib/slug";
 import { useUsedNames } from "@/lib/useUsedNames";
 import { translateColor } from "@/lib/colors";
@@ -41,6 +42,12 @@ export function ProductInfoCard() {
   // Shared cache of "already used" product names across all selected stores
   const { byStore: usedNamesByStore, loading: usedNamesLoading } = useUsedNames();
   const selectedStoresKey = data.selectedStores.join(",");
+  // How many pool names are still free across ALL stores (a name is one garment
+  // everywhere). Shown only when it gets low — see the hint under the name field.
+  const namePool = useMemo(
+    () => poolStatus(Object.values(usedNamesByStore).flatMap((l) => l ?? [])),
+    [usedNamesByStore]
+  );
 
   // ── Name-availability check (debounced 600ms; flags ANY store that owns the name) ──
   const [nameStatus, setNameStatus] = useState<NameStatus>("idle");
@@ -50,10 +57,12 @@ export function ProductInfoCard() {
     if (usedNamesLoading) { setNameStatus("checking"); return; }
     setNameStatus("checking");
     const t = setTimeout(() => {
-      const lower = data.name.toLowerCase();
+      // By Shopify slug, like the pre-publish check: "Adele" and "Adèle" are the
+      // same handle. (This line compared lower-cased titles and said "available".)
+      const slug = slugName(data.name);
       const offending: StoreKey[] = [];
       for (const s of data.selectedStores) {
-        if ((usedNamesByStore[s] ?? []).some((n) => n.toLowerCase() === lower)) {
+        if ((usedNamesByStore[s] ?? []).some((n) => slugName(n) === slug)) {
           offending.push(s);
         }
       }
@@ -307,6 +316,21 @@ export function ProductInfoCard() {
           </button>
         </div>
         <NameStatusLine status={nameStatus} takenInStores={takenInStores} />
+        {isNumberedName(data.name) && (
+          <div className="text-[11px] text-danger mt-1">
+            ⚠ A number in the name ends up in the URL, the SKU and the SEO title — press ↻ for a real first name.
+          </div>
+        )}
+        {!usedNamesLoading && namePool.free < 150 && (
+          <div
+            className={`text-[11px] mt-1 ${namePool.free === 0 ? "text-danger" : "text-amber-600 dark:text-amber-400"}`}
+            title="Names are unique per garment across all stores. When the pool runs out the dashboard has to make names up — ask to have the pool extended before that."
+          >
+            {namePool.free === 0
+              ? "⚠ The name pool is used up — ↻ now makes up a name. Ask to have the pool extended."
+              : `Only ${namePool.free} of ${namePool.total} pool names are still free — ask to have the pool extended.`}
+          </div>
+        )}
       </Field>
 
       <Field>

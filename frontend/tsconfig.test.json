@@ -16,6 +16,7 @@
   },
   "include": [
     "lib/publishChecks.ts",
+    "lib/names.ts",
     "lib/cogsStores.ts",
     "lib/nbCategory.ts",
     "lib/scrape-utils.ts",

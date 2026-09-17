@@ -181,6 +181,13 @@ export interface NameCheck {
  * controle. Precies zo kregen 38 kledingstukken een naam die al bezet was: een
  * trage store gaf een lege lijst, en "leeg" werd gelezen als "uniek".
  */
+/** "Berit 2", "Ylva 3": the old name-pool fallback. A number in the name leaks
+ *  into the handle (berit-2-blue), the SKU, the SEO title and the siblings
+ *  collection — 135 products had to be renamed for it in Sept 2026. */
+export function isNumberedName(name: string): boolean {
+  return /\d/.test((name || "").trim());
+}
+
 export function nameCheck(
   name: string,
   takenSlugs: Set<string>,
@@ -188,6 +195,13 @@ export function nameCheck(
 ): NameCheck {
   const clean = (name || "").trim();
   if (!clean) return { level: "fail", label: "Product name is empty" };
+  if (isNumberedName(clean)) {
+    return {
+      level: "fail",
+      label: "Product name contains a number",
+      detail: `"${clean}" -- press ↻ next to the name for a real first name (a number ends up in the URL, the SKU and the SEO title)`,
+    };
+  }
   if (unavailable.length > 0) {
     return {
       level: "fail",
