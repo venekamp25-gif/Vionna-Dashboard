@@ -9005,7 +9005,9 @@ def get_names():
         # Without this param Shopify only returns active products by default.
         next_url = shopify_url(store, 'products.json?fields=title&status=active,draft,archived&limit=250')
         pages = 0
-        while next_url and pages < 10:  # max 2500 products = plenty
+        # 60 pagina's = 15.000 titels. Was 10 (2.500): DK staat op 2.109 incl.
+        # archief en zou binnen weken 'complete:false' geven -> elke import stopt.
+        while next_url and pages < 60:
             r = req.get(next_url, headers=shopify_headers(store), timeout=15)
             data = r.json()
             for p in data.get('products', []):
@@ -9033,6 +9035,144 @@ def get_names():
         # geen geslaagde controle.
         print(f'[names] Error: {e}')
         return jsonify({'names': [], 'error': str(e)[:300]}), 502
+
+
+# ── Naampoel-bewaking ───────────────────────────────────────────────────────
+# De poel (frontend/lib/names.ts) raakt op zonder dat iemand het ziet: elke
+# listing verbruikt één naam over alle winkels. Twee keer leeg gelopen
+# (2026-08-31: 38 dubbele namen; 2026-09-15: 'Berit 2', 'Ylva 2'…). De droplet
+# heeft de hele repo, dus hij kan de poel zelf lezen en tegen de winkels leggen.
+NAMES_TS_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             'frontend', 'lib', 'names.ts')
+NAME_POOL_WARN_BELOW = 150       # vrije namen; bij ~30/week is dat ~5 weken
+_NAME_POOL_LAST = {'at': 0.0, 'status': None, 'warned_free': None}
+_NAME_SLUG_MAP = {'ø': 'o', 'æ': 'ae', 'å': 'a', 'ä': 'a', 'ö': 'o', 'ü': 'u', 'ß': 'ss', 'œ': 'oe',
+                  'ð': 'd', 'þ': 'th', 'ł': 'l'}
+
+
+def _name_slug(text):
+    """Shopify's handle slug for a product name (same rules as the frontend's
+    slugName: ø→o, æ→ae, å→a; accents fold; Adele == Adèle)."""
+    t = ''.join(_NAME_SLUG_MAP.get(c, c) for c in (text or '').lower())
+    t = unicodedata.normalize('NFKD', t)
+    return re.sub(r'[^a-z0-9]+', '-', ''.join(c for c in t if not unicodedata.combining(c))).strip('-')
+
+
+def _name_pool_names(path=None):
+    """The WOMEN_NAMES list parsed out of names.ts. [] when unreadable."""
+    try:
+        with open(path or NAMES_TS_PATH, encoding='utf-8') as f:
+            ts = f.read()
+        m = re.search(r'WOMEN_NAMES\s*=\s*\[(.*?)\];', ts, re.S)
+        if not m:
+            return []
+        # Commentaar eerst weg: daar staan ook woorden tussen aanhalingstekens
+        # ('de terugval deelde "Berit 2" uit') en die zijn geen poolnamen.
+        return re.findall(r'"([^"]+)"', re.sub(r'//[^\n]*', '', m.group(1)))
+    except Exception as e:
+        print(f'[names] pool unreadable: {e}')
+        return []
+
+
+def _store_titles(store):
+    """Every product title of a store (all statuses). Raises on failure — an
+    unread store must never count as 'no names in use'."""
+    titles, pages = [], 0
+    next_url = shopify_url(store, 'products.json?fields=title&status=active,draft,archived&limit=250')
+    while next_url and pages < 60:
+        r = _shopify_call('get', next_url, shopify_headers(store), timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(f'{store}: HTTP {r.status_code}')
+        titles += [p['title'] for p in r.json().get('products', []) if p.get('title')]
+        next_url = None
+        for part in (r.headers.get('Link', '') or '').split(','):
+            if 'rel="next"' in part:
+                u = part.split(';')[0].strip().lstrip('<').rstrip('>')
+                next_url = u if u.startswith('http') else None
+                break
+        pages += 1
+    return titles
+
+
+def _name_pool_status(titles_by_store=None, pool=None):
+    """{pool, free, in_use, numbered, stores_failed, low}. `titles_by_store` and
+    `pool` are injectable for tests."""
+    pool = pool if pool is not None else _name_pool_names()
+    failed, titles = [], []
+    if titles_by_store is None:
+        titles_by_store = {}
+        for s in ('dk', 'fr', 'fi'):
+            if s not in tokens:
+                continue
+            try:
+                titles_by_store[s] = _store_titles(s)
+            except Exception as e:
+                failed.append(s)
+                print(f'[names] pool status: {e}')
+    for lst in titles_by_store.values():
+        titles += lst
+    used = {_name_slug(t) for t in titles}
+    pool_slugs = {_name_slug(n) for n in pool}
+    free = len(pool_slugs - used)
+    numbered = sorted({t for t in titles if re.search(r'\s\d{1,2}$', t.strip())})
+    return {'pool': len(pool_slugs), 'free': free, 'in_use': len(used), 'numbered_names': numbered[:40],
+            'stores_failed': failed, 'warn_below': NAME_POOL_WARN_BELOW,
+            # Onbekend is geen 'genoeg': met een mislukte winkel is `free` te hoog.
+            'low': bool(pool_slugs) and not failed and free < NAME_POOL_WARN_BELOW,
+            'checked_at': datetime.datetime.utcnow().isoformat() + 'Z'}
+
+
+@app.route('/api/name_pool_status')
+def api_name_pool_status():
+    """How much of the product-name pool is left. Open and read-only, so the
+    answer is cached 10 minutes — no way to make it re-read three catalogues
+    on every hit."""
+    now = time.time()
+    if _NAME_POOL_LAST['status'] and now - _NAME_POOL_LAST['at'] < 600:
+        return jsonify(_NAME_POOL_LAST['status'])
+    st = _name_pool_status()
+    _NAME_POOL_LAST.update({'at': now, 'status': st})
+    return jsonify(st)
+
+
+def _name_pool_watch_once():
+    """One daily check: Slack ping when the pool is low or a numbered name shows
+    up. Pings again only when it got WORSE, not every day."""
+    st = _name_pool_status()
+    _NAME_POOL_LAST.update({'at': time.time(), 'status': st})
+    if st['stores_failed'] or not st['pool']:
+        return st
+    worse = _NAME_POOL_LAST['warned_free'] is None or st['free'] <= _NAME_POOL_LAST['warned_free'] - 25
+    if (st['low'] and worse) or (st['numbered_names'] and _NAME_POOL_LAST['warned_free'] is None):
+        bits = [f":label: *Product-name pool*: {st['free']} of {st['pool']} names still free "
+                f"({st['in_use']} in use across DK/FR/FI)."]
+        if st['free'] == 0:
+            bits.append("The pool is EMPTY — the dashboard is now making names up. Extend `frontend/lib/names.ts`.")
+        elif st['low']:
+            bits.append(f"Below the {NAME_POOL_WARN_BELOW} mark — extend `frontend/lib/names.ts` before it runs out.")
+        if st['numbered_names']:
+            bits.append("Numbered names in the stores: " + ', '.join(st['numbered_names'][:12]))
+        _blog_slack('\n'.join(bits))
+        _NAME_POOL_LAST['warned_free'] = st['free']
+    return st
+
+
+def _name_pool_watch_loop():
+    time.sleep(900)
+    while True:
+        try:
+            _name_pool_watch_once()
+        except Exception as e:
+            print(f'[names] pool watch error: {e}')
+        time.sleep(24 * 3600)
+
+
+# Same guards as the other unattended loops: never from a dev machine or pytest.
+if os.getenv('NAME_POOL_WATCH') != '0' and os.getenv('DEV_LOCAL') != '1' and 'pytest' not in sys.modules:
+    try:
+        threading.Thread(target=_name_pool_watch_loop, daemon=True, name='name-pool-watch').start()
+    except Exception as _e:
+        print(f'[names] could not start pool watch: {_e}')
 
 
 # --- Generate content via Claude ---

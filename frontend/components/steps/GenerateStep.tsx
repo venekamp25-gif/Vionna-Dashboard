@@ -153,6 +153,13 @@ export function GenerateStep() {
         );
       }
       const chosenName = randomName(Array.from(usedFromShopify));
+      if (!chosenName) {
+        // Pool AND the composed fallback are used up. Never invent "Name 2".
+        throw new Error(
+          "The product-name pool is completely used up. Ask to have it extended (frontend/lib/names.ts) — " +
+            "a numbered name would end up in the URL, SKU and SEO title."
+        );
+      }
 
       const ctx: PendingCtx = {
         product,

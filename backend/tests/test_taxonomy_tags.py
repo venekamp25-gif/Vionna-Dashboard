@@ -570,6 +570,10 @@ def test_daily_loop_skips_dev_local_and_waits_for_a_live_backfill(monkeypatch, t
     import json
     path = str(tmp_path / 'b.json')
     monkeypatch.setattr(server, 'TAXONOMY_BACKFILL_STATE_PATH', path)
+    # This part is about the STATE FILE. Without this line a laptop that has
+    # tokens.json falls through to the live-catalogue evidence: the test then
+    # queries the real stores and fails (green in CI, red locally).
+    monkeypatch.setattr(server, 'tokens', {})
     assert server._taxonomy_live_backfill_done() is False, 'no state file yet'
     for st, ok in (({'status': 'done', 'dry_run': True}, False),
                    ({'status': 'running', 'dry_run': False}, False),
