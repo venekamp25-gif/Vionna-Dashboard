@@ -84,3 +84,9 @@ backend/bs_product_cache.json
 # binary store, pruned on a retention window. Never belongs in a public repo.
 hf_media/
 backend/hf_media/
+
+# Claude Code: personal settings + worktrees never belong in the repo.
+# (Claude Code adds settings.local.json to your global git excludes when it
+# creates the file; this line covers a hand-made one and every fresh clone.)
+.claude/settings.local.json
+.claude/worktrees/

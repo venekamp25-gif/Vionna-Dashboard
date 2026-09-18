@@ -11,7 +11,8 @@ and sales channels.
   - Self-updates from `main` automatically (see "Deploy & self-update" below);
     bump `backend/version.txt` for any backend change so the droplet picks it up.
 - Repo is PUBLIC — never commit secrets. `.env`, `tokens.json`, `slack_config.json`
-  are gitignored and live only on the droplet.
+  are gitignored and live only on the droplet and the owner's laptop. A second
+  developer never needs them: see "Working here as a second developer" below.
 
 ---
 
@@ -116,8 +117,12 @@ bug queue"), run this flow without asking for clarification first:
    the user to paste the bug text from the `#bugs-report` Slack message, then fix
    from that.
 4. **After fixing each bug:**
-   - **Local laptop session:** commit + push to `main` (Netlify + droplet auto-deploy;
-     bump `backend/version.txt` if backend changed), then mark it resolved:
+   - **Local laptop session:** push a branch and open a PR. A direct push to
+     `main` is refused by the branch ruleset (active since 2026-08-31). The owner
+     turns on auto-merge (squash) so green CI merges it; a contributor without
+     write access waits for the owner to merge. Bump `backend/version.txt` if
+     backend changed. After the merge (Netlify + droplet auto-deploy) mark it
+     resolved:
      ```bash
      curl -sS -X POST "https://188-166-11-177.nip.io/api/bug_reports/<id>/resolve"
      ```
@@ -248,3 +253,108 @@ The hands-off pipeline distinguishes two kinds of reports:
 - The routine's cloud environment needs network access to the droplet
   (`188-166-11-177.nip.io`) for the plan POST + resolve calls; if unreachable it
   falls back to a draft PR describing the plan.
+
+---
+
+## 👥 Working here as a second developer
+
+The owner is not the only person building this dashboard. If that is you, this
+section is your whole setup; nothing else in the repo assumes production access.
+
+**What you need on your machine:** Git, the GitHub CLI (`gh auth login` with
+**your own** GitHub account), Python 3.12 or newer, Node 20, and Claude Code.
+
+**Get the code.** You have no write access to this repo, so work from a fork:
+
+```bash
+gh repo fork venekamp25-gif/Vionna-Dashboard --clone
+```
+
+**Local settings.** Copy `backend/.env.example` to `backend/.env` and fill in
+your own values. Two things go in there:
+
+- an `ANTHROPIC_API_KEY` from the workspace the owner gives you (the dashboard
+  itself calls the Claude API for content generation; this is separate from
+  your Claude Code login);
+- a **Shopify development store** (free, from the Partners dashboard) with an
+  app created in the **Dev Dashboard**, redirect URL
+  `http://localhost:5000/callback`. Put its domain + client id/secret under
+  `SHOPIFY_DK_*`, start the backend, then open `http://localhost:5000/auth/dk`
+  once to connect it. Publishing then hits *your* dev store, never the real shops.
+
+You never need the owner's `.env`, `tokens.json` or `lighting_tokens.json`.
+Claude Code is denied read access to those paths via `.claude/settings.json`
+(scripts can still open them; the deny only keeps them out of transcripts).
+
+**Run it.** `start.bat` starts the backend on http://localhost:5000 with
+`DEV_LOCAL=1` (auth gate and self-updater off; local only, never on the
+droplet). `start-frontend.bat` starts the Next.js UI on http://localhost:3000;
+it talks to `localhost:5000` by default, no frontend env file needed.
+
+**Ship a change.**
+
+1. One branch per feature, small PRs. Bump `backend/version.txt` whenever the
+   backend changes (the droplet only installs a higher version).
+2. Before you push, run what CI runs:
+   ```bash
+   bash scripts/ci-local.sh
+   ```
+3. Push to your fork and open a PR against `main` (`gh pr create`). CI must be
+   green. The owner reviews and merges; a merge is live on Netlify and the
+   droplet within ~10 minutes, so "merged" means "in production".
+4. Never `git add -A`, never push to `main`, never enable auto-merge yourself,
+   never touch the droplet, Netlify or the Shopify admin for a deploy. You
+   don't need to: the merge does it.
+5. A commit that contains something that looks like a secret is blocked by the
+   `scripts/secret-scan.py` hook (shared via `.claude/settings.json`). If it
+   fires, un-stage the file; `.gitignore` already covers the usual suspects.
+
+**Behaviour changes for the lister** (new flows, changed defaults, anything
+that spends money or writes to the live shops) are agreed with the owner
+first, via **Plans** (see above) or a short message, and built afterwards.
+
+---
+
+## 📏 Domain rules that every change must respect
+
+These are hard-won and enforced by tests where possible; a PR that breaks one
+gets sent back even when CI is green. Details live in the linked tests.
+
+- **Dropshipper vs own stock:** with a delivery *range* the LOWER bound decides;
+  a lower bound of 5+ days means dropshipper, `1-5d` / `3-7d` / `4-11d` mean own
+  stock. Always derive the label from the days; never let an LLM or API layer
+  keep its own word (`backend/shipping_check.py`, `tests/test_shipping.py`).
+- **A transient failure is never a verdict.** 429, timeout or an empty API
+  answer must land as BLOCKED, not as "no" (`tests/test_scrape_rate_limit.py`,
+  `tests/test_dfs_errors.py`).
+- **No unverified fabric claims:** cashmere/wool/silk etc. only when the
+  competitor's own title or description names the fabric (four-layer filter;
+  `/api/generate` strips the rest).
+- **No unverified length claims:** long/short/maxi/midi/knee-length only when the
+  source says so; otherwise the review shows an `unverified_length` banner.
+- **No colour keywords in shared copy.** Copy shared across colour variants
+  never names a colour; a variant's own copy may name its OWN colour. The bug is
+  a WRONG colour (`tests/test_publish_guards.py`).
+- **Accessories are One Size**, never XS-XL (`_guard_accessory_sizes`,
+  `tests/test_size_guard.py`).
+- **Siblings = collection membership.** `theme.siblings` points at a collection
+  that must be called `<Name> Siblings` (never translated); a filled metafield is
+  not "working" until the products are members
+  (`tests/test_siblings_membership.py`, `/api/siblings_audit`).
+- **Numbered handles are not duplicates.** `x`, `x-1`, `x-copy` with the same
+  SKU are the mis-derived-colour bug; compare real colour (RGB) and group on
+  `theme.siblings` before ever archiving anything.
+- **Product names come from the name pool** and never carry a number
+  (v1.303); the pool warns before it runs dry.
+- **SEO page titles:** `{product-type phrase} - {name} {colour}`, keyword first,
+  colour mandatory (one product per colour), budget 60 chars minus the theme
+  suffix, truncate on a sentence boundary (Finnish carries the case in the word).
+- **Competitor source URLs stay backend-only** (publish history), never in a
+  metafield or the Google feed.
+- **Bundles exist only in the Home Decor (lighting) vertical.** Vionna fashion
+  never bundles; don't build it into the fashion import.
+- **New Shopify apps go through the Dev Dashboard** (client-credentials tokens),
+  so code must accept both that and a fixed `shpat_` token.
+- **Fix the root cause and add detection**, not only the damage: every bug fix
+  also asks "which pipeline step let this through, and what alerts next time?"
+- **Same product on 3+ competitor stores is a heat signal**, not noise.
