@@ -12667,6 +12667,11 @@ _WTL_NICHE_SAMPLE = 30                # products.json?limit= (ruim genoeg, klein
 _WTL_NICHE_MIN_FASHION = 5            # minder damesmode-producten dan dit = geen modewinkel
 _WTL_NICHE_KINDS = ('womenswear', 'menswear', 'kids', 'jewelry', 'shoes', 'beauty', 'home',
                     'sport', 'electronics', 'pet', 'food', 'general', 'other')
+# Versie van de OORDEELSREGELS. Verhoog 'm zodra een bestaand oordeel anders kan
+# uitvallen: een 'yes' van een oudere ruleset telt dan niet meer als vers en
+# wordt opnieuw beoordeeld bij de volgende 'Check niche'. Zonder dit blijft een
+# fout oordeel 30 dagen staan en ziet de medewerker de fix niet (bug #62).
+_WTL_NICHE_RULES = 2
 
 
 def _wtl_niche_load():
@@ -12698,6 +12703,11 @@ def _wtl_niche_fresh(n):
         age = (datetime.datetime.utcnow()
                - datetime.datetime.fromisoformat(str(n.get('ts', '')).rstrip('Z'))).total_seconds()
     except Exception:
+        return False
+    # Een 'yes' van een oudere ruleset is niet meer vers. De store-audience-poort
+    # (bug #62) kan alleen een 'yes' omzetten in een 'no'; 'no' en 'unknown'
+    # raakt hij niet aan, dus die hoeven niet opnieuw door de molen.
+    if n.get('status') == 'yes' and int(n.get('rules') or 1) < _WTL_NICHE_RULES:
         return False
     # Een echt oordeel 30 dagen; 'unknown' én een onbevestigd 'yes' (de LLM gaf
     # geen antwoord -- een storing) morgen opnieuw.
@@ -12865,6 +12875,55 @@ def _gd_homepage_hint(domain, timeout=10):
     return ' | '.join(b for b in bits if b)
 
 
+# WIE de winkel bedient staat zelden IN het product: 'Skjorte', 'Strik' en
+# 'Sneakers' liggen net zo goed in een heren- of kinderwinkel als in een
+# dameswinkel. De bucketer kijkt alleen naar het product en las die winkels
+# daarom als damesmode. GEMETEN op de live DK-lijst (2026-09-23, bug #62):
+#   skjorten.dk         -> 'yes, 83% womenswear'  (<title>: "Herretøj online |
+#                          Skjorter og tøj til mænd")
+#   halokids.dk         -> 'yes, 73% womenswear'  (<title>: "Tøj til Børn")
+#   herrernesmagasin.dk -> 'yes, 83% womenswear'  (<title>: "Herrernes Magasin")
+# De winkel ZEGT het zelf wel: in zijn domeinnaam en in zijn <title>/meta/h1.
+# Dat is het signaal dat hier telt -- en het weegt zwaarder dan producttitels
+# die over de doelgroep zwijgen.
+#
+# NB: net als _BS_NOT_WOMENS_RE nooit via een kale shell-heredoc bewerken --
+# een \b die als backspace wordt weggeschreven sloopt het filter geruisloos.
+# Bewust GEEN kale \bmen\b: 'men' is in het Deens gewoon 'maar' en staat in
+# half de meta-teksten van een dameswinkel.
+_STORE_MEN_RE = _bs_rx(r"\bherre\w*|\bheren\b|herenmode|til m[æa]nd|\bm[æa]nd\b|"
+                       r"menswear|\bmen'?s\b|for men\b|\bm[äa]nner\b|"
+                       r"pour homme\w*|\bhommes?\b|v[êe]tements? homme\w*|"
+                       r"\bmiesten\w*|\bmiehille\b|\bmiehet\b")
+_STORE_KIDS_RE = _bs_rx(r"\bkids?\b|kidswear|\bchildren'?s?\b|\btoddler\b|"
+                        r"\bb[øo]rn\w*|\bbarnet[øo]j\b|\bkinder\w*|"
+                        r"\benfants?\b|v[êe]tements? (?:enfant|b[ée]b[ée])|"
+                        r"\blasten\w*|\blapsille\b|\blapset\b|\bjunior\b")
+# Noemt de winkel ook vrouwen, dan is 'heren' geen afwijzing maar een gemengde
+# winkel (wupp.dk: "Mode til ham & hende ... til mænd og kvinder").
+_STORE_WOMEN_RE = _bs_rx(r"\bwom[ae]n'?s?\b|\bladies\b|\bfemale\b|\bdame\w*|\bkvinde\w*|"
+                         r"\bkvinder\w*|\bfemmes?\b|pour femme\w*|\bnaisten\w*|"
+                         r"\bnaisille\b|\bnaiset\b|\bdamen\b")
+
+
+def _store_audience(domain, hint=''):
+    """What the STORE says it sells, from its OWN words (domain + homepage
+    <title>/meta/h1): 'menswear', 'kids', or None when it does not say.
+
+    Only decisive when it names a men's or a kids' audience and NEVER a
+    women's one -- 'toj til maend og kvinder' is a mixed store and no reason to
+    reject it. Silence is not evidence either: an unreadable homepage gives ''
+    and therefore None, so the product rules keep the last word."""
+    words = f"{re.sub(r'[^a-z0-9]+', ' ', (domain or '').lower())} {hint or ''}"
+    if _STORE_WOMEN_RE.search(words):
+        return None
+    if _STORE_KIDS_RE.search(words):
+        return 'kids'
+    if _STORE_MEN_RE.search(words):
+        return 'menswear'
+    return None
+
+
 def _niche_llm(domain, products, profile, hint=''):
     """Tie-break for the ambiguous zone. Returns (True|False|None, kind)."""
     if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
@@ -12935,20 +12994,34 @@ def _wtl_niche_check(domain, products=None, http_status=None, error=None, save=T
                     cache[bare] = entry
                     _wtl_niche_save(cache)
             return entry
-        if status == 'ambiguous':
-            wf, k = _niche_llm(bare, products, prof, hint=_gd_homepage_hint(bare))
-            source = 'llm'
-            if wf is True:
-                status, kind = 'yes', 'womenswear'
-            elif wf is False:
-                status, kind = 'no', (k or _niche_kind_from_profile(prof))
-            else:
-                # Geen oordeel te krijgen: doorlaten met een vlag (warn, never block).
-                status, kind, unverified = 'yes', 'womenswear', True
-                reason += ' — niet bevestigd'
+        if status in ('yes', 'ambiguous'):
+            # Wat de winkel ZELF zegt te verkopen gaat voor op de producttitels:
+            # die noemen de doelgroep niet, dus een herenwinkel vol 'Skjorte' en
+            # 'Strik' kwam er als damesmode doorheen (bug #62). Eerst deze
+            # deterministische poort, dan pas de LLM — anders moet de LLM een
+            # herenwinkel herkennen aan producttitels die daar niets over zeggen.
+            hint = _gd_homepage_hint(bare)
+            audience = _store_audience(bare, hint)
+            if audience:
+                status, kind, source = 'no', audience, 'audience'
+                reason = ("the store presents itself as a "
+                          + ('kids' if audience == 'kids' else "men's")
+                          + f' store ({reason})')
+            elif status == 'ambiguous':
+                wf, k = _niche_llm(bare, products, prof, hint=hint)
+                source = 'llm'
+                if wf is True:
+                    status, kind = 'yes', 'womenswear'
+                elif wf is False:
+                    status, kind = 'no', (k or _niche_kind_from_profile(prof))
+                else:
+                    # Geen oordeel te krijgen: doorlaten met een vlag (warn, never block).
+                    status, kind, unverified = 'yes', 'womenswear', True
+                    reason += ' — niet bevestigd'
         entry = {'status': status, 'reason': reason, 'kind': kind,
                  'fashion_share': prof['fashion_share'], 'clothing_share': prof['clothing_share'],
-                 'buckets': prof['buckets'], 'total': prof['total'], 'source': source, 'ts': ts}
+                 'buckets': prof['buckets'], 'total': prof['total'], 'source': source,
+                 'rules': _WTL_NICHE_RULES, 'ts': ts}
         if unverified:
             entry['unverified'] = True
     if save:
