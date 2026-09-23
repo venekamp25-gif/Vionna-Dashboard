@@ -50,6 +50,9 @@ def _setup(monkeypatch, tmp_path, classify=None):
                                                     {'url': 'https://www.facebook.com/x', 'type': 'organic'}])
     monkeypatch.setattr(server, '_gd_is_local', lambda d, m: True)
     monkeypatch.setattr(server, '_gd_products_sample', lambda d, **kw: SAMPLES[d])
+    # The niche check reads the store's own homepage words (bug #62) — keep the
+    # suite offline; an empty hint means 'the store does not say', as before.
+    monkeypatch.setattr(server, '_gd_homepage_hint', lambda d, **kw: '')
     monkeypatch.setattr(server, '_wtl_classify_store', classify or (lambda d: {
         'label': 'Dropshipper', 'detail': '', 'confidence': 'high', 'source': 'policy',
         'ts': datetime.datetime.utcnow().isoformat() + 'Z'}))

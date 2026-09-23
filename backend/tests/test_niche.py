@@ -86,7 +86,7 @@ def test_transient_failure_is_unknown_with_a_short_ttl(monkeypatch, tmp_path):
     assert server._wtl_niche_fresh(n)                      # today: don't hammer it
     n['ts'] = _ago(2)
     assert not server._wtl_niche_fresh(n)                  # 2 days later: try again
-    yes = {'status': 'yes', 'ts': _ago(2)}
+    yes = {'status': 'yes', 'rules': server._WTL_NICHE_RULES, 'ts': _ago(2)}
     assert server._wtl_niche_fresh(yes)                    # a real verdict lasts 30 days
     yes['ts'] = _ago(40)
     assert not server._wtl_niche_fresh(yes)
@@ -112,3 +112,96 @@ def test_niche_missing_checks_unmarked_stores_first(monkeypatch):
     res = server._wtl_niche_missing(['a.dk', 'b.dk', 'c.dk'], cap=2, workers=1)
     assert order == ['b.dk', 'c.dk']
     assert res == {'checked': 2, 'due': 3, 'yes': 2, 'no': 0, 'unknown': 0}
+
+
+# ── bug #62: the store's own words decide who it dresses ────────────────────
+# Product titles almost never name the audience: 'Skjorte', 'Strik' and
+# 'Sneakers' sit in a men's, a kids' and a women's shop alike. Measured on the
+# live DK list (2026-09-23) skjorten.dk ("Herretøj online … tøj til mænd"),
+# herrernesmagasin.dk and halokids.dk ("Tøj til Børn") all carried a green
+# "womenswear" chip in the stores tab. The homepage says it plainly.
+
+MENS_CATALOGUE = _prods(15, 'Strik V-Neck Navy - Modern fit', 'STRIK') + \
+                 _prods(10, 'Sand Hørskjorte - Summer', 'SKJORTE')
+KIDS_CATALOGUE = _prods(12, 'Sneakers - Glam Racer', 'Sneakers') + _prods(8, 'Jakke', 'Jakke')
+
+
+def test_store_audience_reads_the_stores_own_words():
+    a = server._store_audience
+    assert a('skjorten.dk', 'Herretøj online | Skjorter og tøj til mænd | Skjorten.dk') == 'menswear'
+    assert a('herrernesmagasin.dk', 'Herrernes Magasin by David K') == 'menswear'
+    assert a('legends.dk', 'Legends - Shop Menswear') == 'menswear'
+    assert a('boutique.fr', 'Vêtements homme | chemises pour hommes') == 'menswear'
+    assert a('halokids.dk', 'Tøj til Børn | Køb børnetøj fra lækre brands') == 'kids'
+    assert a('pikku.fi', 'Lasten vaatteet verkkokaupasta') == 'kids'
+    # Womenswear stores are untouched — including the ones that say nothing.
+    assert a('basicapparel.dk', 'Stort udvalg af økologisk kvalitetstøj til kvinder') is None
+    assert a('aya-s.dk', 'Essentials designed for the modern woman') is None
+    assert a('cyycle.dk', 'Cyycle') is None
+    assert a('shop.dk', '') is None
+    # A store that dresses BOTH is not a rejection (wupp.dk, measured).
+    assert a('wupp.dk', 'Shop tøj til mænd og kvinder | dametøj, herretøj') is None
+    # 'men' is Danish for 'but' — never a men's signal on its own.
+    assert a('kjoleshop.dk', 'Vi sender i dag, men kun før kl. 15') is None
+
+
+def test_menswear_store_is_no_even_when_every_product_reads_as_womenswear(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, 'WTL_NICHE_PATH', str(tmp_path / 'niche.json'))
+    monkeypatch.setattr(server, '_niche_llm',
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError('llm asked')))
+    # The bucketer alone calls this womenswear — that is exactly the bug.
+    assert server._niche_verdict(server._niche_profile(MENS_CATALOGUE))[0] == 'yes'
+
+    monkeypatch.setattr(server, '_gd_homepage_hint',
+                        lambda d, **kw: 'Herretøj online | Skjorter og tøj til mænd')
+    n = server._wtl_niche_check('skjorten.dk', products=MENS_CATALOGUE, http_status=200)
+    assert (n['status'], n['kind'], n['source']) == ('no', 'menswear', 'audience')
+    # The product numbers stay in the reason — the chip must say WHY it flipped.
+    assert "men's store" in n['reason'] and '100% womenswear' in n['reason']
+
+
+def test_kids_store_is_no(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, 'WTL_NICHE_PATH', str(tmp_path / 'niche.json'))
+    monkeypatch.setattr(server, '_gd_homepage_hint', lambda d, **kw: 'Tøj til Børn | børnetøj')
+    assert server._niche_verdict(server._niche_profile(KIDS_CATALOGUE))[0] == 'yes'
+    n = server._wtl_niche_check('halokids.dk', products=KIDS_CATALOGUE, http_status=200)
+    assert (n['status'], n['kind'], n['source']) == ('no', 'kids', 'audience')
+
+
+def test_a_womenswear_store_still_passes(monkeypatch, tmp_path):
+    """The gate may only ever take stores OUT — never block a real source."""
+    monkeypatch.setattr(server, 'WTL_NICHE_PATH', str(tmp_path / 'niche.json'))
+    monkeypatch.setattr(server, '_gd_homepage_hint', lambda d, **kw: 'Kvalitetstøj til kvinder')
+    n = server._wtl_niche_check('basicapparel.dk',
+                                products=_prods(20, 'Sommerkjole', 'Kjoler'), http_status=200)
+    assert (n['status'], n['kind'], n['source']) == ('yes', 'womenswear', 'rules')
+
+    # Homepage unreadable → no signal → the product rules keep the last word.
+    monkeypatch.setattr(server, '_gd_homepage_hint', lambda d, **kw: '')
+    n = server._wtl_niche_check('quiet.dk', products=_prods(20, 'Kjole', 'Kjoler'), http_status=200)
+    assert n['status'] == 'yes'
+
+
+def test_audience_beats_the_llm_on_an_ambiguous_menswear_store(monkeypatch, tmp_path):
+    """herrernesmagasin.dk landed in the ambiguous zone and the LLM said 'yes'.
+    A deterministic 'this shop dresses men' outranks that guess."""
+    monkeypatch.setattr(server, 'WTL_NICHE_PATH', str(tmp_path / 'niche.json'))
+    monkeypatch.setattr(server, '_gd_homepage_hint', lambda d, **kw: 'Herrernes Magasin')
+    monkeypatch.setattr(server, '_niche_llm',
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError('llm asked')))
+    ambiguous = _prods(5, 'Maxi dress', 'Dresses') + _prods(5, 'Candle', 'Home')
+    assert server._niche_verdict(server._niche_profile(ambiguous))[0] == 'ambiguous'
+    n = server._wtl_niche_check('herrernesmagasin.dk', products=ambiguous, http_status=200)
+    assert (n['status'], n['kind'], n['source']) == ('no', 'menswear', 'audience')
+
+
+def test_a_yes_from_an_older_ruleset_is_rechecked():
+    """Without this the 453 stores already cached as 'yes' would keep their
+    wrong chip for 30 days and the fix would be invisible."""
+    old = {'status': 'yes', 'ts': _ago(1)}                      # written before the gate
+    assert not server._wtl_niche_fresh(old)
+    new = dict(old, rules=server._WTL_NICHE_RULES)
+    assert server._wtl_niche_fresh(new)
+    # A 'no' or an 'unknown' is untouched: the gate can only overturn a 'yes'.
+    assert server._wtl_niche_fresh({'status': 'no', 'ts': _ago(1)})
+    assert server._wtl_niche_fresh({'status': 'unknown', 'ts': _ago(0)})

@@ -72,7 +72,8 @@ def test_empty_catalogue_check_is_transient(monkeypatch, tmp_path):
 
 
 def test_cached_or_check_does_not_refetch(monkeypatch):
-    fresh = {'status': 'yes', 'ts': datetime.datetime.utcnow().isoformat() + 'Z'}
+    fresh = {'status': 'yes', 'rules': server._WTL_NICHE_RULES,
+             'ts': datetime.datetime.utcnow().isoformat() + 'Z'}
     monkeypatch.setattr(server, '_wtl_niche_load', lambda: {'known.dk': fresh})
     monkeypatch.setattr(server, '_wtl_niche_check', lambda d: (_ for _ in ()).throw(AssertionError('refetched')))
     assert server._wtl_niche_cached_or_check('www.known.dk') is fresh
