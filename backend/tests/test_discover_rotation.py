@@ -15,11 +15,42 @@ def test_queries_rotate_between_runs():
     first = server._gd_pick_queries('dk', state, n=10)
     second = server._gd_pick_queries('dk', state, n=10)
     assert len(first) == 10 and len(second) == 10
-    assert not set(first) & set(second)
+    q1, q2 = [q for q, _ in first], [q for q, _ in second]
+    assert not set(q1) & set(q2)
     assert len(server._gd_query_bank('dk')) >= 100
     assert len(server._gd_query_bank('fi')) >= 100
     # the state carries the stamps, so the NEXT process rotates too
-    assert set(state['queries']['dk']) == set(first) | set(second)
+    assert set(state['queries']['dk']) == set(q1) | set(q2)
+    # a query nobody has run yet starts on page 1
+    assert {d for _, d in first + second} == {30}
+
+
+def test_queries_page_deeper_once_the_bank_has_come_round(monkeypatch):
+    """bug #63: rotating through the bank is not enough — the bank is FINITE.
+
+    DK holds 136 queries and a run takes 24, so after 6 runs every query comes
+    back. Before this, each one came back at depth 30: the same page 1, the same
+    7-day SERP cache key, and therefore only domains the 'seen' memory (30-90
+    days) still knows. Every run after the sixth reported 0 new candidates, in
+    all three markets at once — which is what bug #63 was reported for. A
+    repeated query must go DEEPER, the way the seed source already does.
+    """
+    monkeypatch.setattr(server, '_gd_query_bank', lambda m: ['q1', 'q2', 'q3', 'q4'])
+    state = {}
+
+    def run():
+        return server._gd_pick_queries('dk', state, n=2)
+
+    assert run() == [('q1', 30), ('q2', 30)]
+    assert run() == [('q3', 30), ('q4', 30)]     # bank not round yet: page 1
+    assert run() == [('q1', 100), ('q2', 100)]   # round -> deeper, NOT page 1 again
+    assert run() == [('q3', 100), ('q4', 100)]
+    assert run() == [('q1', 200), ('q2', 200)]
+    assert run() == [('q3', 200), ('q4', 200)]
+    # and it wraps instead of paying for ever-deeper pages
+    assert run() == [('q1', 30), ('q2', 30)]
+    # the cursor survives the process: it lives in the saved state
+    assert state['query_depths']['dk']['q1'] == 1
 
 
 def test_query_bank_has_no_duplicates_and_folds_in_wtl_terms(monkeypatch):

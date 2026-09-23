@@ -14012,6 +14012,14 @@ _GD_SEEN_TTL_DAYS = {'check failed': 1, 'check mislukt': 1,          # storing â
 _GD_SEEN_DEFAULT_TTL = 14
 _GD_QUERIES_PER_RUN = 24     # per markt per run, uit een roulerende bank van ~150
 _GD_SEEDS_PER_RUN = 3        # bekende dropshippers als 'lijkt op'-seed per markt
+# Hoe DIEP de SERP voor een query wordt gelezen, per keer dat die query terugkomt.
+# Roteren over de bank alleen is niet genoeg: de bank is eindig (136 voor DK) en
+# bij 24 per run is hij na 6 runs rond. Vanaf run 7 komt elke query terug op
+# pagina 1 -- dezelfde 30 rijen, dezelfde cache-key, en dus alleen domeinen die
+# het 'seen'-geheugen (30-90 dagen) nog kent: 0 nieuwe kandidaten, voor altijd
+# (bug #63). De seed-bron pagineert al wel dieper bij hergebruik (0/100/200);
+# dit geeft de zoekbank diezelfde uitweg.
+_GD_QUERY_DEPTHS = (30, 100, 200)
 
 
 def _gd_seen_load():
@@ -14129,15 +14137,26 @@ def _gd_state_save(st):
 
 
 def _gd_pick_queries(market, state, n=_GD_QUERIES_PER_RUN):
-    """The n least-recently-run queries for this market; stamps them as run."""
+    """[(query, depth)]: the n least-recently-run queries for this market, each
+    with the SERP depth to read it at; stamps them as run.
+
+    A query that has run before comes back one page DEEPER (30 -> 100 -> 200 ->
+    30), exactly like _gd_pick_seed_stores pages its seeds. Without that the
+    bank runs out: page 1 of every query is judged within 6 runs and the 'seen'
+    memory outlives it by weeks, so every later run finds 0 new candidates."""
     ran = state.setdefault('queries', {}).setdefault(market, {})
+    depths = state.setdefault('query_depths', {}).setdefault(market, {})
     bank = _gd_query_bank(market)
     bank.sort(key=lambda q: ran.get(q) or '')      # nooit gedraaid ('') eerst, dan oudste
     picked = bank[:max(1, int(n))]
     now = datetime.datetime.utcnow().isoformat() + 'Z'
+    out = []
     for q in picked:
+        i = int(depths.get(q) or 0) % len(_GD_QUERY_DEPTHS)
+        out.append((q, _GD_QUERY_DEPTHS[i]))
         ran[q] = now
-    return picked
+        depths[q] = (i + 1) % len(_GD_QUERY_DEPTHS)
+    return out
 
 
 def _gd_seed_candidates(market):
@@ -14277,10 +14296,14 @@ def _gd_is_local(domain, market):
 
 
 def _gd_google(queries_by_market):
-    """[(market, term, url)] from one Apify google-search run per market (organic + paid)."""
+    """[(market, term, url)] from one Apify google-search run per market (organic + paid).
+
+    Takes the (query, depth) pairs _gd_pick_queries hands out; this actor already
+    walks 3 pages per query, so it uses the query and ignores the depth."""
     token = os.getenv('APIFY_TOKEN', '').strip()
     out = []
-    for m, queries in queries_by_market.items():
+    for m, picked in queries_by_market.items():
+        queries = [q for q, _ in picked]
         if not queries:
             continue
         try:
@@ -14541,8 +14564,8 @@ def _wtl_discover_run(markets, jid, ignore_seen):
             _job_set(jid, phase='Google search + checking candidates as they arrive')
         if dfs:
             with _cf.ThreadPoolExecutor(max_workers=6) as spool:
-                futs = {spool.submit(_dfs_serp_results, q, m, 30): (m, q)
-                        for m, qs in queries.items() for q in qs}
+                futs = {spool.submit(_dfs_serp_results, q, m, depth): (m, q)
+                        for m, qs in queries.items() for q, depth in qs}
                 for f in _cf.as_completed(futs):
                     m, q = futs[f]
                     try:
