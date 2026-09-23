@@ -40,7 +40,7 @@ def _setup(monkeypatch, tmp_path, classify=None):
     monkeypatch.setattr(server, '_load_blocked_sources', lambda: set())
     monkeypatch.setattr(server, '_dfs_configured', lambda: True)
     monkeypatch.setattr(server, '_gd_pick_seed_stores', lambda m, st, n=3: [('seed.dk', 0)])
-    monkeypatch.setattr(server, '_gd_pick_queries', lambda m, st, n=24: ['kjole webshop'])
+    monkeypatch.setattr(server, '_gd_pick_queries', lambda m, st, n=24: [('kjole webshop', 30)])
     monkeypatch.setattr(server, '_dfs_competitor_domains',
                         lambda target, store, limit=100, offset=0: [
                             {'domain': 'newshop.dk'}, {'domain': 'known.dk'}, {'domain': 'homeshop.dk'},
@@ -158,6 +158,21 @@ def test_dead_store_is_removed_after_the_life_check(monkeypatch, tmp_path):
     assert [g['domain'] for g in res['gated']] == ['newshop.dk']
     assert json.load(open(tmp_path / 'extra.json')) == []
     assert server._JOBS[jid]['live']['found'][0]['status'] == 'gated'
+
+
+def test_serp_is_read_at_the_depth_the_rotation_picked(monkeypatch, tmp_path):
+    """bug #63: the run hardcoded depth 30, so the deeper pages the rotation
+    hands out never reached DataForSEO and every repeat query re-read page 1."""
+    _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(server, '_gd_pick_queries', lambda m, st, n=24: [('kjole webshop', 200)])
+    asked = []
+
+    def _serp(q, store, depth=30):
+        asked.append((q, store, depth))
+        return []
+    monkeypatch.setattr(server, '_dfs_serp_results', _serp)
+    server._wtl_discover(['dk'])
+    assert asked == [('kjole webshop', 'dk', 200)]
 
 
 def test_unknown_traffic_is_allowed(monkeypatch, tmp_path):
