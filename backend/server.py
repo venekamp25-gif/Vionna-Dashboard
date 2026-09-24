@@ -6343,9 +6343,16 @@ def api_research_keywords():
     configured:false) until DATAFORSEO_LOGIN/PASSWORD are set on the server."""
     body = request.get_json(silent=True) or {}
     stores = body.get('stores') or ['dk', 'fr', 'fi']
-    seeds = _derive_seeds_llm(body.get('competitor_title', ''), body.get('product_name', ''),
-                              body.get('category', ''), body.get('description', ''),
-                              stores=stores)
+    # Home Decor: the import step already understood the product (brief) — its
+    # search terms ARE the seeds. Derive only for markets the brief lacks.
+    given = body.get('seed_terms') if isinstance(body.get('seed_terms'), dict) else {}
+    seeds = {st: [str(t).strip() for t in (given.get(st) or []) if str(t).strip()][:6]
+             for st in stores if isinstance(given.get(st), list) and given.get(st)}
+    if len(seeds) < len(stores):
+        derived = _derive_seeds_llm(body.get('competitor_title', ''), body.get('product_name', ''),
+                                    body.get('category', ''), body.get('description', ''),
+                                    stores=[st for st in stores if st not in seeds]) or {}
+        seeds.update({st: v for st, v in derived.items() if st not in seeds})
     if not _dfs_configured():
         out = {'configured': False, 'seeds': seeds,
                'message': 'DataForSEO not configured — set DATAFORSEO_LOGIN and DATAFORSEO_PASSWORD env vars. '
@@ -23344,6 +23351,144 @@ diner tot doorlezen.
 De Bottle geeft je in een handbeweging de sfeer die een plafondlamp nooit haalt."""
 
 
+# ── Product understanding (import) ──────────────────────────────────────────
+# What IS this thing? One haiku call over the competitor's title + description
+# → a brief: lamp-type family, the shop word for the type per market, how it is
+# powered, where it goes, its features, and broad search terms per market. The
+# brief seeds the keyword research and anchors the copy. Operator > model: a
+# typed product type overrides the model's family.
+LIGHT_LANG_LABEL = {'nl': ('Nederlands', 'Dutch'), 'de': ('Duits', 'German'), 'com': ('Engels', 'English')}
+_LIGHT_LANG_STOPWORDS = {
+    'nl': {'de', 'het', 'een', 'en', 'van', 'je', 'niet', 'met', 'voor', 'die', 'dat', 'zijn', 'ook', 'waar',
+           'naar', 'zonder', 'licht', 'lamp', 'geen', 'als', 'maar', 'bij', 'over', 'hem', 'wordt', 'deze'},
+    'de': {'der', 'die', 'das', 'und', 'ein', 'eine', 'nicht', 'mit', 'für', 'ist', 'auch', 'sich', 'auf',
+           'dem', 'den', 'oder', 'wo', 'ohne', 'licht', 'lampe', 'kein', 'keine', 'bei', 'über', 'wird', 'du'},
+    'com': {'the', 'and', 'a', 'an', 'of', 'to', 'you', 'your', 'with', 'for', 'is', 'not', 'it', 'that',
+            'this', 'where', 'without', 'light', 'lamp', 'no', 'or', 'on', 'in', 'at', 'from'},
+}
+
+
+def _light_lang_guess(text):
+    """('nl'|'de'|'com'|None, scores): which store language does this text read
+    as? Stopword counting — enough to catch a Dutch text in the German card.
+    None when there is too little signal (short/empty)."""
+    words = re.findall(r"[a-zäöüßáéíóúàèìòùâêîôûëïç']+", (text or '').lower())
+    if len(words) < 12:
+        return None, {}
+    scores = {k: sum(1 for w in words if w in sw) for k, sw in _LIGHT_LANG_STOPWORDS.items()}
+    best = max(scores, key=scores.get)
+    if scores[best] < 4:
+        return None, scores
+    return best, scores
+
+
+def _light_type_words_in(text, exclude_family=None):
+    """Lamp-type words in `text` that belong to a family other than exclude_family."""
+    out = []
+    for fam, rx in _LIGHT_TYPE_RES.items():
+        if fam == exclude_family:
+            continue
+        for m in rx.finditer((text or '').lower()):
+            out.append(m.group(0))
+    return sorted(set(out))
+
+
+def _light_brief_guard(brief, product_type=''):
+    """Make the model's brief consistent and let the operator win.
+    - family: the operator's typed type (if placeable) > the family named by the
+      type words the model returned > the model's own 'family' field;
+    - search_terms about another family are dropped (with a note)."""
+    brief = dict(brief or {})
+    fams_from_type = _light_type_families(product_type)
+    types = brief.get('type') if isinstance(brief.get('type'), dict) else {}
+    fams_from_words = _light_type_families(' '.join(str(v) for v in types.values()))
+    fam = brief.get('family') if brief.get('family') in _LIGHT_TYPE_FAMILIES else None
+    if fams_from_type:
+        fam = sorted(fams_from_type)[0]
+        brief['family_source'] = 'operator'
+    elif fams_from_words and fam not in fams_from_words:
+        fam = sorted(fams_from_words)[0]
+        brief['family_source'] = 'type words'
+    else:
+        brief['family_source'] = 'model'
+    brief['family'] = fam or 'other'
+    terms = brief.get('search_terms') if isinstance(brief.get('search_terms'), dict) else {}
+    kept, dropped = {}, []
+    for st, lst in terms.items():
+        if st not in LIGHT_LANG_LABEL or not isinstance(lst, list):
+            continue
+        ok = []
+        for t in lst:
+            t = str(t).strip()
+            if not t:
+                continue
+            # Compare on the FAMILY, not on text: 'plugin' is a family name,
+            # not a lamp word, so the text-based conflict check never fired.
+            have = _light_type_families(t)
+            if fam != 'other' and have and fam not in have:
+                dropped.append(t)
+            else:
+                ok.append(t)
+        kept[st] = ok[:6]
+    brief['search_terms'] = kept
+    brief['terms_dropped'] = dropped
+    feats = brief.get('features') if isinstance(brief.get('features'), list) else []
+    brief['features'] = [str(f).strip() for f in feats if str(f).strip()][:6]
+    for k in ('what', 'placement', 'power'):
+        brief[k] = str(brief.get(k) or '').strip()[:300]
+    brief['type'] = {k: str(types.get(k) or '').strip() for k in ('nl', 'de', 'com')}
+    return brief
+
+
+@app.route('/api/lighting/understand', methods=['POST'])
+@require_droplet_token
+def api_lighting_understand():
+    """Read the competitor's title + description and say what the product IS.
+    Body: {source_text, product_title, product_type?}. Returns the brief (see
+    _light_brief_guard) or {error}. One haiku call; nothing is stored."""
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        return jsonify({'error': 'Anthropic API key missing'}), 400
+    data = request.json or {}
+    source_text = str(data.get('source_text') or '')[:4000]
+    product_title = str(data.get('product_title') or '').strip()
+    product_type = str(data.get('product_type') or '').strip()
+    if not (source_text.strip() or product_title):
+        return jsonify({'error': 'no source text to read'}), 400
+    fams = ', '.join(sorted(_LIGHT_TYPE_FAMILIES))
+    prompt = (
+        "You read a competitor's product page for a home-LIGHTING webshop and describe what the product "
+        "IS, so a writer and a keyword researcher do not guess. Use ONLY the text below; never invent "
+        "specs. Return compact JSON with exactly these keys:\n"
+        '{"family": one of [' + fams + ', other], '
+        '"type": {"nl": "the common Dutch shop word for this type, 1-2 words", '
+        '"de": "the common German shop word", "com": "the common English shop word"}, '
+        '"what": "one Dutch sentence: what it is, how it is powered, where it is used", '
+        '"placement": "where it goes (wall socket / table / ceiling / outdoor…), in Dutch", '
+        '"power": one of [socket, rechargeable, mains, battery, solar, unknown], '
+        '"features": ["max 6 short Dutch phrases, only what the text states"], '
+        '"search_terms": {"nl": ["3-5 broad terms shoppers type for THIS type, Dutch"], '
+        '"de": ["same, German"], "com": ["same, English"]}}\n'
+        "A lamp that plugs straight into a wall socket is family 'plugin' (nl 'stekkerlamp'), NOT a "
+        "table or wall lamp. A lamp you charge and carry is 'portable'.\n"
+        + (f"The operator already typed the type: \"{product_type}\" — keep it unless the text clearly "
+           f"contradicts it.\n" if product_type else '')
+        + f"\nTitle: {product_title}\nText:\n{source_text}\n"
+    )
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=700,
+                                     messages=[{'role': 'user', 'content': prompt}])
+        txt = (msg.content[0].text if msg.content else '') or ''
+        m = re.search(r'\{.*\}', txt, re.S)
+        raw = json.loads(m.group(0)) if m else {}
+    except Exception as e:
+        return jsonify({'error': f'Could not read the product: {str(e)[:160]}'}), 502
+    brief = _light_brief_guard(raw, product_type)
+    brief['ok'] = True
+    return jsonify(brief)
+
+
 @app.route('/api/lighting/generate', methods=['POST'])
 @require_droplet_token
 def api_lighting_generate():
@@ -23368,9 +23513,17 @@ def api_lighting_generate():
     keywords      = [k for k in (data.get('keywords') or []) if str(k).strip()]
     # Wel: een keyword over een ANDER lamptype gaat eruit. 'hanglamp' in de copy
     # van een stekkerlamp (2026-09-24) kwam hier vandaan.
-    type_dropped  = [k for k in keywords if product_type and _light_type_conflict(k, product_type)]
+    brief         = data.get('brief') if isinstance(data.get('brief'), dict) else {}
+    # De familie van het product: getypt type > brief. Keywords van een ANDER
+    # lamptype gaan eruit ('hanglamp' bij een stekkerlamp).
+    fam_anchor    = product_type or ((brief.get('type') or {}).get('nl') if isinstance(brief.get('type'), dict) else '') or ''
+    families      = _light_type_families(fam_anchor)
+    family        = sorted(families)[0] if families else None
+    type_dropped  = [k for k in keywords if fam_anchor and _light_type_conflict(k, fam_anchor)]
     keywords      = [k for k in keywords if k not in type_dropped]
     only_field    = (data.get('only_field') or '').strip()
+    lang_nl, lang_en = LIGHT_LANG_LABEL.get(store, ('Nederlands', 'Dutch'))
+    type_local    = ((brief.get('type') or {}).get(store) if isinstance(brief.get('type'), dict) else '') or product_type
 
     # Specs die de CONCURRENT zelf noemt — alleen die mogen terugkomen.
     # Let op: dit zijn GENORMALISEERDE claims ('w7', 'k2700'), geen letterlijke
@@ -23391,12 +23544,23 @@ def api_lighting_generate():
         'geen "dimbaar". Beschrijf alleen wat je op de foto en in de tekst ziet.'
     )
 
-    type_line = (f'Het producttype is: {product_type}. Beschrijf het als precies dat type — '
-                 f'noem het nooit een ander soort lamp, ook niet als een keyword dat suggereert.\n'
-                 if product_type else '')
+    type_line = (f'Het producttype is: {product_type or type_local}'
+                 + (f' (in het {lang_nl}: {type_local})' if type_local and type_local != product_type else '')
+                 + '. Beschrijf het als precies dat type — noem het nooit een ander soort lamp (geen tafellamp, '
+                   'hanglamp, wandlamp… als het dat niet is), ook niet als een keyword of het voorbeeld dat suggereert.\n'
+                 if (product_type or type_local) else '')
+    brief_line = ''
+    if brief.get('what'):
+        brief_line = ('Wat dit product IS (gelezen uit de bron bij import):\n'
+                      f"- {brief.get('what')}\n"
+                      + (f"- Voeding: {brief.get('power')}\n" if brief.get('power') else '')
+                      + (f"- Plaatsing: {brief.get('placement')}\n" if brief.get('placement') else '')
+                      + (('- Kenmerken: ' + '; '.join(brief.get('features') or []) + '\n') if brief.get('features') else ''))
     prompt = f"""Je bent productschrijver voor een verlichtingswinkel (The Light Supplier).
-Schrijf productcontent in het {language} voor een lamp genaamd "{product_name}".
-{type_line}
+Schrijf productcontent voor een lamp genaamd "{product_name}".
+
+TAAL: schrijf ALLES — description, meta_description én m_title_specs — in het {lang_nl} ({lang_en}). Geen Nederlands als de taal {lang_en} is. Het stijlvoorbeeld verderop is Nederlands en gaat over een ANDER product (een tafellamp): neem alleen toon, ritme en opbouw over — niet de taal, niet de productsoort, niet de eigenschappen.
+{type_line}{brief_line}
 Producttitel van de bron: {product_title}
 Keywords (verwerk de relevantste natuurlijk; sla een keyword over als het niet bij dit product past): {', '.join(keywords[:12])}
 
@@ -23430,15 +23594,48 @@ Antwoord uitsluitend als geldig JSON:
     if only_field in ('description', 'meta_description', 'm_title_specs'):
         prompt += f"\n\nGeef ALLEEN het veld {only_field} terug in de JSON."
 
-    try:
+    def _ask(p):
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
         msg = client.messages.create(model='claude-sonnet-4-5', max_tokens=1200,
-                                     messages=[{'role': 'user', 'content': prompt}])
+                                     messages=[{'role': 'user', 'content': p}])
         txt = (msg.content[0].text if msg.content else '') or ''
         m = re.search(r'\{.*\}', txt, re.S)
-        out = json.loads(m.group(0)) if m else {}
+        return json.loads(m.group(0)) if m else {}
+
+    def _problems(o):
+        """(wrong_language, other_type_words) for a candidate answer."""
+        desc = str(o.get('description') or '')
+        guess, _ = _light_lang_guess(desc)
+        wrong_lang = bool(guess) and guess != store
+        others = _light_type_words_in(' '.join(str(o.get(k) or '') for k in
+                                               ('description', 'meta_description', 'm_title_specs')),
+                                      exclude_family=family) if family else []
+        return wrong_lang, others
+
+    try:
+        out = _ask(prompt)
+        # Eén herkansing met de fout benoemd: de verkeerde taal (de DE-kaart in
+        # het Nederlands) of een ander lamptype ('tafellamp' voor een stekkerlamp).
+        wrong_lang, others = _problems(out)
+        if wrong_lang or others:
+            fix = '\n\nCORRECTIE — je vorige antwoord was fout:'
+            if wrong_lang:
+                fix += f' het stond niet in het {lang_nl}. Schrijf ALLES in het {lang_nl} ({lang_en}).'
+            if others:
+                fix += (f" je noemde het product {', '.join(others)}; het is een {product_type or type_local}. "
+                        f"Gebruik dat woord en nooit een ander lamptype.")
+            out2 = _ask(prompt + fix)
+            wrong2, others2 = _problems(out2)
+            if (int(wrong2) + int(bool(others2))) <= (int(wrong_lang) + int(bool(others))):
+                out, wrong_lang, others = out2, wrong2, others2
     except Exception as e:
         return jsonify({'error': f'Generation failed: {str(e)[:160]}'}), 502
+    # Vlaggen voor de UI (warn, never block): de medewerker ziet precies wat er
+    # niet klopt en kan herschrijven.
+    if wrong_lang:
+        out['language_mismatch'] = True
+    if others:
+        out['type_mismatch'] = others
     # Markdown eruit, wat het model ook doet: de editor toont platte tekst en de
     # storefront krijgt zijn nadruk via _publish_to_html(bold_leadin=True).
     for k in ('description', 'meta_description', 'm_title_specs'):

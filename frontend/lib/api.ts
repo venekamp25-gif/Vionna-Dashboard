@@ -680,6 +680,10 @@ export const api = {
     competitor_title: string;
     category?: string;
     description?: string;
+    /** Seeds per market from the import-time understanding (Home Decor). When
+     *  given, these replace the LLM-derived seeds for that market: they come
+     *  from the competitor's own text, so they describe THIS product. */
+    seed_terms?: Partial<Record<string, string[]>>;
     min_volume?: number;
     limit?: number;
   }) =>
@@ -1633,6 +1637,25 @@ export interface LightGenerateResponse {
   /** Ticked keywords about a DIFFERENT lamp type than `product_type` — left out
    *  of the copy ("hanglamp" for a stekkerlamp). */
   type_dropped?: string[];
+  /** Still in the wrong language after one retry (a Dutch text for DE). */
+  language_mismatch?: boolean;
+  /** Lamp-type words of another family still in the copy after one retry. */
+  type_mismatch?: string[];
+  error?: string;
+}
+
+/** The import-time product understanding (see LightBrief in lightProduct.tsx). */
+export interface LightUnderstandResponse {
+  ok?: boolean;
+  family?: string;
+  family_source?: string;
+  type?: { nl: string; de: string; com: string };
+  what?: string;
+  placement?: string;
+  power?: string;
+  features?: string[];
+  search_terms?: Partial<Record<LightStore, string[]>>;
+  terms_dropped?: string[];
   error?: string;
 }
 
@@ -1687,6 +1710,11 @@ export const lightingApi = {
       authed: true,
     }),
 
+  /** Read the competitor's title + description and say what the product IS
+   *  (type per market, power, placement, features, search terms). One LLM call. */
+  understand: (params: { source_text: string; product_title: string; product_type?: string }) =>
+    call<LightUnderstandResponse>("/api/lighting/understand", { method: "POST", body: params, authed: true }),
+
   generate: (params: {
     store: LightStore;
     product_name: string;
@@ -1694,6 +1722,9 @@ export const lightingApi = {
     /** The lamp TYPE the operator typed ("Stekkerlamp"). Anchors the copy and
      *  filters ticked keywords about another type; `type_dropped` reports them. */
     product_type?: string;
+    /** The import-time understanding — goes into the prompt so the writer
+     *  knows what the product is, in which language and of which type. */
+    brief?: LightUnderstandResponse | null;
     /** Competitor's own title + description — the ONLY source a spec claim may come from. */
     source_text: string;
     keywords?: string[];
