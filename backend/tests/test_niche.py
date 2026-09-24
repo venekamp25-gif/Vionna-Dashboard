@@ -205,3 +205,71 @@ def test_a_yes_from_an_older_ruleset_is_rechecked():
     # A 'no' or an 'unknown' is untouched: the gate can only overturn a 'yes'.
     assert server._wtl_niche_fresh({'status': 'no', 'ts': _ago(1)})
     assert server._wtl_niche_fresh({'status': 'unknown', 'ts': _ago(0)})
+
+
+# ── plan #11: unisex merch reads as 100% womenswear to the bucketer ─────────
+# A graphic-tee shop sells nothing but tops, so the rules call it 100%
+# womenswear, and the store-audience gate cannot help: such a shop names no
+# audience at all, in neither its domain nor its <title>. Only whoever READS
+# 'Warhammer 40k T-Shirt' sees it. So every rules-'yes' now goes past the LLM
+# too, not just the ambiguous ones.
+MERCH_CATALOGUE = _prods(12, 'Warhammer 40k T-Shirt Black', 'T-Shirts') + \
+                  _prods(8, 'Dune Hoodie Oversized', 'Hoodies')
+MERCH_HINT = 'Geek Store | film- en game-prints'
+
+
+def test_a_rules_yes_is_read_by_the_llm_too(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, 'WTL_NICHE_PATH', str(tmp_path / 'niche.json'))
+    monkeypatch.setattr(server, '_gd_homepage_hint', lambda d, **kw: MERCH_HINT)
+    monkeypatch.setattr(server, 'ANTHROPIC_KEY', 'sk-test')   # an LLM IS available
+    # The two gates before the LLM both wave this shop through — that is the bug.
+    assert server._niche_verdict(server._niche_profile(MERCH_CATALOGUE))[0] == 'yes'
+    assert server._store_audience('geekstore.dk', MERCH_HINT) is None
+
+    seen = {}
+
+    def fake_llm(d, p, prof, hint=''):
+        seen['hint'] = hint
+        return False, 'general'
+    monkeypatch.setattr(server, '_niche_llm', fake_llm)
+    n = server._wtl_niche_check('geekstore.dk', products=MERCH_CATALOGUE, http_status=200)
+    assert (n['status'], n['kind'], n['source']) == ('no', 'general', 'llm')
+    assert seen['hint'] == MERCH_HINT          # the homepage words go along
+
+
+def test_a_confirmed_yes_keeps_its_30_day_verdict(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, 'WTL_NICHE_PATH', str(tmp_path / 'niche.json'))
+    monkeypatch.setattr(server, '_gd_homepage_hint', lambda d, **kw: 'Kvalitetstøj til kvinder')
+    monkeypatch.setattr(server, 'ANTHROPIC_KEY', 'sk-test')   # an LLM IS available
+    monkeypatch.setattr(server, '_niche_llm', lambda *a, **k: (True, 'womenswear'))
+    n = server._wtl_niche_check('basicapparel.dk',
+                                products=_prods(20, 'Sommerkjole', 'Kjoler'), http_status=200)
+    assert (n['status'], n['kind'], n['source']) == ('yes', 'womenswear', 'llm')
+    assert not n.get('unverified')
+    n['ts'] = _ago(2)
+    assert server._wtl_niche_fresh(n)          # a real verdict lasts 30 days
+
+
+def test_an_unanswered_yes_stays_yes_but_flagged(monkeypatch, tmp_path):
+    """Warn, never block: a shop may not disappear because the LLM was down."""
+    monkeypatch.setattr(server, 'WTL_NICHE_PATH', str(tmp_path / 'niche.json'))
+    monkeypatch.setattr(server, '_gd_homepage_hint', lambda d, **kw: 'Shop')
+    monkeypatch.setattr(server, 'ANTHROPIC_KEY', 'sk-test')   # an LLM IS available
+    monkeypatch.setattr(server, '_niche_llm', lambda *a, **k: (None, None))
+    n = server._wtl_niche_check('quiet.dk', products=_prods(20, 'Kjole', 'Kjoler'), http_status=200)
+    assert (n['status'], n['kind']) == ('yes', 'womenswear')
+    assert n['unverified'] is True and n['source'] == 'rules'
+    n['ts'] = _ago(2)
+    assert not server._wtl_niche_fresh(n)      # re-tried tomorrow, not pinned for 30 days
+
+
+def test_without_an_llm_key_a_rules_yes_is_left_alone(monkeypatch, tmp_path):
+    """No key is a missing CONFIG, not doubt about the store — flagging all 655
+    stores 'unconfirmed' would make the flag meaningless."""
+    monkeypatch.setattr(server, 'WTL_NICHE_PATH', str(tmp_path / 'niche.json'))
+    monkeypatch.setattr(server, '_gd_homepage_hint', lambda d, **kw: 'Shop')
+    monkeypatch.setattr(server, 'ANTHROPIC_KEY', None)
+    monkeypatch.setattr(server, '_niche_llm',
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError('llm asked')))
+    n = server._wtl_niche_check('quiet.dk', products=_prods(20, 'Kjole', 'Kjoler'), http_status=200)
+    assert (n['status'], n['source']) == ('yes', 'rules') and not n.get('unverified')
