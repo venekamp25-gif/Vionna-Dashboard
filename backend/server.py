@@ -6315,22 +6315,39 @@ _LIGHT_TYPE_FAMILIES = {
                 r"cordless (?:light|lamp)|rechargeable (?:light|lamp)|portable (?:light|lamp)",
 }
 _LIGHT_TYPE_RES = {k: re.compile(v, re.I) for k, v in _LIGHT_TYPE_FAMILIES.items()}
+# 'portable' (oplaadbaar/draadloos/akku) is a POWER attribute that combines
+# with any placement: an "oplaadbare tafellamp" is table AND portable. It never
+# competes with another family (review of PR #66: legitimate seeds were dropped
+# and correct copy flagged).
+_LIGHT_ATTR_FAMILIES = {'portable'}
+# The copy check runs over PROSE, where bare 'spot(s)', 'nachtlampje', 'night
+# light', 'sconce' and 'Strahler' are ordinary words, not a type claim. Only
+# compound lamp nouns count there; the keyword table above stays as it is.
+_LIGHT_TYPE_COPY_FAMILIES = dict(_LIGHT_TYPE_FAMILIES)
+_LIGHT_TYPE_COPY_FAMILIES['spot'] = r"spotlight\w*|inbouwspot\w*|opbouwspot\w*|einbaustrahler|downlight\w*"
+_LIGHT_TYPE_COPY_FAMILIES['wall'] = r"wandlamp\w*|wandleucht\w*|wall (?:light|lamp|sconce)"
+_LIGHT_TYPE_COPY_FAMILIES['plugin'] = (r"stekkerlamp\w*|stopcontact ?lamp\w*|lamp (?:in|voor) (?:het )?stopcontact|"
+                                       r"steckdosenlamp\w*|steckdosenleucht\w*|plug[- ]?in (?:light|lamp|night ?light|wall light)|"
+                                       r"socket (?:light|lamp)")
+_LIGHT_TYPE_COPY_RES = {k: re.compile(v, re.I) for k, v in _LIGHT_TYPE_COPY_FAMILIES.items()}
 
 
-def _light_type_families(text):
-    """Set of lamp-type families named in `text` (empty when none)."""
+def _light_type_families(text, placement_only=False):
+    """Set of lamp-type families named in `text` (empty when none). With
+    placement_only the attribute families (portable) are left out."""
     t = (text or '').lower()
-    return {k for k, rx in _LIGHT_TYPE_RES.items() if rx.search(t)}
+    fams = {k for k, rx in _LIGHT_TYPE_RES.items() if rx.search(t)}
+    return fams - _LIGHT_ATTR_FAMILIES if placement_only else fams
 
 
 def _light_type_conflict(keyword, product_type):
     """True when the keyword names a lamp type the product is NOT. A keyword
     without any type word ('warm licht eettafel') never conflicts; a product
     type we cannot place in a family never blocks anything (warn, never block)."""
-    want = _light_type_families(product_type)
+    want = _light_type_families(product_type, placement_only=True)
     if not want:
         return False
-    have = _light_type_families(keyword)
+    have = _light_type_families(keyword, placement_only=True)
     return bool(have) and not (have & want)
 
 
@@ -23382,13 +23399,24 @@ def _light_lang_guess(text):
     return best, scores
 
 
-def _light_type_words_in(text, exclude_family=None):
-    """Lamp-type words in `text` that belong to a family other than exclude_family."""
+def _light_type_words_in(text, exclude=None):
+    """Lamp-type words in `text` that belong to a family the product is NOT.
+    `exclude` is the product's own family set (all of them: a "plug-in wall
+    light" is plugin AND wall). The product's own phrases are removed first,
+    so 'wall light' inside 'plug-in wall light' is not counted against it;
+    attribute families (portable) never count; the prose table leaves bare
+    'spot'/'nachtlampje'/'sconce' alone."""
+    excl = set(exclude or ()) | _LIGHT_ATTR_FAMILIES
+    t = (text or '').lower()
+    for fam in excl:
+        rx = _LIGHT_TYPE_COPY_RES.get(fam)
+        if rx is not None:
+            t = rx.sub(' ', t)
     out = []
-    for fam, rx in _LIGHT_TYPE_RES.items():
-        if fam == exclude_family:
+    for fam, rx in _LIGHT_TYPE_COPY_RES.items():
+        if fam in excl:
             continue
-        for m in rx.finditer((text or '').lower()):
+        for m in rx.finditer(t):
             out.append(m.group(0))
     return sorted(set(out))
 
@@ -23399,19 +23427,25 @@ def _light_brief_guard(brief, product_type=''):
       type words the model returned > the model's own 'family' field;
     - search_terms about another family are dropped (with a note)."""
     brief = dict(brief or {})
-    fams_from_type = _light_type_families(product_type)
+    fams_from_type = _light_type_families(product_type, placement_only=True)
     types = brief.get('type') if isinstance(brief.get('type'), dict) else {}
-    fams_from_words = _light_type_families(' '.join(str(v) for v in types.values()))
-    fam = brief.get('family') if brief.get('family') in _LIGHT_TYPE_FAMILIES else None
+    fams_from_words = _light_type_families(' '.join(str(v) for v in types.values()), placement_only=True)
+    fam_raw = brief.get('family')
+    fam = fam_raw if isinstance(fam_raw, str) and fam_raw in _LIGHT_TYPE_FAMILIES else None
     if fams_from_type:
-        fam = sorted(fams_from_type)[0]
+        fams = fams_from_type
         brief['family_source'] = 'operator'
     elif fams_from_words and fam not in fams_from_words:
-        fam = sorted(fams_from_words)[0]
+        fams = fams_from_words
         brief['family_source'] = 'type words'
     else:
+        fams = {fam} if fam else set()
         brief['family_source'] = 'model'
+    fam = sorted(fams)[0] if fams else None
     brief['family'] = fam or 'other'
+    # All placement families the product names (a "plug-in wall light" is
+    # plugin AND wall) — a term of any of them is legitimate.
+    own = fams - _LIGHT_ATTR_FAMILIES
     terms = brief.get('search_terms') if isinstance(brief.get('search_terms'), dict) else {}
     kept, dropped = {}, []
     for st, lst in terms.items():
@@ -23424,8 +23458,9 @@ def _light_brief_guard(brief, product_type=''):
                 continue
             # Compare on the FAMILY, not on text: 'plugin' is a family name,
             # not a lamp word, so the text-based conflict check never fired.
-            have = _light_type_families(t)
-            if fam != 'other' and have and fam not in have:
+            # Attribute families (portable) never conflict.
+            have = _light_type_families(t, placement_only=True)
+            if own and have and not (have & own):
                 dropped.append(t)
             else:
                 ok.append(t)
@@ -23481,10 +23516,12 @@ def api_lighting_understand():
                                      messages=[{'role': 'user', 'content': prompt}])
         txt = (msg.content[0].text if msg.content else '') or ''
         m = re.search(r'\{.*\}', txt, re.S)
-        raw = json.loads(m.group(0)) if m else {}
+        if not m:
+            raise ValueError('the model returned no JSON')
+        raw = json.loads(m.group(0))
+        brief = _light_brief_guard(raw, product_type)
     except Exception as e:
         return jsonify({'error': f'Could not read the product: {str(e)[:160]}'}), 502
-    brief = _light_brief_guard(raw, product_type)
     brief['ok'] = True
     return jsonify(brief)
 
@@ -23517,8 +23554,7 @@ def api_lighting_generate():
     # De familie van het product: getypt type > brief. Keywords van een ANDER
     # lamptype gaan eruit ('hanglamp' bij een stekkerlamp).
     fam_anchor    = product_type or ((brief.get('type') or {}).get('nl') if isinstance(brief.get('type'), dict) else '') or ''
-    families      = _light_type_families(fam_anchor)
-    family        = sorted(families)[0] if families else None
+    families      = _light_type_families(fam_anchor, placement_only=True)
     type_dropped  = [k for k in keywords if fam_anchor and _light_type_conflict(k, fam_anchor)]
     keywords      = [k for k in keywords if k not in type_dropped]
     only_field    = (data.get('only_field') or '').strip()
@@ -23609,8 +23645,15 @@ Antwoord uitsluitend als geldig JSON:
         wrong_lang = bool(guess) and guess != store
         others = _light_type_words_in(' '.join(str(o.get(k) or '') for k in
                                                ('description', 'meta_description', 'm_title_specs')),
-                                      exclude_family=family) if family else []
+                                      exclude=families) if families else []
         return wrong_lang, others
+
+    def _score(wrong, others_):
+        # The wrong language weighs more than one stray type word: a German
+        # text with 'Tischlampe' beats a Dutch text without it.
+        return 2 * int(wrong) + int(bool(others_))
+
+    need = only_field if only_field in ('description', 'meta_description', 'm_title_specs') else 'description'
 
     try:
         out = _ask(prompt)
@@ -23622,11 +23665,23 @@ Antwoord uitsluitend als geldig JSON:
             if wrong_lang:
                 fix += f' het stond niet in het {lang_nl}. Schrijf ALLES in het {lang_nl} ({lang_en}).'
             if others:
-                fix += (f" je noemde het product {', '.join(others)}; het is een {product_type or type_local}. "
+                # The STORE's word for the type (Steckdosenlampe / plug-in
+                # light), not the operator's Dutch word — the retry for the
+                # German card must not be told to say "Stekkerlamp".
+                fix += (f" je noemde het product {', '.join(others)}; het is een {type_local or product_type}"
+                        f"{' (' + lang_nl + ')' if store != 'nl' else ''}. "
                         f"Gebruik dat woord en nooit een ander lamptype.")
-            out2 = _ask(prompt + fix)
+            # The retry may never cost the operator the first answer: a 429 /
+            # timeout keeps answer one plus its flags (storing ≠ oordeel), and
+            # an empty or JSON-less retry does not "win" with a score of 0.
+            try:
+                out2 = _ask(prompt + fix)
+            except Exception as e2:
+                print(f"[lighting] {product_name!r}: retry failed, keeping the first answer: {str(e2)[:120]}")
+                out2 = {}
             wrong2, others2 = _problems(out2)
-            if (int(wrong2) + int(bool(others2))) <= (int(wrong_lang) + int(bool(others))):
+            usable2 = bool(str(out2.get(need) or '').strip())
+            if usable2 and _score(wrong2, others2) <= _score(wrong_lang, others):
                 out, wrong_lang, others = out2, wrong2, others2
     except Exception as e:
         return jsonify({'error': f'Generation failed: {str(e)[:160]}'}), 502

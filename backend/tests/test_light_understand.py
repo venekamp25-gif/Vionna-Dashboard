@@ -87,7 +87,8 @@ class _FakeClient:
 
     def create(self, **kw):
         _FakeClient.prompts.append(kw['messages'][0]['content'])
-        txt = json.dumps(_FakeClient.answers.pop(0))
+        a = _FakeClient.answers.pop(0)
+        txt = a if isinstance(a, str) else json.dumps(a)
         return type('M', (), {'content': [type('T', (), {'text': txt})()]})()
 
 
@@ -176,3 +177,103 @@ def test_understand_endpoint_returns_a_guarded_brief(monkeypatch):
     assert body['ok'] and body['family'] == 'plugin'
     assert body['search_terms'] == {'nl': ['stekkerlamp']} and body['terms_dropped'] == ['hanglamp']
     assert "family 'plugin'" in _FakeClient.prompts[0]
+
+
+# ── v1.309: fixes from the adversarial review of PR #66 ───────────────────
+def test_retry_without_usable_text_never_replaces_the_first_answer(gen):
+    """A prose / truncated retry scored 0 and 'won' → empty card, no flags."""
+    _FakeClient.answers = [
+        {'description': DUTCH, 'meta_description': 'x', 'm_title_specs': 'y'},
+        'Entschuldigung, hier ist die Beschreibung ohne JSON.',
+    ]
+    body = gen('de')
+    assert body['description'] == DUTCH
+    assert body['language_mismatch'] is True and body['type_mismatch'] == ['tafellamp']
+
+
+def test_retry_that_fails_transiently_keeps_the_first_answer_and_its_flags(gen):
+    """429 on the retry is not a verdict: answer one + warning, never a 502."""
+    class Boom(Exception):
+        pass
+
+    def create(self, **kw):
+        _FakeClient.prompts.append(kw['messages'][0]['content'])
+        if len(_FakeClient.prompts) == 2:
+            raise Boom('429 rate limited')
+        return type('M', (), {'content': [type('T', (), {'text': json.dumps(
+            {'description': DUTCH, 'meta_description': 'x', 'm_title_specs': 'y'})})()]})()
+    orig = _FakeClient.create
+    _FakeClient.create = create
+    try:
+        body = gen('de')
+    finally:
+        _FakeClient.create = orig
+    assert body['description'] == DUTCH
+    assert body['language_mismatch'] is True and 'error' not in body
+
+
+def test_wrong_language_weighs_more_than_one_stray_type_word(gen):
+    german_with_word = GERMAN.replace('eine Steckdosenlampe', 'eine kleine Tischlampe')
+    _FakeClient.answers = [
+        {'description': german_with_word, 'meta_description': 'a', 'm_title_specs': 'b'},
+        {'description': DUTCH.replace('tafellamp', 'stekkerlamp'), 'meta_description': 'a', 'm_title_specs': 'b'},
+    ]
+    body = gen('de')
+    assert body['description'] == german_with_word          # right language kept
+    assert body['type_mismatch'] == ['tischlampe'] and not body.get('language_mismatch')
+
+
+def test_correction_names_the_stores_own_type_word(gen):
+    _FakeClient.answers = [
+        {'description': DUTCH, 'meta_description': 'x', 'm_title_specs': 'y'},
+        {'description': GERMAN, 'meta_description': 'a', 'm_title_specs': 'b'},
+    ]
+    gen('de')
+    p = _FakeClient.prompts[1]
+    assert 'het is een Steckdosenlampe (Duits)' in p and 'een Stekkerlamp.' not in p
+
+
+def test_portable_is_an_attribute_not_a_rival_type():
+    # keyword research: 'draadloze lamp' is fine for an oplaadbare tafellamp
+    assert server._light_type_conflict('draadloze lamp', 'Oplaadbare tafellamp') is False
+    assert server._light_type_conflict('hanglamp', 'Oplaadbare tafellamp') is True
+    # brief guard: portable seeds survive, the family is the placement
+    b = server._light_brief_guard({'family': 'portable', 'type': {'nl': 'tafellamp'},
+                                   'search_terms': {'nl': ['oplaadbare lamp', 'tafellamp', 'hanglamp']}},
+                                  'Oplaadbare tafellamp')
+    assert b['family'] == 'table' and b['search_terms'] == {'nl': ['oplaadbare lamp', 'tafellamp']}
+    assert b['terms_dropped'] == ['hanglamp']
+    # copy check: 'oplaadbare lamp' in the text of a table lamp is not a rival
+    assert server._light_type_words_in('Een oplaadbare lamp voor op tafel.', exclude={'table'}) == []
+
+
+def test_multi_family_type_and_prose_words_are_not_flagged():
+    fams = server._light_type_families('Plug-in wall light', placement_only=True)
+    assert fams == {'plugin', 'wall'}
+    assert server._light_type_words_in('This plug-in wall light sits in any socket.', exclude=fams) == []
+    assert server._light_type_words_in('creates warm spots of light on the table', exclude={'pendant'}) == []
+    assert server._light_type_words_in('Perfect als nachtlampje op het nachtkastje', exclude={'table'}) == []
+    assert server._light_type_words_in('Deze tafellamp past overal.', exclude={'plugin'}) == ['tafellamp']
+    b = server._light_brief_guard({'family': 'plugin', 'type': {'nl': 'stekkerlamp'},
+                                   'search_terms': {'nl': ['wandlamp stopcontact', 'stekkerlamp', 'hanglamp']}},
+                                  'Plug-in wall light')
+    assert b['search_terms'] == {'nl': ['wandlamp stopcontact', 'stekkerlamp']} and b['terms_dropped'] == ['hanglamp']
+
+
+def test_guard_survives_a_family_that_is_not_a_string():
+    b = server._light_brief_guard({'family': ['plugin'], 'type': {'nl': 'stekkerlamp'}}, '')
+    assert b['family'] == 'plugin' and b['family_source'] == 'type words'
+    assert server._light_brief_guard({'family': {'x': 1}, 'type': 'nope'}, '')['family'] == 'other'
+
+
+def test_understand_without_json_is_an_error_not_an_empty_brief(monkeypatch):
+    import anthropic
+    monkeypatch.setattr(anthropic, 'Anthropic', _FakeClient)
+    monkeypatch.setattr(server, 'ANTHROPIC_KEY', 'test-key')
+    monkeypatch.setattr(server, 'DROPLET_TOKEN_SECRET', None)
+    monkeypatch.setenv('DEV_LOCAL', '1')
+    _FakeClient.answers, _FakeClient.prompts = ['Ik kan dit niet lezen.'], []
+    server.app.config['TESTING'] = True
+    with server.app.test_client() as c:
+        r = c.post('/api/lighting/understand', json={'source_text': 'x y z', 'product_title': 'Glow'})
+    assert r.status_code == 502 and 'no JSON' in r.get_json()['error']

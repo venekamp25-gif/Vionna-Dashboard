@@ -116,7 +116,10 @@ const LIGHT_DRAFT_KEY = "home_decor_draft_v1";
 
 interface Ctx {
   draft: LightDraft;
-  patch: (p: Partial<LightDraft>) => void;
+  /** Merge fields into the draft. Pass a function to read the LIVE draft at
+   *  apply time — an async result (the import-time brief) must not overwrite
+   *  what the operator typed while the call was in flight. */
+  patch: (p: Partial<LightDraft> | ((d: LightDraft) => Partial<LightDraft>)) => void;
   /** Update ONE market's copy. Must be functional: callers generate several
    *  markets in an await-loop, and a `{...draft.content}` spread built from the
    *  render-time draft would drop every market but the last — silently, since
@@ -155,7 +158,8 @@ export function LightProductProvider({ children }: { children: ReactNode }) {
     }
   }, [draft]);
 
-  const patch = (p: Partial<LightDraft>) => setDraft((d) => ({ ...d, ...p }));
+  const patch = (p: Partial<LightDraft> | ((d: LightDraft) => Partial<LightDraft>)) =>
+    setDraft((d) => ({ ...d, ...(typeof p === "function" ? p(d) : p) }));
   const patchContent = (store: LightStore, p: Partial<LightContent>) =>
     setDraft((d) => ({
       ...d,
