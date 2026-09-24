@@ -27,15 +27,33 @@ const DRAFT_STORAGE_KEY = "vionna-dashboard:active-draft-v1";
  * starting points. That keeps the published catalogue from looking like
  * every product uses the exact same model setup.
  */
+//
+// SELF-HOSTED (frontend/public/bg-refs, deployed with the app). Until 2026-09-24
+// these were four rosamae.com CDN links; the competitor removed the files and all
+// four went 404 — silently. The backend skipped the unreadable reference and
+// step 1 ran with only the competitor photo, so every product got a different
+// background (grey concrete, beige, off-white…). A reference on someone else's
+// CDN is a dependency we cannot see break; our own shots on our own host are not.
 export const BG_REFERENCE_OPTIONS: string[] = [
-  "https://rosamae.com/cdn/shop/files/rosa-mae-anastasia-corset-lace-maxi-dress-maxi-dresses-white-3674260.png?v=1778076206&width=1200",
-  "https://rosamae.com/cdn/shop/files/rosa-mae-sandra-striped-maxi-dress-maxi-dresses-blue-6229760.png?v=1775673464&width=1200",
-  "https://rosamae.com/cdn/shop/files/rosa-mae-althea-long-sleeve-top-tops-blue-8792039.png?v=1778905256&width=1200",
-  "https://rosamae.co.uk/cdn/shop/files/rosa-mae-ruth-cloud-knit-long-sleeve-top-tops-black-2308554.jpg?v=1762948524&width=1000",
+  "/bg-refs/ref-1.jpg", // Agnes — off-white studio, full body
+  "/bg-refs/ref-2.jpg", // Odile — off-white studio, full body, soft floor shadow
+  "/bg-refs/ref-3.jpg", // Blandine — off-white studio, three-quarter
+  "/bg-refs/ref-4.jpg", // Tone — off-white studio, three-quarter
 ];
 
+/** Where the app is served from — the backend downloads the reference by URL,
+ *  so it must be absolute. Netlify in production, the dev server locally. */
+export const PUBLIC_SITE_URL = "https://fashion-dashboard.netlify.app";
+
+export function absoluteBgReferenceUrl(path: string): string {
+  if (/^https?:\/\//i.test(path)) return path;
+  const origin =
+    typeof window !== "undefined" && window.location?.origin ? window.location.origin : PUBLIC_SITE_URL;
+  return `${origin}${path.startsWith("/") ? "" : "/"}${path}`;
+}
+
 export function pickRandomBgReferenceUrl(): string {
-  return BG_REFERENCE_OPTIONS[Math.floor(Math.random() * BG_REFERENCE_OPTIONS.length)];
+  return absoluteBgReferenceUrl(BG_REFERENCE_OPTIONS[Math.floor(Math.random() * BG_REFERENCE_OPTIONS.length)]);
 }
 
 export interface CompetitorInfo {

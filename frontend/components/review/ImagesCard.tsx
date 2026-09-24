@@ -57,13 +57,29 @@ export function ImagesCard() {
 
       <div className="grid grid-cols-1 sm:grid-cols-[1fr_180px] gap-3 mb-6 p-4 rounded-[10px] bg-[var(--accent-soft)] border border-accent/20">
         <Field className="!mb-0">
-          <Label hint="— competitor photo with a nice background">Background reference URL</Label>
-          <Input
-            type="text"
-            value={data.bgReferenceUrl}
-            onChange={(e) => patch({ bgReferenceUrl: e.target.value })}
-            placeholder="https://rosamae.co.uk/cdn/shop/files/...jpg"
-          />
+          <Label hint="— our standard off-white studio shot; paste another image URL to override">Background reference URL</Label>
+          <div className="flex items-center gap-2">
+            {/* A broken reference used to fail silently (four dead CDN links for
+                weeks). The thumbnail makes a dead URL visible before generating. */}
+            {data.bgReferenceUrl && (
+              <img
+                src={data.bgReferenceUrl}
+                alt=""
+                className="w-9 h-12 rounded object-cover border border-border shrink-0 bg-bg-elev-2"
+                onError={(e) => {
+                  e.currentTarget.style.outline = "2px solid var(--danger)";
+                  e.currentTarget.title = "This image cannot be loaded — step 1 will refuse to run with it";
+                }}
+              />
+            )}
+            <Input
+              type="text"
+              value={data.bgReferenceUrl}
+              onChange={(e) => patch({ bgReferenceUrl: e.target.value })}
+              placeholder="/bg-refs/ref-1.jpg"
+              className="flex-1"
+            />
+          </div>
         </Field>
         <Field className="!mb-0">
           <Label>Product type</Label>

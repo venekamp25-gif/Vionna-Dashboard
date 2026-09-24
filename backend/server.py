@@ -5418,17 +5418,31 @@ def _derive_seeds_llm(competitor_title, product_name, category, description, sto
         langs = ', '.join(f'{s}={DFS_LANG_NAME[s]}' for s in stores)
         shape = '{' + ','.join(f'"{s}":[..]' for s in stores) + '}'
         if _is_light_market(stores[0]):
+            # The TYPE the operator typed is the anchor. Without this line a
+            # plug-in night light ("stekkerlamp") was researched as "hanglamp":
+            # the model reached for the most common lamp word (2026-09-24).
+            type_rule = (
+                f"The product TYPE is \"{category}\" (as entered by the operator). EVERY seed must be about "
+                f"THAT type: the type word itself (translated per market) and type + ONE attribute. "
+                f"NEVER a different lamp type — if the type is a plug-in / socket light, no pendant, floor, "
+                f"table or ceiling lamp seeds.\n"
+                if (category or '').strip() else
+                "Use the lamp TYPE you can infer from the product info below; never a different lamp type.\n"
+            )
             head = (
                 "You are a home-LIGHTING e-commerce SEO researcher. For the lamp below, output 3-4 SHORT, "
                 "BROAD search SEED terms in the LOCAL language of each market — the kind of common terms "
                 "shoppers actually type, that other keywords contain. Use the lamp TYPE and type+ONE "
                 "attribute (room, style or finish), each 1-2 words max. Prefer common single compound "
                 "words where the language uses them.\n"
+                + type_rule +
                 "Colour/finish IS wanted (a lamp is one product, so \"zwarte hanglamp\" is a real search).\n"
                 "NEVER use a technical spec (wattage, lumen, IP rating, kelvin, E27/GU10) unless the "
                 "product info below explicitly states it.\n"
-                "Examples — nl: [\"hanglamp\",\"eettafel lamp\",\"zwarte hanglamp\"]; "
-                "de: [\"pendelleuchte\",\"esstisch lampe\"]; com: [\"pendant light\",\"dining table light\"].\n"
+                "Examples — type 'hanglamp' → nl: [\"hanglamp\",\"eettafel lamp\",\"zwarte hanglamp\"]; "
+                "de: [\"pendelleuchte\",\"esstisch lampe\"]; com: [\"pendant light\",\"dining table light\"]. "
+                "Type 'stekkerlamp' → nl: [\"stekkerlamp\",\"nachtlampje stopcontact\",\"lamp in stopcontact\"]; "
+                "de: [\"steckdosenlampe\",\"nachtlicht steckdose\"]; com: [\"plug in night light\",\"plug in wall light\"].\n"
             )
         else:
             head = (
@@ -6277,6 +6291,49 @@ def api_what_to_list():
     return jsonify(out)
 
 
+# ── Lamp TYPE families (nl/de/en) ────────────────────────────────────────────
+# A keyword about a DIFFERENT lamp type than the product is noise, however high
+# its volume: "hanglamp" (33.100/mnd) is worthless copy for a plug-in night
+# light. The family of the product type comes from the operator's own words.
+_LIGHT_TYPE_FAMILIES = {
+    'pendant':  r"hanglamp\w*|pendellamp\w*|pendelleucht\w*|hängelamp\w*|haengelamp\w*|pendant\b|pendants\b|hanging (?:light|lamp)",
+    'ceiling':  r"plafondlamp\w*|plafonni[eè]re\w*|deckenleucht\w*|deckenlamp\w*|ceiling (?:light|lamp)|flush ?mount",
+    'floor':    r"vloerlamp\w*|staande lamp\w*|stehlamp\w*|stehleucht\w*|floor (?:light|lamp)",
+    'table':    r"tafellamp\w*|tischlamp\w*|tischleucht\w*|table (?:light|lamp)|bedside (?:light|lamp)|nachtkastlamp\w*",
+    'desk':     r"bureaulamp\w*|schreibtischlamp\w*|schreibtischleucht\w*|desk (?:light|lamp)",
+    'wall':     r"wandlamp\w*|wandleucht\w*|wall (?:light|lamp|sconce)|sconce",
+    'plugin':   r"stekkerlamp\w*|stopcontact ?lamp\w*|lamp (?:in|voor) (?:het )?stopcontact|nachtlamp\w*|"
+                r"steckdosenlamp\w*|steckdosenleucht\w*|nachtlicht\w*|plug[- ]?in (?:light|lamp|night ?light|wall light)|"
+                r"night ?light\w*|socket (?:light|lamp)",
+    'spot':     r"\bspots?\b|spotlight\w*|inbouwspot\w*|opbouwspot\w*|einbaustrahler|strahler|downlight\w*",
+    'strip':    r"led[- ]?strip\w*|lichtslang|lichtstreifen|light strip\w*|led ?band",
+    'outdoor':  r"buitenlamp\w*|tuinlamp\w*|tuinverlichting|au(?:ß|ss)enleucht\w*|au(?:ß|ss)enlamp\w*|gartenlamp\w*|"
+                r"gartenleucht\w*|outdoor (?:light|lamp)|garden (?:light|lamp)|solar ?(?:light|lamp)|"
+                r"solarlamp\w*|solarleucht\w*|tuinlantaarn\w*",
+    'chandelier': r"kroonluchter\w*|kronleuchter\w*|chandelier\w*",
+    'portable': r"draadloze lamp\w*|oplaadbare lamp\w*|akku ?lamp\w*|akkuleucht\w*|kabellose lamp\w*|"
+                r"cordless (?:light|lamp)|rechargeable (?:light|lamp)|portable (?:light|lamp)",
+}
+_LIGHT_TYPE_RES = {k: re.compile(v, re.I) for k, v in _LIGHT_TYPE_FAMILIES.items()}
+
+
+def _light_type_families(text):
+    """Set of lamp-type families named in `text` (empty when none)."""
+    t = (text or '').lower()
+    return {k for k, rx in _LIGHT_TYPE_RES.items() if rx.search(t)}
+
+
+def _light_type_conflict(keyword, product_type):
+    """True when the keyword names a lamp type the product is NOT. A keyword
+    without any type word ('warm licht eettafel') never conflicts; a product
+    type we cannot place in a family never blocks anything (warn, never block)."""
+    want = _light_type_families(product_type)
+    if not want:
+        return False
+    have = _light_type_families(keyword)
+    return bool(have) and not (have & want)
+
+
 @app.route('/api/research_keywords', methods=['POST'])
 @require_droplet_token
 def api_research_keywords():
@@ -6319,6 +6376,8 @@ def api_research_keywords():
         mv = int(body.get('min_volume') or max(150, DFS_MIN_VOLUME.get(st, 1000) // 4))
         best = {}
         mats_dropped = 0
+        type_dropped = 0
+        light_type = (body.get('category') or '') if _is_light_market(st) else ''
         for seed in st_seeds:
             for kw in _dfs_keyword_suggestions(seed, st, min_volume=mv, limit=20):
                 if 'error' in kw:
@@ -6329,6 +6388,9 @@ def api_research_keywords():
                     continue
                 if _material_concepts_in(k) - allowed_mats:
                     mats_dropped += 1          # fabric the competitor never mentioned
+                    continue
+                if light_type and _light_type_conflict(k, light_type):
+                    type_dropped += 1          # 'hanglamp' for a stekkerlamp
                     continue
                 if k not in best or v > (best[k].get('volume') or 0):
                     kw['seed'] = seed
@@ -6348,7 +6410,9 @@ def api_research_keywords():
         results[st] = {'seeds': st_seeds, 'min_volume': mv, 'keywords': kws,
                        'recommended_count': sum(1 for k in kws if k.get('recommended')),
                        'materials_allowed': sorted(allowed_mats),
-                       'materials_dropped': mats_dropped}
+                       'materials_dropped': mats_dropped,
+                       # Keywords about a different lamp type than the product
+                       'type_dropped': type_dropped, 'product_type': light_type or None}
     return jsonify({'configured': True, 'results': results})
 
 
@@ -15025,17 +15089,43 @@ def _md_inline(s):
     return re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', s or '')
 
 
-def _publish_to_html(text):
+def _md_strip(s):
+    """Remove markdown emphasis/heading markers from copy meant for a plain
+    textarea: **bold**, __bold__, *italic*, leading ## headings. The lighting
+    prompt used to ASK for '**eigenschap**' bullets, so the operator saw literal
+    asterisks in the editor (venek, 2026-09-24: 'haal die sterren eruit')."""
+    s = s or ''
+    s = re.sub(r'\*\*(.+?)\*\*', r'\1', s)
+    s = re.sub(r'__(.+?)__', r'\1', s)
+    s = re.sub(r'(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])', r'\1', s)
+    s = re.sub(r'^\s*#{1,6}\s+', '', s, flags=re.M)
+    return s
+
+
+def _bullet_leadin_html(b):
+    """'Eigenschap: uitleg' → '<strong>Eigenschap</strong>: uitleg' — the visual
+    emphasis the storefront had via **bold**, without markdown in the editor."""
+    m = re.match(r'^([^:<>]{2,48}?):\s+(.+)$', b or '')
+    if m and '<strong>' not in b:
+        return f'<strong>{m.group(1).strip()}</strong>: {m.group(2)}'
+    return b
+
+
+def _publish_to_html(text, bold_leadin=False):
     """Convert plain-text description to body_html (lists when '•' or '-'), with
-    inline **bold** converted to <strong>. Truncates the output if it would
-    exceed Shopify's 65535-char body_html cap so the publish call doesn't get
-    rejected with a cryptic 422."""
+    inline **bold** converted to <strong>. `bold_leadin` (lighting copy) also
+    bolds the 'Eigenschap:' lead-in of each bullet. Truncates the output if it
+    would exceed Shopify's 65535-char body_html cap so the publish call doesn't
+    get rejected with a cryptic 422."""
     lines  = (text or '').strip().splitlines()
     html   = []
     bullets = []
     def flush_bullets():
         if bullets:
-            html.append('<ul>' + ''.join(f'<li>{_md_inline(b)}</li>' for b in bullets) + '</ul>')
+            items = [_md_inline(b) for b in bullets]
+            if bold_leadin:
+                items = [_bullet_leadin_html(b) for b in items]
+            html.append('<ul>' + ''.join(f'<li>{b}</li>' for b in items) + '</ul>')
             bullets.clear()
     for line in lines:
         stripped = line.strip()
@@ -17431,18 +17521,34 @@ def higgsfield_generate():
     try:
         tmp_dir = tempfile.mkdtemp()
 
-        # Download reference images as local files (hf.exe auto-uploads them)
-        local_paths = []
+        # Download reference images as local files (hf.exe auto-uploads them).
+        # A reference that cannot be read is NOT skipped silently any more: the
+        # four background references were dead 404s for weeks (2026-09-24) and
+        # every step 1 ran with only the competitor photo — a different
+        # background per product, and nobody saw why. The FIRST reference is
+        # the one the prompt is built around (background / our model): without
+        # it the step is wrong, so it fails. Later ones (colour samples) are
+        # skipped but reported, so the UI can warn.
+        local_paths, missing_refs = [], []
         for i, url in enumerate(image_urls[:4]):
             img_path = os.path.join(tmp_dir, f'ref_{i}.jpg')
             try:
                 r = _scrape_get(url, timeout=15)
                 r.raise_for_status()
+                ctype = (r.headers.get('Content-Type') or '').lower()
+                if not r.content or ('text/html' in ctype):
+                    raise RuntimeError(f'not an image ({ctype or "empty"})')
                 with open(img_path, 'wb') as f:
                     f.write(r.content)
                 local_paths.append(img_path)
-            except Exception:
-                pass
+            except Exception as e:
+                missing_refs.append(url)
+                print(f'[hf] reference {i} unreadable ({_safe_image_ref(url)}): {str(e)[:120]}')
+        if image_urls and image_urls[0] in missing_refs:
+            return jsonify({'error': 'The reference photo for this step could not be loaded '
+                                     f'({_safe_image_ref(image_urls[0])}). Check the background reference URL '
+                                     'in the Images card (it must point to a live image) and try again.',
+                            'missing_refs': missing_refs}), 502
 
         if not HIGGSFIELD_EXE or not os.path.isfile(HIGGSFIELD_EXE):
             return jsonify({'error': 'Higgsfield CLI binary not found on server. '
@@ -17522,7 +17628,8 @@ def higgsfield_generate():
             }), 502
 
         return jsonify({'urls': kept, 'prompt_used': prompt,
-                        'generated': len(all_urls), 'unreachable': len(lost)})
+                        'generated': len(all_urls), 'unreachable': len(lost),
+                        'missing_refs': missing_refs})
 
     except subprocess.TimeoutExpired:
         return jsonify({'error': _map_higgsfield_error('timeout')}), 504
@@ -22642,6 +22749,131 @@ def _light_probe(store_key):
         return False, f'could not reach the store ({str(e)[:60]})'
 
 
+# ── One-shot: markdown asterisks in LIVE lighting descriptions ──────────────
+# The copy prompt asked for '**eigenschap**' bullets until v1.306; publish did
+# convert them to <strong>, but any description edited/pasted by hand kept the
+# literal asterisks. Runs on the droplet (the only place with lighting tokens).
+LIGHT_MD_FIX_STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lighting_md_fix.json')
+_LIGHT_MD_RE = re.compile(r'\*\*(.+?)\*\*')
+
+
+def _light_md_fix_html(html):
+    """'**x**' → '<strong>x</strong>'; everything else untouched."""
+    return _LIGHT_MD_RE.sub(r'<strong>\1</strong>', html or '')
+
+
+def _light_products_all(store_key, fields='id,title,body_html'):
+    """Every product of a lighting store (all statuses), via REST + Link paging."""
+    out, pages = [], 0
+    next_url = shopify_url(store_key, f'products.json?fields={fields}&status=active,draft,archived&limit=250')
+    while next_url and pages < 40:
+        r = _shopify_call('get', next_url, shopify_headers(store_key), timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(f'{store_key}: HTTP {r.status_code}')
+        out += r.json().get('products', []) or []
+        next_url = None
+        for part in (r.headers.get('Link', '') or '').split(','):
+            if 'rel="next"' in part:
+                u = part.split(';')[0].strip().lstrip('<').rstrip('>')
+                next_url = u if u.startswith('http') else None
+                break
+        pages += 1
+    return out
+
+
+def _light_markdown_fix_once(stores=('nl', 'de', 'com'), dry_run=False):
+    """Scan the lighting stores, rewrite body_html where '**' is literal.
+    Returns {store: {scanned, fixed, failed, titles}}; persists the summary."""
+    summary = {}
+    for k in stores:
+        if k not in LIGHT_TOKENS:
+            continue
+        rep = {'scanned': 0, 'fixed': 0, 'failed': 0, 'titles': []}
+        try:
+            prods = _light_products_all(k)
+        except Exception as e:
+            rep['error'] = str(e)[:120]
+            summary[k] = rep
+            continue
+        for p in prods:
+            rep['scanned'] += 1
+            html = p.get('body_html') or ''
+            if '**' not in html:
+                continue
+            new = _light_md_fix_html(html)
+            if new == html:
+                continue
+            if dry_run:
+                rep['fixed'] += 1
+                rep['titles'].append(p.get('title'))
+                continue
+            try:
+                r = _shopify_call('put', shopify_url(k, f"products/{p['id']}.json"), shopify_headers(k),
+                                  json={'product': {'id': p['id'], 'body_html': new}}, timeout=30)
+                if r.status_code == 200:
+                    rep['fixed'] += 1
+                    rep['titles'].append(p.get('title'))
+                else:
+                    rep['failed'] += 1
+            except Exception:
+                rep['failed'] += 1
+        rep['titles'] = rep['titles'][:40]
+        summary[k] = rep
+    state = {'done': not dry_run, 'dry_run': dry_run, 'at': datetime.datetime.utcnow().isoformat() + 'Z',
+             'summary': summary}
+    try:
+        tmp = LIGHT_MD_FIX_STATE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, LIGHT_MD_FIX_STATE)
+    except Exception as e:
+        print(f'[lighting] md-fix state save failed: {e}')
+    return summary
+
+
+def _light_markdown_fix_boot():
+    """Run once per droplet (state file), 5 minutes after boot, and say what
+    happened in Slack. LIGHT_MD_FIX=0 disables, =again re-runs."""
+    time.sleep(300)
+    try:
+        if os.getenv('LIGHT_MD_FIX') != 'again' and os.path.exists(LIGHT_MD_FIX_STATE):
+            with open(LIGHT_MD_FIX_STATE, encoding='utf-8') as f:
+                if (json.load(f) or {}).get('done'):
+                    return
+        summary = _light_markdown_fix_once()
+        fixed = sum(v.get('fixed', 0) for v in summary.values())
+        scanned = sum(v.get('scanned', 0) for v in summary.values())
+        failed = sum(v.get('failed', 0) for v in summary.values())
+        print(f'[lighting] markdown fix: {fixed} fixed / {scanned} scanned / {failed} failed')
+        if fixed or failed:
+            _blog_slack(f":sparkles: *Lighting descriptions*: literal `**` replaced by bold in {fixed} product(s) "
+                        f"({scanned} scanned" + (f", {failed} failed" if failed else '') + "). "
+                        + ' | '.join(f"{k}: {', '.join(v.get('titles', [])[:6])}" for k, v in summary.items()
+                                     if v.get('fixed')))
+    except Exception as e:
+        print(f'[lighting] markdown fix error: {e}')
+
+
+if (os.getenv('LIGHT_MD_FIX') != '0' and os.getenv('DEV_LOCAL') != '1'
+        and 'pytest' not in sys.modules and LIGHT_TOKENS):
+    try:
+        threading.Thread(target=_light_markdown_fix_boot, daemon=True, name='light-md-fix').start()
+    except Exception as _e:
+        print(f'[lighting] could not start md fix: {_e}')
+
+
+@app.route('/api/lighting/markdown_fix_status')
+def api_lighting_markdown_fix_status():
+    """Read-only: did the one-shot markdown repair run, and what did it change?"""
+    try:
+        with open(LIGHT_MD_FIX_STATE, encoding='utf-8') as f:
+            return jsonify(json.load(f) or {})
+    except FileNotFoundError:
+        return jsonify({'done': False, 'summary': {}})
+    except Exception as e:
+        return jsonify({'error': str(e)[:120]}), 500
+
+
 @app.route('/api/lighting/status')
 def api_lighting_status():
     """Which lighting stores are wired up. Read-only, NEVER exposes a token.
@@ -22835,7 +23067,7 @@ def api_lighting_publish():
             continue
 
         c = content.get(store) or {}
-        body_html = _publish_to_html(c.get('description') or '')
+        body_html = _publish_to_html(_md_strip(c.get('description') or ''), bold_leadin=True)
         variants = ([{'option1': v, 'price': price, 'compare_at_price': compare_at,
                       'sku': _light_make_sku(product_name, v),
                       'inventory_management': None} for v in option_values]
@@ -23050,10 +23282,15 @@ def api_lighting_generate():
     language      = LIGHT_LANGUAGE.get(store, 'Nederlands')
     product_name  = (data.get('product_name') or '').strip()
     product_title = (data.get('product_title') or '').strip()
+    product_type  = (data.get('product_type') or '').strip()
     source_text   = str(data.get('source_text') or '')
     # GEEN _strip_color_kws hier: kleur/finish is voor verlichting een primair
     # zoekwoord ("zwarte hanglamp"), niet een gedeelde-copy-probleem.
     keywords      = [k for k in (data.get('keywords') or []) if str(k).strip()]
+    # Wel: een keyword over een ANDER lamptype gaat eruit. 'hanglamp' in de copy
+    # van een stekkerlamp (2026-09-24) kwam hier vandaan.
+    type_dropped  = [k for k in keywords if product_type and _light_type_conflict(k, product_type)]
+    keywords      = [k for k in keywords if k not in type_dropped]
     only_field    = (data.get('only_field') or '').strip()
 
     # Specs die de CONCURRENT zelf noemt — alleen die mogen terugkomen.
@@ -23075,11 +23312,14 @@ def api_lighting_generate():
         'geen "dimbaar". Beschrijf alleen wat je op de foto en in de tekst ziet.'
     )
 
+    type_line = (f'Het producttype is: {product_type}. Beschrijf het als precies dat type — '
+                 f'noem het nooit een ander soort lamp, ook niet als een keyword dat suggereert.\n'
+                 if product_type else '')
     prompt = f"""Je bent productschrijver voor een verlichtingswinkel (The Light Supplier).
 Schrijf productcontent in het {language} voor een lamp genaamd "{product_name}".
-
+{type_line}
 Producttitel van de bron: {product_title}
-Keywords (verwerk de relevantste natuurlijk): {', '.join(keywords[:12])}
+Keywords (verwerk de relevantste natuurlijk; sla een keyword over als het niet bij dit product past): {', '.join(keywords[:12])}
 
 Alle informatie die we over dit product hebben (van de bron):
 ---
@@ -23095,7 +23335,7 @@ Regels:
 - Gebruik de productnaam ({product_name}) in de eerste en de laatste zin
 - Eerste regel: korte pakkende zin over het gevoel/resultaat in de ruimte
 - Dan een alinea met de naam + waarvoor je hem gebruikt (welke kamer, welk moment)
-- Dan 5 bulletpoints: **eigenschap**: kort wat de klant eraan heeft
+- Dan 5 bulletpoints, elk als "- Eigenschap: kort wat de klant eraan heeft" (gewone tekst, GEEN markdown, geen sterretjes)
 - Slotzin over wat de lamp met de ruimte doet
 - Direct en warm, spreek de lezer aan met "je". Geen loze superlatieven, geen uitroeptekens-spam
 - Kleur/finish MAG je noemen (dit product heeft één beschrijving, kleuren zijn varianten)
@@ -23120,6 +23360,13 @@ Antwoord uitsluitend als geldig JSON:
         out = json.loads(m.group(0)) if m else {}
     except Exception as e:
         return jsonify({'error': f'Generation failed: {str(e)[:160]}'}), 502
+    # Markdown eruit, wat het model ook doet: de editor toont platte tekst en de
+    # storefront krijgt zijn nadruk via _publish_to_html(bold_leadin=True).
+    for k in ('description', 'meta_description', 'm_title_specs'):
+        if isinstance(out.get(k), str):
+            out[k] = _md_strip(out[k])
+    if type_dropped:
+        out['type_dropped'] = type_dropped
 
     # Vangnet: het model kan tóch een spec verzinnen. Warn, never block (Billy J-regel)
     # — de medewerker beslist, maar ziet precies wat er niet klopt.
