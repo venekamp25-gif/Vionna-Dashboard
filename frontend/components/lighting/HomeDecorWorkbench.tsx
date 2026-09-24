@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { Logo } from "@/components/Logo";
 import { ThemeToggle } from "@/components/ThemeToggle";
@@ -75,6 +75,7 @@ export function HomeDecorWorkbench() {
   // Import-time understanding of the product (one LLM read of the competitor's text).
   const [briefLoading, setBriefLoading] = useState(false);
   const [briefError, setBriefError] = useState<string | null>(null);
+  const briefSeq = useRef(0);
   // Bundle picker: your own collections + what the competitor runs.
   const [collections, setCollections] = useState<{ title: string; handle: string; products: number }[]>([]);
   const [bundleInfo, setBundleInfo] = useState<{
@@ -111,6 +112,13 @@ export function HomeDecorWorkbench() {
     if (!url) return;
     setScraping(true);
     setScrapeError(null);
+    setBriefError(null);
+    // A type the previous brief filled in belongs to the PREVIOUS lamp; only a
+    // type the operator typed themselves carries over to the next import.
+    // Otherwise a hanglamp's auto-filled type would anchor the next stekkerlamp
+    // with "operator" authority.
+    const prevType = draft.productType.trim();
+    const typedType = prevType && prevType !== (draft.brief?.type?.nl ?? "").trim() ? prevType : "";
     try {
       const res: ScrapedProduct = await api.scrape(url);
       if (res.error || !res.product) throw new Error(res.error || "Nothing came back");
@@ -161,6 +169,7 @@ export function HomeDecorWorkbench() {
         images: imgs,
         imagesByValue: byValue,
         price: draft.price || firstPrice,
+        productType: typedType,
         content: {},
         brief: null,
       });
@@ -168,22 +177,33 @@ export function HomeDecorWorkbench() {
       // features, search terms) from the competitor's own text. Seeds the
       // keyword research and anchors the copy; fills the type if it is empty.
       // Never blocks the import — no brief just means the old, guessier path.
+      // The sequence number makes sure a slow answer for an EARLIER import (or
+      // one from before "Start over") never lands on the current lamp.
+      const seq = ++briefSeq.current;
       setBriefLoading(true);
       lightingApi
-        .understand({ source_text: sourceText, product_title: p.title ?? "", product_type: draft.productType.trim() })
+        .understand({ source_text: sourceText, product_title: p.title ?? "", product_type: typedType })
         .then((b) => {
+          if (seq !== briefSeq.current) return;
           if (b.error || !b.ok) {
-            setBriefError(b.error || "could not read the product");
+            setBriefError((b.error || "could not read the product").replace(/^Could not read the product:\s*/i, ""));
             return;
           }
           const brief = b as LightBrief;
-          patch({
+          // Read the LIVE draft: the operator may have typed a type while the
+          // call was running, and the operator always wins over the model.
+          patch((d) => ({
             brief,
-            productType: draft.productType.trim() || brief.type?.nl || "",
-          });
+            productType: d.productType.trim() || brief.type?.nl || "",
+          }));
         })
-        .catch((e) => setBriefError(e instanceof Error ? e.message : String(e)))
-        .finally(() => setBriefLoading(false));
+        .catch((e) => {
+          if (seq !== briefSeq.current) return;
+          setBriefError((e instanceof Error ? e.message : String(e)).replace(/^Could not read the product:\s*/i, ""));
+        })
+        .finally(() => {
+          if (seq === briefSeq.current) setBriefLoading(false);
+        });
       // Read the competitor's bundle so we can suggest a matching one of yours.
       // Never blocks the import — no readable bundle just means no suggestion.
       lightingApi
@@ -271,8 +291,10 @@ export function HomeDecorWorkbench() {
       });
       if (r.error) throw new Error(r.error);
       if (r.type_dropped?.length) {
+        // Same anchor the backend uses: typed type, else the brief's type.
+        const anchor = draft.productType.trim() || draft.brief?.type?.nl || "unknown";
         setKwNote(
-          `Left out of the ${LIGHT_STORE_CONFIG[store].label} copy — not a "${draft.productType.trim()}": ${r.type_dropped.join(", ")}. Untick them, or change the product type if it is wrong.`
+          `Left out of the ${LIGHT_STORE_CONFIG[store].label} copy — not a "${anchor}": ${r.type_dropped.join(", ")}. Untick them, or change the product type if it is wrong.`
         );
       }
       const c: LightContent = {
@@ -409,6 +431,10 @@ export function HomeDecorWorkbench() {
                 if (confirm("Clear this lamp and start over?")) {
                   reset();
                   setResults(null);
+                  // Invalidate an in-flight understand call and its error.
+                  briefSeq.current += 1;
+                  setBriefLoading(false);
+                  setBriefError(null);
                 }
               }}
               className="text-[12px] text-text-faint hover:text-danger transition-colors"
@@ -787,19 +813,22 @@ export function HomeDecorWorkbench() {
                         )}
                         <textarea
                           value={c.description}
-                          onChange={(e) => patchContent(s, { description: e.target.value })}
+                          onChange={(e) =>
+                            // The flags describe the GENERATED text; a hand edit clears them.
+                            patchContent(s, { description: e.target.value, languageMismatch: false, typeMismatch: [] })
+                          }
                           rows={8}
                           className="w-full px-3 py-2 rounded-[10px] bg-bg-elev border border-border text-[12px] leading-relaxed focus:outline-none focus:border-accent resize-y"
                         />
                         <input
                           value={c.metaDescription}
-                          onChange={(e) => patchContent(s, { metaDescription: e.target.value })}
+                          onChange={(e) => patchContent(s, { metaDescription: e.target.value, typeMismatch: [] })}
                           placeholder="Meta description"
                           className="w-full mt-2 px-3 h-9 rounded-[10px] bg-bg-elev border border-border text-[12px] focus:outline-none focus:border-accent"
                         />
                         <input
                           value={c.mTitleSpecs}
-                          onChange={(e) => patchContent(s, { mTitleSpecs: e.target.value })}
+                          onChange={(e) => patchContent(s, { mTitleSpecs: e.target.value, typeMismatch: [] })}
                           placeholder="Google Shopping title suffix"
                           className="w-full mt-2 px-3 h-9 rounded-[10px] bg-bg-elev border border-border text-[12px] focus:outline-none focus:border-accent"
                         />
