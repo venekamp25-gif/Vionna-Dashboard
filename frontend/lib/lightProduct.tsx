@@ -13,6 +13,12 @@ export interface LightContent {
   mTitleSpecs: string;
   unverifiedClaims: string[];
   sourceSpecs: string[];
+  /** The copy came back in the wrong language (a Dutch text in the German card)
+   *  even after one retry — warn-only, rewrite. */
+  languageMismatch?: boolean;
+  /** Lamp-type words of ANOTHER family that survived the retry ("tafellamp" for
+   *  a stekkerlamp) — warn-only, rewrite or fix the product type. */
+  typeMismatch?: string[];
 }
 
 export const EMPTY_CONTENT: LightContent = {
@@ -22,6 +28,21 @@ export const EMPTY_CONTENT: LightContent = {
   unverifiedClaims: [],
   sourceSpecs: [],
 };
+
+/** What the product IS, read from the competitor's page at import (one LLM
+ *  call). Seeds the keyword research and anchors the copy, so a plug-in night
+ *  light is never researched or written up as a pendant or table lamp. */
+export interface LightBrief {
+  family: string;
+  family_source?: string;
+  type: { nl: string; de: string; com: string };
+  what: string;
+  placement: string;
+  power: string;
+  features: string[];
+  search_terms: Partial<Record<LightStore, string[]>>;
+  terms_dropped?: string[];
+}
 
 export interface LightImage {
   url: string;
@@ -62,6 +83,8 @@ export interface LightDraft {
   kaching: boolean;
   bundleCollection: string;
   activate: boolean;
+  /** Product understanding from the import step; null until read. */
+  brief?: LightBrief | null;
 }
 
 export const EMPTY_DRAFT: LightDraft = {
@@ -83,6 +106,7 @@ export const EMPTY_DRAFT: LightDraft = {
   kaching: true,
   bundleCollection: "",
   activate: false,
+  brief: null,
 };
 
 /** Own storage key — the fashion draft is keyed per user only (server-side

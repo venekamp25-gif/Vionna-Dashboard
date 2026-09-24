@@ -14,7 +14,7 @@ import {
   type LightPublishResult,
   type ScrapedProduct,
 } from "@/lib/api";
-import { useLightProduct, type LightContent } from "@/lib/lightProduct";
+import { useLightProduct, type LightBrief, type LightContent } from "@/lib/lightProduct";
 import { LightWhatToList } from "./LightWhatToList";
 import { LightStoreConnect } from "./LightStoreConnect";
 
@@ -72,6 +72,9 @@ export function HomeDecorWorkbench() {
   const [researchMarket, setResearchMarket] = useState<LightStore>("nl");
   const [kwLoading, setKwLoading] = useState(false);
   const [kwNote, setKwNote] = useState<string | null>(null);
+  // Import-time understanding of the product (one LLM read of the competitor's text).
+  const [briefLoading, setBriefLoading] = useState(false);
+  const [briefError, setBriefError] = useState<string | null>(null);
   // Bundle picker: your own collections + what the competitor runs.
   const [collections, setCollections] = useState<{ title: string; handle: string; products: number }[]>([]);
   const [bundleInfo, setBundleInfo] = useState<{
@@ -159,7 +162,28 @@ export function HomeDecorWorkbench() {
         imagesByValue: byValue,
         price: draft.price || firstPrice,
         content: {},
+        brief: null,
       });
+      // Understand WHAT the product is (type per market, power, placement,
+      // features, search terms) from the competitor's own text. Seeds the
+      // keyword research and anchors the copy; fills the type if it is empty.
+      // Never blocks the import — no brief just means the old, guessier path.
+      setBriefLoading(true);
+      lightingApi
+        .understand({ source_text: sourceText, product_title: p.title ?? "", product_type: draft.productType.trim() })
+        .then((b) => {
+          if (b.error || !b.ok) {
+            setBriefError(b.error || "could not read the product");
+            return;
+          }
+          const brief = b as LightBrief;
+          patch({
+            brief,
+            productType: draft.productType.trim() || brief.type?.nl || "",
+          });
+        })
+        .catch((e) => setBriefError(e instanceof Error ? e.message : String(e)))
+        .finally(() => setBriefLoading(false));
       // Read the competitor's bundle so we can suggest a matching one of yours.
       // Never blocks the import — no readable bundle just means no suggestion.
       lightingApi
@@ -195,6 +219,9 @@ export function HomeDecorWorkbench() {
         // "Stekkerlamp" was researched as "hanglamp" (the most common lamp word).
         category: draft.productType.trim(),
         description: draft.sourceText,
+        // Seeds from the import-time understanding: what shoppers type for
+        // THIS kind of product, per market. Volume then ranks them.
+        seed_terms: draft.brief?.search_terms ?? undefined,
       });
       if (!r.configured) {
         setKwNote(r.message || "Keyword research isn't switched on for this server yet.");
@@ -238,6 +265,7 @@ export function HomeDecorWorkbench() {
         // The typed TYPE goes with the copy: a "Stekkerlamp" was written up as a
         // "glazen hanglamp voor eettafel" because the writer never saw the type.
         product_type: draft.productType.trim(),
+        brief: draft.brief ?? undefined,
         source_text: draft.sourceText,
         keywords: (draft.keywords[store] ?? []).filter((k) => k.selected).map((k) => k.keyword),
       });
@@ -253,6 +281,8 @@ export function HomeDecorWorkbench() {
         mTitleSpecs: r.m_title_specs ?? "",
         unverifiedClaims: r.unverified_claims ?? [],
         sourceSpecs: r.source_specs ?? [],
+        languageMismatch: !!r.language_mismatch,
+        typeMismatch: r.type_mismatch ?? [],
       };
       // Functional update — generateAll() awaits several markets in a row, and a
       // spread of the render-time draft.content would drop all but the last.
@@ -451,6 +481,68 @@ export function HomeDecorWorkbench() {
             </button>
           </div>
           {scrapeError && <p className="text-[12px] text-danger mt-2">{scrapeError}</p>}
+
+          {scraped && (briefLoading || briefError || draft.brief) && (
+            <div className="mt-4 rounded-xl border border-border bg-bg-elev-2 p-3.5">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide">What this product is</span>
+                <span className="text-[10.5px] text-text-faint">read from the competitor&apos;s text</span>
+              </div>
+              {briefLoading && <p className="text-[12px] text-text-dim mt-2">Reading the competitor&apos;s description…</p>}
+              {briefError && !briefLoading && (
+                <p className="text-[12px] text-danger mt-2">
+                  Could not read the product ({briefError}). Fill in the product type yourself — research and copy still work,
+                  just with less to go on.
+                </p>
+              )}
+              {draft.brief && !briefLoading && (
+                <div className="mt-2 space-y-1.5 text-[12px] text-text">
+                  <p>{draft.brief.what}</p>
+                  <p className="text-text-dim">
+                    <strong className="text-text">Type:</strong> {draft.brief.type?.nl || "—"} · DE {draft.brief.type?.de || "—"} · EN{" "}
+                    {draft.brief.type?.com || "—"}
+                    {draft.brief.family_source === "operator" && (
+                      <span className="text-text-faint"> (from your product type)</span>
+                    )}
+                  </p>
+                  {(draft.brief.power || draft.brief.placement) && (
+                    <p className="text-text-dim">
+                      {draft.brief.power && (
+                        <>
+                          <strong className="text-text">Power:</strong> {draft.brief.power}
+                        </>
+                      )}
+                      {draft.brief.power && draft.brief.placement && " · "}
+                      {draft.brief.placement && (
+                        <>
+                          <strong className="text-text">Placement:</strong> {draft.brief.placement}
+                        </>
+                      )}
+                    </p>
+                  )}
+                  {draft.brief.features.length > 0 && (
+                    <p className="text-text-dim">
+                      <strong className="text-text">Features:</strong> {draft.brief.features.join(" · ")}
+                    </p>
+                  )}
+                  {Object.keys(draft.brief.search_terms ?? {}).length > 0 && (
+                    <p className="text-text-faint text-[11px]">
+                      Search terms for the keyword research:{" "}
+                      {(["nl", "de", "com"] as LightStore[])
+                        .filter((m) => (draft.brief?.search_terms?.[m]?.length ?? 0) > 0)
+                        .map((m) => `${m.toUpperCase()}: ${draft.brief!.search_terms[m]!.join(", ")}`)
+                        .join(" · ")}
+                    </p>
+                  )}
+                  {(draft.brief.terms_dropped?.length ?? 0) > 0 && (
+                    <p className="text-text-faint text-[11px]">
+                      Left out (another kind of lamp): {draft.brief.terms_dropped!.join(", ")}
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
 
           {scraped && (
             <div className="mt-5 grid gap-4 sm:grid-cols-2">
@@ -677,6 +769,17 @@ export function HomeDecorWorkbench() {
                     </div>
                     {c ? (
                       <>
+                        {c.languageMismatch && (
+                          <p className="text-[11px] text-danger mb-2">
+                            This text is not in {LIGHT_STORE_CONFIG[s].language}, even after a retry. Rewrite before publishing.
+                          </p>
+                        )}
+                        {(c.typeMismatch?.length ?? 0) > 0 && (
+                          <p className="text-[11px] text-danger mb-2">
+                            The copy calls this a different kind of lamp ({c.typeMismatch!.join(", ")}) while the product type is
+                            &quot;{draft.productType.trim() || draft.brief?.type?.nl || "unknown"}&quot;. Rewrite, or fix the product type.
+                          </p>
+                        )}
                         {c.sourceSpecs.length > 0 && (
                           <p className="text-[10.5px] text-text-faint mb-2">
                             Specs the source states (safe to use): {c.sourceSpecs.join(", ")}
