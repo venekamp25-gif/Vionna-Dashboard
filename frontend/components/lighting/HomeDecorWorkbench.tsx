@@ -191,6 +191,9 @@ export function HomeDecorWorkbench() {
         stores: draft.selectedStores,
         product_name: draft.productName,
         competitor_title: draft.competitorTitle,
+        // The TYPE the operator typed anchors the research. Without it a
+        // "Stekkerlamp" was researched as "hanglamp" (the most common lamp word).
+        category: draft.productType.trim(),
         description: draft.sourceText,
       });
       if (!r.configured) {
@@ -232,10 +235,18 @@ export function HomeDecorWorkbench() {
         store,
         product_name: draft.productName,
         product_title: draft.competitorTitle,
+        // The typed TYPE goes with the copy: a "Stekkerlamp" was written up as a
+        // "glazen hanglamp voor eettafel" because the writer never saw the type.
+        product_type: draft.productType.trim(),
         source_text: draft.sourceText,
         keywords: (draft.keywords[store] ?? []).filter((k) => k.selected).map((k) => k.keyword),
       });
       if (r.error) throw new Error(r.error);
+      if (r.type_dropped?.length) {
+        setKwNote(
+          `Left out of the ${LIGHT_STORE_CONFIG[store].label} copy — not a "${draft.productType.trim()}": ${r.type_dropped.join(", ")}. Untick them, or change the product type if it is wrong.`
+        );
+      }
       const c: LightContent = {
         description: r.description ?? "",
         metaDescription: r.meta_description ?? "",

@@ -172,6 +172,10 @@ def test_a_womenswear_store_still_passes(monkeypatch, tmp_path):
     """The gate may only ever take stores OUT — never block a real source."""
     monkeypatch.setattr(server, 'WTL_NICHE_PATH', str(tmp_path / 'niche.json'))
     monkeypatch.setattr(server, '_gd_homepage_hint', lambda d, **kw: 'Kvalitetstøj til kvinder')
+    # This test is about the RULES path. On a laptop with a real ANTHROPIC_KEY in
+    # backend/.env the rules-'yes' is read back by the LLM (plan #11) — a paid
+    # call, and source becomes 'llm' (green in CI, red locally). Keep it offline.
+    monkeypatch.setattr(server, '_niche_llm_ready', lambda: False)
     n = server._wtl_niche_check('basicapparel.dk',
                                 products=_prods(20, 'Sommerkjole', 'Kjoler'), http_status=200)
     assert (n['status'], n['kind'], n['source']) == ('yes', 'womenswear', 'rules')

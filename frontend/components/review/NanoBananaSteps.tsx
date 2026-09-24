@@ -111,6 +111,7 @@ export function NanoBananaSteps() {
     const slots: (NbResult | null)[] = Array(TOTAL_VARIANTS).fill(null);
 
     const slotErrors: (string | undefined)[] = Array(TOTAL_VARIANTS).fill(undefined);
+    let refWarning: string | null = null;
     const calls = Array.from({ length: TOTAL_VARIANTS }, async (_, i) => {
       try {
         const res = await higgsfieldQueue.run(() => api.higgsfield({
@@ -121,6 +122,11 @@ export function NanoBananaSteps() {
         }));
         const url = res.urls?.[0];
         if (!url) throw new Error(res.error ?? "No image returned");
+        if (res.missing_refs?.length) {
+          refWarning = `⚠ ${res.missing_refs.length} reference photo(s) could not be loaded and were skipped: ${res.missing_refs
+            .map((u) => u.split("?")[0].split("/").pop())
+            .join(", ")}`;
+        }
         slots[i] = { url, selected: false };
         slotErrors[i] = undefined;
       } catch (e) {
@@ -158,6 +164,9 @@ export function NanoBananaSteps() {
           : "All variants failed. Check Higgsfield + try again.",
       }));
     } else {
+      // Generated, but with a skipped reference: say so instead of shipping a
+      // subtly wrong set (colour samples missing → colours guessed).
+      if (refWarning) setStepErrors((e) => ({ ...e, [stepNum]: refWarning }));
       notify(
         `Step ${stepNum} ready`,
         `${successCount} variants generated — back to review.`,

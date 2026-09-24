@@ -362,6 +362,9 @@ export interface HiggsfieldResponse {
   generated?: number;
   /** How many of those could not be downloaded and were therefore dropped. */
   unreachable?: number;
+  /** Reference images the backend could not load and therefore skipped (the
+   *  first one — background / our model — is never skipped: the call fails). */
+  missing_refs?: string[];
   error?: string;
 }
 
@@ -1627,6 +1630,9 @@ export interface LightGenerateResponse {
   unverified_claims?: string[];
   /** Spec claims the source itself states — these are safe to use. */
   source_specs?: string[];
+  /** Ticked keywords about a DIFFERENT lamp type than `product_type` — left out
+   *  of the copy ("hanglamp" for a stekkerlamp). */
+  type_dropped?: string[];
   error?: string;
 }
 
@@ -1685,6 +1691,9 @@ export const lightingApi = {
     store: LightStore;
     product_name: string;
     product_title: string;
+    /** The lamp TYPE the operator typed ("Stekkerlamp"). Anchors the copy and
+     *  filters ticked keywords about another type; `type_dropped` reports them. */
+    product_type?: string;
     /** Competitor's own title + description — the ONLY source a spec claim may come from. */
     source_text: string;
     keywords?: string[];
