@@ -12722,7 +12722,8 @@ def _similarweb_bulk(hosts):
 # De dropship-verdict zegt alleen 'dropshipper of merk'; niets keek naar wat er
 # verkocht wordt. Gemeten pool 2026-09-15: intersport, golfexperten, skechers,
 # een meubelwinkel met groene dropshipper-chip. Eén products.json-call + de
-# bucketer geeft het antwoord in ~1-3 s; alleen bij twijfel een haiku-call.
+# bucketer geeft het antwoord in ~1-3 s; een 'ja' (en twijfel) gaat daarna langs
+# een haiku-call, 30 dagen gecached -- zie _wtl_niche_check.
 WTL_NICHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wtl_niche.json')
 _WTL_NICHE_TTL = 30 * 86400
 _WTL_NICHE_TRANSIENT_TTL = 86400      # 'unknown' door een storing: morgen opnieuw
@@ -12735,7 +12736,9 @@ _WTL_NICHE_KINDS = ('womenswear', 'menswear', 'kids', 'jewelry', 'shoes', 'beaut
 # uitvallen: een 'yes' van een oudere ruleset telt dan niet meer als vers en
 # wordt opnieuw beoordeeld bij de volgende 'Check niche'. Zonder dit blijft een
 # fout oordeel 30 dagen staan en ziet de medewerker de fix niet (bug #62).
-_WTL_NICHE_RULES = 2
+#   2 = store-audience-poort (bug #62)
+#   3 = LLM leest OOK elke rules-'yes' na (plan #11)
+_WTL_NICHE_RULES = 3
 
 
 def _wtl_niche_load():
@@ -12988,9 +12991,16 @@ def _store_audience(domain, hint=''):
     return None
 
 
+def _niche_llm_ready():
+    """Is er een sleutel om de LLM-lezing mee te doen? Zonder sleutel is een
+    uitblijvend oordeel geen twijfel OVER de winkel maar een ontbrekende
+    configuratie -- dan mag een rules-'yes' niet als 'onbevestigd' de lijst in."""
+    return bool(ANTHROPIC_KEY and ANTHROPIC_KEY != 'VOELINJEYHIER')
+
+
 def _niche_llm(domain, products, profile, hint=''):
-    """Tie-break for the ambiguous zone. Returns (True|False|None, kind)."""
-    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+    """Reads the catalogue itself. Returns (True|False|None, kind)."""
+    if not _niche_llm_ready():
         return None, None
     lines = []
     for p in (products or [])[:40]:
@@ -13071,16 +13081,27 @@ def _wtl_niche_check(domain, products=None, http_status=None, error=None, save=T
                 reason = ("the store presents itself as a "
                           + ('kids' if audience == 'kids' else "men's")
                           + f' store ({reason})')
-            elif status == 'ambiguous':
+            elif status == 'ambiguous' or _niche_llm_ready():
+                # Ook een rules-'yes' wordt nagelezen (plan #11). De bucketer leest
+                # een unisex merch-winkel als 100% damesmode -- 'Warhammer T-Shirt'
+                # is voor hem gewoon een T-shirt -- en de audience-poort hierboven
+                # helpt daar niet: zo'n winkel noemt in domein noch <title> een
+                # doelgroep. Alleen wie de producttitels LEEST ziet het. Kost 1
+                # haiku-call per winkel, 30 dagen gecached.
                 wf, k = _niche_llm(bare, products, prof, hint=hint)
-                source = 'llm'
                 if wf is True:
-                    status, kind = 'yes', 'womenswear'
+                    status, kind, source = 'yes', 'womenswear', 'llm'
                 elif wf is False:
-                    status, kind = 'no', (k or _niche_kind_from_profile(prof))
-                else:
+                    status, kind, source = 'no', (k or _niche_kind_from_profile(prof)), 'llm'
+                elif status == 'ambiguous':
                     # Geen oordeel te krijgen: doorlaten met een vlag (warn, never block).
-                    status, kind, unverified = 'yes', 'womenswear', True
+                    status, kind, source, unverified = 'yes', 'womenswear', 'llm', True
+                    reason += ' — niet bevestigd'
+                else:
+                    # Een rules-'yes' die de LLM niet kon bevestigen blijft een
+                    # 'yes' -- de regels houden het laatste woord (warn, never
+                    # block) -- maar met de vlag, en dus morgen opnieuw.
+                    unverified = True
                     reason += ' — niet bevestigd'
         entry = {'status': status, 'reason': reason, 'kind': kind,
                  'fashion_share': prof['fashion_share'], 'clothing_share': prof['clothing_share'],
@@ -14823,12 +14844,9 @@ def _wtl_traffic_loop():
                     _wtl_discover(todo)
         except Exception as e:
             print(f'[wtl] discovery loop error: {e}')
-        try:
-            res = _wtl_classify_missing(sorted(_wtl_all_domains()), cap=5)
-            if res.get('classified'):
-                print(f"[wtl] weekly verdicts: {res}")
-        except Exception as e:
-            print(f'[wtl] verdict loop error: {e}')
+        # De dropship-verdicts draaien niet meer mee in deze lus: 5 winkels per
+        # 12 uur haalde de wachtrij van 296 'Onbekend' nooit in. _wtl_classify_loop
+        # hieronder is nu de enige eigenaar ervan (plan #11).
         try:
             # Niche voor de bestaande pool (460 domeinen): 60 per 12 uur, dus in
             # een paar dagen is alles gelabeld zonder een winkel te bestoken.
@@ -14844,6 +14862,67 @@ try:
     threading.Thread(target=_wtl_traffic_loop, daemon=True, name='wtl-traffic').start()
 except Exception as _e:
     print(f'[wtl] could not start traffic loop: {_e}')
+
+
+# ── Dropship-wachtrij: 296 winkels stonden op 'niet gecheckt' ───────────────
+# _wtl_classify_store levert 'Onbekend' als het verzendbeleid onleesbaar is, en
+# zo'n winkel gaat bewust TOCH de pool in met een 'niet gecheckt'-chip (bug #22:
+# de strenge lat filterde juist de kleine dropshippers weg). De poort strenger
+# maken zou die fout herhalen; de wachtrij moet gewoon weggewerkt worden. De
+# '🛡 Verify dropshippers'-knop doet dat werk al -- er was alleen niemand die 'm
+# vaak genoeg indrukte (plan #11, bug #62).
+_WTL_CLASSIFY_BLOCK = 10        # winkels per ronde (sequentieel, traag werk)
+_WTL_CLASSIFY_ROUNDS = 12       # rondes per dag -> 120 winkels/dag
+_WTL_CLASSIFY_PAUSE = 60        # adempauze tussen twee rondes
+
+
+def _wtl_classify_pass(rounds=None, block=None, pause=None):
+    """Eén dagelijkse rit: `rounds` blokken van `block` winkels, met het slot
+    tussendoor LOS -- anders zou de knop een uur lang 'classification already
+    running' melden. Stopt zodra de wachtrij leeg is (een blok dat niet vol
+    raakt) of een handmatige job het slot vasthoudt. Returns: aantal winkels."""
+    rounds = _WTL_CLASSIFY_ROUNDS if rounds is None else int(rounds)
+    block = _WTL_CLASSIFY_BLOCK if block is None else int(block)
+    pause = _WTL_CLASSIFY_PAUSE if pause is None else pause
+    done = 0
+    for i in range(max(1, rounds)):
+        try:
+            res = _wtl_classify_missing(sorted(_wtl_all_domains()), cap=block) or {}
+        except Exception as e:
+            print(f'[wtl] classify pass error: {e}')
+            break
+        if res.get('error'):
+            break                      # de knop draait -- morgen weer
+        n = int(res.get('classified') or 0)
+        done += n
+        if n < block:
+            break                      # wachtrij leeg
+        if i + 1 < max(1, rounds) and pause:
+            time.sleep(pause)
+    return done
+
+
+def _wtl_classify_loop():
+    """Dagelijks een blok onbeoordeelde winkels classificeren, zoals de niche-lus,
+    zodat de teller vanzelf naar 0 loopt. Dezelfde check als de knop, alleen
+    gespreid. Kill switch: WTL_CLASSIFY_LOOP=0."""
+    if os.getenv('WTL_CLASSIFY_LOOP', '1') == '0':
+        return
+    time.sleep(900)                    # de traffic-lus eerst zijn gang laten gaan
+    while True:
+        try:
+            done = _wtl_classify_pass()
+            if done:
+                print(f'[wtl] daily dropship pass: {done} store(s) classified')
+        except Exception as e:
+            print(f'[wtl] classify loop error: {e}')
+        time.sleep(24 * 3600)
+
+
+try:
+    threading.Thread(target=_wtl_classify_loop, daemon=True, name='wtl-classify').start()
+except Exception as _e:
+    print(f'[wtl] could not start classify loop: {_e}')
 
 
 @app.route('/api/set_products_status', methods=['POST'])
