@@ -130,3 +130,16 @@ test("fetch: a non-product URL never hits the network", async () => {
   assert.equal(r.ok, false);
   assert.equal(called, false);
 });
+
+test("fetch: a locale-prefixed .json that 404s is retried without the prefix", async () => {
+  const seen: string[] = [];
+  const r = await fetchProductJsonFromBrowser("https://shop.com/en-us/products/aora", {
+    fetchImpl: fakeFetch((url) => {
+      seen.push(url);
+      if (url.includes("/en-us/")) return { ok: false, status: 404, headers: new Headers(), text: async () => "" };
+      return okResponse(PRODUCT);
+    }),
+  });
+  assert.equal(r.ok, true);
+  assert.deepEqual(seen, ["https://shop.com/en-us/products/aora.json", "https://shop.com/products/aora.json"]);
+});

@@ -31,6 +31,21 @@ export const RATE_LIMIT_PATTERN =
 export const BLOCKED_PATTERN =
   /cloudflare|anti-bot|blocking|cdn|geo-restrict|authentication|private|preventing|forbidden/i;
 
+/**
+ * Only a shop that REFUSES our server (rate-limit or anti-bot wall) justifies
+ * reading it from the operator's browser. A bare "API /api/scrape → 502" (the
+ * droplet restarting for a self-update), a timeout or "Failed to fetch" is a
+ * transient dashboard failure: the paste offer may still show (it is harmless),
+ * but the browser route must not run and must not call it "this shop blocks us".
+ */
+export function isShopRefusal(message: string | null | undefined): boolean {
+  const msg = message ?? "";
+  if (RATE_LIMIT_PATTERN.test(msg)) return true;
+  if (/^API \/api\/scrape/.test(msg)) return false;
+  if (/\b50[234]\b|timeout|timed out|failed to fetch|network/i.test(msg)) return false;
+  return /anti-bot|blocking our scraper|blocks our server|temporarily blocking|geo-restricted|forbidden|cloudflare/i.test(msg);
+}
+
 export function classifyScrapeError(message: string | null | undefined): ScrapeFailure {
   const msg = message ?? "";
   // Rate-limit first: the 429 body mentions our scraper being refused, which

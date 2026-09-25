@@ -3172,8 +3172,20 @@ def api_size_chart_recheck():
 
 
 _PAGE_TEXT_MAX = 6000
-_PAGE_BLOCK_RE = re.compile(r'<(script|style|noscript|svg|template|iframe|form|header|footer|nav)\b[^>]*>.*?</\1\s*>',
-                            re.I | re.S)
+# Never text: code, styles, icons. Forms and headers are NOT stripped inside
+# <main> — older themes wrap the whole buy box (description included) in
+# <form action="/cart/add"> and put the title in a <header> (review of #68).
+_PAGE_STRIP_RE = re.compile(r'<(script|style|noscript|svg|template|iframe)\b[^>]*>.*?</\1\s*>', re.I | re.S)
+# Page chrome, stripped when there is no <main> to narrow to; inside <main> only <nav>.
+_PAGE_CHROME_RE = re.compile(r'<(header|footer|nav)\b[^>]*>.*?</\1\s*>', re.I | re.S)
+_PAGE_NAV_RE = re.compile(r'<nav\b[^>]*>.*?</nav\s*>', re.I | re.S)
+# Review / upsell / cart widgets live in DIVs inside the product section
+# (Judge.me jdgm-widget, Loox looxReviews, Yotpo, Okendo, Stamped); their
+# server-rendered text (star ratings, "Write a review", upsell badges) must not
+# become a claim about the product.
+_PAGE_WIDGET_RE = re.compile(
+    r'<div\b[^>]*(?:jdgm|judgeme|loox|yotpo|okendo|stamped|reviews?-widget|review-list|cart-drawer|cart__drawer|'
+    r'upsell|cross-?sell|recommendations?|related-products|recently-viewed)[^>]*>.*?</div\s*>', re.I | re.S)
 # Sections that describe OTHER products or the shop, never this product:
 # related/recommended carousels, recently viewed, reviews widgets, cart drawer,
 # newsletter, menus. Matched on id/class of section/aside/div-with-id blocks.
@@ -3221,12 +3233,17 @@ def _page_text_from_html(html, handle=None):
     m = re.search(r'<main\b[^>]*>(.*?)</main\s*>', h, re.I | re.S)
     if m:
         body = m.group(1)
-    body = _PAGE_BLOCK_RE.sub(' ', body)
+    body = _PAGE_STRIP_RE.sub(' ', body)
+    body = _PAGE_NAV_RE.sub(' ', body) if m else _PAGE_CHROME_RE.sub(' ', body)
     body = _PAGE_NOISE_RE.sub(' ', body)
+    body = _PAGE_WIDGET_RE.sub(' ', body)
     # Cards/links to OTHER products: their text would become claims about
-    # this one ("cashmere" from a related-products carousel).
+    # this one ("cashmere" from a related-products carousel). The href may be
+    # percent-encoded while the .json handle is not — accept both spellings.
     if handle:
-        body = re.sub(r'<a\b[^>]*href="[^"]*/products/(?!' + re.escape(handle) + r'(?:[/?#."]|$))[^"]*"[^>]*>.*?</a\s*>',
+        spellings = {re.escape(handle), re.escape(urllib.parse.quote(handle, safe=''))}
+        own = '(?:' + '|'.join(sorted(spellings)) + ')'
+        body = re.sub(r'<a\b[^>]*href="[^"]*/products/(?!' + own + r'(?:[/?#."]|$))[^"]*"[^>]*>.*?</a\s*>',
                       ' ', body, flags=re.I | re.S)
     body = re.sub(r'<(?:br|/p|/li|/h\d|/div|/section|/tr|/dd|/dt)\b[^>]*>', '\n', body, flags=re.I)
     body = re.sub(r'<[^>]+>', ' ', body)
@@ -3257,13 +3274,18 @@ def _body_html_text(body_html):
 _BODY_TEXT_THIN = 200
 
 
-def _page_text_for(base, fallback_html, html_url=None):
+def _page_text_for(base, fallback_html, html_url=None, prior_status=None):
     """(page_text, status) for a scraped product: 'json' when body_html is
-    fine, 'page' when the page text filled the gap, else why not."""
+    fine, 'page' when the page text filled the gap, else why not.
+    `prior_status`: what an EARLIER fetch of the page in this request got
+    (HTTP code or 'error') — then we do not ask the refusing host again."""
     if len(_body_html_text(base.get('body_html'))) >= _BODY_TEXT_THIN:
         return None, 'json'
     html_text = fallback_html
     status = 'unavailable'
+    if not html_text and prior_status is not None:
+        return None, ('rate_limited' if prior_status == 429 else
+                      'unreachable' if prior_status == 'error' else f'http_{prior_status}')
     if not html_text and html_url:
         try:
             hr = _scrape_get(html_url, timeout=15)
@@ -3279,13 +3301,38 @@ def _page_text_for(base, fallback_html, html_url=None):
     return (txt or None), ('page' if txt else 'empty')
 
 
+# Words that claim how a lamp is POWERED or triggered. One table for the
+# keyword filter and the copy claims. Tightened after the review of #68:
+# 'wireless remote', 'kabellose Fernbedienung', 'akkurat', 'Solaris' and the
+# shop's 'outlet' are not power claims; 'accu', 'opladen via USB-C', 'plug it
+# in', 'Netzbetrieb', 'schemering' are.
+_LIGHT_POWER_RES = {
+    'rechargeable': re.compile(
+        r"\b(?:oplaadba(?:ar|re)|herlaadba\w*|oplaadtijd|opladen|oplaadt|accu(?:s|pack|'s)?\b|"
+        r"wiederaufladbar\w*|aufladbar\w*|aufladen|akkus?\b|akku[- ]?(?:betrieb|lampe|leucht|pack|laufzeit)\w*|"
+        r"ladezeit|rechargeable|recharg\w*|charg(?:e|es|ed|ing)\b|op batterijen|batterij\w*|batter(?:y|ies)|"
+        r"batterie\w*|\d+\s*mah|lithium)\b", re.I),
+    'cordless': re.compile(
+        r"\b(?:draadlo(?:os|ze)|snoerloo?s|kabellos\w*|cordless|wireless)\b"
+        r"(?!\s*(?:remote|afstandsbediening|fernbedienung|charg\w*|opla\w*|lade\w*|laden|speaker|luidspreker|"
+        r"lautsprecher|bluetooth|control|bediening|schakelaar|switch|schalter))", re.I),
+    'solar': re.compile(
+        r"\b(?:solar(?:lamp|leucht|licht|light|panel|paneel|powered|betrieb|energie|cel|zelle)\w*|solar[- ]powered|"
+        r"solar\b|zonne-?energie|zonnepane\w*|op zonne\w*)", re.I),
+    'sensor': re.compile(
+        r"\b(?:schemer(?:sensor|schakelaar|ing)|dusk[- ]to[- ]dawn|d[äa]mmerung\w*|bewegings(?:sensor|melder)|"
+        r"motion[- ]?(?:sensor|detect\w*|activated)|bewegungs(?:sensor|melder)|(?:light|licht|lichts)[- ]?sensor\w*|"
+        r"sensors?\b|sensoren)\b", re.I),
+    'socket': re.compile(
+        r"\b(?:stekker\w*|stopcontact\w*|steckdose\w*|plug[- ]?in\b|plug(?:s|ged)?\s+(?:it\s+)?in(?:to)?\b|"
+        r"(?:wall|power|electrical|any|the)\s+outlets?\b|into\s+(?:an|the|any)\s+outlet|wall socket|"
+        r"netzbetrieb|netzstrom|netstroom|mains[- ]powered|op netstroom)\b", re.I),
+}
+# 'oplaadbaar' and 'draadloos' both mean "not from the socket" for the keyword filter
 _LIGHT_POWER_WORDS = {
-    # keyword words that claim a power source — a research keyword may not
-    # claim one the product does not have ('oplaadbare lamp' for a plug-in lamp)
-    'rechargeable': re.compile(r'oplaadba|wiederauflad|aufladbar|akku|rechargeab|batterij|battery|batterie|'
-                               r'draadlo|kabellos|cordless|wireless|snoerloo', re.I),
-    'solar':        re.compile(r'solar|zonne', re.I),
-    'socket':       re.compile(r'stekker|stopcontact|steckdose|plug[- ]?in|outlet|wall socket', re.I),
+    'rechargeable': re.compile('|'.join(f'(?:{_LIGHT_POWER_RES[k].pattern})' for k in ('rechargeable', 'cordless')), re.I),
+    'solar': _LIGHT_POWER_RES['solar'],
+    'socket': _LIGHT_POWER_RES['socket'],
 }
 
 
@@ -3524,15 +3571,18 @@ def scrape():
     # sibling discovery below reuses it instead of fetching the page twice.
     size_chart = None
     size_chart_verdict = {}
+    html_fetch_status = None     # what the page fetch here got, for _page_text_for
     try:
         if fallback_html is None:
             sc_r = _scrape_get(html_url, timeout=10)
+            html_fetch_status = sc_r.status_code
             if sc_r.status_code == 200:
                 fallback_html = sc_r.text
         if fallback_html:
             size_chart = _extract_size_chart_full(fallback_html, html_url,
                                                   size_chart_verdict)
     except Exception as e:
+        html_fetch_status = html_fetch_status or 'error'
         print(f"[scrape] size-chart fetch failed: {e}")
 
     # If we couldn't read a chart, check whether one nonetheless EXISTS (unknown
@@ -3543,7 +3593,7 @@ def scrape():
     size_chart_status = 'found' if size_chart else ('unread' if size_chart_hint else 'none')
 
     # The PAGE's text when the .json body is empty/thin (theme-section shops).
-    page_text, page_text_status = _page_text_for(base, fallback_html, html_url)
+    page_text, page_text_status = _page_text_for(base, fallback_html, html_url, prior_status=html_fetch_status)
     if page_text:
         print(f"[scrape] body_html thin — read {len(page_text)} chars from the page itself")
 
@@ -22872,10 +22922,38 @@ _LIGHT_DIM_RE = re.compile(
 # Netspanning is een constante, geen productclaim — nooit flaggen.
 _LIGHT_MAINS_RE = re.compile(r'\b2[23]0\s*-?\s*240?\s*v(?:olt)?\b|\b2[23]0\s*v(?:olt)?\b', re.I)
 
+# Negated specs/claims. Verb negation (niet/nicht/not) works for a property
+# ('niet dimbaar', 'nicht wiederaufladbar'); for the SOCKET only absence words
+# count ('geen stopcontact nodig', 'ohne Steckdose', 'no outlet needed') and
+# never a second/other socket ('blockiert keine zweite Steckdose') — 'blockiert
+# nicht die Steckdose daneben' is not a claim that it needs no socket.
 _LIGHT_NEG_RE = re.compile(
     r'\b(?:niet|geen|non|not|no|nicht|kein[e]?|zonder|without|ohne)\s+(?:\w+\s+){0,2}?'
     r'(dimbaar|dimbare|dimmbar|dimmable|waterdicht|wasserdicht|waterproof|'
-    r'stopcontact\w*|stekker\w*|steckdose\w*|outlet|wall socket|plug[- ]?in)\b', re.I)
+    r'oplaadba(?:ar|re)|wiederaufladbar|aufladbar|rechargeable|akku\w*|accu\w*|batterij\w*|batter(?:y|ies)|batterie\w*|'
+    r'draadlo(?:os|ze)|kabellos\w*|cordless|wireless|solar\w*|'
+    r'sensor\w*|schemersensor|bewegingssensor|d[äa]mmerungssensor|dusk[- ]to[- ]dawn)\b', re.I)
+_LIGHT_NEG_SOCKET_RE = re.compile(
+    r'\b(?:geen|kein[e]?|no|zonder|without|ohne)\s+'
+    r'(?!(?:\w+\s+){0,2}?(?:zweite|tweede|second|andere|other|weitere|extra|nog|ander)\b)(?:\w+\s+){0,2}?'
+    r'(stopcontact\w*|stekker\w*|steckdose\w*|outlets?|wall socket|plug[- ]?in)\b', re.I)
+
+
+def _light_neg_claim(word):
+    w = word.lower()
+    if w.startswith('dim'):
+        return 'dimbaar'
+    if w.startswith(('water', 'wasser')):
+        return 'waterproof'
+    if w.startswith(('draadlo', 'kabellos', 'cordless', 'wireless')):
+        return 'draadloos'
+    if w.startswith('solar'):
+        return 'solar'
+    if w.startswith(('sensor', 'schemer', 'beweg', 'dämmer', 'dammer', 'dusk')):
+        return 'sensor'
+    if w.startswith(('stopcontact', 'stekker', 'steckdose', 'outlet', 'wall', 'plug')):
+        return 'stopcontact'
+    return 'oplaadbaar'
 
 # (regex, normalisatie-functie) — elke match wordt één canonieke claim.
 _LIGHT_SPEC_PATTERNS = [
@@ -22906,16 +22984,13 @@ _LIGHT_SPEC_PATTERNS = [
     (re.compile(r'\b(?:energielabel|energieklasse|energy\s+class)\s*[:=]?\s*([a-g](?:\+{1,3})?)\b', re.I),
      lambda m: 'energy' + m.group(1).lower()),
     # Voeding — een stekkerlamp werd 'oplaadbaar en draadloos' (2026-09-25).
-    # Dezelfde regel als bij specs: alleen wat de bron zelf zegt.
-    (re.compile(r'\b(?:oplaadba(?:ar|re)|wiederaufladbar\w*|aufladbar\w*|akku\w*|rechargeable|'
-                r'op batterijen|batterij\w*|batter(?:y|ies)|batterie\w*)\b', re.I), lambda m: 'oplaadbaar'),
-    (re.compile(r'\b(?:draadlo(?:os|ze)|kabellos\w*|cordless|wireless|snoerloo?s)\b', re.I), lambda m: 'draadloos'),
-    (re.compile(r'\b(?:solar\w*|zonne-?energie|zonnepane\w*)\b', re.I), lambda m: 'solar'),
-    (re.compile(r'\b(?:schemer(?:sensor|schakelaar)|dusk[- ]to[- ]dawn|d[äa]mmerungs\w*|bewegings(?:sensor|melder)|'
-                r'motion[- ]?(?:sensor|detect\w*)|bewegungs(?:sensor|melder)|(?:light|licht)[- ]?sensor|sensor)\b', re.I),
-     lambda m: 'sensor'),
-    (re.compile(r'\b(?:stekker\w*|stopcontact\w*|steckdose\w*|plug[- ]?in|(?:wall )?outlet|wall socket|'
-                r'in het stopcontact)\b', re.I), lambda m: 'stopcontact'),
+    # Dezelfde regel als bij specs: alleen wat de bron zelf zegt. Eén tabel
+    # met de keyword-filter (_LIGHT_POWER_RES).
+    (_LIGHT_POWER_RES['rechargeable'], lambda m: 'oplaadbaar'),
+    (_LIGHT_POWER_RES['cordless'], lambda m: 'draadloos'),
+    (_LIGHT_POWER_RES['solar'], lambda m: 'solar'),
+    (_LIGHT_POWER_RES['sensor'], lambda m: 'sensor'),
+    (_LIGHT_POWER_RES['socket'], lambda m: 'stopcontact'),
 ]
 # Claims about the power source / sensor: wrong ones make the copy describe a
 # different product, so they get the correction retry (not just the warning).
@@ -22930,8 +23005,9 @@ _LIGHT_NUMWORDS = {
     'ein': 1, 'eins': 1, 'zwei': 2, 'drei': 3, 'fünf': 5, 'sechs': 6, 'sieben': 7, 'neun': 9, 'zehn': 10,
     'zwölf': 12, 'fünfzehn': 15, 'zwanzig': 20,
 }
+# 'two watts' / 'zwei Watt' → digits; not 'Ein W-LAN', 'one w/', 'twee W x drie H'
 _LIGHT_NUMWORD_RE = re.compile(r'\b(' + '|'.join(sorted(_LIGHT_NUMWORDS, key=len, reverse=True))
-                               + r')[\s-]*(watts?|w)\b', re.I)
+                               + r')[\s-]*(watts?|w)\b(?![-/]|\s*[x×])', re.I)
 
 
 def _light_spec_claims(text):
@@ -22946,11 +23022,10 @@ def _light_spec_claims(text):
     t = _LIGHT_DIM_RE.sub(' ', t)        # afmetingen zijn geen wattage
     t = _LIGHT_MAINS_RE.sub(' ', t)      # 230V is een constante
     out = set()
-    for m in _LIGHT_NEG_RE.finditer(t):
-        word = m.group(1).lower()
-        out.add('not:' + ('dimbaar' if word.startswith('dim') else
-                          'waterproof' if word.startswith(('water', 'wasser')) else 'stopcontact'))
-    t_pos = _LIGHT_NEG_RE.sub(' ', t)    # ontkende specs niet ook positief tellen
+    for rx in (_LIGHT_NEG_RE, _LIGHT_NEG_SOCKET_RE):
+        for m in rx.finditer(t):
+            out.add('not:' + _light_neg_claim(m.group(1)))
+    t_pos = _LIGHT_NEG_SOCKET_RE.sub(' ', _LIGHT_NEG_RE.sub(' ', t))    # ontkende specs niet ook positief tellen
     for rx, norm in _LIGHT_SPEC_PATTERNS:
         for m in rx.finditer(t_pos):
             try:
@@ -23787,12 +23862,26 @@ def api_lighting_generate():
     # What may be claimed = the source + what the brief read from it. The
     # brief's power word counts ('socket' → stopcontact), and 'oplaadbaar'
     # implies 'draadloos'.
-    claim_source = ' '.join([source_text, product_title, str(brief.get('what') or ''),
-                             ' '.join(str(f) for f in (brief.get('features') or [])),
-                             {'socket': 'stopcontact', 'mains': 'stopcontact', 'rechargeable': 'oplaadbaar',
-                              'battery': 'oplaadbaar', 'solar': 'solar'}.get(str(brief.get('power') or '').lower(), '')])
+    # The operator's type and the brief's type words are part of it: the
+    # prompt ORDERS the model to call it a stekkerlamp / Steckdosenlampe, so
+    # that word can never be an unverified socket claim. The brief's own power
+    # guess only counts when the source itself says something about power —
+    # a model guess must not verify a model claim.
+    _src_power = _light_spec_claims(source_text + ' ' + product_title) & _LIGHT_POWER_CLAIMS
+    _brief_power = ({'socket': 'stopcontact', 'mains': 'stopcontact', 'rechargeable': 'oplaadbaar',
+                     'battery': 'oplaadbaar', 'solar': 'solar'}.get(str(brief.get('power') or '').lower(), '')
+                    if _src_power else '')
+    claim_source = ' '.join([source_text, product_title, product_type, type_local or '',
+                             ' '.join(str(_btypes.get(k) or '') for k in ('nl', 'de', 'com')),
+                             str(brief.get('what') or ''),
+                             ' '.join(str(f) for f in (brief.get('features') or [])), _brief_power])
     if 'oplaadbaar' in _light_spec_claims(claim_source):
         claim_source += ' draadloos'
+    # 'Geen stopcontact nodig' is only a contradiction for a lamp that plugs in;
+    # a rechargeable lamp may say it (the style example does) even when its
+    # source mentions an outlet for charging.
+    socket_product = (str(brief.get('power') or '').lower() in ('socket', 'mains')
+                      or bool(families & {'plugin'}))
     source_thin = len(re.sub(r'\s+', ' ', source_text).strip()) < 80
     source_rule = (
         'LET OP: de bron heeft (bijna) GEEN beschrijving. Verzin dan ook GEEN eigenschappen: niet oplaadbaar, '
@@ -23878,14 +23967,15 @@ Antwoord uitsluitend als geldig JSON:
         claims = [c for c in _light_unverified_claims(joined, claim_source) if c in _LIGHT_POWER_CLAIMS]
         # 'Geen stopcontact nodig' for a lamp the source plugs in: a contradiction,
         # reported as 'geen stopcontact'.
-        claims += ['geen ' + c[4:] for c in _light_spec_conflicts(joined, claim_source)
-                   if c.startswith('not:') and c[4:] in _LIGHT_POWER_CLAIMS]
+        if socket_product:
+            claims += ['geen ' + c[4:] for c in _light_spec_conflicts(joined, claim_source)
+                       if c.startswith('not:') and c[4:] in _LIGHT_POWER_CLAIMS]
         return wrong_lang, others, claims
 
     def _score(wrong, others_, claims_=()):
-        # The wrong language weighs more than one stray type word or claim: a
-        # German text with 'Tischlampe' beats a Dutch text without it.
-        return 2 * int(wrong) + int(bool(others_)) + int(bool(claims_))
+        # The wrong language outweighs a type word AND a claim together (3 > 2):
+        # a German text with 'Tischlampe' beats a Dutch text without it.
+        return 3 * int(wrong) + int(bool(others_)) + int(bool(claims_))
 
     need = only_field if only_field in ('description', 'meta_description', 'm_title_specs') else 'description'
 

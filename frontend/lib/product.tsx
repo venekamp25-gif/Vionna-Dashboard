@@ -211,6 +211,10 @@ export interface ProductData {
    *  offer the worker a one-click "Notify" so support for that app gets added. */
   sizeChartStatus: "found" | "unread" | "none" | null;
   sizeChartHint: string | null;
+  /** How the competitor product came in when it was NOT our server's scrape
+   *  (read from the worker's browser / pasted): those routes do no sibling-colour
+   *  discovery, and Review must say so. null for a normal scrape. */
+  importNote: string | null;
   bgReferenceUrl: string;
   productType: string;
   nbResults: Record<number, NbResult[]>;
@@ -262,6 +266,7 @@ const DEFAULT_DATA: ProductData = {
   sizeChart: null,
   sizeChartStatus: null,
   sizeChartHint: null,
+  importNote: null,
   // Initial bg-reference is picked randomly from BG_REFERENCE_OPTIONS at module
   // load (= per page open). resetForNewProduct re-rolls it so each new product
   // started without a reload also gets a fresh model.
