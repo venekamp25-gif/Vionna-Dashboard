@@ -99,61 +99,102 @@ tells "no URL set" apart from "kill switch on".
 
 ---
 
-## 🛡️ Spy Shield beacon (since v1.314.0)
+## 🛡️ Spy Shield beacon (since v1.314.0, hardened in v1.315.0)
 
 "Spy Shield" is a theme snippet (repo `vionna-store-themes`) that shows a fake
 "502 Bad Gateway" to competitor-research traffic (PPSpy, Koala, WinningHunter,
 …) on the six stores. Every decision it takes sends ONE small JSON record via
 `navigator.sendBeacon` to a beacon URL set in the theme settings. The theme
-**refuses Block mode until that URL exists** ("never block blind"), so this
-backend is the prerequisite for ever switching a store to Block.
+**refuses Block mode while that URL field is empty** ("never block blind"), so
+this backend is the prerequisite for ever switching a store to Block.
 
 - **Route:** `POST /api/spy_shield/<token>` — **ungated by design** (storefront
   browsers post to it; there is no session). What keeps it safe instead:
   the path token is compared constant-time against `SPY_SHIELD_BEACON_TOKEN`
   (wrong or missing → still 204, counted as rejected: no oracle); body ≤ 2 KB;
   JSON object with `event:"spy_shield"` and `ss_action` ∈ allow/monitor/block;
-  field whitelist (`_SS_FIELDS`) with per-field truncation and 0/1 coercion;
-  rate limit 30/min per IP and 20 000/day globally (silent drop); **append-only**
-  to `backend/spy_shield.jsonl` and **no other side effect** (no Slack, no PR,
-  no shop call — "no auto-actions ever"). Every branch answers `204` with an
-  empty body; the handler is wrapped so `handle_error` can never turn a crash
-  into a JSON 500. Kill switch: `SPY_SHIELD_BEACON=0` in `.env`.
-- **Privacy:** the raw IP (first `X-Forwarded-For` hop behind Caddy) and the
-  user-agent are never stored. The record carries
-  `browser_key = sha256(daily_salt + ip + ua[:120])`, `daily_salt =
-  sha256(secret + YYYY-MM-DD)` (secret = `DROPLET_TOKEN_SECRET`, falling back to
-  the beacon token). The key rotates daily, so unique-browser counts are per day.
+  field whitelist (`_SS_FIELDS`) with per-field truncation, 0/1 coercion and a
+  UTF-8 check (a lone-surrogate escape is rejected as `shape` before it costs
+  budget); rate limit **30/min and 300/day per IP** and 20 000/day globally
+  (silent drop — the per-IP daily cap is what stops one source from eating the
+  whole day budget); **append-only** to `backend/spy_shield.jsonl` (ASCII-only
+  lines) and **no other side effect** (no Slack, no PR, no shop call — "no
+  auto-actions ever"). Every branch answers `204` with an empty body; the
+  handler is wrapped so `handle_error` can never turn a crash into a JSON 500.
+  Kill switch: `SPY_SHIELD_BEACON=0` in `.env`.
+- **The token is public by design.** The theme prints the beacon URL in the
+  source of every storefront page, so `SPY_SHIELD_BEACON_TOKEN` is spam-gating,
+  not authentication: it only keeps random scanners out; the rate limits and
+  the append-only/no-side-effect route are the actual protection. Never reuse
+  it for anything else. Consequence: **anyone with the URL can forge a record**
+  (a red "Buyers in flagged sessions" tile, an `ss_pt` alarm). The tab therefore
+  shows how many browsers are behind a red tile and the checklist says: open
+  the order / read the raw log before acting, never act on one red tile.
+- **Client IP** = the LAST `X-Forwarded-For` hop (the one Caddy appended), and
+  only when the request came in over loopback (= via Caddy); otherwise
+  `remote_addr`. A first hop is poster-controlled and is ignored. To make
+  "every request passes Caddy" true, **Flask binds to `127.0.0.1` since v1.315**
+  (`BIND_HOST` in `.env` overrides; Caddy and the self-updater both talk to
+  127.0.0.1 already). Werkzeug's access log skips `/api/spy_shield/` lines.
+- **Privacy:** the raw IP and the user-agent are never stored. The record
+  carries `browser_key = sha256(daily_salt + ip + ua[:120])`, `daily_salt =
+  sha256(DROPLET_TOKEN_SECRET + YYYY-MM-DD)`. The salt must come from
+  `DROPLET_TOKEN_SECRET` (always set on the droplet — the gates fail closed
+  without it); on a box without it a random per-process salt is used, **never
+  the beacon token** (that is public, so the key would be recomputable). The
+  key rotates daily, so "unique browsers" are **browser-days**.
 - **Token:** `SPY_SHIELD_BEACON_TOKEN` in the droplet's `.env`, minted from the
   dashboard: `POST /api/spy_shield/setup` (gated, body `{"rotate": bool}`) writes
   it through `_env_write` (it is on `_ENV_ALLOWED_KEYS`), applies it to
   `os.environ` live (no restart) and returns only `beacon_url`
-  (`https://188-166-11-177.nip.io/api/spy_shield/<token>`). Rotating invalidates
-  the URL pasted in all six themes — they fall back to Monitor until re-pasted.
+  (`https://188-166-11-177.nip.io/api/spy_shield/<token>`). **Rotating does NOT
+  downgrade the themes:** the theme only refuses Block when the URL field is
+  empty, so a store left in Block with the old URL keeps serving 502s while
+  every beacon is dropped as `token` — blocking blind. Set the stores to
+  Monitor before rotating and re-paste right away; the tab shows a warning
+  banner while `dropped.token` keeps rising.
 - **Log:** `backend/spy_shield.jsonl` (gitignored, droplet-only, in the daily
-  backup list of `_run_backup`). One line per record: `ts`, `day`, `store`
-  (dk/fr/fi/nl/com/de/unknown from `shop.permanent_domain`), `browser_key` +
-  the whitelisted `ss_*` fields.
+  backup list of `_run_backup`). One line per record: `ts`, `day` (UTC),
+  `store` (dk/fr/fi/nl/com/de/unknown from `shop.permanent_domain`),
+  `browser_key` + the whitelisted `ss_*` fields. **Bounded:** `_ss_prune`
+  rewrites it once a day (temp file + `os.replace` under `_SS_LOCK`) keeping 90
+  days, and above 100 MB new records are dropped as `full`. The prune runs from
+  the digest tick, never from the beacon route.
 - **Reading it:** the Tools menu entry **"Spy Shield"** opens `/spy-shield`
   (full-screen page like Margin watch) which calls
   `GET /api/spy_shield/summary?days=7|14|30&store=all|dk|…` (gated: session
   token OR `X-Notify-Token` = `NOTIFY_SECRET`, so master-dashboard can pull the
-  digest line server-to-server). It returns hits per store × reason × action,
-  unique browsers, `ss_pt` alarm (records from a preview theme — on a live store
-  that means the shield is effectively off), daily counts, last 20 hits (never
-  `browser_key`), and **`buyers_flagged`**: Vionna orders (DK/FR/FI, via
-  `tokens.json`) whose `landing_site` path matches a block-tier record within
-  ±60 min. That counter must be 0 before a store goes to Block; `null` means
-  orders could not be read (no token / no `read_orders`) — not proof of 0.
-  Light Supplier orders are not reachable from this backend, the tab says so.
-- **Daily Slack line:** `_spy_shield_digest_loop` posts one line at ~09:05
-  (`🛡️ Spy Shield (14d): N monitor-hits, N blokkades, N kopers gemarkeerd, N
-  unieke browsers · DK n / FR n`) via the bug-report webhook, only when there
-  are records. Guarded like the other loops (skipped under pytest / DEV_LOCAL);
-  kill switch `SPY_SHIELD_DIGEST=0`. The real dagbericht is composed in
-  master-dashboard; that repo can add the same line from the summary endpoint.
+  digest line server-to-server — that caller gets `beacon_url: null`, the
+  write token is dashboard-session information). A period of N days = today +
+  N-1 UTC days. Per store: hits × reason × action, `block_tier_hits` (the
+  "Would-be blocks" tile: what WOULD get the 502 — in Monitor `by_action.block`
+  stays 0), browser-days, `utm_hits`, `first_hit_at` + `active_days` (the
+  14-clean-days rule per store), `pt_alarm` + `pt_alarm_active` (records from a
+  preview theme count as an alarm only when > 5 % or > 10 AND newer than 2
+  days — venek's own duplicate-theme tests must not paint the tab red for
+  weeks), daily counts, last 20 hits (never `browser_key`), and
+  **`buyers_flagged`**: Vionna orders (DK/FR/FI, via `tokens.json`) whose
+  `landing_site` path matches a block-tier record of the same store within
+  ±60 min — by page and time, not by cookie, so a coincidence is possible;
+  `matched_browsers` says how many browsers are behind the matches. That
+  counter must be 0 before a store goes to Block; `null` means orders could
+  not be read (no token / no `read_orders`) — not proof of 0 (orange tile).
+  Orders are cached per (store, window) for 30 min; a failed read only 60 s.
+  Light Supplier is not wired up (their tokens are in `LIGHT_TOKENS` /
+  `_shop_entry`, `read_orders` unverified) — the tab says so.
+- **Daily Slack line (stopgap):** `_spy_shield_digest_tick` posts one line at
+  ~09:05 **droplet-local time (UTC → 11:05 NL in summer)** via the bug-report
+  webhook (`_slack_webhook_url`), only when there are records; the posted day
+  is persisted in `backend/spy_shield_digest.json` so a self-update restart
+  cannot post twice. Same vocabulary as the tiles (`N would-be blocks, N 502s
+  getoond, N buyers in flagged sessions, N browser-dagen · DK n / FR n`), plus
+  warnings for an active `ss_pt` alarm, dropped records and `token` drops.
+  The real dagbericht is composed in master-dashboard; once it pulls the
+  summary with `X-Notify-Token`, disable this loop with `SPY_SHIELD_DIGEST=0`.
+  Guarded like the other loops (skipped under pytest / DEV_LOCAL).
 - **Verify:** `curl -X POST -d '{}' https://188-166-11-177.nip.io/api/spy_shield/wrong`
-  → `204` and nothing appended. Tests: `backend/tests/test_spy_shield.py`.
+  → `204` and nothing appended. Tests: `backend/tests/test_spy_shield.py` +
+  `test_spy_shield_review.py` (the v1.314 review findings as regression tests).
 
 ---
 

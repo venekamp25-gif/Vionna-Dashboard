@@ -153,12 +153,16 @@ export interface SpyShieldBuyer {
   landing_site: string;
   matched_reason: string;
   matched_at: string;
+  /** ss_mode of the matched record: in "monitor" the buyer saw the normal page
+   *  (would have got the 502 in Block); in "block" the block did not stop them. */
+  matched_mode?: string;
 }
 
 export interface SpyShieldSummary {
   /** Whether SPY_SHIELD_BEACON_TOKEN exists on the droplet. */
   configured: boolean;
-  /** Full beacon URL (carries the token) — only ever sent to the gated caller. */
+  /** Full beacon URL (carries the token); null when unconfigured or when the
+   *  caller came in via X-Notify-Token (master-dashboard needs numbers only). */
   beacon_url: string | null;
   days: number;
   store: string;
@@ -168,10 +172,15 @@ export interface SpyShieldSummary {
   totals: {
     total: number;
     by_action: SsByAction;
+    /** Browser-DAYS: the hash rotates daily, so one browser counts once per day. */
     unique_browsers: number;
     repeat_hits: number;
     pt_alarm: number;
+    pt_last_at?: string | null;
+    /** True only when preview-theme records are a real share (> 5 % or > 10) AND recent (< 2 days). */
+    pt_alarm_active?: boolean;
     block_tier_hits: number;
+    utm_hits?: number;
     last_hit_at: string | null;
   };
   buyers_flagged: {
@@ -181,9 +190,17 @@ export interface SpyShieldSummary {
     orders: SpyShieldBuyer[];
     orders_checked: Record<string, number | null>;
     note: string;
+    /** Distinct browser hashes behind the matched records — "all N from 1 browser" = look at the raw log first. */
+    matched_browsers?: number;
+    block_tier_browsers?: number;
   };
+  /** Drop counters since server start: token (old/wrong URL pasted somewhere),
+   *  off (kill switch), rate_ip / rate_day (flood protection), full (log at
+   *  size cap), size / json / shape / error (malformed posts). */
   dropped: Record<string, number>;
   accepted_since_start: number;
+  log_full?: boolean;
+  limits?: { per_ip_min: number; per_ip_day: number; per_day: number; retention_days: number };
 }
 
 
@@ -1060,7 +1077,12 @@ export const api = {
   // ── Spy Shield ──
   // The beacon log lives on the droplet (backend/spy_shield.jsonl); the summary
   // is the only way to read it and it never carries a browser_key. The beacon
-  // URL contains the write token, so it only ever travels over this gated call.
+  // URL (with its write token) is NOT a secret: the theme prints it in the
+  // source of every storefront page, so it only keeps random scanners out —
+  // the per-IP/global rate limits and the append-only, side-effect-free route
+  // are the actual protection. That is also why a red tile can be forged by
+  // anyone with the URL: the tab shows browser concentration and tells the
+  // operator to check the order/raw log before acting.
   spyShieldSummary: (days: 7 | 14 | 30 = 14, store = "all") =>
     call<SpyShieldSummary>(`/api/spy_shield/summary?days=${days}&store=${encodeURIComponent(store)}`, {
       authed: true,

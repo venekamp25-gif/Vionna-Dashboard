@@ -17,7 +17,9 @@ import server
 
 TOKEN = 'test-beacon-token'
 POST_PATH = f'/api/spy_shield/{TOKEN}'
-HDRS = {'X-Forwarded-For': '203.0.113.9, 10.0.0.1', 'User-Agent': 'Mozilla/5.0 test-ua'}
+# Caddy appends the real client as the LAST hop; the first hop is whatever the
+# poster sent along, so the tests spoof one to prove it is ignored.
+HDRS = {'X-Forwarded-For': '10.0.0.1, 203.0.113.9', 'User-Agent': 'Mozilla/5.0 test-ua'}
 
 
 @pytest.fixture(autouse=True)
@@ -30,7 +32,8 @@ def _sandbox(tmp_path, monkeypatch):
     monkeypatch.delenv('NOTIFY_SECRET', raising=False)
     monkeypatch.setenv('DEV_LOCAL', '1')
     monkeypatch.setattr(server, 'DROPLET_TOKEN_SECRET', '')
-    monkeypatch.setattr(server, '_SS_RATE', {'ip': {}, 'day': '', 'day_count': 0})
+    monkeypatch.setattr(server, '_SS_RATE', {'ip': {}, 'ip_day': {}, 'day': '', 'day_count': 0})
+    monkeypatch.setattr(server, 'SPY_SHIELD_DIGEST_STATE', str(tmp_path / 'spy_shield_digest.json'))
     monkeypatch.setattr(server, '_SS_ORDERS_CACHE', {})
     for k in server._SS_DROPPED:
         server._SS_DROPPED[k] = 0
@@ -317,8 +320,11 @@ def test_digest_line_is_silent_without_data_and_counts_with(client, _sandbox, mo
     _write_rows(_sandbox, [_row('dk', 'monitor', _iso(1)), _row('dk', 'monitor', _iso(2), browser_key='q'),
                            _row('fr', 'block', _iso(3), ss_pt=1)])
     line = server._spy_shield_digest_line(14)
-    assert line.startswith('🛡️ Spy Shield (14d): 2 monitor-hits, 1 blokkades, 0 kopers gemarkeerd, 3 unieke browsers')
-    assert 'DK 2 / FR 1' in line and 'ss_pt=1' in line
+    # Same vocabulary as the tab tiles: would-be blocks (block-tier), 502s shown, buyers in flagged sessions.
+    assert line.startswith('🛡️ Spy Shield (14d): 3 would-be blocks, 1 502s getoond, 0 buyers in flagged sessions, 3 browser-dagen')
+    assert 'DK 2 / FR 1' in line
+    # 1 of 3 records from a preview theme, 3 hours old → above 5 % and recent → the warning fires.
+    assert 'ss_pt=1' in line and '33%' in line
 
 
 # ── setup + gates ─────────────────────────────────────────────────────────────

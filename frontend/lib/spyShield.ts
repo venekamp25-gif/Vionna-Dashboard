@@ -46,14 +46,24 @@ export interface SsStoreSummary {
   by_action: SsByAction;
   /** [reason, count] pairs, most frequent first, top 25. */
   by_reason: [string, number][];
+  /** Distinct day-salted browser hashes = browser-DAYS (the same browser counts again each day). */
   unique_browsers: number;
   repeat_hits: number;
   /** Records with ss_pt=1: the theme did not see itself as the live theme. */
   pt_alarm: number;
+  /** ts of the newest ss_pt=1 record, if any. */
+  pt_last_at?: string | null;
+  /** Backend verdict: share (> 5 % or > 10) AND recent (< 2 days) — see _ss_pt_alarm_active. */
+  pt_alarm_active?: boolean;
   block_tier_hits: number;
+  /** Records with ss_utm=1 (ad-spy cards with baked-in UTMs). */
+  utm_hits?: number;
   daily: SsDaily[];
   last_hits: SsHit[];
   last_hit_at: string | null;
+  first_hit_at?: string | null;
+  /** Distinct UTC days with at least one record — "days of data" for the 14-day rule. */
+  active_days?: number;
 }
 
 export const SS_STORE_LABELS: Record<string, string> = {
@@ -144,7 +154,11 @@ export function maxDailyTotal(days: SsDaily[]): number {
   return Math.max(1, ...days.map((d) => d.monitor + d.block + d.allow));
 }
 
-/** "2026-09-25T10:31:04Z" → "25 Sep 10:31" (UTC-independent: uses the browser's zone). */
+/**
+ * "2026-09-25T10:31:04Z" → "25 Sep 10:31", always in UTC: the backend files every
+ * record under its UTC `day`, so the "Per day" rows and the hit times must use
+ * the same clock or a hit at 00:40 Amsterdam time would sit under yesterday's bar.
+ */
 export function fmtHitTime(ts: string | undefined): string {
   if (!ts) return "";
   const d = new Date(ts);
@@ -154,5 +168,30 @@ export function fmtHitTime(ts: string | undefined): string {
     month: "short",
     hour: "2-digit",
     minute: "2-digit",
+    timeZone: "UTC",
   });
+}
+
+/** "2026-09-12T08:00:00Z" → "12 Sep" (UTC). */
+export function fmtHitDay(ts: string | null | undefined): string {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return ts;
+  return d.toLocaleString("en-GB", { day: "2-digit", month: "short", timeZone: "UTC" });
+}
+
+/** Minimum days of data a store needs in Monitor before Block is allowed (README/SPEC R5). */
+export const SS_MONITOR_DAYS = 14;
+
+/**
+ * Human line for the store totals row: "Vionna DK 12 · first hit 12 Sep · 9 days of data".
+ * `ready` is true once the store has ≥ SS_MONITOR_DAYS days with records.
+ */
+export function storeProgress(code: string, s: SsStoreSummary): { text: string; ready: boolean } {
+  const days = s.active_days ?? 0;
+  const first = fmtHitDay(s.first_hit_at ?? null);
+  const parts = [`${ssStoreLabel(code)} ${s.total}`];
+  if (first) parts.push(`first hit ${first}`);
+  parts.push(`${days} day${days === 1 ? "" : "s"} of data`);
+  return { text: parts.join(" · "), ready: days >= SS_MONITOR_DAYS };
 }

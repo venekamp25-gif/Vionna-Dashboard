@@ -89,3 +89,4 @@ backend/hf_media/
 # no IP) — droplet-only, never in a public repo.
 spy_shield.jsonl
 backend/spy_shield.jsonl
+backend/spy_shield_digest.json
