@@ -39,3 +39,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# generated at build time (next.config.ts) — the live build sha for the reload banner
+/public/build.json

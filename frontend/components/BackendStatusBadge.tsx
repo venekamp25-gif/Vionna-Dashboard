@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api, BackendStatus } from "@/lib/api";
+import { BUILD_SHA } from "@/lib/buildInfo";
 import { HealthCheckModal } from "./HealthCheckModal";
 
 type ConnState = "checking" | "ok" | "fail";
@@ -35,7 +36,7 @@ export function BackendStatusBadge() {
         type="button"
         onClick={() => setHealthOpen(true)}
         className="text-[11px] flex items-center gap-1.5 cursor-pointer hover:opacity-80 transition-opacity"
-        title={`${tooltip}\n(click for full diagnostic)`}
+        title={`${tooltip}\nfrontend build ${BUILD_SHA.slice(0, 7)}\n(click for full diagnostic)`}
       >
         {content}
       </button>
