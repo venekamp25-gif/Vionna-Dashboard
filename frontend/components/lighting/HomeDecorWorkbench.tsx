@@ -46,9 +46,16 @@ const toPlainText = bodyHtmlText;
 /** Only a type the operator TYPED is the operator's word; the one the brief
  *  filled in belongs to the model's reading and must not be sent back as
  *  operator truth (it would lock a wrong family — review of #67/#68). */
-function typedTypeOf(d: { productType: string; brief?: { type?: { nl?: string } } | null }): string {
+function typedTypeOf(d: {
+  productType: string;
+  brief?: { type?: { nl?: string }; type_operator?: string } | null;
+}): string {
   const t = d.productType.trim();
-  return t && t !== (d.brief?.type?.nl ?? "").trim() ? t : "";
+  if (!t) return "";
+  // The brief reports the operator's own word back as type_operator (v1.313);
+  // older briefs only carried the model's word in type.nl.
+  if (d.brief?.type_operator && t === d.brief.type_operator.trim()) return t;
+  return t !== (d.brief?.type?.nl ?? "").trim() ? t : "";
 }
 
 /** Section shell — same visual language as the research workbench. */

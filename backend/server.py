@@ -6543,18 +6543,45 @@ _LIGHT_TYPE_COPY_FAMILIES['plugin'] = (r"stekkerlamp\w*|stopcontact ?lamp\w*|lam
 _LIGHT_TYPE_COPY_RES = {k: re.compile(v, re.I) for k, v in _LIGHT_TYPE_COPY_FAMILIES.items()}
 # "als een (ingebouwde) wandlamp" / "like a (hard-wired) sconce" / "wie eine (fest
 # installierte) Wandleuchte": a comparison, removed before the type check.
+# Whitespace inside a comparison: spaces, or ONE soft-wrap newline — never a
+# blank line (new paragraph) or a line that starts a bullet ('- Wandlamp: …').
+_LIGHT_CMP_WS = r"(?:[ \t]|\n(?![ \t]*(?:\n|[-*•][ \t])))+"
+_LIGHT_TYPE_ALT = '|'.join(f'(?:{v})' for v in _LIGHT_TYPE_COPY_FAMILIES.values())
+# Bare 'als' / 'wie' / 'like' also mean 'as' / 'how' / the verb ("gebruik hem als
+# tafellamp" IS a type claim), so they only count as a comparison WITH an
+# indefinite article; the unambiguous markers take any article or none.
 _LIGHT_TYPE_COMPARE_RE = re.compile(
-    r"\b(?:als|zoals|net als|like|just like|wie|so wie|ähnlich wie|effect van|look van|look of|effect of|"
-    r"charakter einer|charakter eines|karakter van)\s+(?:een|a|an|eine|einer|ein|the|de|het)?\s*(?:[\w-]+\s+){0,2}?"
-    r"(?:" + '|'.join(f'(?:{v})' for v in _LIGHT_TYPE_COPY_FAMILIES.values()) + r")", re.I)
+    r"\b(?:(?:als|wie|like)" + _LIGHT_CMP_WS + r"(?:een|a|an|ein|eine|einer|einem|einen)|"
+    r"(?:zoals|net als|just like|so wie|ähnlich wie|effect van|look van|look of|effect of|"
+    r"charakter einer|charakter eines|karakter van)(?:" + _LIGHT_CMP_WS + r"(?:een|a|an|eine|einer|ein|the|de|het))?)"
+    + _LIGHT_CMP_WS + r"(?:\w[\w-]*" + _LIGHT_CMP_WS + r"){0,2}?(?:" + _LIGHT_TYPE_ALT + r")", re.I)
+# "unlike a ceiling light" / "not a table lamp" / "no wiring, no ceiling light" /
+# "geen plafondlamp nodig" / "statt einer Deckenleuchte" / "instead of a sconce":
+# a type the text NEGATES or replaces is not what the product is.
+_LIGHT_TYPE_NEGATE_RE = re.compile(
+    r"\b(?:unlike|not|no|never|instead of|rather than|without|geen|niet|nooit|zonder|in plaats van|anders dan|"
+    r"kein|keine|keiner|nicht|statt|anstatt|anstelle|ohne)" + _LIGHT_CMP_WS
+    + r"(?:(?:een|a|an|eine|einer|einem|einen|ein|the|de|het)" + _LIGHT_CMP_WS + r")?(?:\w[\w-]*" + _LIGHT_CMP_WS
+    + r"){0,2}?(?:" + _LIGHT_TYPE_ALT + r")", re.I)
 
 
-def _light_type_families(text, placement_only=False):
+def _light_type_families(text, placement_only=False, table=None):
     """Set of lamp-type families named in `text` (empty when none). With
-    placement_only the attribute families (portable) are left out."""
+    placement_only the attribute families (portable) are left out. `table`
+    = the keyword table by default; the prose table for running text."""
     t = (text or '').lower()
-    fams = {k for k, rx in _LIGHT_TYPE_RES.items() if rx.search(t)}
+    fams = {k for k, rx in (table or _LIGHT_TYPE_RES).items() if rx.search(t)}
     return fams - _LIGHT_ATTR_FAMILIES if placement_only else fams
+
+
+def _light_source_families(text):
+    """Families a SOURCE names as what it sells: prose table, comparisons
+    ("like a hard-wired sconce") and negations ("unlike a ceiling light",
+    "not a table lamp", "geen plafondlamp nodig") removed first."""
+    t = (text or '').lower()
+    t = _LIGHT_TYPE_COMPARE_RE.sub(' ', t)
+    t = _LIGHT_TYPE_NEGATE_RE.sub(' ', t)
+    return _light_type_families(t, placement_only=True, table=_LIGHT_TYPE_COPY_RES)
 
 
 def _light_type_conflict(keyword, product_type):
@@ -15722,7 +15749,11 @@ def _publish_to_all_channels(store, product_id, hdrs):
         if r.status_code != 200:
             errors.append(f'{name}: HTTP {r.status_code}')
             continue
-        payload = r.json() or {}
+        try:
+            payload = r.json() or {}
+        except Exception:
+            errors.append(f'{name}: non-JSON response (HTTP 200)')
+            continue
         ue = ((payload.get('data') or {}).get('publishablePublish') or {}).get('userErrors') or []
         if payload.get('errors') or ue:
             msgs = [str(e.get('message') or e) for e in (payload.get('errors') or [])] + \
@@ -22979,8 +23010,8 @@ _LIGHT_MAINS_RE = re.compile(r'\b2[23]0\s*-?\s*240?\s*v(?:olt)?\b|\b2[23]0\s*v(?
 # never a second/other socket ('blockiert keine zweite Steckdose') — 'blockiert
 # nicht die Steckdose daneben' is not a claim that it needs no socket.
 _LIGHT_NEG_RE = re.compile(
-    r'\b(?:niet|geen|non|not|no|nicht|kein[e]?|zonder|without|ohne)\s+(?:\w+\s+){0,2}?'
-    r'(dimbaar|dimbare|dimmbar|dimmable|waterdicht|wasserdicht|waterproof|'
+    r'\b(?:niet|geen|non|not|no|nicht|kein[e]?|zonder|without|ohne)\s+(?:\w+\s+){0,3}?'
+    r'(dimba(?:ar|re)|dimmbar\w*|dimmable|dimmers?|dimm?schakelaar|waterdicht|wasserdicht|waterproof|'
     r'oplaadba(?:ar|re)|wiederaufladbar|aufladbar|rechargeable|akku\w*|accu\w*|batterij\w*|batter(?:y|ies)|batterie\w*|'
     r'draadlo(?:os|ze)|kabellos\w*|cordless|wireless|solar\w*|'
     r'sensor\w*|schemersensor|bewegingssensor|d[äa]mmerungssensor|dusk[- ]to[- ]dawn)\b', re.I)
@@ -23031,7 +23062,11 @@ _LIGHT_SPEC_PATTERNS = [
      lambda m: 'v' + m.group(1).replace(',', '.')),
     # dimbaar (positief; de ontkenning wordt apart afgehandeld). Een dimmer
     # (schuif, knop) bewijst 'dimbaar' — de Aoraglow heeft een 'slide dimmer'.
-    (re.compile(r'\b(?:dimbaar|dimbare|dimmbar|dimmable|dimmers?|dimm?schakelaar|dimmable)\b', re.I), lambda m: 'dimbaar'),
+    # 'dimmbar\w*' = eine dimmbare / mit dimmbarem (German inflects); a bare
+    # 'dimmer' is the device, not the English comparative ("a dimmer, softer glow").
+    (re.compile(r'\b(?:dimba(?:ar|re)|dimmbar\w*|dimmable|dimm?schakelaar|'
+                r'dimmers?\b(?!\s*,\s*[a-z]+er\b|\s+(?:than|and|or|but|glow|light|lighting|setting|mood|tone|shade|end|version)\b))\b',
+                re.I), lambda m: 'dimbaar'),
     # energielabel
     (re.compile(r'\b(?:energielabel|energieklasse|energy\s+class)\s*[:=]?\s*([a-g](?:\+{1,3})?)\b', re.I),
      lambda m: 'energy' + m.group(1).lower()),
@@ -23746,8 +23781,10 @@ def _light_type_words_in(text, exclude=None):
     excl = set(exclude or ()) | _LIGHT_ATTR_FAMILIES
     t = (text or '').lower()
     # A comparison is not a claim: "hetzelfde effect als een ingebouwde wandlamp",
-    # "like a hard-wired sconce", "wie eine fest installierte Wandleuchte".
+    # "like a hard-wired sconce", "wie eine fest installierte Wandleuchte" —
+    # nor is a negation: "geen plafondlamp nodig", "unlike a ceiling light".
     t = _LIGHT_TYPE_COMPARE_RE.sub(' ', t)
+    t = _LIGHT_TYPE_NEGATE_RE.sub(' ', t)
     for fam in excl:
         rx = _LIGHT_TYPE_COPY_RES.get(fam)
         if rx is not None:
@@ -23836,13 +23873,20 @@ def _light_brief_guard(brief, product_type=''):
     brief['type'] = {k: str(types.get(k) or '').strip() for k in ('nl', 'de', 'com')}
     # Known family → the canonical shop word per market wins over the model's
     # near-miss; the operator's own Dutch word stays for nl when typed.
+    brief['type_model'] = dict(brief['type'])
     canon = _LIGHT_TYPE_CANON.get(brief['family'])
-    if canon:
-        brief['type_model'] = dict(brief['type'])
+    # A compound ('plug-in wall light' = plugin + wall) keeps the model's more
+    # specific words; a single family gets the shop word.
+    if canon and len(own) <= 1:
         for k in ('nl', 'de', 'com'):
             brief['type'][k] = canon[k]
-    if product_type.strip():
-        brief['type']['nl'] = product_type.strip()
+    # The operator's own word is reported separately (the frontend tells a
+    # typed word from a filled-in one by it) and is the Dutch type only when it
+    # IS Dutch — 'Plug-in wall light' or 'Steckdosenlampe' typed by the operator
+    # must not become the NL card's type word.
+    brief['type_operator'] = product_type.strip()
+    if brief['type_operator'] and not re.search(r'light|lampe|leuchte|sconce|strahler', brief['type_operator'], re.I):
+        brief['type']['nl'] = brief['type_operator']
     return brief
 
 
@@ -23917,16 +23961,29 @@ def _light_native_edit(out, store, lang_nl, lang_en, product_name, keywords):
     """One editor call: (edited_fields, changes). Raises on API failure (the
     caller keeps the first version)."""
     import anthropic
-    payload = {k: str(out.get(k) or '') for k in ('description', 'meta_description', 'm_title_specs')}
-    prompt = (
-        f"Redigeer deze productcontent naar natuurlijk, correct {lang_nl} ({lang_en}). Behoud ELKE eigenschap, "
-        f"de volgorde, de bullets als '- Eigenschap: uitleg', de productnaam ({product_name}) in de eerste en "
-        f"laatste zin, en deze keywords als ze erin staan: {', '.join(keywords[:12]) or '-'}. "
-        "Voeg niets toe wat er niet staat. Als een zin al goed is, laat hem staan.\n"
-        "Geef terug als JSON: {\"description\": \"...\", \"meta_description\": \"...\", "
-        "\"m_title_specs\": \"...\", \"changes\": [\"kort: wat → waarin\"]} — 'changes' is leeg als je niets veranderde.\n\n"
-        + json.dumps(payload, ensure_ascii=False)
-    )
+    # Only the fields the writer produced (an only_field regeneration has one),
+    # so the editor never invents the others.
+    fields = [k for k in ('description', 'meta_description', 'm_title_specs') if str(out.get(k) or '').strip()]
+    payload = {k: str(out.get(k) or '') for k in fields}
+    keys_json = ', '.join(f'"{k}": "..."' for k in fields)
+    kw = ', '.join(keywords[:12]) or '-'
+    # The user prompt in the STORE's language too — a Dutch instruction pulled
+    # the German/English meta and title back to Dutch.
+    prompts = {
+        'nl': (f"Redigeer deze productcontent naar natuurlijk, correct Nederlands. Behoud ELKE eigenschap, de volgorde, "
+               f"de bullets als '- Eigenschap: uitleg', de productnaam ({product_name}) in de eerste en laatste zin, en "
+               f"deze keywords als ze erin staan: {kw}. Voeg niets toe wat er niet staat. Als een zin al goed is, laat hem staan.\n"
+               "Geef terug als JSON: {" + keys_json + ", \"changes\": [\"kort: wat → waarin\"]} — 'changes' is leeg als je niets veranderde.\n\n"),
+        'de': (f"Redigiere diesen Produkttext zu natürlichem, korrektem Deutsch. Behalte JEDE Eigenschaft, die Reihenfolge, "
+               f"die Bullets als '- Eigenschaft: Erklärung', den Produktnamen ({product_name}) im ersten und letzten Satz und "
+               f"diese Keywords, wenn sie vorkommen: {kw}. Füge nichts hinzu, was nicht dasteht. Ein guter Satz bleibt stehen.\n"
+               "Antworte als JSON: {" + keys_json + ", \"changes\": [\"kurz: was → wozu\"]} — 'changes' bleibt leer, wenn du nichts geändert hast.\n\n"),
+        'com': (f"Edit this product copy into natural, correct English. Keep EVERY feature, the order, the bullets as "
+                f"'- Feature: explanation', the product name ({product_name}) in the first and last sentence, and these "
+                f"keywords where present: {kw}. Add nothing that is not there. A good sentence stays as it is.\n"
+                "Answer as JSON: {" + keys_json + ", \"changes\": [\"short: what → into what\"]} — 'changes' is empty if you changed nothing.\n\n"),
+    }
+    prompt = prompts.get(store, prompts['nl']) + json.dumps(payload, ensure_ascii=False)
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     msg = client.messages.create(model='claude-sonnet-4-5', max_tokens=1400,
                                  system=_LIGHT_EDITOR_SYSTEM.get(store, _LIGHT_EDITOR_SYSTEM['nl']),
@@ -23937,7 +23994,7 @@ def _light_native_edit(out, store, lang_nl, lang_en, product_name, keywords):
         raise ValueError('editor returned no JSON')
     ed = json.loads(m.group(0))
     changes = ed.get('changes') if isinstance(ed.get('changes'), list) else []
-    return {k: _md_strip(str(ed.get(k) or '')) for k in ('description', 'meta_description', 'm_title_specs')}, changes
+    return {k: _md_strip(str(ed.get(k) or '')) for k in fields}, changes
 
 
 def _light_edit_rejected(before, after, product_name, families, claim_source, store):
@@ -23945,17 +24002,22 @@ def _light_edit_rejected(before, after, product_name, families, claim_source, st
     empty text, product name gone, a different number of bullets, the wrong
     language, another lamp type, or a spec/power claim the first version did
     not make. The editor fixes words, never facts."""
-    desc_b, desc_a = str(before.get('description') or ''), str(after.get('description') or '')
-    if len(desc_a.strip()) < max(40, len(desc_b.strip()) // 2):
+    # Same normalised form on both sides: the editor's answer is md-stripped,
+    # the writer's may still carry '* ' bullets.
+    before = {k: _md_strip(str(before.get(k) or '')) for k in ('description', 'meta_description', 'm_title_specs')}
+    desc_b, desc_a = before['description'], str(after.get('description') or '')
+    if 'description' in after and len(desc_a.strip()) < max(40, len(desc_b.strip()) // 2):
         return 'edited text too short'
-    if product_name and product_name.lower() not in desc_a.lower():
+    name = (product_name or '').lower()
+    if name and name in desc_b.lower() and 'description' in after and name not in desc_a.lower():
         return 'product name dropped'
     bullets = lambda t: len(re.findall(r'^\s*-\s+', t, flags=re.M))
-    if bullets(desc_b) and bullets(desc_a) != bullets(desc_b):
+    if 'description' in after and bullets(desc_b) and bullets(desc_a) != bullets(desc_b):
         return f'bullet count changed ({bullets(desc_b)} → {bullets(desc_a)})'
-    guess, _ = _light_lang_guess(desc_a)
-    if guess and guess != store:
-        return f'edited text is not in the store language ({guess})'
+    for k in ('description', 'meta_description'):
+        guess, _ = _light_lang_guess(str(after.get(k) or ''))
+        if guess and guess != store:
+            return f'edited {k} is not in the store language ({guess})'
     if families:
         join_types = lambda o: _light_type_words_in(' '.join(str(o.get(k) or '') for k in
                                                               ('description', 'meta_description', 'm_title_specs')),
@@ -24010,7 +24072,7 @@ def api_lighting_generate():
     # lamp type. Only the opening (meta/og description + hero), where a shop
     # names what it sells — not the whole page with its comparisons.
     if families:
-        families = families | _light_type_families(product_title + ' ' + source_text[:600], placement_only=True)
+        families = families | _light_source_families(product_title + ' ' + source_text[:600])
     type_dropped  = [k for k in keywords if fam_anchor and _light_type_conflict(k, fam_anchor)]
     keywords      = [k for k in keywords if k not in type_dropped]
     only_field    = (data.get('only_field') or '').strip()
@@ -24214,6 +24276,10 @@ Antwoord uitsluitend als geldig JSON:
     # vertalingen en kromme zinnen eruit, inhoud gelijk. De redacteur mag geen
     # feit toevoegen en geen structuur breken — dezelfde guards als hierboven
     # beoordelen het resultaat, anders blijft de eerste versie staan.
+    # Markdown eruit vóór de redacteur ziet/vergelijkt: '* '-bullets worden '- '.
+    for k in ('description', 'meta_description', 'm_title_specs'):
+        if isinstance(out.get(k), str):
+            out[k] = _md_strip(out[k])
     out['language_pass'] = {'applied': False, 'reason': 'skipped'}
     if not data.get('skip_language_pass') and str(out.get('description') or '').strip():
         try:
