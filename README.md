@@ -16,19 +16,26 @@ vionna-dashboard/
 │   └── version.txt
 ├── frontend/             ← Next.js app (in opbouw)
 ├── start.bat             ← dubbelklik om dashboard lokaal te starten
-├── publish-update.bat    ← push nieuwe versie naar GitHub
+├── backend/.env.example  ← voorbeeld-instellingen om lokaal te draaien
 └── README.md
 ```
 
 ## 🚀 Lokaal draaien
 
-1. Dubbelklik `start.bat`
-2. Dashboard opent op http://localhost:5000
+1. Kopieer `backend/.env.example` naar `backend/.env` en vul je eigen waarden in
+2. Dubbelklik `start.bat`
+3. Dashboard opent op http://localhost:5000
 
 ## 🔄 Update uitrollen
 
-1. Dubbelklik `publish-update.bat`
-2. Versienummer wordt verhoogd, alles gepusht naar GitHub
+Rechtstreeks naar `main` pushen kan niet meer (branch-regel sinds 2026-08-31).
+Elke wijziging gaat via een branch + pull request: de CI moet groen zijn en de
+eigenaar merget. Na de merge zetten Netlify en de droplet het binnen ~10 minuten
+zelf live. Bij een backend-wijziging hoort een hogere `backend/version.txt`.
+Hoe je lokaal draait en een PR maakt staat in `CLAUDE.md` onder
+"Working here as a second developer".
+
+Gebruik nooit `git add -A`: in deze map staan `.env` en `tokens.json`.
 
 ## 🛣 Roadmap
 
