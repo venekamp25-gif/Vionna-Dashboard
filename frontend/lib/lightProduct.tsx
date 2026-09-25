@@ -22,6 +22,9 @@ export interface LightContent {
   /** Power/sensor claims (oplaadbaar, draadloos, sensor, stopcontact) the copy
    *  makes and the source never states, after one retry — warn-only, rewrite. */
   claimMismatch?: string[];
+  /** The native-editor pass: what it changed (anglicisms, literal
+   *  translations, typos), or why its result was not used. */
+  languagePass?: { applied: boolean; changes?: string[]; reason?: string };
 }
 
 export const EMPTY_CONTENT: LightContent = {

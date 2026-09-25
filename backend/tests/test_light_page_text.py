@@ -154,6 +154,7 @@ def gen(monkeypatch):
             return c.post('/api/lighting/generate', json={
                 'store': store, 'product_name': 'PLUGIFY Aora', 'product_title': 'Aoraglow',
                 'product_type': product_type, 'source_text': source_text, 'keywords': [],
+                'skip_language_pass': True,
                 'brief': brief if brief is not None else {
                     'family': 'plugin', 'type': {'nl': 'stekkerlamp', 'de': 'Steckdosenlampe', 'com': 'plug-in light'},
                     'what': 'Een lamp die je in het stopcontact steekt.', 'power': 'socket',

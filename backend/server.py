@@ -3171,7 +3171,7 @@ def api_size_chart_recheck():
     })
 
 
-_PAGE_TEXT_MAX = 6000
+_PAGE_TEXT_MAX = 12000
 # Never text: code, styles, icons. Forms and headers are NOT stripped inside
 # <main> — older themes wrap the whole buy box (description included) in
 # <form action="/cart/add"> and put the title in a <header> (review of #68).
@@ -6541,6 +6541,12 @@ _LIGHT_TYPE_COPY_FAMILIES['plugin'] = (r"stekkerlamp\w*|stopcontact ?lamp\w*|lam
                                        r"steckdosenlamp\w*|steckdosenleucht\w*|plug[- ]?in (?:light|lamp|night ?light|wall light)|"
                                        r"socket (?:light|lamp)")
 _LIGHT_TYPE_COPY_RES = {k: re.compile(v, re.I) for k, v in _LIGHT_TYPE_COPY_FAMILIES.items()}
+# "als een (ingebouwde) wandlamp" / "like a (hard-wired) sconce" / "wie eine (fest
+# installierte) Wandleuchte": a comparison, removed before the type check.
+_LIGHT_TYPE_COMPARE_RE = re.compile(
+    r"\b(?:als|zoals|net als|like|just like|wie|so wie|ähnlich wie|effect van|look van|look of|effect of|"
+    r"charakter einer|charakter eines|karakter van)\s+(?:een|a|an|eine|einer|ein|the|de|het)?\s*(?:[\w-]+\s+){0,2}?"
+    r"(?:" + '|'.join(f'(?:{v})' for v in _LIGHT_TYPE_COPY_FAMILIES.values()) + r")", re.I)
 
 
 def _light_type_families(text, placement_only=False):
@@ -15417,6 +15423,9 @@ def _md_strip(s):
     s = re.sub(r'__(.+?)__', r'\1', s)
     s = re.sub(r'(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])', r'\1', s)
     s = re.sub(r'^\s*#{1,6}\s+', '', s, flags=re.M)
+    # '* Eigenschap: …' / '• …' list markers → '- …' (the publish path only
+    # knows '-' and '•'; the model sometimes answers with '*').
+    s = re.sub(r'^[ \t]*[*•·][ \t]+', '- ', s, flags=re.M)
     return s
 
 
@@ -15680,6 +15689,48 @@ def _publish_to_default_channels(store, product_id, hdrs):
     pub_payload = (payload.get('data') or {}).get('publishablePublish') or {}
     user_errors = pub_payload.get('userErrors') or []
     return [f"{(ue.get('field') or [''])[0]}: {ue.get('message')}" for ue in user_errors]
+
+
+def _publish_to_all_channels(store, product_id, hdrs):
+    """Put ONE product on EVERY sales channel the shop has (Online Store, Shop,
+    Google & YouTube, Facebook & Instagram, TikTok, Pinterest, POS…). One
+    mutation per publication, so a channel that refuses (an app not installed
+    any more) never blocks the others. Returns (channels_on, errors).
+    Idempotent: a product already on a channel is silently re-confirmed."""
+    pubs = _list_publications(store, hdrs)
+    if not pubs:
+        return [], ['no publications found in shop']
+    product_gid = f'gid://shopify/Product/{product_id}'
+    mutation = (
+        'mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {'
+        ' publishablePublish(id: $id, input: $input) {'
+        '   publishable { ... on Product { id } }'
+        '   userErrors { field message }'
+        ' }'
+        '}'
+    )
+    on, errors = [], []
+    for p in pubs:
+        name = p.get('name') or str(p.get('id'))
+        body = {'query': mutation,
+                'variables': {'id': product_gid, 'input': [{'publicationId': f'gid://shopify/Publication/{p["id"]}'}]}}
+        try:
+            r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs, json=body, timeout=15)
+        except Exception as e:
+            errors.append(f'{name}: {e}')
+            continue
+        if r.status_code != 200:
+            errors.append(f'{name}: HTTP {r.status_code}')
+            continue
+        payload = r.json() or {}
+        ue = ((payload.get('data') or {}).get('publishablePublish') or {}).get('userErrors') or []
+        if payload.get('errors') or ue:
+            msgs = [str(e.get('message') or e) for e in (payload.get('errors') or [])] + \
+                   [str(u.get('message') or u) for u in ue]
+            errors.append(f"{name}: {'; '.join(msgs)[:160]}")
+            continue
+        on.append(name)
+    return on, errors
 
 
 def _ensure_siblings_collection(store, product_name, siblings_handle, hdrs, base):
@@ -22978,8 +23029,9 @@ _LIGHT_SPEC_PATTERNS = [
     # spanning (netspanning is er al uitgeknipt)
     (re.compile(r'\b(\d+(?:[.,]\d+)?)\s*v(?:olt)?\b', re.I),
      lambda m: 'v' + m.group(1).replace(',', '.')),
-    # dimbaar (positief; de ontkenning wordt apart afgehandeld)
-    (re.compile(r'\bdimbaar|dimbare|dimmbar|dimmable\b', re.I), lambda m: 'dimbaar'),
+    # dimbaar (positief; de ontkenning wordt apart afgehandeld). Een dimmer
+    # (schuif, knop) bewijst 'dimbaar' — de Aoraglow heeft een 'slide dimmer'.
+    (re.compile(r'\b(?:dimbaar|dimbare|dimmbar|dimmable|dimmers?|dimm?schakelaar|dimmable)\b', re.I), lambda m: 'dimbaar'),
     # energielabel
     (re.compile(r'\b(?:energielabel|energieklasse|energy\s+class)\s*[:=]?\s*([a-g](?:\+{1,3})?)\b', re.I),
      lambda m: 'energy' + m.group(1).lower()),
@@ -23435,11 +23487,18 @@ def api_lighting_publish():
             continue
         if existing:
             # Zelfde idempotency-gedachte als fashion: nooit een Shopify-gesuffixte
-            # duplicate maken bij een retry/dubbelklik.
+            # duplicate maken bij een retry/dubbelklik. Wél: alle verkoopkanalen
+            # aan (idempotent), zodat een eerder halve publicatie alsnog compleet is.
+            try:
+                ch_on, ch_err = _publish_to_all_channels(store, existing.get('id'), hdrs)
+            except Exception as e:
+                ch_on, ch_err = [], [str(e)]
             results[store] = {'product_id': existing.get('id'), 'reused': True,
                               'status': existing.get('status'),
                               'admin_url': f"https://{_shop_entry(store).get('shop','')}"
-                                           f"/admin/products/{existing.get('id')}"}
+                                           f"/admin/products/{existing.get('id')}",
+                              'channels': ch_on,
+                              'metafield_errors': [f'sales channel {e}' for e in ch_err]}
             continue
 
         c = content.get(store) or {}
@@ -23585,9 +23644,13 @@ def api_lighting_publish():
             else:
                 mf_errors.append(f'bundle collection {coll_handle!r} not found on {store}')
 
+        # ALLE verkoopkanalen (Online Store, Shop, Google & YouTube, Facebook &
+        # Instagram, TikTok, Pinterest, POS…) — venek, 2026-09-25.
+        channels_on = []
         try:
-            for err in (_publish_to_default_channels(store, pid, hdrs) or []):
-                mf_errors.append(f'sales channels: {err}')
+            channels_on, ch_err = _publish_to_all_channels(store, pid, hdrs)
+            for err in ch_err:
+                mf_errors.append(f'sales channel {err}')
         except Exception as e:
             mf_errors.append(f'sales channels: {e}')
 
@@ -23606,7 +23669,8 @@ def api_lighting_publish():
         results[store] = {'product_id': pid, 'handle': handle,
                           'admin_url': f'https://{shop_dom}/admin/products/{pid}' if shop_dom else '',
                           'images': uploaded, 'variants': len(prod.get('variants', [])),
-                          'activated': activated, 'metafield_errors': mf_errors}
+                          'activated': activated, 'channels': channels_on,
+                          'metafield_errors': mf_errors}
 
         # ► Eigen logboek. NOOIT publish_history.jsonl: dat is tevens het
         #   fashion-concurrentregister (_known_comp_data) + blog-gap-bron.
@@ -23681,6 +23745,9 @@ def _light_type_words_in(text, exclude=None):
     'spot'/'nachtlampje'/'sconce' alone."""
     excl = set(exclude or ()) | _LIGHT_ATTR_FAMILIES
     t = (text or '').lower()
+    # A comparison is not a claim: "hetzelfde effect als een ingebouwde wandlamp",
+    # "like a hard-wired sconce", "wie eine fest installierte Wandleuchte".
+    t = _LIGHT_TYPE_COMPARE_RE.sub(' ', t)
     for fam in excl:
         rx = _LIGHT_TYPE_COPY_RES.get(fam)
         if rx is not None:
@@ -23692,6 +23759,25 @@ def _light_type_words_in(text, exclude=None):
         for m in rx.finditer(t):
             out.append(m.group(0))
     return sorted(set(out))
+
+
+# The shop word for each family, per market. The model's own word is often a
+# near-miss ('Steckdosenlamp' without the e, 2026-09-25) and the copy prompt
+# orders "use exactly this word", so the typo propagated into the German copy.
+_LIGHT_TYPE_CANON = {
+    'pendant':    {'nl': 'hanglamp',          'de': 'Pendelleuchte',        'com': 'pendant light'},
+    'ceiling':    {'nl': 'plafondlamp',       'de': 'Deckenleuchte',        'com': 'ceiling light'},
+    'floor':      {'nl': 'vloerlamp',         'de': 'Stehlampe',            'com': 'floor lamp'},
+    'table':      {'nl': 'tafellamp',         'de': 'Tischlampe',           'com': 'table lamp'},
+    'desk':       {'nl': 'bureaulamp',        'de': 'Schreibtischlampe',    'com': 'desk lamp'},
+    'wall':       {'nl': 'wandlamp',          'de': 'Wandleuchte',          'com': 'wall light'},
+    'plugin':     {'nl': 'stekkerlamp',       'de': 'Steckdosenlampe',      'com': 'plug-in light'},
+    'spot':       {'nl': 'spot',              'de': 'Strahler',             'com': 'spotlight'},
+    'strip':      {'nl': 'ledstrip',          'de': 'LED-Streifen',         'com': 'LED strip'},
+    'outdoor':    {'nl': 'buitenlamp',        'de': 'Außenleuchte',         'com': 'outdoor light'},
+    'chandelier': {'nl': 'kroonluchter',      'de': 'Kronleuchter',         'com': 'chandelier'},
+    'portable':   {'nl': 'oplaadbare lamp',   'de': 'Akku-Lampe',           'com': 'rechargeable lamp'},
+}
 
 
 def _light_brief_guard(brief, product_type=''):
@@ -23748,6 +23834,15 @@ def _light_brief_guard(brief, product_type=''):
     for k in ('what', 'placement', 'power'):
         brief[k] = str(brief.get(k) or '').strip()[:300]
     brief['type'] = {k: str(types.get(k) or '').strip() for k in ('nl', 'de', 'com')}
+    # Known family → the canonical shop word per market wins over the model's
+    # near-miss; the operator's own Dutch word stays for nl when typed.
+    canon = _LIGHT_TYPE_CANON.get(brief['family'])
+    if canon:
+        brief['type_model'] = dict(brief['type'])
+        for k in ('nl', 'de', 'com'):
+            brief['type'][k] = canon[k]
+    if product_type.strip():
+        brief['type']['nl'] = product_type.strip()
     return brief
 
 
@@ -23760,7 +23855,7 @@ def api_lighting_understand():
     if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
         return jsonify({'error': 'Anthropic API key missing'}), 400
     data = request.json or {}
-    source_text = str(data.get('source_text') or '')[:4000]
+    source_text = str(data.get('source_text') or '')[:8000]
     product_title = str(data.get('product_title') or '').strip()
     product_type = str(data.get('product_type') or '').strip()
     if not (source_text.strip() or product_title):
@@ -23802,6 +23897,81 @@ def api_lighting_understand():
     return jsonify(brief)
 
 
+_LIGHT_EDITOR_SYSTEM = {
+    'nl': ('Je bent eindredacteur Nederlands bij een verlichtingswebshop. Je maakt productteksten natuurlijk en '
+           'correct Nederlands: anglicismen, letterlijke vertalingen uit het Engels, kromme zinnen, spelfouten. '
+           'Je verandert NOOIT de inhoud: geen nieuwe eigenschappen, geen weggelaten feiten, dezelfde opbouw en '
+           'hetzelfde aantal bullets, de productnaam blijft staan. Je antwoordt uitsluitend met JSON.'),
+    'de': ('Du bist Schlussredakteur/in Deutsch bei einem Leuchten-Webshop. Du machst Produkttexte zu natürlichem, '
+           'korrektem Deutsch: Anglizismen, wörtliche Übersetzungen, holprige Sätze, Rechtschreibfehler '
+           '(z. B. "Steckdosenlamp" → "Steckdosenlampe"). Du änderst NIE den Inhalt: keine neuen Eigenschaften, '
+           'keine weggelassenen Fakten, gleicher Aufbau und gleiche Anzahl Bullets, der Produktname bleibt. '
+           'Du antwortest ausschließlich mit JSON.'),
+    'com': ('You are a native English copy editor at a lighting webshop. You make product copy natural, correct '
+            'English: loan translations, awkward phrasing, spelling. You NEVER change the content: no new features, '
+            'no dropped facts, same structure and number of bullets, the product name stays. You answer with JSON only.'),
+}
+
+
+def _light_native_edit(out, store, lang_nl, lang_en, product_name, keywords):
+    """One editor call: (edited_fields, changes). Raises on API failure (the
+    caller keeps the first version)."""
+    import anthropic
+    payload = {k: str(out.get(k) or '') for k in ('description', 'meta_description', 'm_title_specs')}
+    prompt = (
+        f"Redigeer deze productcontent naar natuurlijk, correct {lang_nl} ({lang_en}). Behoud ELKE eigenschap, "
+        f"de volgorde, de bullets als '- Eigenschap: uitleg', de productnaam ({product_name}) in de eerste en "
+        f"laatste zin, en deze keywords als ze erin staan: {', '.join(keywords[:12]) or '-'}. "
+        "Voeg niets toe wat er niet staat. Als een zin al goed is, laat hem staan.\n"
+        "Geef terug als JSON: {\"description\": \"...\", \"meta_description\": \"...\", "
+        "\"m_title_specs\": \"...\", \"changes\": [\"kort: wat → waarin\"]} — 'changes' is leeg als je niets veranderde.\n\n"
+        + json.dumps(payload, ensure_ascii=False)
+    )
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    msg = client.messages.create(model='claude-sonnet-4-5', max_tokens=1400,
+                                 system=_LIGHT_EDITOR_SYSTEM.get(store, _LIGHT_EDITOR_SYSTEM['nl']),
+                                 messages=[{'role': 'user', 'content': prompt}])
+    txt = (msg.content[0].text if msg.content else '') or ''
+    m = re.search(r'\{.*\}', txt, re.S)
+    if not m:
+        raise ValueError('editor returned no JSON')
+    ed = json.loads(m.group(0))
+    changes = ed.get('changes') if isinstance(ed.get('changes'), list) else []
+    return {k: _md_strip(str(ed.get(k) or '')) for k in ('description', 'meta_description', 'm_title_specs')}, changes
+
+
+def _light_edit_rejected(before, after, product_name, families, claim_source, store):
+    """Why an editor result may NOT replace the first version ('' = fine):
+    empty text, product name gone, a different number of bullets, the wrong
+    language, another lamp type, or a spec/power claim the first version did
+    not make. The editor fixes words, never facts."""
+    desc_b, desc_a = str(before.get('description') or ''), str(after.get('description') or '')
+    if len(desc_a.strip()) < max(40, len(desc_b.strip()) // 2):
+        return 'edited text too short'
+    if product_name and product_name.lower() not in desc_a.lower():
+        return 'product name dropped'
+    bullets = lambda t: len(re.findall(r'^\s*-\s+', t, flags=re.M))
+    if bullets(desc_b) and bullets(desc_a) != bullets(desc_b):
+        return f'bullet count changed ({bullets(desc_b)} → {bullets(desc_a)})'
+    guess, _ = _light_lang_guess(desc_a)
+    if guess and guess != store:
+        return f'edited text is not in the store language ({guess})'
+    if families:
+        join_types = lambda o: _light_type_words_in(' '.join(str(o.get(k) or '') for k in
+                                                              ('description', 'meta_description', 'm_title_specs')),
+                                                     exclude=families)
+        # Only words the editor ADDED count — a type word the first version
+        # already had is the writer's, and is flagged there (type_mismatch).
+        others = sorted(set(join_types(after)) - set(join_types(before)))
+        if others:
+            return 'another lamp type introduced: ' + ', '.join(others)
+    join = lambda o: ' '.join(str(o.get(k) or '') for k in ('description', 'meta_description', 'm_title_specs'))
+    new_claims = set(_light_unverified_claims(join(after), claim_source)) - set(_light_unverified_claims(join(before), claim_source))
+    if new_claims:
+        return 'claim introduced: ' + ', '.join(sorted(new_claims))
+    return ''
+
+
 @app.route('/api/lighting/generate', methods=['POST'])
 @require_droplet_token
 def api_lighting_generate():
@@ -23834,6 +24004,13 @@ def api_lighting_generate():
     _btypes       = brief.get('type') if isinstance(brief.get('type'), dict) else {}
     fam_anchor    = product_type or ' '.join(str(_btypes.get(k) or '') for k in ('nl', 'de', 'com')).strip()
     families      = _light_type_families(fam_anchor, placement_only=True)
+    # The families the SOURCE itself names in its title / opening lines are the
+    # product's own too: aorabrand calls its plug-in lamp a 'wall light' and a
+    # 'sconce', so 'wandlamp' in our copy mirrors the source, it is not another
+    # lamp type. Only the opening (meta/og description + hero), where a shop
+    # names what it sells — not the whole page with its comparisons.
+    if families:
+        families = families | _light_type_families(product_title + ' ' + source_text[:600], placement_only=True)
     type_dropped  = [k for k in keywords if fam_anchor and _light_type_conflict(k, fam_anchor)]
     keywords      = [k for k in keywords if k not in type_dropped]
     only_field    = (data.get('only_field') or '').strip()
@@ -23889,6 +24066,25 @@ def api_lighting_generate():
         '"Wat dit product IS" staat.\n' if source_thin else
         'Voeding en werking (oplaadbaar, draadloos, in het stopcontact, sensor) neem je alleen over als de bron '
         'ze noemt — nooit uit het stijlvoorbeeld.\n')
+    # The source is usually English; the model translated it word for word
+    # ('blinde muur' for blank wall, 'poel licht' for pool of light, 'dusk-to-
+    # dawn sensor' left in English — venek, 2026-09-25). Say it, and give the
+    # shop words for the terms that go wrong most.
+    _GLOSS = {
+        'nl': ('Schrijf zoals een Nederlandse webshop schrijft, NOOIT als een letterlijke vertaling van de bron: '
+               'blank wall = kale muur (niet "blinde muur"), pool of light = zachte lichtvlek (niet "poel"), '
+               'dusk-to-dawn sensor = schemersensor, plug-in = stekkerlamp / in het stopcontact, sconce = wandlamp, '
+               'up-and-down light = licht naar boven en beneden, cordless = draadloos, dimmer = dimmer, '
+               'warm white = warmwit. Geen Engelse termen als er een gangbaar Nederlands woord is.'),
+        'de': ('Schreib wie ein deutscher Leuchten-Shop schreibt, NIE als wörtliche Übersetzung der Quelle: '
+               'blank wall = kahle Wand, pool of light = weicher Lichtkegel, dusk-to-dawn sensor = Dämmerungssensor, '
+               'plug-in = Steckdosenlampe / in die Steckdose, sconce = Wandleuchte, up-and-down light = Licht nach '
+               'oben und unten, cordless = kabellos, warm white = warmweiß. Korrekte deutsche Rechtschreibung '
+               '(Steckdosenlampe, nicht Steckdosenlamp). Keine englischen Begriffe, wenn es ein gängiges deutsches Wort gibt.'),
+        'com': ('Write like a native English lighting webshop, never as a word-for-word rendering of the source: '
+                'natural idiom, no Dutch or German loanwords, British or American spelling consistently.'),
+    }
+    natural_rule = _GLOSS.get(store, _GLOSS['nl'])
     type_line = (f'Het producttype is: {product_type or type_local}'
                  + (f' (in het {lang_nl}: {type_local})' if type_local and type_local != product_type else '')
                  + '. Beschrijf het als precies dat type — noem het nooit een ander soort lamp (geen tafellamp, '
@@ -23911,7 +24107,7 @@ Keywords (verwerk de relevantste natuurlijk; sla een keyword over als het niet b
 
 Alle informatie die we over dit product hebben (van de bron):
 ---
-{source_text[:2500]}
+{source_text[:6000]}
 ---
 {source_rule}
 Schrijf in exact deze stijl (alleen de TOON — het voorbeeld gaat over een ander product):
@@ -23928,6 +24124,7 @@ Regels:
 - Direct en warm, spreek de lezer aan met "je". Geen loze superlatieven, geen uitroeptekens-spam
 - Kleur/finish MAG je noemen (dit product heeft één beschrijving, kleuren zijn varianten)
 - {spec_rule}
+- {natural_rule}
 
 Geef ook:
 - meta_description: max 155 tekens, SEO voor {language}, verwerk 1-2 keywords natuurlijk
@@ -24012,6 +24209,28 @@ Antwoord uitsluitend als geldig JSON:
                 out, wrong_lang, others, claims = out2, wrong2, others2, claims2
     except Exception as e:
         return jsonify({'error': f'Generation failed: {str(e)[:160]}'}), 502
+
+    # Eindredactie door een "moedertaalspreker": anglicismen, letterlijke
+    # vertalingen en kromme zinnen eruit, inhoud gelijk. De redacteur mag geen
+    # feit toevoegen en geen structuur breken — dezelfde guards als hierboven
+    # beoordelen het resultaat, anders blijft de eerste versie staan.
+    out['language_pass'] = {'applied': False, 'reason': 'skipped'}
+    if not data.get('skip_language_pass') and str(out.get('description') or '').strip():
+        try:
+            edited, changes = _light_native_edit(out, store, lang_nl, lang_en, product_name, keywords)
+            reason = _light_edit_rejected(out, edited, product_name, families, claim_source, store)
+            if reason:
+                out['language_pass'] = {'applied': False, 'reason': reason}
+                print(f"[lighting] {product_name!r} {store}: language pass rejected — {reason}")
+            else:
+                for k in ('description', 'meta_description', 'm_title_specs'):
+                    if isinstance(edited.get(k), str) and edited[k].strip():
+                        out[k] = edited[k]
+                wrong_lang, others, claims = _problems(out)
+                out['language_pass'] = {'applied': True, 'changes': [str(c)[:120] for c in changes][:8]}
+        except Exception as e2:
+            # Transient (429/timeout): the first version stays, never a 502.
+            out['language_pass'] = {'applied': False, 'reason': f'editor unavailable: {str(e2)[:80]}'}
     # Vlaggen voor de UI (warn, never block): de medewerker ziet precies wat er
     # niet klopt en kan herschrijven.
     if wrong_lang:
