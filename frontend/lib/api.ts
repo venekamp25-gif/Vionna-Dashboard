@@ -4,6 +4,13 @@
  * Backend URL is configurable via NEXT_PUBLIC_BACKEND_URL env var so we can
  * point at localhost during dev and a real server (DigitalOcean droplet) in prod.
  */
+import {
+  BODY_TEXT_THIN,
+  bodyHtmlText,
+  fetchPageHtmlFromBrowser,
+  fetchProductJsonFromBrowser,
+} from "./browserScrape";
+
 const BACKEND_URL =
   process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/+$/, "") || "http://localhost:5000";
 
@@ -311,6 +318,13 @@ export interface ScrapedProduct {
   /** 'found' = chart read; 'unread' = a chart clearly EXISTS but we couldn't read
    *  it (unknown app etc.) — worker can flag it; 'none' = genuinely no chart. */
   size_chart_status?: "found" | "unread" | "none";
+  /** The product's own text read from its PAGE when the .json body_html was
+   *  empty/thin (theme-section shops): meta/og/JSON-LD description + the visible
+   *  text of <main> minus nav, footer, other-product cards and widgets. */
+  page_text?: string | null;
+  /** 'json' = body_html was fine; 'page' = page text filled the gap; otherwise
+   *  why the page could not be read ('rate_limited', 'http_403', 'empty'…). */
+  page_text_status?: string;
   /** What tipped us off that an unread chart exists (e.g. "SizeFox app"). */
   size_chart_hint?: string | null;
   error?: string;
@@ -614,11 +628,44 @@ export const api = {
    * and pastes it here. Same product shape as /api/scrape — minus sibling-discovery
    * (which would need the HTML page).
    */
-  scrapeManual: (rawJson: string) =>
+  scrapeManual: (rawJson: string, source: "paste" | "browser" = "paste", html?: string) =>
     call<ScrapedProduct & { source?: string }>(
       "/api/scrape_manual",
-      { method: "POST", body: { json: rawJson }, authed: true }
+      { method: "POST", body: { json: rawJson, source, ...(html ? { html } : {}) }, authed: true }
     ),
+
+  /**
+   * Zero-click fallback when a shop refuses our server (429 / anti-bot wall):
+   * fetch the product .json from THIS browser (the worker's residential IP,
+   * which the shop answers) and validate it through /api/scrape_manual. Never
+   * throws: `{product}` on success, `{error}` with the reason otherwise so the
+   * caller can fall through to the manual paste with a true sentence.
+   */
+  scrapeFromBrowser: async (url: string): Promise<ScrapedProduct & { source?: string }> => {
+    const r = await fetchProductJsonFromBrowser(url);
+    if (!r.ok) return { error: r.reason };
+    // Theme-section shops keep the description on the PAGE, not in the .json
+    // (aorabrand.co). Shopify serves the page cross-origin too, so read it as
+    // well when the .json body is thin — best effort, never a reason to fail.
+    let html: string | undefined;
+    try {
+      const parsed = JSON.parse(r.json) as { product?: { body_html?: string }; body_html?: string };
+      const bodyHtml = parsed?.product?.body_html ?? parsed?.body_html ?? "";
+      if (bodyHtmlText(bodyHtml).length < BODY_TEXT_THIN) {
+        const h = await fetchPageHtmlFromBrowser(url);
+        if (h.ok) html = h.html;
+      }
+    } catch {
+      /* the server validates the JSON; a page we could not read just means no page text */
+    }
+    try {
+      const m = await api.scrapeManual(r.json, "browser", html);
+      if (m.error || !m.product) return { error: m.error || "the server rejected the product JSON" };
+      return m;
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : String(e) };
+    }
+  },
 
   /**
    * Re-ask the backend what it makes of a competitor page's size chart NOW.
@@ -684,6 +731,9 @@ export const api = {
      *  given, these replace the LLM-derived seeds for that market: they come
      *  from the competitor's own text, so they describe THIS product. */
     seed_terms?: Partial<Record<string, string[]>>;
+    /** Home Decor: the product's power source from the brief ('socket',
+     *  'rechargeable', …). Keywords claiming another one are dropped. */
+    power?: string;
     min_volume?: number;
     limit?: number;
   }) =>
@@ -1641,6 +1691,8 @@ export interface LightGenerateResponse {
   language_mismatch?: boolean;
   /** Lamp-type words of another family still in the copy after one retry. */
   type_mismatch?: string[];
+  /** Power/sensor claims the copy makes that the source never states (after one retry). */
+  claim_mismatch?: string[];
   error?: string;
 }
 
