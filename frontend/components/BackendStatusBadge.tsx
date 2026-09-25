@@ -36,7 +36,7 @@ export function BackendStatusBadge() {
         type="button"
         onClick={() => setHealthOpen(true)}
         className="text-[11px] flex items-center gap-1.5 cursor-pointer hover:opacity-80 transition-opacity"
-        title={`${tooltip}\nfrontend build ${BUILD_SHA.slice(0, 7)}\n(click for full diagnostic)`}
+        title={`${tooltip}${BUILD_SHA !== "dev" ? `\nfrontend build ${BUILD_SHA.slice(0, 7)}` : ""}\n(click for full diagnostic)`}
       >
         {content}
       </button>
