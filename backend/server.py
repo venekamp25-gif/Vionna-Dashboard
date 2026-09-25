@@ -1,6 +1,6 @@
-import os, sys, json, re, hashlib, hmac, base64, urllib.parse, subprocess, tempfile, shutil, platform, unicodedata, datetime, time, threading
+import os, sys, json, re, hashlib, hmac, base64, secrets, urllib.parse, subprocess, tempfile, shutil, platform, unicodedata, datetime, time, threading, logging
 from functools import wraps
-from flask import Flask, request, redirect, session, jsonify, send_from_directory
+from flask import Flask, request, redirect, session, jsonify, send_from_directory, g
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 import requests as req
@@ -224,7 +224,8 @@ def _run_backup():
                       'wtl_verdicts.json', 'wtl_traffic.json', 'size_chart_fill.json',
                       'taxonomy_backfill.json', 'taxonomy_fill.json',
                       'wtl_store_marks.json', 'wtl_extra_stores.json',
-                      'wtl_discover_seen.json', 'wtl_discover_state.json'):
+                      'wtl_discover_seen.json', 'wtl_discover_state.json',
+                      'spy_shield.jsonl'):
             src = os.path.join(_BASE_DIR, fname)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dest, fname))
@@ -7069,7 +7070,7 @@ def api_save_dataforseo_credentials():
 # .env by hand. That made a two-minute change a CEO-only task. These two routes
 # move it into the dashboard, following exactly the shape of
 # /api/save_dataforseo_credentials above: gated, applied live, never echoed back.
-_ENV_ALLOWED_KEYS = ('SCRAPER_PROXY_URL', 'SCRAPER_PROXY')
+_ENV_ALLOWED_KEYS = ('SCRAPER_PROXY_URL', 'SCRAPER_PROXY', 'SPY_SHIELD_BEACON_TOKEN')
 
 
 def _env_write(values):
@@ -8614,6 +8615,730 @@ def drafts_clear():
         except Exception as e:
             return jsonify({'error': f'Could not clear draft: {e}'}), 500
     return jsonify({'success': True})
+
+
+# ============================================================================
+# 🛡️ Spy Shield beacon (since v1.314.0)
+# ============================================================================
+# Het thema-snippet "Spy Shield" (vionna-store-themes) laat concurrentie-
+# research-verkeer (PPSpy, Koala, WinningHunter, …) een nep-502 zien. Elke
+# beslissing stuurt ÉÉN klein JSON-record via navigator.sendBeacon naar
+# POST /api/spy_shield/<token>. Die route is BEWUST ongegate (browsers posten
+# ernaartoe), dus alles wat hem veilig houdt zit hieronder:
+#   - pad-token, constant-time vergeleken (verkeerd token → tóch 204: geen orakel)
+#   - body ≤ 2 KB, geldige JSON, verplicht event + ss_action, veld-whitelist,
+#     per-veld afkappen, 0/1-velden gedwongen naar int
+#   - rate-limit per IP (30/min én 300/dag) en globaal (20 000/dag) — stil droppen
+#   - append-only naar backend/spy_shield.jsonl, GEEN ander bijeffect
+#     (geen Slack, geen PR, geen shop-call) — "no auto-actions ever" (SPEC §4.4)
+#   - nooit het IP of de UA opslaan: browser_key = sha256(dagzout + ip + ua120)
+#   - logbestand begrensd: 90 dagen bewaren (_ss_prune, dagelijks) + harde
+#     grootte-grens (boven de grens droppen als 'full', nooit onbegrensd groeien)
+# Het token is PUBLIEK BY DESIGN: het thema print de beacon-URL in de bron van
+# elke winkelpagina. Het houdt alleen willekeurige scanners buiten; de echte
+# bescherming is de rate-limit + append-only + geen bijeffecten. Iedereen met de
+# URL kan dus een record vervalsen (bv. een rode koper-teller) — daarom toont de
+# tab hoeveel browsers achter een teller zitten en zegt de checklist: eerst het
+# ruwe log/de order bekijken, nooit op één rode tegel handelen.
+# Het thema weigert de stand "Blokkeren" zolang deze URL niet in de
+# thema-instellingen staat ("never block blind"). Uitlezen: tab "Spy Shield"
+# (GET /api/spy_shield/summary, gegate) + één losse Slack-regel per dag.
+SPY_SHIELD_LOG_PATH = os.path.join(_BASE_DIR, 'spy_shield.jsonl')
+# Laatste dag waarop de Slack-regel gepost is — op schijf, anders post een
+# herstart (self-update binnen ~10 min na een merge) de regel een tweede keer.
+SPY_SHIELD_DIGEST_STATE = os.path.join(_BASE_DIR, 'spy_shield_digest.json')
+
+# shop.permanent_domain (eerste label) → store-code. Bewust hardcoded: de
+# LS-tokens leven niet in deze backend en de code mag nooit crashen op een
+# onbekende winkel (→ 'unknown').
+_SS_STORES = {
+    '86d3b0-76':            'dk',
+    'g3et2j-k1':            'fr',
+    'p2wmp9-1u':            'fi',
+    'ced027-2':             'nl',
+    'thelightsupplier-8195': 'com',
+    '5f729b-7d':            'de',
+}
+_SS_STORE_NAMES = {
+    'dk': 'Vionna DK', 'fr': 'Vionna FR', 'fi': 'Vionna FI',
+    'nl': 'Light Supplier NL', 'com': 'Light Supplier .com', 'de': 'Light Supplier DE',
+    'unknown': 'Unknown store',
+}
+# De koper-join dekt alleen Vionna (dk/fr/fi via STORES + tokens.json). Light
+# Supplier is nog niet aangesloten: hun tokens staan in LIGHT_TOKENS/_shop_entry
+# (zie boven), maar of die read_orders dragen is niet nagekeken. TODO als LS ooit
+# naar Blokkeren gaat: _spy_shield_orders via _shop_entry laten lopen.
+_SS_BUYER_STORES = ('dk', 'fr', 'fi')
+_SS_ACTIONS = ('allow', 'monitor', 'block')
+# Veld → max lengte (str) of 'flag' (0/1). Alles buiten deze lijst wordt genegeerd.
+_SS_FIELDS = {
+    'ss_v': 16, 'ss_store': 64, 'ss_mode': 16, 'ss_pt': 'flag', 'ss_action': 16,
+    'ss_tier': 16, 'ss_reason': 200, 'ss_signals': 200, 'ss_info': 200,
+    'ss_phase': 16, 'ss_ref_host': 200, 'ss_clickid': 'flag', 'ss_utm': 'flag',
+    'ss_repeat': 'flag', 'ss_path': 200,
+}
+# per_ip_day: zonder deze grens vult ÉÉN bron (30/min × 24 u = 43 200) het
+# dagbudget in ~11 uur en wordt elke echte winkel-hit daarna stil gedropt.
+# max_bytes: harde grens op het logbestand; retention_days: _ss_prune.
+_SS_LIMITS = {'body': 2048, 'per_ip_min': 30, 'per_ip_day': 300, 'per_day': 20000,
+              'max_bytes': 100 * 1024 * 1024, 'retention_days': 90}
+_SS_LOCK = threading.Lock()
+# Rate-state (één Flask-proces op de droplet, dus in-memory is consistent).
+_SS_RATE = {'ip': {}, 'ip_day': {}, 'day': '', 'day_count': 0}
+# Tellers voor de summary — nooit een oorzaak naar de poster terug.
+#   token   = beacon met oud/verkeerd token (na een rotatie: ergens staat nog de oude URL)
+#   off     = kill switch SPY_SHIELD_BEACON=0
+#   rate_ip / rate_day = flood-bescherming (log kan onvolledig zijn!)
+#   full    = logbestand boven max_bytes
+#   size / json / shape / error = kapotte posts
+_SS_DROPPED = {'off': 0, 'token': 0, 'size': 0, 'json': 0, 'shape': 0,
+               'rate_ip': 0, 'rate_day': 0, 'full': 0, 'error': 0}
+_SS_ACCEPTED = [0]
+_SS_ORDERS_CACHE = {}          # (store, since_days) → (monotonic, rows|None)
+_SS_ORDERS_TTL = 30 * 60
+_SS_ORDERS_TTL_NONE = 60       # een mislukte fetch (403/geen token) maar kort onthouden
+# Zout voor browser_key als DROPLET_TOKEN_SECRET ontbreekt (dev-machine): een
+# willekeurig proces-geheim. NOOIT het beacon-token: dat staat in de winkelbron,
+# dus dan was browser_key door iedereen terug te rekenen uit ip + ua.
+_SS_PROCESS_SALT = secrets.token_hex(32)
+
+
+def _ss_token():
+    """Per request uit os.environ (niet als module-constante), zodat setup/rotate
+    zonder herstart werkt — zelfde reden als _scraper_proxies."""
+    return (os.getenv('SPY_SHIELD_BEACON_TOKEN') or '').strip()
+
+
+def _ss_public_base():
+    return os.getenv('PUBLIC_BASE_URL', 'https://188-166-11-177.nip.io').rstrip('/')
+
+
+def _ss_beacon_url():
+    tok = _ss_token()
+    return f'{_ss_public_base()}/api/spy_shield/{tok}' if tok else None
+
+
+def _ss_utcnow():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _ss_daily_salt(day):
+    """sha256(secret + YYYY-MM-DD). Het droplet-secret (altijd gezet op de
+    droplet, de gates falen anders dicht) zodat een token-rotatie de browser_key-
+    continuïteit niet halverwege de dag breekt. Zonder droplet-secret: een
+    willekeurig proces-zout — nooit het (publieke) beacon-token."""
+    secret = DROPLET_TOKEN_SECRET or _SS_PROCESS_SALT
+    return hashlib.sha256((secret + day).encode()).hexdigest()
+
+
+def _ss_browser_key(ip, ua, day):
+    """Dag-gezouten hash van ip + ua120 — het enige wat we van de bezoeker bewaren."""
+    return hashlib.sha256((_ss_daily_salt(day) + (ip or '') + (ua or '')[:120]).encode()).hexdigest()
+
+
+_SS_LOOPBACK = ('127.0.0.1', '::1', 'localhost')
+
+
+def _ss_client_ip():
+    """Het client-IP zoals Caddy het zag. Caddy (op dezelfde box, remote_addr =
+    loopback) voegt het echte client-IP als LAATSTE hop aan X-Forwarded-For toe;
+    een eerste hop kan de poster zelf meesturen en is dus waardeloos. Komt de
+    request niet via loopback binnen (Flask rechtstreeks geraakt — sinds v1.315
+    bindt hij op 127.0.0.1, dus dat hoort niet te kunnen), dan telt alleen
+    remote_addr en wordt XFF genegeerd. Alleen gehasht/rate-limit, nooit opgeslagen."""
+    remote = request.remote_addr or ''
+    if remote in _SS_LOOPBACK:
+        xff = request.headers.get('X-Forwarded-For', '')
+        last = xff.rsplit(',', 1)[-1].strip() if xff else ''
+        return last or remote
+    return remote
+
+
+def _ss_rate_allow(ip, now_mono, day):
+    """True als dit record mag worden geschreven. Per IP: max 30 in 60 s én max
+    300 per UTC-dag. Globaal: max 20 000 per UTC-dag. IP's worden gehasht in het
+    geheugen gehouden."""
+    key = hashlib.sha256(ip.encode()).hexdigest()[:16]
+    with _SS_LOCK:
+        if _SS_RATE['day'] != day:
+            _SS_RATE['day'] = day
+            _SS_RATE['day_count'] = 0
+            _SS_RATE['ip'] = {}
+            _SS_RATE['ip_day'] = {}
+        if _SS_RATE['day_count'] >= _SS_LIMITS['per_day']:
+            _SS_DROPPED['rate_day'] += 1
+            return False
+        if _SS_RATE['ip_day'].get(key, 0) >= _SS_LIMITS['per_ip_day']:
+            _SS_DROPPED['rate_ip'] += 1
+            return False
+        hits = [t for t in _SS_RATE['ip'].get(key, []) if now_mono - t < 60]
+        if len(hits) >= _SS_LIMITS['per_ip_min']:
+            _SS_RATE['ip'][key] = hits
+            _SS_DROPPED['rate_ip'] += 1
+            return False
+        hits.append(now_mono)
+        _SS_RATE['ip'][key] = hits
+        _SS_RATE['ip_day'][key] = _SS_RATE['ip_day'].get(key, 0) + 1
+        # Vergeten IP's opruimen zodat de dict niet groeit bij een scan.
+        if len(_SS_RATE['ip']) > 5000:
+            _SS_RATE['ip'] = {k: v for k, v in _SS_RATE['ip'].items()
+                              if v and now_mono - v[-1] < 60}
+        _SS_RATE['day_count'] += 1
+        return True
+
+
+def _ss_clean_fields(data):
+    """Whitelist + afkappen. Retourneert None als de vorm niet klopt — ook bij een
+    string die niet als UTF-8 kan worden weggeschreven (JSON-escape van een losse
+    surrogate zoals "\\ud800"), zodat zo'n post géén rate-budget kost."""
+    if not isinstance(data, dict) or data.get('event') != 'spy_shield':
+        return None
+    out = {}
+    for name, rule in _SS_FIELDS.items():
+        v = data.get(name)
+        if rule == 'flag':
+            out[name] = 1 if v in (1, True, '1', 'true') else 0
+        else:
+            s = '' if v is None else str(v)[:rule]
+            try:
+                s.encode('utf-8')
+            except UnicodeEncodeError:
+                return None
+            out[name] = s
+    if out['ss_action'] not in _SS_ACTIONS:
+        return None
+    return out
+
+
+def _ss_log_full():
+    """True als het logbestand boven de harde grens zit (dan droppen, nooit groeien)."""
+    try:
+        return os.path.getsize(SPY_SHIELD_LOG_PATH) >= _SS_LIMITS['max_bytes']
+    except OSError:
+        return False
+
+
+def _ss_prune(now=None):
+    """Bewaar alleen de laatste `retention_days` UTC-dagen: herschrijf via een
+    tijdelijk bestand + os.replace onder _SS_LOCK (de append ziet nooit een half
+    bestand). Geeft het aantal verwijderde regels terug. Dagelijks vanuit de
+    digest-loop; nooit vanuit de beacon-route (die heeft geen bijeffecten)."""
+    now = now or _ss_utcnow()
+    cutoff = (now - datetime.timedelta(days=_SS_LIMITS['retention_days'] - 1)).strftime('%Y-%m-%d')
+    removed = 0
+    with _SS_LOCK:
+        if not os.path.exists(SPY_SHIELD_LOG_PATH):
+            return 0
+        tmp = SPY_SHIELD_LOG_PATH + '.tmp'
+        with open(SPY_SHIELD_LOG_PATH, 'r', encoding='utf-8') as src, \
+                open(tmp, 'w', encoding='utf-8') as dst:
+            for line in src:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    day = str(json.loads(s).get('day') or '')[:10]
+                except Exception:
+                    removed += 1          # kapotte regel: gaat mee weg
+                    continue
+                if day >= cutoff:
+                    dst.write(s + '\n')
+                else:
+                    removed += 1
+        os.replace(tmp, SPY_SHIELD_LOG_PATH)
+    return removed
+
+
+def _ss_ingest(token):
+    """Verwerk één beacon-POST. Geeft de uitkomst terug ('ok' of de drop-reden)
+    voor tests/tellers — de route zelf antwoordt altijd 204."""
+    if os.getenv('SPY_SHIELD_BEACON', '1') == '0':
+        _SS_DROPPED['off'] += 1
+        return 'off'
+    expected = _ss_token()
+    if not expected or not hmac.compare_digest((token or '').encode(), expected.encode()):
+        _SS_DROPPED['token'] += 1
+        return 'token'
+    cl = request.content_length
+    if cl is None or cl > _SS_LIMITS['body']:
+        _SS_DROPPED['size'] += 1
+        return 'size'
+    raw = request.get_data(cache=False)
+    if len(raw) > _SS_LIMITS['body']:
+        _SS_DROPPED['size'] += 1
+        return 'size'
+    try:
+        data = json.loads(raw.decode('utf-8', 'replace') or '')
+    except Exception:
+        _SS_DROPPED['json'] += 1
+        return 'json'
+    fields = _ss_clean_fields(data)
+    if fields is None:
+        _SS_DROPPED['shape'] += 1
+        return 'shape'
+    if _ss_log_full():
+        _SS_DROPPED['full'] += 1
+        return 'full'
+    now = _ss_utcnow()
+    day = now.strftime('%Y-%m-%d')
+    ip = _ss_client_ip()
+    if not _ss_rate_allow(ip, time.monotonic(), day):
+        return 'rate'
+    ua = str(data.get('ss_ua') or '')[:120]
+    entry = {
+        'ts': now.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'day': day,
+        'store': _SS_STORES.get(fields['ss_store'], 'unknown'),
+        'browser_key': _ss_browser_key(ip, ua, day),
+    }
+    entry.update(fields)
+    # ensure_ascii=True: één fysieke regel per record, alles buiten ASCII als
+    # \uXXXX — de reader (json.loads) draait dat 1:1 terug.
+    line = json.dumps(entry, ensure_ascii=True) + '\n'
+    with _SS_LOCK:
+        with open(SPY_SHIELD_LOG_PATH, 'a', encoding='utf-8') as f:
+            f.write(line)
+    _SS_ACCEPTED[0] += 1
+    return 'ok'
+
+
+@app.route('/api/spy_shield/<token>', methods=['POST'])
+def api_spy_shield_beacon(token):
+    """Ongegate beacon-ontvanger (zie blok-commentaar). ELKE uitkomst → 204 zonder
+    body: een verkeerd token, te grote body, kapotte JSON of een rate-limit mag
+    nooit te onderscheiden zijn van een geslaagde append. Alles in try/except,
+    want handle_error zou een crash anders als JSON-500 verraden."""
+    try:
+        _ss_ingest(token)
+    except Exception as e:
+        _SS_DROPPED['error'] += 1
+        print(f'[spy_shield] ingest error: {type(e).__name__}')
+    return ('', 204)
+
+
+def _ss_read_rows(days):
+    """Records van vandaag + de `days`-1 UTC-dagen ervoor (days=7 = 7 kalender-
+    dagen incl. vandaag), kapotte regels overgeslagen."""
+    cutoff = (_ss_utcnow() - datetime.timedelta(days=max(1, int(days)) - 1)).strftime('%Y-%m-%d')
+    rows = []
+    for r in _blog_read_jsonl(SPY_SHIELD_LOG_PATH):
+        if not isinstance(r, dict):
+            continue
+        day = str(r.get('day') or r.get('ts') or '')[:10]
+        if day >= cutoff:
+            rows.append(r)
+    return rows
+
+
+def _ss_parse_ts(s):
+    """ISO-tijd ('…Z' of met offset) → aware UTC datetime, anders None."""
+    try:
+        s = str(s or '').strip()
+        if s.endswith('Z'):
+            s = s[:-1] + '+00:00'
+        d = datetime.datetime.fromisoformat(s)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=datetime.timezone.utc)
+        return d.astimezone(datetime.timezone.utc)
+    except Exception:
+        return None
+
+
+def _ss_path_only(landing):
+    """landing_site → pad zonder query/fragment/slash aan het eind ('' als leeg)."""
+    try:
+        p = urllib.parse.urlparse(str(landing or '')).path or ''
+    except Exception:
+        p = ''
+    p = p.rstrip('/')
+    return p or '/'
+
+
+def _spy_shield_orders(store, since_days):
+    """Vionna-orders (naam, created_at, landing_site) van de laatste `since_days`
+    dagen, 30 min gecacht per (store, since_days) — een breder venster mag nooit
+    stil het smallere cache-venster hergebruiken (valse 0). None = niet leesbaar
+    (geen token, of het token mist read_orders → 403) en wordt maar 60 s
+    onthouden. Zelfde REST-pad als _blog_conversions."""
+    since_days = int(since_days)
+    hit = _SS_ORDERS_CACHE.get((store, since_days))
+    if hit:
+        ttl = _SS_ORDERS_TTL if hit[1] is not None else _SS_ORDERS_TTL_NONE
+        if time.monotonic() - hit[0] < ttl:
+            return hit[1]
+    hdrs = shopify_headers(store)
+    if not hdrs.get('X-Shopify-Access-Token') or not STORES.get(store):
+        rows = None
+    else:
+        # Records gaan since_days-1 dagen terug (+ het ±60-min-venster), dus
+        # since_days kalenderdagen orders dekt elke mogelijke match.
+        since = (_ss_utcnow() - datetime.timedelta(days=since_days)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        url = shopify_url(store, f'orders.json?status=any&limit=250&created_at_min={since}'
+                                 '&fields=id,name,created_at,landing_site')
+        rows = []
+        pages = 0
+        while url and pages < 40:
+            pages += 1
+            r = _shopify_call('get', url, hdrs, timeout=30)
+            if r.status_code == 403:
+                rows = None
+                break
+            if r.status_code != 200:
+                print(f"[spy_shield] orders fetch {store} HTTP {r.status_code}")
+                rows = None
+                break
+            for o in r.json().get('orders', []):
+                rows.append({'order_name': str(o.get('name') or o.get('id') or ''),
+                             'created_at': o.get('created_at') or '',
+                             'landing_site': _ss_path_only(o.get('landing_site'))})
+            link = r.headers.get('Link') or r.headers.get('link') or ''
+            m2 = re.search(r'<([^>]+)>;\s*rel="next"', link)
+            url = m2.group(1) if m2 else None
+    _SS_ORDERS_CACHE[(store, since_days)] = (time.monotonic(), rows)
+    return rows
+
+
+def _spy_shield_buyers(rows, stores, days):
+    """Rode teller: orders waarvan de sessie landde op een pad waar een
+    block-tier record (ss_tier == 'block') van dezelfde winkel binnen ±60 min
+    zat. Alleen Vionna (tokens hier). count None = minstens één gevraagde
+    Vionna-winkel kon niet gecontroleerd worden — dan is '0' geen bewijs."""
+    wanted = [s for s in _SS_BUYER_STORES if s in stores]
+    out = {'supported_stores': list(_SS_BUYER_STORES), 'count': 0, 'orders': [],
+           'orders_checked': {}, 'note': '',
+           # Hoeveel verschillende browsers (dag-hashes) achter de gematchte
+           # records zitten: het beacon-token is publiek, dus één bron kan een
+           # rode teller vervalsen — "alle N treffers uit 1 browser" is het
+           # signaal om eerst het ruwe log te bekijken.
+           'matched_browsers': 0, 'block_tier_browsers': 0}
+    unreadable = []
+    window = datetime.timedelta(minutes=60)
+    matched_keys = set()
+    block_keys = set()
+    for st in wanted:
+        blocks = [r for r in rows if r.get('store') == st and r.get('ss_tier') == 'block']
+        block_keys |= {r.get('browser_key') for r in blocks if r.get('browser_key')}
+        if not blocks:
+            out['orders_checked'][st] = 0
+            continue
+        try:
+            orders = _spy_shield_orders(st, days)
+        except Exception as e:
+            print(f'[spy_shield] orders {st} failed: {type(e).__name__}')
+            orders = None
+        if orders is None:
+            unreadable.append(st)
+            out['orders_checked'][st] = None
+            continue
+        out['orders_checked'][st] = len(orders)
+        by_path = {}
+        for r in blocks:
+            t = _ss_parse_ts(r.get('ts'))
+            if t:
+                by_path.setdefault(_ss_path_only(r.get('ss_path')), []).append((t, r))
+        for o in orders:
+            ot = _ss_parse_ts(o.get('created_at'))
+            cands = by_path.get(o.get('landing_site') or '/')
+            if not ot or not cands:
+                continue
+            for t, r in cands:
+                if abs(ot - t) <= window:
+                    if r.get('browser_key'):
+                        matched_keys.add(r['browser_key'])
+                    out['orders'].append({'store': st, 'order_name': o['order_name'],
+                                          'created_at': o['created_at'],
+                                          'landing_site': o['landing_site'],
+                                          'matched_reason': r.get('ss_reason') or '',
+                                          'matched_at': r.get('ts') or '',
+                                          'matched_mode': r.get('ss_mode') or ''})
+                    break
+    out['count'] = len(out['orders'])
+    out['matched_browsers'] = len(matched_keys)
+    out['block_tier_browsers'] = len(block_keys)
+    notes = ['Buyer check covers Vionna DK/FR/FI only (Light Supplier not wired up yet). '
+             'Match = same store, same landing path, order within ±60 min of a block-tier '
+             'signal — by page and time, not by cookie, so a coincidence is possible: '
+             'open the order before you conclude anything.']
+    if unreadable:
+        out['count'] = None
+        notes.append('Orders not readable for ' + ', '.join(s.upper() for s in unreadable)
+                     + ' (no token or missing read_orders scope) — a 0 here is not proof.')
+    out['note'] = ' '.join(notes)
+    return out
+
+
+def _ss_pt_alarm_active(pt_alarm, total, pt_last_at, now=None):
+    """Het ss_pt-alarm (records uit een niet-gepubliceerd thema) is pas ECHT een
+    alarm als het een wezenlijk deel is (> 5 % of > 10 records) ÉN recent (< 2
+    dagen). Anders is het venek die het duplicaat test (README-checklist draait
+    ?ss_debug=1 / ?ss_sim op het DK-duplicaat, theme.role != 'main') — dat mag
+    niet 14-30 dagen lang een rode tegel + Slack-waarschuwing geven (SPEC §4.4:
+    alarm bij 'a few % of records on a live store')."""
+    if not pt_alarm or not total:
+        return False
+    if not (pt_alarm > 10 or pt_alarm / float(total) > 0.05):
+        return False
+    last = _ss_parse_ts(pt_last_at)
+    if not last:
+        return False
+    return ((now or _ss_utcnow()) - last) < datetime.timedelta(days=2)
+
+
+def _spy_shield_summary(days=14, store='all', with_buyers=True, with_url=True):
+    """Aggregatie voor de tab + de Slack-regel. Nooit browser_key in last_hits.
+    with_url=False laat beacon_url weg (X-Notify-Token-lezers hebben het
+    schrijf-token niet nodig)."""
+    days = max(1, min(int(days or 14), 90))
+    rows = _ss_read_rows(days)
+    store = (store or 'all').lower()
+    if store != 'all':
+        rows = [r for r in rows if r.get('store') == store]
+    stores = {}
+    for r in rows:
+        code = r.get('store') or 'unknown'
+        s = stores.get(code)
+        if s is None:
+            s = stores[code] = {'name': _SS_STORE_NAMES.get(code, code.upper()), 'total': 0,
+                                'by_action': {'allow': 0, 'monitor': 0, 'block': 0},
+                                '_reasons': {}, '_browsers': set(), 'repeat_hits': 0,
+                                'pt_alarm': 0, 'pt_last_at': None, 'block_tier_hits': 0,
+                                'utm_hits': 0, '_daily': {}, 'last_hits': [],
+                                'last_hit_at': None, 'first_hit_at': None, 'active_days': 0}
+        s['total'] += 1
+        act = r.get('ss_action') if r.get('ss_action') in _SS_ACTIONS else 'allow'
+        s['by_action'][act] += 1
+        reason = r.get('ss_reason') or 'none'
+        s['_reasons'][reason] = s['_reasons'].get(reason, 0) + 1
+        if r.get('browser_key'):
+            s['_browsers'].add(r['browser_key'])
+        if r.get('ss_repeat') == 1:
+            s['repeat_hits'] += 1
+        if r.get('ss_utm') == 1:
+            s['utm_hits'] += 1
+        ts = r.get('ts') or ''
+        if r.get('ss_pt') == 1:
+            s['pt_alarm'] += 1
+            if not s['pt_last_at'] or ts > s['pt_last_at']:
+                s['pt_last_at'] = ts
+        if r.get('ss_tier') == 'block':
+            s['block_tier_hits'] += 1
+        day = str(r.get('day') or r.get('ts') or '')[:10]
+        d = s['_daily'].setdefault(day, {'day': day, 'monitor': 0, 'block': 0, 'allow': 0})
+        d[act] += 1
+        if not s['last_hit_at'] or ts > s['last_hit_at']:
+            s['last_hit_at'] = ts
+        if ts and (not s['first_hit_at'] or ts < s['first_hit_at']):
+            s['first_hit_at'] = ts
+    totals = {'total': 0, 'by_action': {'allow': 0, 'monitor': 0, 'block': 0},
+              'unique_browsers': 0, 'repeat_hits': 0, 'pt_alarm': 0, 'pt_last_at': None,
+              'pt_alarm_active': False, 'block_tier_hits': 0, 'utm_hits': 0,
+              'last_hit_at': None}
+    all_browsers = set()
+    for code, s in stores.items():
+        s['by_reason'] = sorted(s.pop('_reasons').items(), key=lambda kv: (-kv[1], kv[0]))[:25]
+        s['by_reason'] = [[k, v] for k, v in s['by_reason']]
+        browsers = s.pop('_browsers')
+        all_browsers |= browsers
+        s['unique_browsers'] = len(browsers)
+        daily = s.pop('_daily')
+        s['daily'] = [daily[k] for k in sorted(daily)]
+        s['active_days'] = len(daily)          # dagen mét records = "dagen data" voor de 14-dagen-eis
+        last = [r for r in rows if (r.get('store') or 'unknown') == code][-20:]
+        s['last_hits'] = [{k: v for k, v in r.items() if k != 'browser_key'} for r in reversed(last)]
+        s['pt_alarm_active'] = _ss_pt_alarm_active(s['pt_alarm'], s['total'], s['pt_last_at'])
+        totals['total'] += s['total']
+        for a in _SS_ACTIONS:
+            totals['by_action'][a] += s['by_action'][a]
+        totals['repeat_hits'] += s['repeat_hits']
+        totals['utm_hits'] += s['utm_hits']
+        totals['pt_alarm'] += s['pt_alarm']
+        if s['pt_last_at'] and (not totals['pt_last_at'] or s['pt_last_at'] > totals['pt_last_at']):
+            totals['pt_last_at'] = s['pt_last_at']
+        totals['block_tier_hits'] += s['block_tier_hits']
+        if s['last_hit_at'] and (not totals['last_hit_at'] or s['last_hit_at'] > totals['last_hit_at']):
+            totals['last_hit_at'] = s['last_hit_at']
+    totals['unique_browsers'] = len(all_browsers)
+    totals['pt_alarm_active'] = _ss_pt_alarm_active(totals['pt_alarm'], totals['total'], totals['pt_last_at'])
+    wanted = list(_SS_BUYER_STORES) if store == 'all' else [store]
+    if with_buyers:
+        try:
+            buyers = _spy_shield_buyers(rows, wanted, days)
+        except Exception as e:
+            print(f'[spy_shield] buyers join failed: {type(e).__name__}')
+            buyers = {'supported_stores': list(_SS_BUYER_STORES), 'count': None, 'orders': [],
+                      'orders_checked': {}, 'note': 'Buyer check failed — see server log.'}
+    else:
+        buyers = {'supported_stores': list(_SS_BUYER_STORES), 'count': None, 'orders': [],
+                  'orders_checked': {}, 'note': 'Buyer check skipped.'}
+    return {
+        'configured': bool(_ss_token()),
+        'beacon_url': _ss_beacon_url() if with_url else None,
+        'days': days,
+        'store': store,
+        'generated_at': _ss_utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'store_names': dict(_SS_STORE_NAMES),
+        'stores': stores,
+        'totals': totals,
+        'buyers_flagged': buyers,
+        'dropped': dict(_SS_DROPPED),
+        'accepted_since_start': _SS_ACCEPTED[0],
+        'log_full': _ss_log_full(),
+        'limits': {k: _SS_LIMITS[k] for k in ('per_ip_min', 'per_ip_day', 'per_day', 'retention_days')},
+    }
+
+
+def require_droplet_or_notify_token(f):
+    """Sessietoken OF het gedeelde cron-geheim (X-Notify-Token, zelfde patroon als
+    /api/pricing/lookup) zodat master-dashboard de dagbericht-regel server-to-
+    server kan ophalen. Zonder geldig geheim valt hij terug op de normale gate.
+    Via het cron-geheim zet hij g.ss_notify zodat de route het schrijf-token
+    (beacon_url) kan weglaten: master-dashboard heeft alleen de cijfers nodig."""
+    gated = require_droplet_token(f)
+
+    @wraps(f)
+    def _wrapped(*args, **kwargs):
+        secret = os.getenv('NOTIFY_SECRET', '')
+        supplied = request.headers.get('X-Notify-Token', '')
+        if secret and hmac.compare_digest(supplied.encode(), secret.encode()):
+            g.ss_notify = True
+            return f(*args, **kwargs)
+        return gated(*args, **kwargs)
+    return _wrapped
+
+
+@app.route('/api/spy_shield/summary', methods=['GET'])
+@require_droplet_or_notify_token
+def api_spy_shield_summary():
+    try:
+        days = int(request.args.get('days', 14))
+    except Exception:
+        days = 14
+    store = (request.args.get('store') or 'all').lower()
+    if store != 'all' and store not in _SS_STORE_NAMES:
+        return jsonify({'error': f'unknown store {store!r}'}), 400
+    with_url = not getattr(g, 'ss_notify', False)
+    return jsonify(_spy_shield_summary(days=days, store=store, with_url=with_url))
+
+
+@app.route('/api/spy_shield/setup', methods=['POST'])
+@require_droplet_token
+def api_spy_shield_setup():
+    """Munt (of roteert) het beacon-token in .env, zelfde patroon als
+    /api/save_scraper_proxy: allowlist, live in os.environ, nooit gelogd. Het
+    token komt alleen terug als onderdeel van beacon_url — venek plakt die in
+    de thema-instellingen van zes winkels."""
+    body = request.get_json(silent=True) or {}
+    rotate = bool(body.get('rotate'))
+    current = _ss_token()
+    if current and not rotate:
+        return jsonify({'ok': True, 'configured': True, 'rotated': False,
+                        'beacon_url': _ss_beacon_url()})
+    new_tok = secrets.token_urlsafe(24)
+    try:
+        _env_write({'SPY_SHIELD_BEACON_TOKEN': new_tok})
+    except Exception as e:
+        return jsonify({'error': 'Could not write .env: ' + str(e)[:80]}), 500
+    os.environ['SPY_SHIELD_BEACON_TOKEN'] = new_tok
+    print('[spy_shield] beacon token ' + ('rotated' if current else 'created') + ' via dashboard')
+    return jsonify({'ok': True, 'configured': True, 'rotated': bool(current),
+                    'beacon_url': _ss_beacon_url()})
+
+
+def _spy_shield_digest_line(days=14):
+    """Eén Slack-regel, of None als er (nog) geen records zijn — een lege
+    pijplijn mag nooit als 'schoon' klinken, dus dan zeggen we niets. Zelfde
+    woorden als de tab-tegels (Would-be blocks / Buyers in flagged sessions)."""
+    s = _spy_shield_summary(days=days, store='all', with_buyers=True, with_url=False)
+    t = s['totals']
+    if not t['total']:
+        return None
+    b = s['buyers_flagged']
+    buyers = b['count']
+    if buyers is None:
+        buyers_txt = 'buyers in flagged sessions: n/a (orders niet leesbaar)'
+    else:
+        buyers_txt = f'{buyers} buyers in flagged sessions'
+        if buyers and b.get('matched_browsers'):
+            buyers_txt += f" (uit {b['matched_browsers']} browser{'s' if b['matched_browsers'] != 1 else ''} — eerst de order bekijken)"
+    per_store = ' / '.join(f"{code.upper()} {st['total']}" for code, st in
+                           sorted(s['stores'].items(), key=lambda kv: -kv[1]['total']))
+    line = (f"🛡️ Spy Shield ({days}d): {t['block_tier_hits']} would-be blocks, "
+            f"{t['by_action']['block']} 502s getoond, {buyers_txt}, "
+            f"{t['unique_browsers']} browser-dagen · {per_store}")
+    if t.get('pt_alarm_active'):
+        pct = round(100.0 * t['pt_alarm'] / max(1, t['total']))
+        line += (f" ⚠️ {pct}% van de records komt uit een preview-thema (ss_pt=1) — test je nu geen "
+                 f"duplicaat, check dan theme.role: het shield staat dan feitelijk uit")
+    d = s['dropped']
+    if d.get('rate_day') or d.get('full'):
+        line += ' ⚠️ records gedropt (dagbudget/logbestand vol): log kan onvolledig zijn'
+    if d.get('token'):
+        line += f" ⚠️ {d['token']} beacons met oude/verkeerde URL sinds herstart (ergens staat nog de oude URL geplakt)"
+    return line
+
+
+def _ss_digest_state():
+    try:
+        with open(SPY_SHIELD_DIGEST_STATE, encoding='utf-8') as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _ss_digest_save(state):
+    try:
+        with open(SPY_SHIELD_DIGEST_STATE, 'w', encoding='utf-8') as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f'[spy_shield] digest state not saved: {type(e).__name__}')
+
+
+def _spy_shield_digest_tick(now=None, post=None):
+    """Eén tik van de digest-loop (apart voor tests): rond 09:05 lokale droplet-
+    tijd (= UTC op de droplet, dus 11:05 NL in de zomer) één keer per dag de
+    Slack-regel posten, en één keer per dag het log snoeien. De 'laatste dag'
+    staat op schijf, dus een herstart (self-update) post niet dubbel."""
+    now = now or datetime.datetime.now()
+    today = now.strftime('%Y-%m-%d')
+    state = _ss_digest_state()
+    did = []
+    if state.get('pruned_day') != today:
+        removed = _ss_prune()
+        state['pruned_day'] = today
+        _ss_digest_save(state)
+        did.append(f'pruned {removed}')
+    if now.hour == 9 and now.minute >= 5 and state.get('posted_day') != today:
+        state['posted_day'] = today
+        _ss_digest_save(state)
+        line = _spy_shield_digest_line(14)
+        url = _slack_webhook_url()
+        if line and url:
+            (post or (lambda u, text: req.post(u, json={'text': text}, timeout=10)))(url, line)
+            did.append('posted')
+    return did
+
+
+def _spy_shield_digest_loop():
+    """Stopgap: post de regel als losse Slack-post via _slack_webhook_url (= het
+    bug-report-kanaal, niet het master-dashboard-dagbericht). De echte plek is
+    master-dashboard, dat dezelfde cijfers via /api/spy_shield/summary
+    (X-Notify-Token) kan ophalen; zodra dat staat kan deze loop uit
+    (SPY_SHIELD_DIGEST=0)."""
+    time.sleep(120)
+    while True:
+        try:
+            _spy_shield_digest_tick()
+        except Exception as e:
+            print(f'[spy_shield] digest error: {e}')
+        time.sleep(600)
+
+
+# Zelfde guards als de andere onbeheerde loops: nooit vanaf een dev-machine of pytest.
+if os.getenv('SPY_SHIELD_DIGEST') != '0' and os.getenv('DEV_LOCAL') != '1' and 'pytest' not in sys.modules:
+    try:
+        threading.Thread(target=_spy_shield_digest_loop, daemon=True, name='spy-shield-digest').start()
+    except Exception as _e:
+        print(f'[spy_shield] could not start digest thread: {_e}')
 
 
 # --- Bug-report intake (queued for CEO's Claude Code session) ---
@@ -24482,7 +25207,26 @@ def api_lighting_bundle_suggest():
     })
 
 
+class _SpyShieldAccessLogFilter(logging.Filter):
+    """Werkzeug's request-log zou anders per beacon 'POST /api/spy_shield/<token>'
+    in journald zetten. Het token is publiek (staat in de winkelbron), maar zes
+    winkels × elke beslissing = ruis die de echte fouten verstopt."""
+    def filter(self, record):
+        try:
+            return '/api/spy_shield/' not in record.getMessage()
+        except Exception:
+            return True
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+    # Sinds v1.315: alleen loopback. Caddy proxyt op dezelfde box naar
+    # 127.0.0.1:PORT en de self-updater praat ook via 127.0.0.1. Rechtstreeks
+    # op :5000 vanaf internet kon eerder wél (memory: 'niet urgent'), maar de
+    # Spy Shield-rate-limit hangt aan het client-IP uit X-Forwarded-For en dat
+    # is alleen betrouwbaar als élke request via Caddy komt. BIND_HOST=0.0.0.0
+    # in .env zet het terug (bv. een dev-machine die via LAN bereikt moet zijn).
+    host = os.environ.get('BIND_HOST', '127.0.0.1')
+    logging.getLogger('werkzeug').addFilter(_SpyShieldAccessLogFilter())
     print(f"\nVionna Dashboard running on http://localhost:{port}\n")
-    app.run(debug=False, host='0.0.0.0', port=port)
+    app.run(debug=False, host=host, port=port)
