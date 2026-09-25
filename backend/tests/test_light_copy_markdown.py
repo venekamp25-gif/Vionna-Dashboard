@@ -96,7 +96,7 @@ def test_copy_prompt_carries_the_type_and_output_has_no_asterisks(monkeypatch):
     monkeypatch.setenv('DEV_LOCAL', '1')
     server.app.config['TESTING'] = True
     with server.app.test_client() as c:
-        body = c.post('/api/lighting/generate', json={
+        body = c.post('/api/lighting/generate', json={'skip_language_pass': True, 
             'store': 'nl', 'product_name': 'PLUGIFY AORA', 'product_title': 'Glow', 'product_type': 'Stekkerlamp',
             'source_text': 'Een lamp voor in het stopcontact.',
             'keywords': ['hanglamp', 'glazen hanglamp', 'stekkerlamp', 'nachtlampje stopcontact']}).get_json()

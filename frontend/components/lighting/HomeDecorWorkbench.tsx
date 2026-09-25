@@ -221,7 +221,10 @@ export function HomeDecorWorkbench() {
     const fromPage = bodyText.length < BODY_TEXT_THIN && !!(pageText && pageText.trim());
     // A short-but-real body is kept in front of the page text, not replaced.
     const descText = fromPage ? [bodyText, (pageText as string).trim()].filter(Boolean).join("\n") : bodyText;
-    const sourceText = [p.title ?? "", descText].join(" ").trim().slice(0, 4000);
+    // The whole page, not a preview of it: the copy step reads up to 6,000
+    // chars and the understand step 8,000 (the Aoraglow's FAQ and dimmer
+    // details sat beyond the old 4,000/2,500 cut).
+    const sourceText = [p.title ?? "", descText].join(" ").trim().slice(0, 12000);
     setSourceNote(
       fromPage
         ? "The product JSON had no description — this was read from the product page itself. Check it before you continue."
@@ -434,6 +437,7 @@ export function HomeDecorWorkbench() {
         languageMismatch: !!r.language_mismatch,
         typeMismatch: r.type_mismatch ?? [],
         claimMismatch: r.claim_mismatch ?? [],
+        languagePass: r.language_pass,
       };
       // Functional update — generateAll() awaits several markets in a row, and a
       // spread of the render-time draft.content would drop all but the last.
@@ -999,6 +1003,15 @@ export function HomeDecorWorkbench() {
                             retry. Rewrite, or take it out by hand.
                           </p>
                         )}
+                        {c.languagePass && (
+                          <p className="text-[10.5px] text-text-faint mb-2">
+                            {c.languagePass.applied
+                              ? c.languagePass.changes?.length
+                                ? `Native-language pass: ${c.languagePass.changes.length} change(s) — ${c.languagePass.changes.slice(0, 4).join("; ")}`
+                                : "Native-language pass: nothing to change."
+                              : `Native-language pass not applied (${c.languagePass.reason ?? "unknown"}).`}
+                          </p>
+                        )}
                         {c.sourceSpecs.length > 0 && (
                           <p className="text-[10.5px] text-text-faint mb-2">
                             Specs the source states (safe to use): {c.sourceSpecs.join(", ")}
@@ -1194,6 +1207,11 @@ export function HomeDecorWorkbench() {
                           : `Created: ${r.variants} variant${r.variants === 1 ? "" : "s"}, ${r.images} photo${
                               r.images === 1 ? "" : "s"
                             }, ${r.activated ? "live" : "draft"}.`}
+                      </p>
+                    )}
+                    {(r.channels ?? []).length > 0 && (
+                      <p className="text-[10.5px] text-text-faint mt-1">
+                        On {r.channels!.length} sales channel{r.channels!.length === 1 ? "" : "s"}: {r.channels!.join(", ")}
                       </p>
                     )}
                     {(r.metafield_errors ?? []).length > 0 && (

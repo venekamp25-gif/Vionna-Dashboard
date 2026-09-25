@@ -1693,6 +1693,8 @@ export interface LightGenerateResponse {
   type_mismatch?: string[];
   /** Power/sensor claims the copy makes that the source never states (after one retry). */
   claim_mismatch?: string[];
+  /** Native-editor pass: applied + what changed, or why it was rejected. */
+  language_pass?: { applied: boolean; changes?: string[]; reason?: string };
   error?: string;
 }
 
@@ -1720,6 +1722,8 @@ export interface LightPublishResult {
   activated?: boolean;
   reused?: boolean;
   status?: string;
+  /** Sales channels the product is now on (Online Store, Shop, Google & YouTube…). */
+  channels?: string[];
   metafield_errors?: string[];
   error?: string;
 }
