@@ -1,13 +1,13 @@
 import type { NextConfig } from "next";
 import { execSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 
 /**
- * The build's commit sha, baked into the bundle (NEXT_PUBLIC_BUILD_SHA) AND
- * written to public/build.json, so a running tab can tell whether a newer
- * build is live (components/UpdateBanner). Netlify provides COMMIT_REF; a
- * local build asks git; anything else is "dev" (never nags).
+ * The build's commit sha, offered to the bundle as NEXT_PUBLIC_BUILD_SHA so
+ * the header can show which build a tab runs (components/UpdateBanner,
+ * lib/buildInfo). Netlify provides COMMIT_REF; a local build asks git;
+ * anything else is "dev". The live build itself is served by
+ * app/api/build/route.ts (prerendered per deploy) — a file written into
+ * public/ here was never served by Netlify (2026-09-25).
  */
 function buildSha(): string {
   const fromEnv = (process.env.COMMIT_REF || process.env.NEXT_PUBLIC_BUILD_SHA || "").trim();
@@ -19,20 +19,9 @@ function buildSha(): string {
   }
 }
 
-const sha = buildSha();
-try {
-  mkdirSync(join(process.cwd(), "public"), { recursive: true });
-  writeFileSync(
-    join(process.cwd(), "public", "build.json"),
-    JSON.stringify({ sha, builtAt: new Date().toISOString() }) + "\n"
-  );
-} catch {
-  /* read-only checkout — the banner then simply never shows */
-}
-
 const nextConfig: NextConfig = {
   env: {
-    NEXT_PUBLIC_BUILD_SHA: sha,
+    NEXT_PUBLIC_BUILD_SHA: buildSha(),
   },
 };
 
