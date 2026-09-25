@@ -10,6 +10,7 @@ import {
   fetchPageHtmlFromBrowser,
   fetchProductJsonFromBrowser,
 } from "./browserScrape";
+import type { SsStoreSummary, SsByAction } from "./spyShield";
 
 const BACKEND_URL =
   process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/+$/, "") || "http://localhost:5000";
@@ -141,6 +142,50 @@ async function call<T>(
 }
 
 // ── Types matching server.py responses ──
+
+// ── Spy Shield (v1.314.0) ──
+
+/** One order whose session landed on a path that carried a block-tier signal. */
+export interface SpyShieldBuyer {
+  store: string;
+  order_name: string;
+  created_at: string;
+  landing_site: string;
+  matched_reason: string;
+  matched_at: string;
+}
+
+export interface SpyShieldSummary {
+  /** Whether SPY_SHIELD_BEACON_TOKEN exists on the droplet. */
+  configured: boolean;
+  /** Full beacon URL (carries the token) — only ever sent to the gated caller. */
+  beacon_url: string | null;
+  days: number;
+  store: string;
+  generated_at: string;
+  store_names: Record<string, string>;
+  stores: Record<string, SsStoreSummary>;
+  totals: {
+    total: number;
+    by_action: SsByAction;
+    unique_browsers: number;
+    repeat_hits: number;
+    pt_alarm: number;
+    block_tier_hits: number;
+    last_hit_at: string | null;
+  };
+  buyers_flagged: {
+    supported_stores: string[];
+    /** null = at least one requested Vionna store could not be checked. */
+    count: number | null;
+    orders: SpyShieldBuyer[];
+    orders_checked: Record<string, number | null>;
+    note: string;
+  };
+  dropped: Record<string, number>;
+  accepted_since_start: number;
+}
+
 
 /** One variant judged on cost-of-goods versus its CURRENT selling price. */
 export interface CogsRow {
@@ -1010,6 +1055,23 @@ export const api = {
     call<CogsOverview>(
       `/api/cogs/overview?scope=${scope}${force ? "&refresh=1" : ""}`,
       { authed: true }
+    ),
+
+  // ── Spy Shield ──
+  // The beacon log lives on the droplet (backend/spy_shield.jsonl); the summary
+  // is the only way to read it and it never carries a browser_key. The beacon
+  // URL contains the write token, so it only ever travels over this gated call.
+  spyShieldSummary: (days: 7 | 14 | 30 = 14, store = "all") =>
+    call<SpyShieldSummary>(`/api/spy_shield/summary?days=${days}&store=${encodeURIComponent(store)}`, {
+      authed: true,
+    }),
+
+  /** Mint the beacon token (first time) or rotate it. Rotating invalidates the
+   *  URL pasted in all six themes — the page confirms before calling this. */
+  spyShieldSetup: (rotate = false) =>
+    call<{ ok?: boolean; configured?: boolean; rotated?: boolean; beacon_url?: string | null; error?: string }>(
+      "/api/spy_shield/setup",
+      { method: "POST", body: { rotate }, authed: true }
     ),
 
   /** Write new prices. Always send compare_at_price when the product carries a
