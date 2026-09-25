@@ -20,7 +20,7 @@ import { LightStoreConnect } from "./LightStoreConnect";
 import { ManualPasteModal } from "@/components/steps/ManualPasteModal";
 import { classifyScrapeError, isShopRefusal } from "@/lib/scrapeError";
 import { BODY_TEXT_THIN, bodyHtmlText } from "@/lib/browserScrape";
-import { BUILD_SHA } from "@/lib/buildInfo";
+import { BuildStamp } from "@/components/BuildStamp";
 
 /** The API helper throws "API /api/scrape → 429: {json}"; show the operator the
  *  server's own sentence, not the envelope. */
@@ -577,9 +577,7 @@ export function HomeDecorWorkbench() {
               Start over
             </button>
           )}
-          <span className="text-[10.5px] text-text-faint font-mono" title="Which build of the dashboard this tab runs">
-            build {BUILD_SHA.slice(0, 7)}
-          </span>
+          <BuildStamp />
           <ThemeToggle />
           <LogoutButton />
         </div>
