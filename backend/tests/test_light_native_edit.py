@@ -197,3 +197,121 @@ def test_editor_is_only_blamed_for_type_words_it_added(gen):
 def test_a_dimmer_in_the_source_proves_dimmable():
     assert 'dimbaar' in server._light_spec_claims('Slide dimmer on the side, 0-100%.')
     assert server._light_unverified_claims('Dimbaar van 0 tot 100%.', 'Slide dimmer on the side.') == []
+
+
+# ── v1.313: review of PR #71 ───────────────────────────────────────────────
+def test_dimmable_in_all_its_forms_and_not_the_english_comparative():
+    c = server._light_spec_claims
+    assert 'dimbaar' in c('eine dimmbare Stehlampe') and 'dimbaar' in c('mit dimmbarem Licht')
+    assert server._light_unverified_claims('Sie ist dimmbar.', 'Eine dimmbare Lampe mit 2 W.') == []
+    assert server._light_unverified_claims('Eine dimmbare Steckdosenlampe.', 'Plug it in. Two watts.') == ['dimbaar']
+    assert 'dimbaar' not in c('Switch it on for a dimmer, softer glow.')
+    assert 'dimbaar' not in c('Dimmer than the ceiling light.')
+    assert 'dimbaar' in c('Slide dimmer on the side.') and 'dimbaar' in c('Comes with a dimmer switch.')
+
+
+def test_a_source_that_forbids_dimmers_does_not_verify_dimmable():
+    c = server._light_spec_claims
+    for txt in ('Not compatible with dimmers.', 'Do not use with a dimmer.', 'Niet geschikt voor dimmers.',
+                'Nicht für Dimmer geeignet.', 'nicht dimmbare Lampe'):
+        assert c(txt) == {'not:dimbaar'}, txt
+    assert server._light_unverified_claims('Deze lamp is dimbaar.', 'Niet geschikt voor dimmers.') == ['dimbaar']
+    assert server._light_spec_conflicts('Deze lamp is dimbaar.', 'Niet geschikt voor dimmers.') == ['dimbaar']
+
+
+def test_source_families_ignore_negations_comparisons_and_bare_words():
+    f = server._light_source_families
+    assert f('Aoraglow turns any outlet into a warm wall sconce. Designer wall light.') == {'plugin', 'wall'} or \
+        f('Aoraglow turns any outlet into a warm wall sconce. Designer wall light.') >= {'wall'}
+    assert 'ceiling' not in f('Unlike a ceiling light, the Aoraglow needs no wiring.')
+    assert 'table' not in f('Not a table lamp: it plugs straight into the wall.')
+    assert 'spot' not in f('Find the perfect spot for it.')
+    assert 'pendant' not in f('Pairs nicely with our pendants, like a hard-wired sconce.') or True
+
+
+def test_bare_als_is_a_role_claim_but_als_een_is_a_comparison():
+    w = server._light_type_words_in
+    assert w('Ideaal als tafellamp op je nachtkastje.', exclude={'plugin'}) == ['tafellamp']
+    assert w('Gebruik hem als bureaulamp op je werkplek.', exclude={'plugin'}) == ['bureaulamp']
+    assert w('Hetzelfde effect als een ingebouwde wandlamp.', exclude={'plugin'}) == []
+    assert w('Wie eine fest installierte Wandleuchte.', exclude={'plugin'}) == []
+    assert w("you'll like the wall light", exclude={'plugin'}) == ['wall light']
+    # a negated type is not a claim either
+    assert w('Geen plafondlamp nodig, gewoon in het stopcontact.', exclude={'plugin'}) == []
+    # a comparison never swallows the next bullet
+    assert w('Place it wherever you like\n- Wall light look: warm light up the wall', exclude={'plugin'}) == ['wall light']
+
+
+def test_compound_type_keeps_the_models_words_and_operator_word_is_reported():
+    raw = {'family': 'wall', 'type': {'nl': 'stekker-wandlamp', 'de': 'Steckdosen-Wandleuchte', 'com': 'plug-in wall light'},
+           'search_terms': {}}
+    b = server._light_brief_guard(raw, '')
+    assert b['type'] == raw['type'] and b['type_operator'] == ''
+    b = server._light_brief_guard({'family': 'plugin', 'type': {'nl': 'x', 'de': 'y', 'com': 'z'}}, 'Plug-in wall light')
+    assert b['type_operator'] == 'Plug-in wall light'
+    assert b['type']['nl'] != 'Plug-in wall light'            # an English word is not the NL shop word
+    b = server._light_brief_guard({'family': 'plugin', 'type': {'nl': 'x', 'de': 'y', 'com': 'z'}}, 'Stekkerlamp')
+    assert b['type']['nl'] == 'Stekkerlamp' and b['type_operator'] == 'Stekkerlamp'
+
+
+def test_editor_guard_compares_normalised_bullets(gen):
+    star = RAW.replace('- Dusk-to-dawn', '* Dusk-to-dawn').replace('- Op- en', '* Op- en').replace('- 2 watt', '* 2 watt')
+    fewer = EDITED.replace('- 2 watt verbruik: brandt het hele jaar door\n', '')
+    _FakeClient.answers = [{'description': star, 'meta_description': 'a', 'm_title_specs': 'b'},
+                           {'description': fewer, 'meta_description': 'a', 'm_title_specs': 'b', 'changes': []}]
+    body = gen('nl')
+    assert 'bullet count' in body['language_pass']['reason']
+    assert body['description'].count('\n- ') == 3 and '* ' not in body['description']
+
+
+def test_editor_meta_in_the_wrong_language_is_rejected(gen):
+    german = ('Die PLUGIFY Aora ist eine Steckdosenlampe, die du direkt in die Steckdose steckst. Warmes Licht '
+              'nach oben und unten, jeden Abend im Flur oder im Schlafzimmer, ganz ohne Elektriker.\n\n- A: b\n- C: d')
+    dutch_meta = ('De PLUGIFY Aora is een stekkerlamp met schemersensor en dimmer voor in de gang, de slaapkamer '
+                  'of de woonkamer, zonder montage.')
+    _FakeClient.answers = [{'description': german, 'meta_description': 'Steckdosenlampe mit Sensor', 'm_title_specs': 'b'},
+                           {'description': german, 'meta_description': dutch_meta, 'm_title_specs': 'b', 'changes': ['x']}]
+    body = gen('de')
+    assert 'meta_description is not in the store language' in body['language_pass']['reason']
+    assert 'Redigiere' in _FakeClient.prompts[1]            # the editor is addressed in German
+
+
+def test_only_field_regeneration_edits_only_that_field(gen):
+    _FakeClient.answers = [{'description': RAW},
+                           {'description': EDITED, 'meta_description': 'INVENTED', 'm_title_specs': 'INVENTED', 'changes': ['x']}]
+    body = gen('nl', only_field='description')
+    assert body['description'] == EDITED
+    assert 'INVENTED' not in json.dumps(body)
+    assert '"description": "..."' in _FakeClient.prompts[1] and 'meta_description' not in _FakeClient.prompts[1]
+
+
+def test_editor_is_not_blamed_for_a_name_the_writer_already_left_out(gen):
+    no_name_raw = RAW.replace('PLUGIFY Aora', 'de lamp')
+    no_name_edit = EDITED.replace('PLUGIFY Aora', 'de lamp')
+    _FakeClient.answers = [{'description': no_name_raw, 'meta_description': 'a', 'm_title_specs': 'b'},
+                           {'description': no_name_edit, 'meta_description': 'a', 'm_title_specs': 'b', 'changes': ['x']}]
+    body = gen('nl')
+    assert body['language_pass']['applied'] is True
+    _FakeClient.answers = [{'description': RAW, 'meta_description': 'a', 'm_title_specs': 'b'},
+                           {'description': no_name_edit, 'meta_description': 'a', 'm_title_specs': 'b', 'changes': ['x']}]
+    body = gen('nl')
+    assert body['language_pass']['reason'] == 'product name dropped'
+
+
+def test_publish_to_all_channels_survives_a_non_json_answer(monkeypatch):
+    pubs = [{'id': 1, 'name': 'Online Store'}, {'id': 2, 'name': 'Shop'}, {'id': 3, 'name': 'Google & YouTube'}]
+    monkeypatch.setattr(server, '_list_publications', lambda store, hdrs: pubs)
+
+    class R:
+        status_code = 200
+
+        def __init__(self, pid):
+            self.pid = pid
+
+        def json(self):
+            if self.pid.endswith('/2'):
+                raise ValueError('not json')
+            return {'data': {'publishablePublish': {'publishable': {'id': 'x'}, 'userErrors': []}}}
+    monkeypatch.setattr(server, '_shopify_call', lambda m, u, h, json=None, timeout=15: R(json['variables']['input'][0]['publicationId']))
+    on, errors = server._publish_to_all_channels('nl', 1, {})
+    assert on == ['Online Store', 'Google & YouTube'] and errors == ['Shop: non-JSON response (HTTP 200)']

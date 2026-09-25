@@ -1704,6 +1704,8 @@ export interface LightUnderstandResponse {
   family?: string;
   family_source?: string;
   type?: { nl: string; de: string; com: string };
+  type_model?: { nl: string; de: string; com: string };
+  type_operator?: string;
   what?: string;
   placement?: string;
   power?: string;

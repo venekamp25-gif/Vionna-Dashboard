@@ -42,6 +42,10 @@ export interface LightBrief {
   family: string;
   family_source?: string;
   type: { nl: string; de: string; com: string };
+  /** The model's own type words before the canonical shop words replaced them. */
+  type_model?: { nl: string; de: string; com: string };
+  /** The word the operator typed when the brief was read ('' when none). */
+  type_operator?: string;
   what: string;
   placement: string;
   power: string;
