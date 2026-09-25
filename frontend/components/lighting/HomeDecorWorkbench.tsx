@@ -18,7 +18,8 @@ import { useLightProduct, type LightBrief, type LightContent } from "@/lib/light
 import { LightWhatToList } from "./LightWhatToList";
 import { LightStoreConnect } from "./LightStoreConnect";
 import { ManualPasteModal } from "@/components/steps/ManualPasteModal";
-import { classifyScrapeError } from "@/lib/scrapeError";
+import { classifyScrapeError, isShopRefusal } from "@/lib/scrapeError";
+import { BODY_TEXT_THIN, bodyHtmlText } from "@/lib/browserScrape";
 
 /** The API helper throws "API /api/scrape → 429: {json}"; show the operator the
  *  server's own sentence, not the envelope. */
@@ -37,9 +38,16 @@ function cleanApiError(e: unknown): string {
 
 const STORES: LightStore[] = ["nl", "de", "com"];
 
-/** Strip HTML → plain text. This is what a spec claim is checked against. */
-function toPlainText(html: string): string {
-  return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+/** Strip HTML → plain text. This is what a spec claim is checked against.
+ *  One tokenizer for "is the .json body thin?" everywhere (lib/browserScrape). */
+const toPlainText = bodyHtmlText;
+
+/** Only a type the operator TYPED is the operator's word; the one the brief
+ *  filled in belongs to the model's reading and must not be sent back as
+ *  operator truth (it would lock a wrong family — review of #67/#68). */
+function typedTypeOf(d: { productType: string; brief?: { type?: { nl?: string } } | null }): string {
+  const t = d.productType.trim();
+  return t && t !== (d.brief?.type?.nl ?? "").trim() ? t : "";
 }
 
 /** Section shell — same visual language as the research workbench. */
@@ -146,8 +154,7 @@ export function HomeDecorWorkbench() {
     // type the operator typed themselves carries over to the next import.
     // Otherwise a hanglamp's auto-filled type would anchor the next stekkerlamp
     // with "operator" authority.
-    const prevType = draft.productType.trim();
-    const typedType = prevType && prevType !== (draft.brief?.type?.nl ?? "").trim() ? prevType : "";
+    const typedType = typedTypeOf(draft);
     try {
       let p: NonNullable<ScrapedProduct["product"]>;
       let pageText: string | null | undefined;
@@ -159,7 +166,9 @@ export function HomeDecorWorkbench() {
       } catch (e) {
         const msg = cleanApiError(e);
         const failure = classifyScrapeError(msg);
-        if (failure === "other") throw new Error(msg);
+        // Only a shop that refuses OUR server: a 502 while the droplet
+        // restarts, or a timeout, is not "this shop blocks us".
+        if (failure === "other" || !isShopRefusal(msg)) throw new Error(msg);
         // The shop refuses OUR server's IP (429 / anti-bot wall), not the
         // product: the same URL answers a normal browser at once. Shopify's
         // product .json allows cross-origin reads, so read it from THIS
@@ -208,13 +217,14 @@ export function HomeDecorWorkbench() {
     // had the whole story only on the page). Nothing at all → say so, and let
     // the operator paste it: copy without a source is copy without facts.
     const bodyText = toPlainText(p.body_html ?? "");
-    const fromPage = bodyText.length < 200 && !!(pageText && pageText.trim());
-    const descText = fromPage ? (pageText as string).trim() : bodyText;
+    const fromPage = bodyText.length < BODY_TEXT_THIN && !!(pageText && pageText.trim());
+    // A short-but-real body is kept in front of the page text, not replaced.
+    const descText = fromPage ? [bodyText, (pageText as string).trim()].filter(Boolean).join("\n") : bodyText;
     const sourceText = [p.title ?? "", descText].join(" ").trim().slice(0, 4000);
     setSourceNote(
       fromPage
         ? "The product JSON had no description — this was read from the product page itself. Check it before you continue."
-        : bodyText.length < 200
+        : bodyText.length < BODY_TEXT_THIN
           ? "No description found: the product JSON is empty and the page could not be read. Paste the competitor's description here so the copy has facts to work with, then press Re-read."
           : null
     );
@@ -249,9 +259,16 @@ export function HomeDecorWorkbench() {
     // only featured_image would silently map zero photos to variants.
     const byValue: Record<string, string[]> = {};
     const abs = (s: string) => (s.startsWith("//") ? `https:${s}` : s);
+    // The chosen option may be option2 (Color next to Pack): read the value
+    // from the matching position, never blindly option1.
+    const optIndex = Math.max(0, (p.options ?? []).findIndex((o) => o === opt));
+    const optKey = (opt?.position ? `option${opt.position}` : `option${optIndex + 1}`) as "option1" | "option2" | "option3";
+    const valueOf = (v: NonNullable<ScrapedProduct["product"]>["variants"] extends (infer V)[] | undefined ? V : never) =>
+      (v[optKey] ?? v.option1 ?? "") as string;
     const valueByVariantId = new Map<number, string>();
     for (const v of p.variants ?? []) {
-      if (v.id && v.option1) valueByVariantId.set(v.id, v.option1);
+      const val = valueOf(v);
+      if (v.id && val) valueByVariantId.set(v.id, val);
     }
     for (const im of p.images ?? []) {
       for (const vid of im.variant_ids ?? []) {
@@ -260,7 +277,7 @@ export function HomeDecorWorkbench() {
       }
     }
     for (const v of p.variants ?? []) {
-      const val = v.option1 ?? "";
+      const val = valueOf(v);
       const src = v.featured_image?.src;
       if (val && src && !(byValue[val]?.length)) (byValue[val] ||= []).push(abs(src));
     }
@@ -510,7 +527,9 @@ export function HomeDecorWorkbench() {
     }
   };
 
-  const scraped = !!draft.sourceText;
+  // Imported = we have a competitor product, even when the operator empties the
+  // source textarea to paste a new description (that must not unmount the panel).
+  const scraped = !!(draft.competitorTitle || draft.sourceText || draft.images.length);
   const haveCopy = draft.selectedStores.some((s) => (draft.content[s]?.description ?? "").length > 0);
 
   const allClaims = useMemo(
@@ -637,9 +656,7 @@ export function HomeDecorWorkbench() {
               setPasteOpen(false);
               setScrapeError(null);
               setImportNote("Pasted from your browser — this shop refuses our server.");
-              const prevType = draft.productType.trim();
-              const typedType = prevType && prevType !== (draft.brief?.type?.nl ?? "").trim() ? prevType : "";
-              applyProduct(p, draft.competitorUrl.trim(), typedType);
+              applyProduct(p, draft.competitorUrl.trim(), typedTypeOf(draft));
             }}
           />
 
@@ -713,7 +730,7 @@ export function HomeDecorWorkbench() {
                 </span>
                 <button
                   type="button"
-                  onClick={() => understandProduct(draft.sourceText, draft.competitorTitle, draft.productType.trim())}
+                  onClick={() => understandProduct(draft.sourceText, draft.competitorTitle, typedTypeOf(draft))}
                   disabled={briefLoading || !draft.sourceText.trim()}
                   className="text-[11px] text-accent hover:underline disabled:opacity-40"
                 >

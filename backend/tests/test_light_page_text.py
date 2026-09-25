@@ -149,11 +149,11 @@ def gen(monkeypatch):
     server.app.config['TESTING'] = True
 
     def run(store='de', source_text='Aoraglow turns any outlet into a warm wall sconce. Plug it in. Dusk-to-dawn sensor.',
-            brief=None):
+            brief=None, product_type='Stekkerlamp'):
         with server.app.test_client() as c:
             return c.post('/api/lighting/generate', json={
                 'store': store, 'product_name': 'PLUGIFY Aora', 'product_title': 'Aoraglow',
-                'product_type': 'Stekkerlamp', 'source_text': source_text, 'keywords': [],
+                'product_type': product_type, 'source_text': source_text, 'keywords': [],
                 'brief': brief if brief is not None else {
                     'family': 'plugin', 'type': {'nl': 'stekkerlamp', 'de': 'Steckdosenlampe', 'com': 'plug-in light'},
                     'what': 'Een lamp die je in het stopcontact steekt.', 'power': 'socket',
@@ -239,3 +239,130 @@ def test_a_plug_in_wall_light_keeps_both_families_without_an_operator_type():
     # The operator's own word narrows it again: typed 'Stekkerlamp' → wall terms go
     b2 = server._light_brief_guard(raw, 'Stekkerlamp')
     assert 'wandlamp stopcontact' in b2['terms_dropped']
+
+
+# ── v1.311: review of PR #68 ───────────────────────────────────────────────
+def test_negation_covers_the_power_and_sensor_words():
+    c = server._light_spec_claims
+    assert c('Niet oplaadbaar, werkt op netstroom.') == {'not:oplaadbaar', 'stopcontact'}
+    assert 'not:oplaadbaar' in c('Nicht wiederaufladbar.') and 'oplaadbaar' not in c('Nicht wiederaufladbar.')
+    assert c('Geen sensor, gewoon een schakelaar.') == {'not:sensor'}
+    assert c('Geen batterijen nodig.') == {'not:oplaadbaar'}
+    assert c('Not cordless.') == {'not:draadloos'}
+
+
+def test_socket_negation_needs_an_absence_word_and_never_a_second_socket():
+    c = server._light_spec_claims
+    assert c('Blockiert nicht die Steckdose daneben.') == {'stopcontact'}
+    assert 'not:stopcontact' not in c('Passt in jede Steckdose, blockiert keine zweite Steckdose.')
+    assert 'not:stopcontact' not in c('Nicht nur eine Steckdosenlampe, sondern auch ein Nachtlicht.')
+    assert c('Geen stopcontact nodig, gewoon neerzetten.') == {'not:stopcontact'}
+    assert c('Ohne Steckdose, einfach aufstellen.') == {'not:stopcontact'}
+    assert c('No outlet needed.') == {'not:stopcontact'}
+
+
+def test_power_words_ignore_remotes_chargers_and_lookalikes():
+    c = server._light_spec_claims
+    for txt in ('Met draadloze afstandsbediening.', 'Wireless remote included.', 'Mit kabelloser Fernbedienung.',
+                'Bluetooth wireless speaker built in.', 'Akkurat gefertigt.', 'Die Solaris Lampe.',
+                'Visit our outlet store.', 'Solarium'):
+        assert not (c(txt) & server._LIGHT_POWER_CLAIMS), txt
+    assert server._light_power_conflict('lamp met draadloze afstandsbediening', 'socket') is False
+
+
+def test_power_words_catch_the_common_phrasings():
+    c = server._light_spec_claims
+    assert 'oplaadbaar' in c('Lamp met ingebouwde accu, 8 uur licht.')
+    assert 'oplaadbaar' in c('Opladen via USB-C.') and 'oplaadbaar' in c('Ladezeit 2 Stunden.')
+    assert 'oplaadbaar' in c('Lithium-ion 2000mAh.') and 'oplaadbaar' in c('USB-C charging, 10h runtime.')
+    assert 'stopcontact' in c('Plug it in.') and 'stopcontact' in c('Plugs into any socket.')
+    assert 'stopcontact' in c('Netzbetrieb mit Stecker.') and 'stopcontact' in c('Mains powered.')
+    assert 'sensor' in c('Gaat vanzelf aan bij schemering.') and 'sensor' in c('Met twee sensoren.')
+
+
+def test_number_words_only_become_watts_when_they_are_watts():
+    c = server._light_spec_claims
+    assert 'w1' not in c('Ein W-LAN Modul.') and 'w1' not in c('Phase one w/ light.')
+    assert 'w2' not in c('Afmetingen: twee W x drie H cm.')
+    assert 'w2' in c('Two watts, cool to the touch.')
+
+
+def test_page_text_keeps_forms_and_headers_inside_main_and_drops_review_widgets():
+    html = ('<html><body><header><nav>Menu</nav></header><main>'
+            '<header class="section-header"><h1>Aoraglow</h1></header>'
+            '<form action="/cart/add"><div class="description">Plugs into any outlet, dusk-to-dawn sensor.</div>'
+            '<button>Add to cart</button></form>'
+            '<div class="jdgm-widget jdgm-review-widget"><span>4.8 stars</span> Write a review, rechargeable is great</div>'
+            '<div id="looxReviews">Loox rechargeable review text</div>'
+            '<a href="/products/aora%C3%A9glow?variant=1">Aoraéglow in white</a>'
+            '</main><footer>Privacy policy</footer></body></html>')
+    t = server._page_text_from_html(html, handle='aoraéglow')
+    assert 'Plugs into any outlet' in t and 'Aoraglow' in t
+    assert 'Aoraéglow in white' in t                          # own link, percent-encoded href
+    for noise in ('Write a review', 'Loox', 'rechargeable', 'Menu', 'Privacy'):
+        assert noise not in t, noise
+
+
+def test_page_text_for_does_not_ask_a_refusing_host_twice(monkeypatch):
+    monkeypatch.setattr(server, '_scrape_get',
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError('fetched again')))
+    assert server._page_text_for({'body_html': '', 'handle': 'x'}, None, 'https://x/products/x',
+                                 prior_status=429) == (None, 'rate_limited')
+    assert server._page_text_for({'body_html': '', 'handle': 'x'}, None, 'https://x/products/x',
+                                 prior_status='error') == (None, 'unreachable')
+    assert server._page_text_for({'body_html': '', 'handle': 'x'}, None, 'https://x/products/x',
+                                 prior_status=403) == (None, 'http_403')
+
+
+def test_the_product_type_itself_is_never_an_unverified_socket_claim(gen):
+    """Thin source, no brief: the prompt orders 'Stekkerlamp', so 'Steckdose' in
+    the copy must not trigger a paid retry or a red flag."""
+    plain = ('Die PLUGIFY Aora ist eine Steckdosenlampe, die du direkt in die Steckdose steckst. Ein Lichtstrahl '
+             'nach oben, ein Lichtkegel nach unten, warm und ruhig, jeden Abend im Flur oder im Schlafzimmer.')
+    _FakeClient.answers = [{'description': plain, 'meta_description': 'a', 'm_title_specs': 'b'}]
+    body = gen('de', source_text='Aoraglow', brief={})
+    assert len(_FakeClient.prompts) == 1 and not body.get('claim_mismatch')
+    # …but a sensor the thin source never mentions IS still an unverified claim
+    _FakeClient.answers = [{'description': PLUGIN_DE, 'meta_description': 'a', 'm_title_specs': 'b'},
+                           {'description': PLUGIN_DE, 'meta_description': 'a', 'm_title_specs': 'b'}]
+    _FakeClient.prompts = []
+    body = gen('de', source_text='Aoraglow', brief={})
+    assert body['claim_mismatch'] == ['sensor']
+
+
+def test_a_rechargeable_lamp_may_say_no_socket_needed(gen):
+    """The style example says it; the source names the outlet only for charging."""
+    text = ('Die PLUGIFY Aora ist eine Akku-Lampe, die du überall hinstellst: auf die Kommode, neben das Bett, '
+            'auf den Esstisch. Keine Steckdose nötig, einfach aufstellen und einschalten, jeden Abend aufs Neue.')
+    _FakeClient.answers = [{'description': text, 'meta_description': 'a', 'm_title_specs': 'b'}]
+    body = gen('de', source_text='Oplaadbare lamp. Aufladen an jeder Steckdose, 8 Stunden Licht.',
+               brief={'family': 'table', 'type': {'nl': 'oplaadbare tafellamp', 'de': 'Akku-Tischlampe', 'com': 'x'},
+                      'what': 'Een oplaadbare lamp.', 'power': 'rechargeable', 'placement': 'tafel', 'features': []},
+               product_type='Oplaadbare tafellamp')
+    assert len(_FakeClient.prompts) == 1 and not body.get('claim_mismatch')
+
+
+def test_a_model_power_guess_does_not_verify_a_model_claim(gen):
+    """Source says nothing about power; the brief guessed 'rechargeable'; the
+    copy claims rechargeable → still unverified (retry + flag)."""
+    _FakeClient.answers = [
+        {'description': RECHARGEABLE_DE, 'meta_description': 'a', 'm_title_specs': 'b'},
+        {'description': RECHARGEABLE_DE, 'meta_description': 'a', 'm_title_specs': 'b'},
+    ]
+    body = gen('de', source_text='Een mooie lamp voor op tafel, warm licht, mat zwart.',
+               brief={'family': 'table', 'type': {'nl': 'tafellamp', 'de': 'Tischlampe', 'com': 'table lamp'},
+                      'what': 'Een tafellamp.', 'power': 'rechargeable', 'placement': 'tafel', 'features': []})
+    assert body['claim_mismatch'] == ['draadloos', 'oplaadbaar']
+
+
+def test_wrong_language_still_loses_to_a_type_word_plus_a_claim(gen):
+    german_two_problems = GERMAN_LIKE = ('Die PLUGIFY Aora ist eine wiederaufladbare Tischlampe, die du direkt in '
+                                          'die Steckdose steckst. Warmes Licht im Flur, Schlafzimmer oder in der Küche.')
+    dutch = ('De PLUGIFY Aora is een stekkerlamp die je in het stopcontact steekt. Warm licht in de gang, de '
+             'slaapkamer of de keuken, elke avond opnieuw, zonder er nog aan te denken.')
+    _FakeClient.answers = [
+        {'description': german_two_problems, 'meta_description': 'a', 'm_title_specs': 'b'},
+        {'description': dutch, 'meta_description': 'a', 'm_title_specs': 'b'},
+    ]
+    body = gen('de')
+    assert body['description'] == german_two_problems and not body.get('language_mismatch')

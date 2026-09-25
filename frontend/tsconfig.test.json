@@ -21,6 +21,7 @@
     "lib/nbCategory.ts",
     "lib/scrape-utils.ts",
     "lib/browserScrape.ts",
+    "lib/scrapeError.ts",
     "tests/**/*.ts"
   ]
 }

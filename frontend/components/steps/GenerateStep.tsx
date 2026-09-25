@@ -18,7 +18,7 @@ import {
   normalizeImageUrl,
   safeHostname,
 } from "@/lib/scrape-utils";
-import { classifyScrapeError } from "@/lib/scrapeError";
+import { classifyScrapeError, isShopRefusal } from "@/lib/scrapeError";
 import { translateColor } from "@/lib/colors";
 import { randomName } from "@/lib/names";
 import { autoSiblingsHandle } from "@/lib/slug";
@@ -409,12 +409,14 @@ export function GenerateStep() {
           sizeChart: scraped.size_chart ?? null,
           sizeChartStatus: scraped.size_chart_status ?? null,
           sizeChartHint: scraped.size_chart_hint ?? null,
+          importNote: null,
         });
         await prepareProduct(scraped.product);
       } catch (e: unknown) {
         let msg = e instanceof Error ? e.message : String(e);
-        const failure = classifyScrapeError(msg);
-        if (failure !== "other") {
+        // Only a shop that refuses OUR server: a 502 while the droplet
+        // restarts, or a timeout, is not "this shop blocks us".
+        if (isShopRefusal(msg)) {
           // The shop refuses OUR server's IP (429 / anti-bot wall), not the
           // product: the same URL answers a normal browser at once, and
           // Shopify's product .json allows cross-origin reads. Read it from
@@ -423,8 +425,15 @@ export function GenerateStep() {
           setSubStage("Reading it from your browser — this shop refuses our server");
           const viaBrowser = await api.scrapeFromBrowser(data.competitorUrl);
           if (viaBrowser.product) {
-            // No HTML page on this route, so no size chart (same as a paste).
-            patch({ sizeChart: null, sizeChartStatus: null, sizeChartHint: null });
+            // No HTML page on this route, so no size chart (same as a paste),
+            // and no sibling-colour discovery either — Review must say so.
+            patch({
+              sizeChart: null,
+              sizeChartStatus: null,
+              sizeChartHint: null,
+              importNote:
+                "Read from your browser — this shop refuses our server. Like a manual paste, this captures only the colour at this URL: for shops where each colour is its own product page (Billy J, SKIMS, meshki), import the other colours separately.",
+            });
             await prepareProduct(viaBrowser.product);
             return;
           }
@@ -546,6 +555,10 @@ export function GenerateStep() {
           onClose={() => setManualPasteOpen(false)}
           onSuccess={(product) => {
             setManualPasteOpen(false);
+            patch({
+              importNote:
+                "Pasted from your browser — this captures only the colour at this URL: for shops where each colour is its own product page, import the other colours separately.",
+            });
             // Re-run the flow with the manually-pasted product
             void prepareProduct(product);
           }}
@@ -570,7 +583,7 @@ export function GenerateStep() {
           <div className="flex flex-col gap-2 min-h-[58px]">
             <p className="text-sm font-medium text-text">{currentLabel.main}</p>
             <p className="text-xs text-text-faint">
-              {stage === "generating" && subStage ? subStage : currentLabel.sub}
+              {(stage === "generating" || stage === "scraping") && subStage ? subStage : currentLabel.sub}
             </p>
           </div>
           <div className="w-full max-w-xs mt-2">

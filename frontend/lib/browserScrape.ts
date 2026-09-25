@@ -119,7 +119,7 @@ export async function fetchPageHtmlFromBrowser(
  */
 export async function fetchProductJsonFromBrowser(
   originalUrl: string,
-  opts: { fetchImpl?: typeof fetch; timeoutMs?: number } = {}
+  opts: { fetchImpl?: typeof fetch; timeoutMs?: number; noLocaleRetry?: boolean } = {}
 ): Promise<BrowserFetchResult> {
   const url = productJsonUrl(originalUrl);
   if (!url) return { ok: false, reason: "this is not a /products/<handle> URL", url: null };
@@ -134,6 +134,12 @@ export async function fetchProductJsonFromBrowser(
       headers: { Accept: "application/json" },
       signal: ctrl?.signal,
     });
+    if (res.status === 404 && !opts.noLocaleRetry) {
+      // Some shops 404 the .json under a locale prefix (/en-us/products/x.json)
+      // but serve it without — the same fallback the server has.
+      const stripped = url.replace(/^(https?:\/\/[^/]+)\/[a-z]{2}(?:-[a-z]{2})?\/products\//i, "$1/products/");
+      if (stripped !== url) return fetchProductJsonFromBrowser(stripped, { ...opts, noLocaleRetry: true });
+    }
     if (!res.ok) {
       return {
         ok: false,

@@ -19,6 +19,7 @@ export function CompetitorPreview() {
         <div className="text-[11px] text-text-faint mt-0.5">
           {data.competitor.hostname} · {data.competitor.variants} variants · {data.competitor.price}
         </div>
+        {data.importNote && <p className="text-[11px] text-warning mt-1 whitespace-normal">{data.importNote}</p>}
       </div>
       {data.competitorUrl ? (
         <a
