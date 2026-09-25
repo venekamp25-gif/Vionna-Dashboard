@@ -20,6 +20,7 @@
     "lib/cogsStores.ts",
     "lib/nbCategory.ts",
     "lib/scrape-utils.ts",
+    "lib/browserScrape.ts",
     "tests/**/*.ts"
   ]
 }

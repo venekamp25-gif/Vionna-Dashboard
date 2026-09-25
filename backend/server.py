@@ -3171,6 +3171,139 @@ def api_size_chart_recheck():
     })
 
 
+_PAGE_TEXT_MAX = 6000
+_PAGE_BLOCK_RE = re.compile(r'<(script|style|noscript|svg|template|iframe|form|header|footer|nav)\b[^>]*>.*?</\1\s*>',
+                            re.I | re.S)
+# Sections that describe OTHER products or the shop, never this product:
+# related/recommended carousels, recently viewed, reviews widgets, cart drawer,
+# newsletter, menus. Matched on id/class of section/aside/div-with-id blocks.
+_PAGE_NOISE_RE = re.compile(
+    r'<(section|aside)\b[^>]*(?:related|recommend|recently|upsell|cross-?sell|review|judgeme|loox|yotpo|'
+    r'cart|drawer|newsletter|menu|breadcrumb|announcement|cookie|popup|modal)[^>]*>.*?</\1\s*>', re.I | re.S)
+_PAGE_LINE_NOISE_RE = re.compile(
+    r'^(?:skip to content|add to cart|buy (?:it )?now|choose (?:your|an?) |log ?in|sign ?(?:in|up)|search|menu|cart|'
+    r'checkout|subscribe|newsletter|©|copyright|privacy policy|terms of service|refund policy|shipping policy|'
+    r'powered by shopify|close|open|previous|next|share|\+|−|-|\d+)$', re.I)
+
+
+def _page_text_from_html(html, handle=None):
+    """The product's own text on its PAGE: meta/og/JSON-LD description plus the
+    visible text of <main>, minus scripts, nav, footer, other-product cards
+    (links to /products/<other>), known widget sections and menu boilerplate.
+
+    Why: shops that build the product page in theme sections leave body_html
+    EMPTY in the .json (aorabrand.co Aoraglow, 2026-09-25) — the whole story
+    (dusk-to-dawn sensor, two watts, plugs into any outlet) lives only here.
+    Best effort, capped at _PAGE_TEXT_MAX chars; '' when nothing useful."""
+    import html as _htmlmod
+    h = str(html or '')
+    if not h.strip():
+        return ''
+    lead = []
+    for rx in (re.compile(r'<meta\s+(?:name|property)="(?:description|og:description)"\s+content="([^"]*)"', re.I),
+               re.compile(r'<meta\s+content="([^"]*)"\s+(?:name|property)="(?:description|og:description)"', re.I)):
+        for m in rx.finditer(h):
+            v = _htmlmod.unescape(m.group(1)).strip()
+            if v and v not in lead:
+                lead.append(v)
+    for m in re.finditer(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', h, re.I | re.S):
+        try:
+            d = json.loads(m.group(1))
+        except Exception:
+            continue
+        for it in (d if isinstance(d, list) else [d]):
+            if isinstance(it, dict) and it.get('@type') in ('Product', 'ProductGroup'):
+                v = _htmlmod.unescape(str(it.get('description') or '')).strip()
+                v = re.sub(r'<[^>]+>', ' ', v)
+                if v and v not in lead:
+                    lead.append(v[:1500])
+    body = h
+    m = re.search(r'<main\b[^>]*>(.*?)</main\s*>', h, re.I | re.S)
+    if m:
+        body = m.group(1)
+    body = _PAGE_BLOCK_RE.sub(' ', body)
+    body = _PAGE_NOISE_RE.sub(' ', body)
+    # Cards/links to OTHER products: their text would become claims about
+    # this one ("cashmere" from a related-products carousel).
+    if handle:
+        body = re.sub(r'<a\b[^>]*href="[^"]*/products/(?!' + re.escape(handle) + r'(?:[/?#."]|$))[^"]*"[^>]*>.*?</a\s*>',
+                      ' ', body, flags=re.I | re.S)
+    body = re.sub(r'<(?:br|/p|/li|/h\d|/div|/section|/tr|/dd|/dt)\b[^>]*>', '\n', body, flags=re.I)
+    body = re.sub(r'<[^>]+>', ' ', body)
+    body = _htmlmod.unescape(body)
+    lines, seen = [], set()
+    for ln in body.split('\n'):
+        ln = re.sub(r'\s+', ' ', ln).strip(' \t\u00a0-–—•·|')
+        if len(ln) < 3 or _PAGE_LINE_NOISE_RE.match(ln):
+            continue
+        key = ln.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(ln)
+    text = '\n'.join(lead + [ln for ln in lines if ln not in lead])
+    return text[:_PAGE_TEXT_MAX].strip()
+
+
+def _body_html_text(body_html):
+    """Plain text of a .json body_html (what the copy currently reads)."""
+    import html as _htmlmod
+    t = re.sub(r'<[^>]+>', ' ', str(body_html or ''))
+    return re.sub(r'\s+', ' ', _htmlmod.unescape(t)).strip()
+
+
+# Below this many chars of body text the .json told us nothing: the shop keeps
+# its description in theme sections, so the PAGE is the source.
+_BODY_TEXT_THIN = 200
+
+
+def _page_text_for(base, fallback_html, html_url=None):
+    """(page_text, status) for a scraped product: 'json' when body_html is
+    fine, 'page' when the page text filled the gap, else why not."""
+    if len(_body_html_text(base.get('body_html'))) >= _BODY_TEXT_THIN:
+        return None, 'json'
+    html_text = fallback_html
+    status = 'unavailable'
+    if not html_text and html_url:
+        try:
+            hr = _scrape_get(html_url, timeout=15)
+            if hr.status_code == 200:
+                html_text = hr.text
+            else:
+                status = 'rate_limited' if hr.status_code == 429 else f'http_{hr.status_code}'
+        except Exception as e:
+            print(f"[scrape] page-text fetch failed: {str(e)[:120]}")
+    if not html_text:
+        return None, status
+    txt = _page_text_from_html(html_text, handle=base.get('handle'))
+    return (txt or None), ('page' if txt else 'empty')
+
+
+_LIGHT_POWER_WORDS = {
+    # keyword words that claim a power source — a research keyword may not
+    # claim one the product does not have ('oplaadbare lamp' for a plug-in lamp)
+    'rechargeable': re.compile(r'oplaadba|wiederauflad|aufladbar|akku|rechargeab|batterij|battery|batterie|'
+                               r'draadlo|kabellos|cordless|wireless|snoerloo', re.I),
+    'solar':        re.compile(r'solar|zonne', re.I),
+    'socket':       re.compile(r'stekker|stopcontact|steckdose|plug[- ]?in|outlet|wall socket', re.I),
+}
+
+
+def _light_power_conflict(keyword, power):
+    """True when the keyword claims a power source the product does NOT have,
+    per the import-time brief ('socket' / 'mains' / 'rechargeable' / 'battery' /
+    'solar'). Unknown power never blocks."""
+    p = (power or '').strip().lower()
+    k = keyword or ''
+    if p in ('socket', 'mains'):
+        return bool(_LIGHT_POWER_WORDS['rechargeable'].search(k) or _LIGHT_POWER_WORDS['solar'].search(k))
+    if p in ('rechargeable', 'battery'):
+        return bool(_LIGHT_POWER_WORDS['socket'].search(k) or _LIGHT_POWER_WORDS['solar'].search(k))
+    if p == 'solar':
+        return bool(_LIGHT_POWER_WORDS['socket'].search(k))
+    return False
+
+
 @app.route('/api/scrape', methods=['POST'])
 @require_droplet_token
 def scrape():
@@ -3238,13 +3371,19 @@ def scrape():
                 }), 400
             if _detect_cdn_bot_block(body, r.headers):
                 return jsonify({
-                    'error': "This shop's anti-bot protection (Cloudflare or similar) is blocking our scraper. Try a different product from this shop, or ask the shop owner to whitelist us.",
+                    'error': "This shop's anti-bot protection (Cloudflare or similar) is blocking our scraper. "
+                             "The dashboard now tries to read it from your own browser instead.",
+                    'code': 'blocked',
                     'url_tried': json_url,
+                    'json_url': json_url,
                 }), 400
             # Unknown 401/403 — generic message
             return jsonify({
-                'error': f'Upstream returned {r.status_code}. The shop may be private, geo-restricted, or temporarily blocking us.',
+                'error': f'Upstream returned {r.status_code}. The shop may be private, geo-restricted, or temporarily blocking us. '
+                         'The dashboard now tries to read it from your own browser instead.',
+                'code': 'blocked',
                 'url_tried': json_url,
+                'json_url': json_url,
             }), 400
         # Rate-limited — either a real 429 from the shop, or the synthetic one
         # _scrape_get returns while that host is in cooldown (bug #16). Both used
@@ -3259,11 +3398,16 @@ def scrape():
             except (TypeError, ValueError):
                 wait_s = 0
             wait_msg = f' Try again in about {wait_s}s.' if wait_s > 0 else ' Try again in a few minutes.'
+            # `code` + `json_url` let the frontend read the product from the
+            # OPERATOR'S browser (Shopify's product .json allows cross-origin
+            # reads) — the shop refuses our datacenter IP, not the product.
             return jsonify({
-                'error': f"This shop is rate-limiting our scraper (HTTP 429 — too many requests).{wait_msg} "
-                         "It usually clears on its own; you can also use the manual-paste workaround below, "
-                         "which comes from your own browser instead of ours.",
+                'error': f"This shop is rate-limiting our server (HTTP 429 — too many requests).{wait_msg} "
+                         "It usually clears on its own. The dashboard now tries to read it from your own "
+                         "browser instead; if that fails too, paste the product JSON.",
+                'code': 'rate_limited',
                 'url_tried': json_url,
+                'json_url': json_url,
             }), 429
         if r.status_code == 200 and _detect_private_shop(r.text or ''):
             return jsonify({
@@ -3398,6 +3542,11 @@ def scrape():
         size_chart_hint = _detect_size_chart_hint(fallback_html, size_chart_verdict)
     size_chart_status = 'found' if size_chart else ('unread' if size_chart_hint else 'none')
 
+    # The PAGE's text when the .json body is empty/thin (theme-section shops).
+    page_text, page_text_status = _page_text_for(base, fallback_html, html_url)
+    if page_text:
+        print(f"[scrape] body_html thin — read {len(page_text)} chars from the page itself")
+
     # Detect the "one-product-per-colour" pattern (Billy J etc.) and merge sibling
     # colour-products into the result so the dashboard sees ONE multi-colour product.
     try:
@@ -3484,7 +3633,8 @@ def scrape():
                         'colors': (merged.get('options') or [{}])[0].get('values', []),
                     }
                     return jsonify({'product': merged, 'size_chart': size_chart,
-                                    'size_chart_status': size_chart_status, 'size_chart_hint': size_chart_hint})
+                                    'size_chart_status': size_chart_status, 'size_chart_hint': size_chart_hint,
+                                    'page_text': page_text, 'page_text_status': page_text_status})
     except Exception as e:
         print(f"[scrape] sibling-merge step failed (continuing with base only): {e}")
 
@@ -3497,7 +3647,8 @@ def scrape():
         'colors': (base.get('options') or [{}])[0].get('values', []),
     }
     return jsonify({'product': base, 'size_chart': size_chart,
-                    'size_chart_status': size_chart_status, 'size_chart_hint': size_chart_hint})
+                    'size_chart_status': size_chart_status, 'size_chart_hint': size_chart_hint,
+                    'page_text': page_text, 'page_text_status': page_text_status})
 
 
 @app.route('/api/scrape_manual', methods=['POST'])
@@ -3518,6 +3669,9 @@ def scrape_manual():
     """
     payload = request.json or {}
     raw_json = payload.get('json') or ''
+    # 'browser' = the dashboard fetched it from the operator's browser itself
+    # (v1.310, zero clicks); 'paste' = the operator pasted it by hand.
+    source = 'browser' if payload.get('source') == 'browser' else 'paste'
     if not isinstance(raw_json, str) or not raw_json.strip():
         return jsonify({'error': 'Paste the product JSON in the `json` field of the request body.'}), 400
     try:
@@ -3547,7 +3701,14 @@ def scrape_manual():
         return jsonify({
             'error': 'This product has no variants — likely sold-out, hidden, or discontinued.',
         }), 400
-    return jsonify({'product': base, 'source': 'manual-paste'})
+    # The browser route may also hand us the product PAGE (Shopify serves it
+    # cross-origin too), so a theme-section shop still yields a description.
+    page_html = payload.get('html') if isinstance(payload.get('html'), str) else ''
+    page_text, page_text_status = _page_text_for(base, page_html[:3_000_000] if page_html else None, None)
+    print(f"[scrape] product {base.get('handle') or base.get('title')!r} came in via {source}"
+          f" (page text: {page_text_status})")
+    return jsonify({'product': base, 'source': 'manual-paste' if source == 'paste' else 'browser-fetch',
+                    'page_text': page_text, 'page_text_status': page_text_status})
 
 
 # --- Debug: inspect siblings setup for a given product name ---
@@ -6402,6 +6563,7 @@ def api_research_keywords():
         mats_dropped = 0
         type_dropped = 0
         light_type = (body.get('category') or '') if _is_light_market(st) else ''
+        light_power = (body.get('power') or '') if _is_light_market(st) else ''
         for seed in st_seeds:
             for kw in _dfs_keyword_suggestions(seed, st, min_volume=mv, limit=20):
                 if 'error' in kw:
@@ -6415,6 +6577,9 @@ def api_research_keywords():
                     continue
                 if light_type and _light_type_conflict(k, light_type):
                     type_dropped += 1          # 'hanglamp' for a stekkerlamp
+                    continue
+                if light_power and _light_power_conflict(k, light_power):
+                    type_dropped += 1          # 'oplaadbare lamp' for a plug-in lamp
                     continue
                 if k not in best or v > (best[k].get('volume') or 0):
                     kw['seed'] = seed
@@ -22708,8 +22873,9 @@ _LIGHT_DIM_RE = re.compile(
 _LIGHT_MAINS_RE = re.compile(r'\b2[23]0\s*-?\s*240?\s*v(?:olt)?\b|\b2[23]0\s*v(?:olt)?\b', re.I)
 
 _LIGHT_NEG_RE = re.compile(
-    r'\b(?:niet|geen|non|not|nicht|kein[e]?)\s+(?:\w+\s+){0,2}?'
-    r'(dimbaar|dimbare|dimmbar|dimmable|waterdicht|wasserdicht|waterproof)\b', re.I)
+    r'\b(?:niet|geen|non|not|no|nicht|kein[e]?|zonder|without|ohne)\s+(?:\w+\s+){0,2}?'
+    r'(dimbaar|dimbare|dimmbar|dimmable|waterdicht|wasserdicht|waterproof|'
+    r'stopcontact\w*|stekker\w*|steckdose\w*|outlet|wall socket|plug[- ]?in)\b', re.I)
 
 # (regex, normalisatie-functie) — elke match wordt één canonieke claim.
 _LIGHT_SPEC_PATTERNS = [
@@ -22739,7 +22905,33 @@ _LIGHT_SPEC_PATTERNS = [
     # energielabel
     (re.compile(r'\b(?:energielabel|energieklasse|energy\s+class)\s*[:=]?\s*([a-g](?:\+{1,3})?)\b', re.I),
      lambda m: 'energy' + m.group(1).lower()),
+    # Voeding — een stekkerlamp werd 'oplaadbaar en draadloos' (2026-09-25).
+    # Dezelfde regel als bij specs: alleen wat de bron zelf zegt.
+    (re.compile(r'\b(?:oplaadba(?:ar|re)|wiederaufladbar\w*|aufladbar\w*|akku\w*|rechargeable|'
+                r'op batterijen|batterij\w*|batter(?:y|ies)|batterie\w*)\b', re.I), lambda m: 'oplaadbaar'),
+    (re.compile(r'\b(?:draadlo(?:os|ze)|kabellos\w*|cordless|wireless|snoerloo?s)\b', re.I), lambda m: 'draadloos'),
+    (re.compile(r'\b(?:solar\w*|zonne-?energie|zonnepane\w*)\b', re.I), lambda m: 'solar'),
+    (re.compile(r'\b(?:schemer(?:sensor|schakelaar)|dusk[- ]to[- ]dawn|d[äa]mmerungs\w*|bewegings(?:sensor|melder)|'
+                r'motion[- ]?(?:sensor|detect\w*)|bewegungs(?:sensor|melder)|(?:light|licht)[- ]?sensor|sensor)\b', re.I),
+     lambda m: 'sensor'),
+    (re.compile(r'\b(?:stekker\w*|stopcontact\w*|steckdose\w*|plug[- ]?in|(?:wall )?outlet|wall socket|'
+                r'in het stopcontact)\b', re.I), lambda m: 'stopcontact'),
 ]
+# Claims about the power source / sensor: wrong ones make the copy describe a
+# different product, so they get the correction retry (not just the warning).
+_LIGHT_POWER_CLAIMS = {'oplaadbaar', 'draadloos', 'solar', 'sensor', 'stopcontact'}
+
+
+_LIGHT_NUMWORDS = {
+    'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+    'twelve': 12, 'fifteen': 15, 'twenty': 20,
+    'een': 1, 'één': 1, 'twee': 2, 'drie': 3, 'vier': 4, 'vijf': 5, 'zes': 6, 'zeven': 7, 'acht': 8, 'negen': 9,
+    'tien': 10, 'twaalf': 12, 'vijftien': 15, 'twintig': 20,
+    'ein': 1, 'eins': 1, 'zwei': 2, 'drei': 3, 'fünf': 5, 'sechs': 6, 'sieben': 7, 'neun': 9, 'zehn': 10,
+    'zwölf': 12, 'fünfzehn': 15, 'zwanzig': 20,
+}
+_LIGHT_NUMWORD_RE = re.compile(r'\b(' + '|'.join(sorted(_LIGHT_NUMWORDS, key=len, reverse=True))
+                               + r')[\s-]*(watts?|w)\b', re.I)
 
 
 def _light_spec_claims(text):
@@ -22749,12 +22941,15 @@ def _light_spec_claims(text):
     Ontkenning wordt een eigen claim ('not:dimbaar'), zodat "niet dimbaar" nooit
     als "dimbaar" gelezen wordt."""
     t = str(text or '')
+    # "Two watts" / "twee watt" is a wattage too (aorabrand.co writes it in words)
+    t = _LIGHT_NUMWORD_RE.sub(lambda m: f"{_LIGHT_NUMWORDS[m.group(1).lower()]} {m.group(2)}", t)
     t = _LIGHT_DIM_RE.sub(' ', t)        # afmetingen zijn geen wattage
     t = _LIGHT_MAINS_RE.sub(' ', t)      # 230V is een constante
     out = set()
     for m in _LIGHT_NEG_RE.finditer(t):
         word = m.group(1).lower()
-        out.add('not:' + ('dimbaar' if word.startswith(('dim',)) else 'waterproof'))
+        out.add('not:' + ('dimbaar' if word.startswith('dim') else
+                          'waterproof' if word.startswith(('water', 'wasser')) else 'stopcontact'))
     t_pos = _LIGHT_NEG_RE.sub(' ', t)    # ontkende specs niet ook positief tellen
     for rx, norm in _LIGHT_SPEC_PATTERNS:
         for m in rx.finditer(t_pos):
@@ -22780,7 +22975,10 @@ def _light_spec_conflicts(generated_text, source_text):
     Bron zegt 'niet dimbaar', wij schrijven 'dimbaar'."""
     ours = _light_spec_claims(generated_text)
     theirs = _light_spec_claims(source_text)
-    return sorted(c for c in ours if ('not:' + c) in theirs)
+    # Both directions: we say 'dimbaar' while the source says 'niet dimbaar',
+    # and we say 'geen stopcontact nodig' while the source says it plugs in.
+    return sorted([c for c in ours if ('not:' + c) in theirs]
+                  + [c for c in ours if c.startswith('not:') and c[4:] in theirs])
 
 
 def _light_slug(text):
@@ -23439,7 +23637,10 @@ def _light_brief_guard(brief, product_type=''):
         fams = fams_from_words
         brief['family_source'] = 'type words'
     else:
-        fams = {fam} if fam else set()
+        # The model's family agrees with its own type words: keep ALL families
+        # those words name ('plug-in wall light' = plugin + wall), so a term of
+        # either is legitimate.
+        fams = fams_from_words if (fams_from_words and fam in fams_from_words) else ({fam} if fam else set())
         brief['family_source'] = 'model'
     fam = sorted(fams)[0] if fams else None
     brief['family'] = fam or 'other'
@@ -23553,7 +23754,10 @@ def api_lighting_generate():
     brief         = data.get('brief') if isinstance(data.get('brief'), dict) else {}
     # De familie van het product: getypt type > brief. Keywords van een ANDER
     # lamptype gaan eruit ('hanglamp' bij een stekkerlamp).
-    fam_anchor    = product_type or ((brief.get('type') or {}).get('nl') if isinstance(brief.get('type'), dict) else '') or ''
+    # Operator's type first; else ALL the brief's type words (nl+de+com), so a
+    # 'plug-in wall light' keeps both its families.
+    _btypes       = brief.get('type') if isinstance(brief.get('type'), dict) else {}
+    fam_anchor    = product_type or ' '.join(str(_btypes.get(k) or '') for k in ('nl', 'de', 'com')).strip()
     families      = _light_type_families(fam_anchor, placement_only=True)
     type_dropped  = [k for k in keywords if fam_anchor and _light_type_conflict(k, fam_anchor)]
     keywords      = [k for k in keywords if k not in type_dropped]
@@ -23580,6 +23784,22 @@ def api_lighting_generate():
         'geen "dimbaar". Beschrijf alleen wat je op de foto en in de tekst ziet.'
     )
 
+    # What may be claimed = the source + what the brief read from it. The
+    # brief's power word counts ('socket' → stopcontact), and 'oplaadbaar'
+    # implies 'draadloos'.
+    claim_source = ' '.join([source_text, product_title, str(brief.get('what') or ''),
+                             ' '.join(str(f) for f in (brief.get('features') or [])),
+                             {'socket': 'stopcontact', 'mains': 'stopcontact', 'rechargeable': 'oplaadbaar',
+                              'battery': 'oplaadbaar', 'solar': 'solar'}.get(str(brief.get('power') or '').lower(), '')])
+    if 'oplaadbaar' in _light_spec_claims(claim_source):
+        claim_source += ' draadloos'
+    source_thin = len(re.sub(r'\s+', ' ', source_text).strip()) < 80
+    source_rule = (
+        'LET OP: de bron heeft (bijna) GEEN beschrijving. Verzin dan ook GEEN eigenschappen: niet oplaadbaar, '
+        'niet draadloos, geen sensor, geen dimmer, geen materiaal — alleen het type en wat hierboven bij '
+        '"Wat dit product IS" staat.\n' if source_thin else
+        'Voeding en werking (oplaadbaar, draadloos, in het stopcontact, sensor) neem je alleen over als de bron '
+        'ze noemt — nooit uit het stijlvoorbeeld.\n')
     type_line = (f'Het producttype is: {product_type or type_local}'
                  + (f' (in het {lang_nl}: {type_local})' if type_local and type_local != product_type else '')
                  + '. Beschrijf het als precies dat type — noem het nooit een ander soort lamp (geen tafellamp, '
@@ -23604,8 +23824,8 @@ Alle informatie die we over dit product hebben (van de bron):
 ---
 {source_text[:2500]}
 ---
-
-Schrijf in exact deze stijl:
+{source_rule}
+Schrijf in exact deze stijl (alleen de TOON — het voorbeeld gaat over een ander product):
 ---
 {_LIGHT_TONE_EXAMPLE}
 ---
@@ -23630,28 +23850,42 @@ Antwoord uitsluitend als geldig JSON:
     if only_field in ('description', 'meta_description', 'm_title_specs'):
         prompt += f"\n\nGeef ALLEEN het veld {only_field} terug in de JSON."
 
+    # A system prompt in the STORE's language is the strongest lever against
+    # the Dutch instructions + Dutch style example pulling the answer to Dutch.
+    system_msg = {
+        'nl': 'Je bent copywriter voor een verlichtingswebshop. Je schrijft uitsluitend in het Nederlands.',
+        'de': 'Du bist Texter für einen Leuchten-Webshop. Du schreibst AUSSCHLIESSLICH auf Deutsch — jedes Feld '
+              'deiner JSON-Antwort ist Deutsch, auch wenn die Anweisungen und das Stilbeispiel Niederländisch sind.',
+        'com': 'You are a copywriter for a lighting webshop. You write ONLY in English — every field of your JSON '
+               'answer is English, even though the instructions and the style example are in Dutch.',
+    }.get(store, 'Je bent copywriter voor een verlichtingswebshop.')
+
     def _ask(p):
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        msg = client.messages.create(model='claude-sonnet-4-5', max_tokens=1200,
+        msg = client.messages.create(model='claude-sonnet-4-5', max_tokens=1200, system=system_msg,
                                      messages=[{'role': 'user', 'content': p}])
         txt = (msg.content[0].text if msg.content else '') or ''
         m = re.search(r'\{.*\}', txt, re.S)
         return json.loads(m.group(0)) if m else {}
 
     def _problems(o):
-        """(wrong_language, other_type_words) for a candidate answer."""
+        """(wrong_language, other_type_words, unverified_power_claims) for a candidate answer."""
         desc = str(o.get('description') or '')
+        joined = ' '.join(str(o.get(k) or '') for k in ('description', 'meta_description', 'm_title_specs'))
         guess, _ = _light_lang_guess(desc)
         wrong_lang = bool(guess) and guess != store
-        others = _light_type_words_in(' '.join(str(o.get(k) or '') for k in
-                                               ('description', 'meta_description', 'm_title_specs')),
-                                      exclude=families) if families else []
-        return wrong_lang, others
+        others = _light_type_words_in(joined, exclude=families) if families else []
+        claims = [c for c in _light_unverified_claims(joined, claim_source) if c in _LIGHT_POWER_CLAIMS]
+        # 'Geen stopcontact nodig' for a lamp the source plugs in: a contradiction,
+        # reported as 'geen stopcontact'.
+        claims += ['geen ' + c[4:] for c in _light_spec_conflicts(joined, claim_source)
+                   if c.startswith('not:') and c[4:] in _LIGHT_POWER_CLAIMS]
+        return wrong_lang, others, claims
 
-    def _score(wrong, others_):
-        # The wrong language weighs more than one stray type word: a German
-        # text with 'Tischlampe' beats a Dutch text without it.
-        return 2 * int(wrong) + int(bool(others_))
+    def _score(wrong, others_, claims_=()):
+        # The wrong language weighs more than one stray type word or claim: a
+        # German text with 'Tischlampe' beats a Dutch text without it.
+        return 2 * int(wrong) + int(bool(others_)) + int(bool(claims_))
 
     need = only_field if only_field in ('description', 'meta_description', 'm_title_specs') else 'description'
 
@@ -23659,9 +23893,12 @@ Antwoord uitsluitend als geldig JSON:
         out = _ask(prompt)
         # Eén herkansing met de fout benoemd: de verkeerde taal (de DE-kaart in
         # het Nederlands) of een ander lamptype ('tafellamp' voor een stekkerlamp).
-        wrong_lang, others = _problems(out)
-        if wrong_lang or others:
+        wrong_lang, others, claims = _problems(out)
+        if wrong_lang or others or claims:
             fix = '\n\nCORRECTIE — je vorige antwoord was fout:'
+            if claims:
+                fix += (f" je beweert '{', '.join(claims)}' terwijl de bron dat nergens zegt. "
+                        f"Laat die eigenschap weg en beschrijf de voeding/werking alleen zoals de bron die noemt.")
             if wrong_lang:
                 fix += f' het stond niet in het {lang_nl}. Schrijf ALLES in het {lang_nl} ({lang_en}).'
             if others:
@@ -23679,10 +23916,10 @@ Antwoord uitsluitend als geldig JSON:
             except Exception as e2:
                 print(f"[lighting] {product_name!r}: retry failed, keeping the first answer: {str(e2)[:120]}")
                 out2 = {}
-            wrong2, others2 = _problems(out2)
+            wrong2, others2, claims2 = _problems(out2)
             usable2 = bool(str(out2.get(need) or '').strip())
-            if usable2 and _score(wrong2, others2) <= _score(wrong_lang, others):
-                out, wrong_lang, others = out2, wrong2, others2
+            if usable2 and _score(wrong2, others2, claims2) <= _score(wrong_lang, others, claims):
+                out, wrong_lang, others, claims = out2, wrong2, others2, claims2
     except Exception as e:
         return jsonify({'error': f'Generation failed: {str(e)[:160]}'}), 502
     # Vlaggen voor de UI (warn, never block): de medewerker ziet precies wat er
@@ -23691,6 +23928,8 @@ Antwoord uitsluitend als geldig JSON:
         out['language_mismatch'] = True
     if others:
         out['type_mismatch'] = others
+    if claims:
+        out['claim_mismatch'] = claims       # power/sensor claims the source never made
     # Markdown eruit, wat het model ook doet: de editor toont platte tekst en de
     # storefront krijgt zijn nadruk via _publish_to_html(bold_leadin=True).
     for k in ('description', 'meta_description', 'm_title_specs'):

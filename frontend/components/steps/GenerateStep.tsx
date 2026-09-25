@@ -412,7 +412,24 @@ export function GenerateStep() {
         });
         await prepareProduct(scraped.product);
       } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
+        let msg = e instanceof Error ? e.message : String(e);
+        const failure = classifyScrapeError(msg);
+        if (failure !== "other") {
+          // The shop refuses OUR server's IP (429 / anti-bot wall), not the
+          // product: the same URL answers a normal browser at once, and
+          // Shopify's product .json allows cross-origin reads. Read it from
+          // THIS browser (the worker's residential IP) and continue as if the
+          // server had scraped it — zero clicks instead of the 30 s paste.
+          setSubStage("Reading it from your browser — this shop refuses our server");
+          const viaBrowser = await api.scrapeFromBrowser(data.competitorUrl);
+          if (viaBrowser.product) {
+            // No HTML page on this route, so no size chart (same as a paste).
+            patch({ sizeChart: null, sizeChartStatus: null, sizeChartHint: null });
+            await prepareProduct(viaBrowser.product);
+            return;
+          }
+          msg = `${msg} Reading it from your browser did not work either (${viaBrowser.error || "no product came back"}).`;
+        }
         setError(msg);
         started.current = false;
         // The shop is rate-limiting our datacentre IP (bug #34), not refusing

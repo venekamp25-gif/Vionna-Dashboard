@@ -17,6 +17,23 @@ import {
 import { useLightProduct, type LightBrief, type LightContent } from "@/lib/lightProduct";
 import { LightWhatToList } from "./LightWhatToList";
 import { LightStoreConnect } from "./LightStoreConnect";
+import { ManualPasteModal } from "@/components/steps/ManualPasteModal";
+import { classifyScrapeError } from "@/lib/scrapeError";
+
+/** The API helper throws "API /api/scrape → 429: {json}"; show the operator the
+ *  server's own sentence, not the envelope. */
+function cleanApiError(e: unknown): string {
+  const msg = e instanceof Error ? e.message : String(e);
+  const m = msg.match(/^API \S+ → \d+: ([\s\S]*)$/);
+  if (!m) return msg;
+  try {
+    const body = JSON.parse(m[1]) as { error?: string };
+    if (body && typeof body.error === "string" && body.error) return body.error;
+  } catch {
+    /* truncated JSON — fall through to the raw text */
+  }
+  return m[1];
+}
 
 const STORES: LightStore[] = ["nl", "de", "com"];
 
@@ -66,6 +83,16 @@ export function HomeDecorWorkbench() {
   const [status, setStatus] = useState<LightStatusResponse | null>(null);
   const [scraping, setScraping] = useState(false);
   const [scrapeError, setScrapeError] = useState<string | null>(null);
+  // Where the product came from when it was NOT our server: the shop refused
+  // the droplet's IP and the dashboard read it from the operator's browser
+  // (automatic) or the operator pasted it (manual fallback).
+  const [importNote, setImportNote] = useState<string | null>(null);
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteReason, setPasteReason] = useState<"block" | "rate-limit">("rate-limit");
+  // Where the description came from (the .json, the page itself, or nowhere)
+  // and which option we did NOT turn into variants ("Pack" next to "Color").
+  const [sourceNote, setSourceNote] = useState<string | null>(null);
+  const [optionNote, setOptionNote] = useState<string | null>(null);
   const [generating, setGenerating] = useState<LightStore | null>(null);
   const [publishing, setPublishing] = useState(false);
   const [results, setResults] = useState<Record<string, LightPublishResult> | null>(null);
@@ -113,6 +140,8 @@ export function HomeDecorWorkbench() {
     setScraping(true);
     setScrapeError(null);
     setBriefError(null);
+    setImportNote(null);
+    setPasteOpen(false);
     // A type the previous brief filled in belongs to the PREVIOUS lamp; only a
     // type the operator typed themselves carries over to the next import.
     // Otherwise a hanglamp's auto-filled type would anchor the next stekkerlamp
@@ -120,106 +149,184 @@ export function HomeDecorWorkbench() {
     const prevType = draft.productType.trim();
     const typedType = prevType && prevType !== (draft.brief?.type?.nl ?? "").trim() ? prevType : "";
     try {
-      const res: ScrapedProduct = await api.scrape(url);
-      if (res.error || !res.product) throw new Error(res.error || "Nothing came back");
-      const p = res.product;
-      const sourceText = [p.title ?? "", toPlainText(p.body_html ?? "")].join(" ").trim().slice(0, 4000);
-
-      // The variant axis, exactly as this product has it. The live catalogue uses
-      // Kleur, Color, Design and light-colour — so read it, never assume "colour".
-      const opt = (p.options ?? []).find((o) => (o.values ?? []).length > 1) ?? (p.options ?? [])[0];
-      const optionName = opt?.name && opt.name !== "Title" ? opt.name : "";
-      const optionValues = optionName ? (opt?.values ?? []).filter(Boolean) : [];
-
-      // Images, plus the competitor's own variant→image tagging where present.
-      const imgs = (p.images ?? []).slice(0, 12).map((im) => ({
-        url: im.src.startsWith("//") ? `https:${im.src}` : im.src,
-        selected: true,
-      }));
-
-      // Two shapes exist in the wild and only one is usually filled. Verified on
-      // the real catalogue (AMBIENTIFY Bottle): its variants carry NO
-      // featured_image — the link lives on images[].variant_ids instead. Reading
-      // only featured_image would silently map zero photos to variants.
-      const byValue: Record<string, string[]> = {};
-      const abs = (s: string) => (s.startsWith("//") ? `https:${s}` : s);
-      const valueByVariantId = new Map<number, string>();
-      for (const v of p.variants ?? []) {
-        if (v.id && v.option1) valueByVariantId.set(v.id, v.option1);
-      }
-      for (const im of p.images ?? []) {
-        for (const vid of im.variant_ids ?? []) {
-          const val = valueByVariantId.get(vid);
-          if (val) (byValue[val] ||= []).push(abs(im.src));
+      let p: NonNullable<ScrapedProduct["product"]>;
+      let pageText: string | null | undefined;
+      try {
+        const res: ScrapedProduct = await api.scrape(url);
+        if (res.error || !res.product) throw new Error(res.error || "Nothing came back");
+        p = res.product;
+        pageText = res.page_text;
+      } catch (e) {
+        const msg = cleanApiError(e);
+        const failure = classifyScrapeError(msg);
+        if (failure === "other") throw new Error(msg);
+        // The shop refuses OUR server's IP (429 / anti-bot wall), not the
+        // product: the same URL answers a normal browser at once. Shopify's
+        // product .json allows cross-origin reads, so read it from THIS
+        // browser — the operator's residential IP — and validate it through
+        // the same path a manual paste takes. Zero clicks instead of 30 s.
+        setPasteReason(failure);
+        setImportNote(
+          failure === "rate-limit"
+            ? "This shop is rate-limiting our server — reading it from your browser instead…"
+            : "This shop blocks our server — reading it from your browser instead…"
+        );
+        const viaBrowser = await api.scrapeFromBrowser(url);
+        if (viaBrowser.error || !viaBrowser.product) {
+          setImportNote(null);
+          throw new Error(
+            `${msg} Reading it from your browser did not work either (${viaBrowser.error || "no product came back"}). ` +
+              "Use \"Paste JSON manually\" below: open the product JSON in a new tab and paste it back."
+          );
         }
+        p = viaBrowser.product;
+        pageText = viaBrowser.page_text;
+        setImportNote(
+          failure === "rate-limit"
+            ? "Read from your browser — this shop is rate-limiting our server."
+            : "Read from your browser — this shop blocks our server."
+        );
       }
-      for (const v of p.variants ?? []) {
-        const val = v.option1 ?? "";
-        const src = v.featured_image?.src;
-        if (val && src && !(byValue[val]?.length)) (byValue[val] ||= []).push(abs(src));
-      }
-
-      const firstPrice = p.variants?.[0]?.price ?? "";
-      patch({
-        sourceText,
-        competitorTitle: p.title ?? "",
-        productName: draft.productName || (p.title ?? ""),
-        optionName,
-        optionValues,
-        images: imgs,
-        imagesByValue: byValue,
-        price: draft.price || firstPrice,
-        productType: typedType,
-        content: {},
-        brief: null,
-      });
-      // Understand WHAT the product is (type per market, power, placement,
-      // features, search terms) from the competitor's own text. Seeds the
-      // keyword research and anchors the copy; fills the type if it is empty.
-      // Never blocks the import — no brief just means the old, guessier path.
-      // The sequence number makes sure a slow answer for an EARLIER import (or
-      // one from before "Start over") never lands on the current lamp.
-      const seq = ++briefSeq.current;
-      setBriefLoading(true);
-      lightingApi
-        .understand({ source_text: sourceText, product_title: p.title ?? "", product_type: typedType })
-        .then((b) => {
-          if (seq !== briefSeq.current) return;
-          if (b.error || !b.ok) {
-            setBriefError((b.error || "could not read the product").replace(/^Could not read the product:\s*/i, ""));
-            return;
-          }
-          const brief = b as LightBrief;
-          // Read the LIVE draft: the operator may have typed a type while the
-          // call was running, and the operator always wins over the model.
-          patch((d) => ({
-            brief,
-            productType: d.productType.trim() || brief.type?.nl || "",
-          }));
-        })
-        .catch((e) => {
-          if (seq !== briefSeq.current) return;
-          setBriefError((e instanceof Error ? e.message : String(e)).replace(/^Could not read the product:\s*/i, ""));
-        })
-        .finally(() => {
-          if (seq === briefSeq.current) setBriefLoading(false);
-        });
-      // Read the competitor's bundle so we can suggest a matching one of yours.
-      // Never blocks the import — no readable bundle just means no suggestion.
-      lightingApi
-        .bundleSuggest(url, draft.selectedStores[0] ?? "nl")
-        .then((b) => {
-          setBundleInfo(b);
-          if (b.suggestion && !draft.bundleCollection) {
-            patch({ bundleCollection: b.suggestion.handle });
-          }
-        })
-        .catch(() => setBundleInfo(null));
+      applyProduct(p, url, typedType, pageText);
     } catch (e) {
-      setScrapeError(e instanceof Error ? e.message : String(e));
+      setScrapeError(cleanApiError(e));
     } finally {
       setScraping(false);
     }
+  };
+
+  /** Everything after we HAVE the competitor's product, whichever way it came
+   *  in: our server, the operator's browser, or a manual paste. */
+  const applyProduct = (
+    p: NonNullable<ScrapedProduct["product"]>,
+    url: string,
+    typedType: string,
+    pageText?: string | null
+  ) => {
+    // The description: the .json body when the shop filled it, else the text of
+    // the product PAGE (theme-section shops leave body_html empty — aorabrand.co
+    // had the whole story only on the page). Nothing at all → say so, and let
+    // the operator paste it: copy without a source is copy without facts.
+    const bodyText = toPlainText(p.body_html ?? "");
+    const fromPage = bodyText.length < 200 && !!(pageText && pageText.trim());
+    const descText = fromPage ? (pageText as string).trim() : bodyText;
+    const sourceText = [p.title ?? "", descText].join(" ").trim().slice(0, 4000);
+    setSourceNote(
+      fromPage
+        ? "The product JSON had no description — this was read from the product page itself. Check it before you continue."
+        : bodyText.length < 200
+          ? "No description found: the product JSON is empty and the page could not be read. Paste the competitor's description here so the copy has facts to work with, then press Re-read."
+          : null
+    );
+
+    // The variant axis, exactly as this product has it. The live catalogue uses
+    // Kleur, Color, Design and light-colour — so read it, never assume "colour".
+    // With several multi-value options (Aoraglow: "Pack" 2/4/6/8 + "Color"),
+    // the colour-like one becomes the variants; the others are shown as a note.
+    const multi = (p.options ?? []).filter((o) => (o.values ?? []).length > 1);
+    const colourish = multi.find((o) => /colou?r|kleur|farbe|finish|design|licht|light|tint/i.test(o.name ?? ""));
+    const opt = colourish ?? multi[0] ?? (p.options ?? [])[0];
+    const optionName = opt?.name && opt.name !== "Title" ? opt.name : "";
+    const optionValues = optionName ? (opt?.values ?? []).filter(Boolean) : [];
+    const others = multi.filter((o) => o !== opt);
+    setOptionNote(
+      others.length
+        ? `Not imported as variants: ${others
+            .map((o) => `${o.name} (${(o.values ?? []).join(", ")})`)
+            .join("; ")}. The price below is the first variant's — check it against a single unit.`
+        : null
+    );
+
+    // Images, plus the competitor's own variant→image tagging where present.
+    const imgs = (p.images ?? []).slice(0, 12).map((im) => ({
+      url: im.src.startsWith("//") ? `https:${im.src}` : im.src,
+      selected: true,
+    }));
+
+    // Two shapes exist in the wild and only one is usually filled. Verified on
+    // the real catalogue (AMBIENTIFY Bottle): its variants carry NO
+    // featured_image — the link lives on images[].variant_ids instead. Reading
+    // only featured_image would silently map zero photos to variants.
+    const byValue: Record<string, string[]> = {};
+    const abs = (s: string) => (s.startsWith("//") ? `https:${s}` : s);
+    const valueByVariantId = new Map<number, string>();
+    for (const v of p.variants ?? []) {
+      if (v.id && v.option1) valueByVariantId.set(v.id, v.option1);
+    }
+    for (const im of p.images ?? []) {
+      for (const vid of im.variant_ids ?? []) {
+        const val = valueByVariantId.get(vid);
+        if (val) (byValue[val] ||= []).push(abs(im.src));
+      }
+    }
+    for (const v of p.variants ?? []) {
+      const val = v.option1 ?? "";
+      const src = v.featured_image?.src;
+      if (val && src && !(byValue[val]?.length)) (byValue[val] ||= []).push(abs(src));
+    }
+
+    const firstPrice = p.variants?.[0]?.price ?? "";
+    patch({
+      sourceText,
+      competitorTitle: p.title ?? "",
+      productName: draft.productName || (p.title ?? ""),
+      optionName,
+      optionValues,
+      images: imgs,
+      imagesByValue: byValue,
+      price: draft.price || firstPrice,
+      productType: typedType,
+      content: {},
+      brief: null,
+    });
+    understandProduct(sourceText, p.title ?? "", typedType);
+    // Read the competitor's bundle so we can suggest a matching one of yours.
+    // Never blocks the import — no readable bundle just means no suggestion.
+    lightingApi
+      .bundleSuggest(url, draft.selectedStores[0] ?? "nl")
+      .then((b) => {
+        setBundleInfo(b);
+        if (b.suggestion && !draft.bundleCollection) {
+          patch({ bundleCollection: b.suggestion.handle });
+        }
+      })
+      .catch(() => setBundleInfo(null));
+  };
+
+  /** Understand WHAT the product is (type per market, power, placement,
+   *  features, search terms) from the competitor's own text. Seeds the keyword
+   *  research and anchors the copy; fills the type if it is empty. Never blocks
+   *  the import — no brief just means the old, guessier path. Runs again from
+   *  "Re-read" after the operator edits or pastes the source text. The sequence
+   *  number makes sure a slow answer for an EARLIER import (or one from before
+   *  "Start over") never lands on the current lamp. */
+  const understandProduct = (sourceText: string, title: string, typedType: string) => {
+    const seq = ++briefSeq.current;
+    setBriefError(null);
+    setBriefLoading(true);
+    lightingApi
+      .understand({ source_text: sourceText, product_title: title, product_type: typedType })
+      .then((b) => {
+        if (seq !== briefSeq.current) return;
+        if (b.error || !b.ok) {
+          setBriefError((b.error || "could not read the product").replace(/^Could not read the product:\s*/i, ""));
+          return;
+        }
+        const brief = b as LightBrief;
+        // Read the LIVE draft: the operator may have typed a type while the
+        // call was running, and the operator always wins over the model.
+        patch((d) => ({
+          brief,
+          productType: d.productType.trim() || brief.type?.nl || "",
+        }));
+      })
+      .catch((e) => {
+        if (seq !== briefSeq.current) return;
+        setBriefError((e instanceof Error ? e.message : String(e)).replace(/^Could not read the product:\s*/i, ""));
+      })
+      .finally(() => {
+        if (seq === briefSeq.current) setBriefLoading(false);
+      });
   };
 
   // ── Step 2a: keyword research per market ──────────────────────────────────
@@ -242,6 +349,9 @@ export function HomeDecorWorkbench() {
         // Seeds from the import-time understanding: what shoppers type for
         // THIS kind of product, per market. Volume then ranks them.
         seed_terms: draft.brief?.search_terms ?? undefined,
+        // Keywords may not claim a power source the product does not have
+        // ('oplaadbare lamp' for a plug-in lamp), however popular.
+        power: draft.brief?.power || undefined,
       });
       if (!r.configured) {
         setKwNote(r.message || "Keyword research isn't switched on for this server yet.");
@@ -305,6 +415,7 @@ export function HomeDecorWorkbench() {
         sourceSpecs: r.source_specs ?? [],
         languageMismatch: !!r.language_mismatch,
         typeMismatch: r.type_mismatch ?? [],
+        claimMismatch: r.claim_mismatch ?? [],
       };
       // Functional update — generateAll() awaits several markets in a row, and a
       // spread of the render-time draft.content would drop all but the last.
@@ -507,6 +618,30 @@ export function HomeDecorWorkbench() {
             </button>
           </div>
           {scrapeError && <p className="text-[12px] text-danger mt-2">{scrapeError}</p>}
+          {scrapeError && classifyScrapeError(scrapeError) !== "other" && (
+            <button
+              type="button"
+              onClick={() => setPasteOpen(true)}
+              className="mt-2 px-3 h-8 rounded-[10px] border border-border bg-bg-elev-2 text-[12px] text-text hover:border-accent transition"
+            >
+              ⌨ Paste JSON manually
+            </button>
+          )}
+          {importNote && !scrapeError && <p className="text-[12px] text-text-dim mt-2">{importNote}</p>}
+          <ManualPasteModal
+            open={pasteOpen}
+            originalUrl={draft.competitorUrl}
+            reason={pasteReason}
+            onClose={() => setPasteOpen(false)}
+            onSuccess={(p) => {
+              setPasteOpen(false);
+              setScrapeError(null);
+              setImportNote("Pasted from your browser — this shop refuses our server.");
+              const prevType = draft.productType.trim();
+              const typedType = prevType && prevType !== (draft.brief?.type?.nl ?? "").trim() ? prevType : "";
+              applyProduct(p, draft.competitorUrl.trim(), typedType);
+            }}
+          />
 
           {scraped && (briefLoading || briefError || draft.brief) && (
             <div className="mt-4 rounded-xl border border-border bg-bg-elev-2 p-3.5">
@@ -571,6 +706,36 @@ export function HomeDecorWorkbench() {
           )}
 
           {scraped && (
+            <div className="mt-4">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] text-text-dim">
+                  Competitor description — the only source a claim may come from
+                </span>
+                <button
+                  type="button"
+                  onClick={() => understandProduct(draft.sourceText, draft.competitorTitle, draft.productType.trim())}
+                  disabled={briefLoading || !draft.sourceText.trim()}
+                  className="text-[11px] text-accent hover:underline disabled:opacity-40"
+                >
+                  {briefLoading ? "Reading…" : "↻ Re-read product"}
+                </button>
+              </div>
+              <textarea
+                value={draft.sourceText}
+                onChange={(e) => patch({ sourceText: e.target.value })}
+                rows={4}
+                spellCheck={false}
+                className="w-full mt-1 px-3 py-2 rounded-[10px] bg-bg-elev-2 border border-border text-[12px] leading-relaxed focus:outline-none focus:border-accent resize-y"
+              />
+              {sourceNote && (
+                <p className={`text-[11.5px] mt-1.5 ${sourceNote.startsWith("No description") ? "text-danger" : "text-text-dim"}`}>
+                  {sourceNote}
+                </p>
+              )}
+            </div>
+          )}
+
+          {scraped && (
             <div className="mt-5 grid gap-4 sm:grid-cols-2">
               <label className="block">
                 <span className="text-[11px] text-text-dim">Product name (yours)</span>
@@ -628,6 +793,7 @@ export function HomeDecorWorkbench() {
                     One variant, no options — published as a single product.
                   </p>
                 )}
+                {optionNote && <p className="text-[11.5px] text-warning mt-1.5">{optionNote}</p>}
                 <p className="text-[10.5px] text-text-faint mt-2">
                   One product with its own variants — no duplicate product per colour (that&apos;s the
                   Vionna model, and your lighting stores don&apos;t use it).
@@ -806,6 +972,12 @@ export function HomeDecorWorkbench() {
                             &quot;{draft.productType.trim() || draft.brief?.type?.nl || "unknown"}&quot;. Rewrite, or fix the product type.
                           </p>
                         )}
+                        {(c.claimMismatch?.length ?? 0) > 0 && (
+                          <p className="text-[11px] text-danger mb-2">
+                            The copy claims {c.claimMismatch!.join(", ")} and the competitor never says that, even after a
+                            retry. Rewrite, or take it out by hand.
+                          </p>
+                        )}
                         {c.sourceSpecs.length > 0 && (
                           <p className="text-[10.5px] text-text-faint mb-2">
                             Specs the source states (safe to use): {c.sourceSpecs.join(", ")}
@@ -815,7 +987,12 @@ export function HomeDecorWorkbench() {
                           value={c.description}
                           onChange={(e) =>
                             // The flags describe the GENERATED text; a hand edit clears them.
-                            patchContent(s, { description: e.target.value, languageMismatch: false, typeMismatch: [] })
+                            patchContent(s, {
+                              description: e.target.value,
+                              languageMismatch: false,
+                              typeMismatch: [],
+                              claimMismatch: [],
+                            })
                           }
                           rows={8}
                           className="w-full px-3 py-2 rounded-[10px] bg-bg-elev border border-border text-[12px] leading-relaxed focus:outline-none focus:border-accent resize-y"

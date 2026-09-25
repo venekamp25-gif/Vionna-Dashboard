@@ -19,6 +19,9 @@ export interface LightContent {
   /** Lamp-type words of ANOTHER family that survived the retry ("tafellamp" for
    *  a stekkerlamp) — warn-only, rewrite or fix the product type. */
   typeMismatch?: string[];
+  /** Power/sensor claims (oplaadbaar, draadloos, sensor, stopcontact) the copy
+   *  makes and the source never states, after one retry — warn-only, rewrite. */
+  claimMismatch?: string[];
 }
 
 export const EMPTY_CONTENT: LightContent = {
