@@ -3079,13 +3079,16 @@ def _extract_size_chart_full(page_html, page_url='', verdict=None):
     Pass a dict as `verdict` to also collect what each app API positively said, and
     hand it to _detect_size_chart_hint so a "no chart for this product" answer
     doesn't become an "unread chart" hint (bug #59)."""
-    return (_extract_size_chart(page_html)
-            or _relentless_size_chart(page_html)
-            or _smartsize_size_chart(page_html)
-            or _kiwi_size_chart(page_html, verdict)
-            or _vitals_size_chart(page_html)
-            or _linked_page_size_chart(page_html, page_url)
-            or _ocr_size_chart(page_html, page_url))
+    chart = (_extract_size_chart(page_html)
+             or _relentless_size_chart(page_html)
+             or _smartsize_size_chart(page_html)
+             or _kiwi_size_chart(page_html, verdict)
+             or _vitals_size_chart(page_html)
+             or _linked_page_size_chart(page_html, page_url)
+             or _ocr_size_chart(page_html, page_url))
+    # One block, in cm: a table with an inch block AND a cm block, or an
+    # inch-only table, must never reach the store as is (2026-09-27).
+    return _size_chart_normalise(chart)[0] if chart else chart
 
 
 @app.route('/api/debug_extract_chart')
@@ -10171,6 +10174,241 @@ def _translate_measure_label(h, store):
     return _map_label(h, store, measure=True) or h
 
 
+# ── Size charts: one block, in cm ─────────────────────────────────────────
+# venek, 2026-09-27: "Sizecharts staan er dubbel in". The competitor's table
+# held XS..XL in inches AND XS..XL in cm; _extract_size_chart stored the whole
+# table, the theme (which converts cm→inches itself under its CM/TOMMER toggle)
+# showed both blocks. 33 products per store. A second group (Iris, Helga…) had
+# an inch-only table under the CM tab. The rules below run at every entry.
+_SC_SIZECODE_HDR = re.compile(
+    r'^(?:size|sizes|taille|maat|koko|st[øo]rrelse|gr[öo]sse|größe|us|usa|uk|eu|eur|aus|au|it|fr|de|nl|int|intl|'
+    r'international|jp|cn|age|alter|leeftijd|ikä|alder|label|etiket)\b', re.I)
+_SC_UNIT_ROW = re.compile(r'^(?:cm|mm|inch(?:es)?|in|tommer|pouces?|tuumaa?|zoll|centimeter|centimètres?)\.?$', re.I)
+_SC_INCH_HDR = re.compile(r'\b(?:inch(?:es)?|in|tommer|pouces?|tuumaa?|zoll)\b|"', re.I)
+_SC_CM_HDR = re.compile(r'\bcm\b|centimet', re.I)
+_SC_NUM = re.compile(r'\d+(?:[.,]\d+)?')
+_SC_INCH_MAX = 60.0     # a cm body chart always has a value above this (bust/hip/length)
+
+
+def _sc_measure_cols(headers, rows):
+    """Column indexes that hold MEASUREMENTS (never column 0, never a size-code
+    column such as US/UK/EU). Headers decide; without headers, a column whose
+    values all look like size codes (2, 4, 8/10, 34…) is a size-code column."""
+    width = max([len(headers or [])] + [len(r) for r in rows]) if (headers or rows) else 0
+    cols = []
+    for i in range(1, width):
+        h = _strip_lead_num((headers[i] if i < len(headers or []) else '') or '').strip()
+        if h:
+            if _SC_SIZECODE_HDR.match(h):
+                continue
+            cols.append(i)
+            continue
+        vals = [(r[i] if i < len(r) else '').strip() for r in rows]
+        vals = [v for v in vals if v]
+        if vals and all(re.fullmatch(r'\d{1,2}(?:\s*/\s*\d{1,2})?', v) for v in vals):
+            continue
+        cols.append(i)
+    return cols
+
+
+def _sc_values(rows, cols):
+    out = []
+    for r in rows:
+        for i in cols:
+            if i < len(r):
+                for m in _SC_NUM.findall(r[i] or ''):
+                    try:
+                        out.append(float(m.replace(',', '.')))
+                    except ValueError:
+                        pass
+    return out
+
+
+def _sc_fmt_cm(v):
+    # cm body charts are whole numbers; the guide itself says 1-2 cm is normal
+    return str(int(round(v * 2.54)))
+
+
+_SC_INCH_MARK = re.compile(r'\s*(?:"|″|&quot;|\binch(?:es)?\b|\bin\b)', re.I)
+# Only a BODY chart can be "in inches because everything is under 60": a boot
+# chart's foot length is 22-28 cm, a bag is 30×40 cm. Conversion needs a body
+# measure in the headers and no foot measure.
+_SC_BODY_HDR = re.compile(
+    r'bryst|bust|chest|poitrine|rinta|brust|talje|waist|taille|vyötärö|vyotaro|hofte|hip|hanche|lantio|hüfte|huefte|'
+    r'skulder|shoulder|épaule|epaule|olkapää|olkapaa|schulter|ærme|aerme|sleeve|manche|hiha|ärmel|aermel|'
+    r'længde|laengde|length|longueur|pituus|länge|laenge|inseam|benl|bukse|jambe|lahje', re.I)
+_SC_FOOT_HDR = re.compile(r'fod|foot|feet|inders[åa]l|insole|jalka|jalan|voet|semelle|pied|fuß|fuss|schuh|shoe|boot|støvle|saappa',
+                          re.I)
+
+
+def _size_chart_normalise(chart):
+    """(chart, fix): ONE block of rows, in cm. `fix` is None when nothing had to
+    change, else 'dedup' (an inch block next to the cm block was dropped),
+    'inches' (an inch-only table was converted) or 'dedup+inches'.
+    Never raises; an unreadable chart comes back untouched."""
+    try:
+        if not isinstance(chart, dict) or not chart.get('rows'):
+            return chart, None
+        headers = [str(h or '') for h in (chart.get('headers') or [])]
+        rows = [[str(c or '') for c in r] for r in chart['rows'] if isinstance(r, (list, tuple))]
+        # A transposed table (shoe charts: sizes or foot lengths AS headers,
+        # one row per measure) has no size labels to dedupe and no inch
+        # columns to convert — leave it alone.
+        hdr_cells = [h.strip() for h in headers[1:] if h.strip()]
+        if hdr_cells and sum(1 for h in hdr_cells if re.fullmatch(r'[\d.,/ \-–]+', h)) >= max(1, len(hdr_cells) // 2):
+            return chart, None
+        # unit-marker rows ('cm' / 'inch' spacer rows) and empty rows carry no size
+        rows = [r for r in rows if any(c.strip() for c in r)
+                and not (r[0].strip() and _SC_UNIT_ROW.match(r[0].strip()) and not any(c.strip() for c in r[1:]))]
+        if not rows:
+            return chart, None
+        fixes = []
+        # 1. blocks: a size label that repeats starts a new block
+        blocks, cur, seen = [], [], set()
+        for r in rows:
+            label = _strip_lead_num(r[0]).strip().lower()
+            if label and label in seen:
+                blocks.append(cur)
+                cur, seen = [], set()
+            cur.append(r)
+            if label:
+                seen.add(label)
+        blocks.append(cur)
+        cols = _sc_measure_cols(headers, rows)
+        if len(blocks) > 1:
+            # keep the block with the largest measurements (the cm one)
+            def score(b):
+                v = _sc_values(b, cols)
+                return (max(v) if v else 0.0, len(b))
+            best = max(blocks, key=score)
+            if best is not rows and len(best) < len(rows):
+                rows = best
+                fixes.append('dedup')
+        # 2. inches → cm
+        vals = _sc_values(rows, cols)
+        hdr_text = ' '.join(headers)
+        body_chart = bool(_SC_BODY_HDR.search(hdr_text)) and not _SC_FOOT_HDR.search(hdr_text)
+        inches = (body_chart and bool(cols) and len(vals) >= 3 and max(vals) < _SC_INCH_MAX
+                  and not _SC_CM_HDR.search(hdr_text))
+        if _SC_INCH_HDR.search(hdr_text) and not _SC_CM_HDR.search(hdr_text) and vals and max(vals) < _SC_INCH_MAX:
+            inches = True
+        if inches:
+            conv = []
+            for r in rows:
+                r2 = list(r)
+                for i in cols:
+                    if i < len(r2):
+                        r2[i] = _SC_INCH_MARK.sub('', _SC_NUM.sub(
+                            lambda m: _sc_fmt_cm(float(m.group(0).replace(',', '.'))), r2[i])).strip()
+                conv.append(r2)
+            rows = conv
+            headers = [_SC_INCH_HDR.sub('cm', h) if _SC_INCH_HDR.search(h) else h for h in headers]
+            fixes.append('inches')
+        if not fixes:
+            return chart, None
+        out = dict(chart)
+        out['headers'], out['rows'] = headers, rows
+        out['unit_fix'] = '+'.join(fixes)
+        return out, '+'.join(fixes)
+    except Exception as e:
+        print(f'[size-chart] normalise failed (chart kept as is): {e}')
+        return chart, None
+
+
+def _size_chart_from_html(html):
+    """{headers, rows} from a stored custom.size_chart table, or None."""
+    import html as _htmlmod
+    trs = re.findall(r'<tr[\s\S]*?</tr>', html or '', re.I)
+    rows = []
+    for tr in trs:
+        cells = [_htmlmod.unescape(re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', c))).strip()
+                 for c in re.findall(r'<t[dh][\s\S]*?</t[dh]>', tr, re.I)]
+        if any(cells):
+            rows.append((re.search(r'<th', tr, re.I) is not None, cells))
+    if not rows:
+        return None
+    if rows[0][0]:
+        headers, body = rows[0][1], [c for _, c in rows[1:]]
+    else:
+        headers, body = [], [c for _, c in rows]
+    return {'headers': headers, 'rows': body}
+
+
+def _chart_table_html(headers, rows):
+    """The plain <table> the theme styles — same shape _size_chart_html emits."""
+    th = ''.join(f'<th>{_esc_html(h)}</th>' for h in headers)
+    body = ''.join('<tr>' + ''.join(f'<td>{_esc_html(c)}</td>' for c in r) + '</tr>' for r in rows)
+    thead = f'<thead><tr>{th}</tr></thead>' if headers else ''
+    return f'<table>{thead}<tbody>{body}</tbody></table>'
+
+
+def _size_chart_unit_audit(store, apply=True, backup_path=None, max_pages=40):
+    """Walk every product's custom.size_chart on `store`; charts with a doubled
+    block or inch values are rewritten in cm, once. Idempotent. Returns a
+    report; with backup_path the old values are appended as JSONL first."""
+    hdrs = shopify_headers(store)
+    q = ('query($c:String){ products(first:250, after:$c){ pageInfo{ hasNextPage endCursor } '
+         'edges{ node{ id legacyResourceId handle title status metafield(namespace:"custom", key:"size_chart"){ value } } } } }')
+    report = {'store': store, 'scanned': 0, 'with_chart': 0, 'to_fix': 0, 'fixed': 0, 'dedup': 0, 'inches': 0,
+              'errors': [], 'samples': [], 'apply': apply}
+    to_write, cursor, pages = [], None, 0
+    while pages < max_pages:
+        pages += 1
+        r = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                          json={'query': q, 'variables': {'c': cursor}}, timeout=45)
+        body = r.json() or {}
+        if body.get('errors'):
+            raise RuntimeError(str(body['errors'])[:150])
+        conn = ((body.get('data') or {}).get('products') or {})
+        for e in (conn.get('edges') or []):
+            n = e['node']
+            report['scanned'] += 1
+            mv = (n.get('metafield') or {}).get('value')
+            if not mv or not mv.strip():
+                continue
+            report['with_chart'] += 1
+            chart = _size_chart_from_html(mv)
+            if not chart:
+                continue
+            fixed, fix = _size_chart_normalise(chart)
+            if not fix:
+                continue
+            report['to_fix'] += 1
+            for f in fix.split('+'):
+                report[f] = report.get(f, 0) + 1
+            if len(report['samples']) < 12:
+                report['samples'].append({'handle': n.get('handle'), 'fix': fix, 'rows': len(fixed['rows']),
+                                          'first': fixed['rows'][0][:5] if fixed['rows'] else []})
+            to_write.append((n['id'], n.get('handle'), mv, _chart_table_html(fixed['headers'], fixed['rows']), fix))
+        pi = conn.get('pageInfo') or {}
+        if not pi.get('hasNextPage'):
+            break
+        cursor = pi.get('endCursor')
+    if not apply or not to_write:
+        return report
+    if backup_path:
+        with open(backup_path, 'a', encoding='utf-8') as f:
+            for gid, handle, old, new, fix in to_write:
+                f.write(json.dumps({'store': store, 'id': gid, 'handle': handle, 'fix': fix, 'old': old, 'new': new},
+                                   ensure_ascii=False) + '\n')
+    mut = ('mutation($mf:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$mf){ '
+           'userErrors{ field message } } }')
+    for i in range(0, len(to_write), 25):
+        batch = to_write[i:i + 25]
+        mfs = [{'ownerId': gid, 'namespace': 'custom', 'key': 'size_chart',
+                'type': 'multi_line_text_field', 'value': new} for gid, _h, _o, new, _f in batch]
+        try:
+            rr = _shopify_call('post', shopify_url(store, 'graphql.json'), hdrs,
+                               json={'query': mut, 'variables': {'mf': mfs}}, timeout=45)
+            ue = (((rr.json() or {}).get('data') or {}).get('metafieldsSet') or {}).get('userErrors') or []
+            if ue:
+                report['errors'].append(str(ue)[:150])
+            report['fixed'] += len(batch) - len(ue)
+        except Exception as e:
+            report['errors'].append(str(e)[:120])
+    return report
+
+
 def _size_chart_html(chart, store):
     """Render a scraped size chart to a clean, style-less HTML <table>, localised
     to `store`: column headers AND first-column measurement labels are translated
@@ -10180,6 +10418,7 @@ def _size_chart_html(chart, store):
     no usable chart."""
     if not isinstance(chart, dict) or not chart.get('rows'):
         return ''
+    chart, _fix = _size_chart_normalise(chart)     # one block, in cm — whatever the source did
     headers = [_strip_lead_num(h) for h in (chart.get('headers') or [])]
     firsts = [_strip_lead_num(r[0]) if r else '' for r in chart['rows']]
 
@@ -10495,6 +10734,16 @@ def _size_chart_fill_loop():
                 try:
                     _std_chart_for(store, None, force_refresh=True)
                     rep = _size_chart_fill_store(store)
+                    # Existing charts: doubled block / inches → cm, once (audit).
+                    try:
+                        au = _size_chart_unit_audit(store)
+                        rep['unit_audit'] = {k: au.get(k) for k in ('scanned', 'with_chart', 'to_fix', 'fixed',
+                                                                    'dedup', 'inches', 'errors')}
+                        if au.get('fixed'):
+                            print(f"[size-chart] unit audit {store}: fixed {au['fixed']} "
+                                  f"(dedup {au.get('dedup', 0)}, inches {au.get('inches', 0)})")
+                    except Exception as e:
+                        rep['unit_audit'] = {'error': str(e)[:150]}
                     rep['at'] = datetime.datetime.utcnow().isoformat() + 'Z'
                     if attempt:
                         rep['attempts'] = attempt + 1
