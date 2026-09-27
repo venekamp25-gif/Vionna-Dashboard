@@ -158,3 +158,15 @@ def test_foot_length_and_bag_charts_are_never_converted():
     # …while a body chart under 60 still is inches
     body = {'headers': ['Størrelse', 'US', 'Bryst', 'Talje'], 'rows': [['XS', '2', '32.3-33.9', '24.4-26'], ['S', '4', '33.9-35.4', '26-27.6'], ['M', '6', '35.4-37', '27.6-29.1']]}
     assert server._size_chart_normalise(body)[1] == 'inches'
+
+
+def test_shoulder_and_length_alone_never_decide_the_unit():
+    crop = {'headers': ['Størrelse', 'Skulder', 'Længde'],
+            'rows': [['S', '38', '44'], ['M', '40', '46'], ['L', '42', '48']]}
+    assert server._size_chart_normalise(crop)[1] is None          # a cm crop top, all under 60
+    merged = {'headers': ['Size US Size Shoulder Width Bust Size', '', '', ''],
+              'rows': [['S', '4', '14.57"', '37.80"'], ['M', '6', '15.35"', '39.37"'], ['L', '8', '15.75"', '41.34"']]}
+    out, fix = server._size_chart_normalise(merged)
+    assert fix == 'inches' and out['rows'][0][3] == '96'          # girth named in the merged header → inches
+    girth_cm = {'headers': ['Size', 'Bust', 'Length'], 'rows': [['S', '58', '40'], ['M', '62', '42'], ['L', '66', '44']]}
+    assert server._size_chart_normalise(girth_cm)[1] is None      # a 58 cm bust (kids/petite) is not 58 inches
