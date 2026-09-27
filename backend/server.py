@@ -10237,6 +10237,13 @@ _SC_BODY_HDR = re.compile(
     r'bryst|bust|chest|poitrine|rinta|brust|talje|waist|taille|vyötärö|vyotaro|hofte|hip|hanche|lantio|hüfte|huefte|'
     r'skulder|shoulder|épaule|epaule|olkapää|olkapaa|schulter|ærme|aerme|sleeve|manche|hiha|ärmel|aermel|'
     r'længde|laengde|length|longueur|pituus|länge|laenge|inseam|benl|bukse|jambe|lahje', re.I)
+# A girth (bust/waist/hip) decides the unit: in cm it is never under 55, in
+# inches never above it. Shoulder + length alone (a crop top: 38 / 45 cm) can
+# be under 60 in cm, so they never decide.
+_SC_GIRTH_HDR = re.compile(
+    r'bryst|bust|chest|poitrine|rinta|brust|talje|waist|taille|vyötärö|vyotaro|hofte|hip|hanche|lantio|hüfte|huefte|'
+    r'omkreds|omfang|omvang|umfang|circumference|tour de', re.I)
+_SC_GIRTH_MAX = 55.0
 _SC_FOOT_HDR = re.compile(r'fod|foot|feet|inders[åa]l|insole|jalka|jalan|voet|semelle|pied|fuß|fuss|schuh|shoe|boot|støvle|saappa',
                           re.I)
 
@@ -10288,7 +10295,15 @@ def _size_chart_normalise(chart):
         vals = _sc_values(rows, cols)
         hdr_text = ' '.join(headers)
         body_chart = bool(_SC_BODY_HDR.search(hdr_text)) and not _SC_FOOT_HDR.search(hdr_text)
+        girth_cols = [i for i in cols if i < len(headers) and _SC_GIRTH_HDR.search(headers[i] or '')]
+        if girth_cols:
+            girth_vals = _sc_values(rows, girth_cols)
+        elif _SC_GIRTH_HDR.search(hdr_text):
+            girth_vals = vals            # merged header cell ('Size US Shoulder Bust'): all measures
+        else:
+            girth_vals = []              # no girth anywhere: the unit cannot be told → leave it
         inches = (body_chart and bool(cols) and len(vals) >= 3 and max(vals) < _SC_INCH_MAX
+                  and len(girth_vals) >= 2 and max(girth_vals) < _SC_GIRTH_MAX
                   and not _SC_CM_HDR.search(hdr_text))
         if _SC_INCH_HDR.search(hdr_text) and not _SC_CM_HDR.search(hdr_text) and vals and max(vals) < _SC_INCH_MAX:
             inches = True
