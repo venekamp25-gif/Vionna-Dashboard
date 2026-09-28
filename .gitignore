@@ -84,3 +84,9 @@ backend/bs_product_cache.json
 # binary store, pruned on a retention window. Never belongs in a public repo.
 hf_media/
 backend/hf_media/
+
+# Spy Shield beacon log (v1.314.0): visitor records (day-salted browser hash,
+# no IP) — droplet-only, never in a public repo.
+spy_shield.jsonl
+backend/spy_shield.jsonl
+backend/spy_shield_digest.json

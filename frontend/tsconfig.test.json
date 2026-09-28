@@ -23,6 +23,7 @@
     "lib/browserScrape.ts",
     "lib/scrapeError.ts",
     "lib/buildInfo.ts",
+    "lib/spyShield.ts",
     "tests/**/*.ts"
   ]
 }
