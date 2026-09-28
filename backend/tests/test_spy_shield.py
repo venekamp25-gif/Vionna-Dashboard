@@ -90,6 +90,7 @@ def test_wrong_token_answers_204_and_appends_nothing(client, _sandbox):
 
 def test_missing_server_token_rejects_everything(client, _sandbox, monkeypatch):
     monkeypatch.delenv('SPY_SHIELD_BEACON_TOKEN')
+    monkeypatch.setenv('SPY_SHIELD_BEACON_DERIVE', '0')
     r = _post(client, _record())
     assert r.status_code == 204
     assert _lines(_sandbox) == []
@@ -242,6 +243,7 @@ def test_summary_aggregates_and_tolerates_corrupt_lines(client, _sandbox, monkey
 
 def test_summary_store_filter_and_unconfigured(client, _sandbox, monkeypatch):
     monkeypatch.delenv('SPY_SHIELD_BEACON_TOKEN')
+    monkeypatch.setenv('SPY_SHIELD_BEACON_DERIVE', '0')
     monkeypatch.setattr(server, '_spy_shield_orders', lambda store, days: [])
     _write_rows(_sandbox, [_row('dk', 'monitor', _iso(1)), _row('fr', 'monitor', _iso(1))])
     s = client.get('/api/spy_shield/summary?days=7&store=fr').get_json()
@@ -331,6 +333,7 @@ def test_digest_line_is_silent_without_data_and_counts_with(client, _sandbox, mo
 
 def test_setup_mints_persists_and_applies_live(client, _sandbox, monkeypatch):
     monkeypatch.delenv('SPY_SHIELD_BEACON_TOKEN')
+    monkeypatch.setenv('SPY_SHIELD_BEACON_DERIVE', '0')
     r = client.post('/api/spy_shield/setup', json={})
     assert r.status_code == 200
     body = r.get_json()
@@ -363,3 +366,31 @@ def test_setup_and_summary_require_the_gate(client, _sandbox, monkeypatch):
 def test_beacon_token_is_on_the_env_allowlist_and_log_is_backed_up():
     assert 'SPY_SHIELD_BEACON_TOKEN' in server._ENV_ALLOWED_KEYS
     assert server.SPY_SHIELD_LOG_PATH.endswith('spy_shield.jsonl')
+
+
+# ── derived default token (no dashboard login needed to get the URL) ─────────
+
+def test_derived_default_token_from_dk_admin_token(client, _sandbox, monkeypatch):
+    monkeypatch.delenv('SPY_SHIELD_BEACON_TOKEN', raising=False)
+    monkeypatch.delenv('SPY_SHIELD_BEACON_DERIVE', raising=False)
+    monkeypatch.setattr(server, 'tokens', {'dk': {'shop': 'x.myshopify.com', 'token': 'shpat_testseed'}})
+    expected = server.hashlib.sha256(b'spy-shield-beacon:shpat_testseed').hexdigest()[:32]
+    assert server._ss_token() == expected
+    assert 'shpat_testseed' not in server._ss_beacon_url()
+    # the derived token is accepted by the beacon and reported as configured
+    _post(client, _record(), path='/api/spy_shield/' + expected)
+    assert len(_lines(_sandbox)) == 1
+    s = client.get('/api/spy_shield/summary?days=7').get_json()
+    assert s['configured'] is True and s['beacon_url'].endswith('/api/spy_shield/' + expected)
+    # setup without rotate keeps the derived URL and writes nothing to .env
+    body = client.post('/api/spy_shield/setup', json={}).get_json()
+    assert body['beacon_url'].endswith('/' + expected)
+    assert 'SPY_SHIELD_BEACON_TOKEN=' not in ((_sandbox / '.env').read_text(encoding='utf-8') if (_sandbox / '.env').exists() else '')
+    # rotate pins an explicit token that wins over the derived one
+    r2 = client.post('/api/spy_shield/setup', json={'rotate': True}).get_json()
+    assert r2['rotated'] is True and not r2['beacon_url'].endswith('/' + expected)
+    assert server._ss_token() == os.environ['SPY_SHIELD_BEACON_TOKEN']
+    # derivation off + no explicit token = unconfigured
+    monkeypatch.delenv('SPY_SHIELD_BEACON_TOKEN')
+    monkeypatch.setenv('SPY_SHIELD_BEACON_DERIVE', '0')
+    assert server._ss_token() == ''

@@ -99,7 +99,15 @@ tells "no URL set" apart from "kill switch on".
 
 ---
 
-## 🛡️ Spy Shield beacon (since v1.314.0, hardened in v1.315.0)
+## 🛡️ Spy Shield beacon (since v1.314.0, hardened in v1.315.0, derived default token in v1.316.0)
+
+- **Derived default token (v1.316.0):** when `.env` has no `SPY_SHIELD_BEACON_TOKEN`,
+  the droplet accepts `sha256('spy-shield-beacon:' + <DK admin token>)[:32]` (one-way,
+  reveals nothing about the admin token). The owner computes the same URL on his
+  laptop with `~/Documents/spy-shield/install.py --beacon-url` — no dashboard login
+  needed to configure the six themes. Rotate in the tab pins an explicit token that
+  wins over the derived one; rotating the DK admin token changes the derived URL
+  (re-paste or Rotate). `SPY_SHIELD_BEACON_DERIVE=0` disables the derivation.
 
 "Spy Shield" is a theme snippet (repo `vionna-store-themes`) that shows a fake
 "502 Bad Gateway" to competitor-research traffic (PPSpy, Koala, WinningHunter,

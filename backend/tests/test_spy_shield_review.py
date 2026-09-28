@@ -389,6 +389,7 @@ def test_digest_tick_posts_once_per_day_across_restarts_and_prunes(client, _sand
 
 def test_setup_token_is_env_safe_and_never_printed(client, _sandbox, capsys, monkeypatch):
     monkeypatch.delenv('SPY_SHIELD_BEACON_TOKEN')
+    monkeypatch.setenv('SPY_SHIELD_BEACON_DERIVE', '0')
     body = client.post('/api/spy_shield/setup', json={'rotate': 'yes'}).get_json()
     tok = body['beacon_url'].rsplit('/', 1)[1]
     assert server.re.fullmatch(r'[A-Za-z0-9_-]{32}', tok)
