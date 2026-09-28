@@ -8706,10 +8706,33 @@ _SS_ORDERS_TTL_NONE = 60       # een mislukte fetch (403/geen token) maar kort o
 _SS_PROCESS_SALT = secrets.token_hex(32)
 
 
+def _ss_derived_token():
+    """Afgeleide standaard zolang .env geen expliciet SPY_SHIELD_BEACON_TOKEN heeft:
+    sha256 van het DK-admin-token (eenrichting — verraadt niets over dat token).
+    Zo kan de eigenaar de beacon-URL op zijn laptop berekenen
+    (`spy-shield/install.py --beacon-url`) zonder dashboard-login, en staat er
+    vanaf de eerste boot een werkend token. Het beacon-token is toch publiek
+    (het staat in de storefront-HTML): spam-gating, geen authenticatie.
+    Let op: wisselt het DK-token, dan wisselt deze URL mee → daarna 'Rotate' in het
+    tabblad (zet een vast token in .env) of de nieuwe URL opnieuw plakken.
+    SPY_SHIELD_BEACON_DERIVE=0 schakelt de afleiding uit (tests, of als je alleen
+    een expliciet token wilt accepteren)."""
+    if os.getenv('SPY_SHIELD_BEACON_DERIVE', '1') == '0':
+        return ''
+    try:
+        seed = ((tokens.get('dk') or {}).get('token') or '').strip()
+    except Exception:
+        seed = ''
+    if not seed:
+        return ''
+    return hashlib.sha256(('spy-shield-beacon:' + seed).encode()).hexdigest()[:32]
+
+
 def _ss_token():
     """Per request uit os.environ (niet als module-constante), zodat setup/rotate
-    zonder herstart werkt — zelfde reden als _scraper_proxies."""
-    return (os.getenv('SPY_SHIELD_BEACON_TOKEN') or '').strip()
+    zonder herstart werkt — zelfde reden als _scraper_proxies. Zonder expliciet
+    token geldt de afgeleide standaard (_ss_derived_token)."""
+    return (os.getenv('SPY_SHIELD_BEACON_TOKEN') or '').strip() or _ss_derived_token()
 
 
 def _ss_public_base():
