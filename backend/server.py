@@ -225,7 +225,7 @@ def _run_backup():
                       'taxonomy_backfill.json', 'taxonomy_fill.json',
                       'wtl_store_marks.json', 'wtl_extra_stores.json',
                       'wtl_discover_seen.json', 'wtl_discover_state.json',
-                      'spy_shield.jsonl'):
+                      'spy_shield.jsonl', 'lighting_channels.json'):
             src = os.path.join(_BASE_DIR, fname)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dest, fname))
@@ -16653,6 +16653,12 @@ def _probe_collection_by_handle(store, handle, hdrs):
 # product publish does the fetch, subsequent ones reuse it. Restart the
 # backend if a sales channel gets added/renamed.
 _PUBLICATION_CACHE: dict = {}  # store_key -> list of {id, name}
+_PUBLICATION_CACHE_AT: dict = {}  # store_key -> time.time() of the successful list
+_PUBLICATION_TTL = 3600           # new/renamed channels show up within the hour
+# Why the last list call failed, per store — so a missing permission is not
+# reported as "no publications found in shop" (Home Decor, 2026-09-28: all
+# three lighting apps lacked read_publications / write_publications).
+_PUBLICATION_ERR: dict = {}
 
 # Match shop-configured publication names case-insensitively. Shopify renames
 # these every couple of years (Facebook → Facebook & Instagram, Google →
@@ -16660,19 +16666,33 @@ _PUBLICATION_CACHE: dict = {}  # store_key -> list of {id, name}
 _DEFAULT_PUBLICATION_MATCHERS = ('online store', 'facebook', 'google', 'pinterest')
 
 
+def _publication_error_text(status, body):
+    b = str(body or '')
+    if status in (401, 403) and 'publications' in b:
+        return ('this store\'s app has no permission to manage sales channels — add the read_publications '
+                'and write_publications scopes to the app in Shopify and approve them')
+    return f'could not list the sales channels (HTTP {status})'
+
+
 def _list_publications(store, hdrs):
-    if store in _PUBLICATION_CACHE:
+    """The store's publications (sales channels). A success is cached for an
+    hour; a FAILURE is never cached (it used to stick until the next restart)
+    and its reason is kept in _PUBLICATION_ERR[store]."""
+    if store in _PUBLICATION_CACHE and time.time() - _PUBLICATION_CACHE_AT.get(store, 0) < _PUBLICATION_TTL:
         return _PUBLICATION_CACHE[store]
     try:
         r = req.get(shopify_url(store, 'publications.json'), headers=hdrs, timeout=15)
         if r.status_code == 200:
             pubs = r.json().get('publications', [])
             _PUBLICATION_CACHE[store] = pubs
+            _PUBLICATION_CACHE_AT[store] = time.time()
+            _PUBLICATION_ERR.pop(store, None)
             return pubs
+        _PUBLICATION_ERR[store] = _publication_error_text(r.status_code, r.text)
         print(f"[publications] list failed ({store}): {r.status_code} — {r.text[:200]}")
     except Exception as e:
+        _PUBLICATION_ERR[store] = f'could not list the sales channels ({str(e)[:80]})'
         print(f"[publications] list error ({store}): {e}")
-    _PUBLICATION_CACHE[store] = []
     return []
 
 
@@ -16697,7 +16717,8 @@ def _publish_to_default_channels(store, product_id, hdrs):
     pubs = _list_publications(store, hdrs)
     targets = _default_publication_targets(pubs)
     if not targets:
-        return ['no matching publications (Online Store / Facebook / Google) found in shop']
+        return [_PUBLICATION_ERR.get(store)
+                or 'no matching publications (Online Store / Facebook / Google) found in shop']
 
     product_gid = f'gid://shopify/Product/{product_id}'
     publication_inputs = [
@@ -16738,7 +16759,14 @@ def _publish_to_all_channels(store, product_id, hdrs):
     Idempotent: a product already on a channel is silently re-confirmed."""
     pubs = _list_publications(store, hdrs)
     if not pubs:
-        return [], ['no publications found in shop']
+        return [], [_PUBLICATION_ERR.get(store) or 'no publications found in shop']
+    done, errors = _publish_to_publications(store, product_id, hdrs, pubs)
+    return [p.get('name') or str(p.get('id')) for p in done], errors
+
+
+def _publish_to_publications(store, product_id, hdrs, pubs):
+    """publishablePublish for ONE product on each of `pubs`, one call each.
+    Returns (publications_done, errors)."""
     product_gid = f'gid://shopify/Product/{product_id}'
     mutation = (
         'mutation publishablePublish($id: ID!, $input: [PublicationInput!]!) {'
@@ -16748,7 +16776,7 @@ def _publish_to_all_channels(store, product_id, hdrs):
         ' }'
         '}'
     )
-    on, errors = [], []
+    done, errors = [], []
     for p in pubs:
         name = p.get('name') or str(p.get('id'))
         body = {'query': mutation,
@@ -16772,8 +16800,8 @@ def _publish_to_all_channels(store, product_id, hdrs):
                    [str(u.get('message') or u) for u in ue]
             errors.append(f"{name}: {'; '.join(msgs)[:160]}")
             continue
-        on.append(name)
-    return on, errors
+        done.append(p)
+    return done, errors
 
 
 def _ensure_siblings_collection(store, product_name, siblings_handle, hdrs, base):
@@ -24159,6 +24187,262 @@ def _light_slug(text):
     return _publish_slug(text)
 
 
+# ── Variant option name + values per market ───────────────────────────────
+# venek, 2026-09-28: "Home decor portal vertaalt bij import niet naar NL of DE
+# bij de varianten". The PLUGIFY Aora went to NL and DE as Color / Black, White
+# because the competitor's words were sent to every store unchanged. The live
+# catalogues use Kleur/Zwart/Wit (nl), Farbe/Schwarz/Weiß (de) and
+# Color/Black/White (com) — measured 2026-09-28.
+_LIGHT_OPT_NAMES = {
+    'colour':   {'nl': 'Kleur',       'de': 'Farbe',       'com': 'Color'},
+    'light':    {'nl': 'Lichtkleur',  'de': 'Lichtfarbe',  'com': 'Light color'},
+    'size':     {'nl': 'Maat',        'de': 'Größe',       'com': 'Size'},
+    'design':   {'nl': 'Design',      'de': 'Gestaltung',  'com': 'Design'},
+    'length':   {'nl': 'Lengte',      'de': 'Länge',       'com': 'Length'},
+    'quantity': {'nl': 'Aantal',      'de': 'Anzahl',      'com': 'Quantity'},
+    'plug':     {'nl': 'Stekkertype', 'de': 'Steckertyp',  'com': 'Plug type'},
+    'diameter': {'nl': 'Diameter',    'de': 'Durchmesser', 'com': 'Diameter'},
+    'cable':    {'nl': 'Type kabel',  'de': 'Kabeltyp',    'com': 'Cable type'},
+}
+# Order matters: 'Light color' / 'Plug type' / 'Cable type' before the generic words.
+_LIGHT_OPT_NAME_RES = [
+    ('light',    re.compile(r'light\s*colou?r|lichtkleur|lichtfarbe|emitting|kleurtemperatuur|farbtemperatur|'
+                            r'colou?r\s*temp|licht\s*temp|light\s*temp', re.I)),
+    ('plug',     re.compile(r'plug|stekker|stecker|fiche', re.I)),
+    ('cable',    re.compile(r'cable|kabel|snoer|\bcord\b', re.I)),
+    ('diameter', re.compile(r'diameter|durchmesser|[øØ∅]', re.I)),
+    ('length',   re.compile(r'length|lengte|l[äa]nge|longueur', re.I)),
+    ('quantity', re.compile(r'quantit|\bqty\b|\bpack|aantal|anzahl|st[üu]ckzahl|\bsets?\b|bundle', re.I)),
+    ('size',     re.compile(r'\bsize|\bmaat|gr[öo](?:ß|ss)e|taille|formaat|\bformat|afmeting|abmessung|dimension', re.I)),
+    ('colour',   re.compile(r'colou?r|kleur|farbe|couleur|finish|afwerking|oberfl', re.I)),
+    ('design',   re.compile(r'design|style|stijl|\bmodel|gestaltung|ausf[üu]hrung|uitvoering|version|versie', re.I)),
+]
+
+# key, nl, de, com, extra aliases (any language; matched lower-case, deaccented)
+_LIGHT_COLOR_TABLE = [
+    ('black',        'Zwart',        'Schwarz',       'Black',         ['noir', 'nero', 'negro', 'sort', 'musta']),
+    ('white',        'Wit',          'Weiß',          'White',         ['weiss', 'blanc', 'bianco', 'blanco', 'hvid']),
+    ('gold',         'Goud',         'Gold',          'Gold',          ['golden', 'goudkleurig', 'dore', 'oro']),
+    ('silver',       'Zilver',       'Silber',        'Silver',        ['zilverkleurig', 'argent', 'argento']),
+    ('grey',         'Grijs',        'Grau',          'Gray',          ['grey', 'gris', 'grigio']),
+    ('green',        'Groen',        'Grün',          'Green',         ['gruen', 'vert', 'verde']),
+    ('red',          'Rood',         'Rot',           'Red',           ['rouge', 'rosso', 'rojo']),
+    ('orange',       'Oranje',       'Orange',        'Orange',        ['arancione', 'naranja']),
+    ('pink',         'Roze',         'Rosa',          'Pink',          []),
+    ('beige',        'Beige',        'Beige',         'Beige',         []),
+    ('brown',        'Bruin',        'Braun',         'Brown',         ['marron', 'brun']),
+    ('blue',         'Blauw',        'Blau',          'Blue',          ['bleu', 'blu', 'azul']),
+    ('navy',         'Donkerblauw',  'Dunkelblau',    'Navy',          ['navy blue', 'dark blue', 'marine', 'marineblauw']),
+    ('yellow',       'Geel',         'Gelb',          'Yellow',        ['jaune']),
+    ('purple',       'Paars',        'Lila',          'Purple',        ['violet']),
+    ('amber',        'Amber',        'Bernstein',     'Amber',         ['ambre']),
+    ('walnut',       'Walnoot',      'Walnuss',       'Walnut',        ['noyer']),
+    ('oak',          'Eiken',        'Eiche',         'Oak',           ['eikenhout', 'chene']),
+    ('wood',         'Hout',         'Holz',          'Wood',          ['wooden', 'houten', 'bois']),
+    ('natural',      'Naturel',      'Natur',         'Natural',       ['nature']),
+    ('khaki',        'Khaki',        'Khaki',         'Khaki',         ['kaki']),
+    ('rosegold',     'Rosé goud',    'Roségold',      'Rose Gold',     ['rose gold', 'rosegold', 'rose goud', 'rosegoud', 'rose gold kleur']),
+    ('bronze',       'Brons',        'Bronze',        'Bronze',        []),
+    ('copper',       'Koper',        'Kupfer',        'Copper',        ['cuivre']),
+    ('chrome',       'Chroom',       'Chrom',         'Chrome',        []),
+    ('brass',        'Messing',      'Messing',       'Brass',         ['laiton']),
+    ('clear',        'Transparant',  'Transparent',   'Clear',         ['doorzichtig', 'klar']),
+    ('smoke',        'Rookglas',     'Rauchglas',     'Smoke',         ['smoked', 'smoky', 'gerookt', 'rauch', 'smoke grey', 'smoked glass']),
+    ('terracotta',   'Terracotta',   'Terrakotta',    'Terracotta',    []),
+    ('cream',        'Crème',        'Creme',         'Cream',         ['ivory', 'ivoor', 'elfenbein', 'off white', 'offwhite', 'gebroken wit']),
+    ('darkgreen',    'Donkergroen',  'Dunkelgrün',    'Dark Green',    ['dark green', 'donker groen', 'dunkelgruen', 'forest green']),
+    ('warmwhite',    'Warm wit',     'Warmweiß',      'Warm White',    ['warm white', 'warmwit', 'warmweiss', 'warm weiss', 'warm light', 'warm licht']),
+    ('coolwhite',    'Koel wit',     'Kaltweiß',      'Cool White',    ['cool white', 'cold white', 'koud wit', 'koelwit', 'kaltweiss', 'kalt weiss',
+                                                                        'daylight', 'daglicht', 'tageslicht']),
+    ('neutralwhite', 'Neutraal wit', 'Neutralweiß',   'Neutral White', ['neutral white', 'neutralweiss']),
+    ('warm',         'Warm',         'Warm',          'Warm',          []),
+    ('cold',         'Koud',         'Kalt',          'Cold',          ['cool', 'koel']),
+    ('neutral',      'Neutraal',     'Neutral',       'Neutral',       []),
+    ('rgb',          'RGB',          'RGB',           'RGB',           ['multicolor', 'multicolour', 'meerkleurig', 'mehrfarbig', 'rgbw']),
+    ('mattblack',    'Mat zwart',    'Mattschwarz',   'Matte Black',   ['matte black', 'matt black', 'matzwart', 'matt schwarz']),
+    ('mattwhite',    'Mat wit',      'Mattweiß',      'Matte White',   ['matte white', 'matt white', 'matwit', 'mattweiss', 'matt weiss']),
+]
+
+
+def _light_norm(s):
+    """lower-case, deaccented, punctuation → space, single spaces."""
+    s = str(s or '').replace('ß', 'ss').replace('ẞ', 'ss')
+    return ' '.join(re.sub(r'[^a-z0-9 ]+', ' ', _deaccent(s)).split())
+
+
+_LIGHT_COLOR_BY_KEY = {k: {'nl': nl, 'de': de, 'com': en} for k, nl, de, en, _a in _LIGHT_COLOR_TABLE}
+_LIGHT_COLOR_LOOKUP = {}
+for _k, _nl, _de, _en, _aliases in _LIGHT_COLOR_TABLE:
+    for _w in [_nl, _de, _en] + list(_aliases):
+        _LIGHT_COLOR_LOOKUP.setdefault(_light_norm(_w), _k)
+_LIGHT_MODIFIERS = [   # (words, nl-prefix, de-prefix, en-prefix)
+    (('dark', 'donker', 'dunkel', 'deep', 'diep'), 'Donker', 'Dunkel', 'Dark '),
+    (('light', 'licht', 'hell', 'pale', 'bleek'), 'Licht', 'Hell', 'Light '),
+    (('matte', 'matt', 'mat'), 'Mat ', 'Matt', 'Matte '),
+]
+_LIGHT_QTY_RE = re.compile(r'^(\d{1,3})\s*(?:x\s*)?(?:pack|pcs|pc|pieces?|stuks?|st|stueck|stuck|sets?|pakket|er\s*set)$')
+_LIGHT_CODE_RE = re.compile(r'^[A-Z0-9][A-Z0-9/+-]{0,5}$')
+
+
+def _light_value_i18n(value):
+    """{'nl','de','com'} for a variant value, or None when it is not known.
+    Numbers, sizes and codes (ø30cm, E27, US, 2700K) stay as they are."""
+    raw = str(value or '').strip()
+    if not raw:
+        return None
+    k = _light_norm(raw)
+    if k in _LIGHT_COLOR_LOOKUP:
+        return dict(_LIGHT_COLOR_BY_KEY[_LIGHT_COLOR_LOOKUP[k]])
+    m = _LIGHT_QTY_RE.match(k)
+    if m:
+        n = m.group(1)
+        return {'nl': f'{n} stuks', 'de': f'{n} Stück', 'com': f'{n} Pack'}
+    if _LIGHT_CODE_RE.match(raw) or re.search(r'\d', raw):
+        return {'nl': raw, 'de': raw, 'com': raw}
+    words = k.split()
+    for mods, nl_p, de_p, en_p in _LIGHT_MODIFIERS:
+        rest = None
+        if len(words) >= 2 and words[0] in mods:
+            rest = ' '.join(words[1:])
+        else:
+            for mw in mods:
+                if len(words) == 1 and k.startswith(mw) and len(k) > len(mw) + 2:
+                    rest = k[len(mw):]
+                    break
+        if rest and rest in _LIGHT_COLOR_LOOKUP:
+            base = _LIGHT_COLOR_BY_KEY[_LIGHT_COLOR_LOOKUP[rest]]
+            # nl/de glue the modifier on ('Donkergroen', 'Dunkelgrün', 'Mattschwarz');
+            # nl 'Mat ' keeps its space ('Mat zwart').
+            return {'nl': nl_p + base['nl'].lower(),
+                    'de': de_p + base['de'].lower(),
+                    'com': en_p + base['com']}
+    return None
+
+
+def _light_opt_concept(name):
+    n = str(name or '').strip()
+    if not n or n.lower() == 'title':
+        return None
+    for concept, rx in _LIGHT_OPT_NAME_RES:
+        if rx.search(n):
+            return concept
+    return None
+
+
+def _light_option_llm(option_name, values, want_name):
+    """One small model call for what the tables do not know. Returns
+    {'name': {st: str}|None, 'values': {orig: {st: str}}} — {} on any failure
+    (the caller keeps the original words: warn, never block)."""
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER' or not (values or want_name):
+        return {}
+    try:
+        import anthropic
+        prompt = (
+            'Translate the variant option of a lighting webshop product into the words a Dutch (nl), German (de) '
+            'and English (com) lighting webshop uses on its product page. Colour, finish, material and glass words '
+            'ARE translated (e.g. "Soft White" → nl "Zacht wit", de "Softweiß"; "Frosted" → nl "Mat glas", de '
+            '"Satiniert"). Only numbers, sizes, codes (US, UK, E27, 2700K) and brand names stay exactly as they '
+            'are. Capitalise like a shop label (German nouns capitalised).\n'
+            f'Option name: {json.dumps(option_name, ensure_ascii=False)}\n'
+            f'Values: {json.dumps(values, ensure_ascii=False)}\n'
+            'Answer JSON only: {"name": {"nl": "...", "de": "...", "com": "..."}, '
+            '"values": {"<original value>": {"nl": "...", "de": "...", "com": "..."}}}')
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        msg = client.messages.create(model='claude-haiku-4-5-20251001', max_tokens=600,
+                                     messages=[{'role': 'user', 'content': prompt}])
+        txt = (msg.content[0].text if msg.content else '') or ''
+        m = re.search(r'\{.*\}', txt, re.S)
+        got = json.loads(m.group(0)) if m else {}
+    except Exception as e:
+        print(f'[lighting] option translation call failed (originals kept): {str(e)[:120]}')
+        return {}
+
+    def ok(d):
+        return (isinstance(d, dict) and all(isinstance(d.get(st), str) and 0 < len(d[st].strip()) <= 40
+                                            for st in ('nl', 'de', 'com')))
+    out = {'name': None, 'values': {}}
+    if want_name and ok(got.get('name')):
+        out['name'] = {st: got['name'][st].strip() for st in ('nl', 'de', 'com')}
+    for v in values:
+        d = (got.get('values') or {}).get(v) if isinstance(got.get('values'), dict) else None
+        if ok(d):
+            out['values'][v] = {st: d[st].strip() for st in ('nl', 'de', 'com')}
+    return out
+
+
+def _light_option_i18n(option_name, values, use_llm=True):
+    """The option name and every value per market:
+    {'nl': {'name', 'values': {orig: word}}, 'de': …, 'com': …,
+     'untranslated': [orig…], 'llm': bool, 'notes': […]}.
+    Tables first (the live catalogue's own words), one model call for the rest,
+    the original word when nothing is known — never an error."""
+    stores = ('nl', 'de', 'com')
+    values = [str(v).strip() for v in (values or []) if str(v).strip()]
+    out = {st: {'name': None, 'values': {}} for st in stores}
+    concept = _light_opt_concept(option_name)
+    unknown = []
+    for v in values:
+        tr = _light_value_i18n(v)
+        if tr:
+            for st in stores:
+                out[st]['values'][v] = tr[st]
+        else:
+            unknown.append(v)
+    want_name = bool(option_name) and concept is None and str(option_name).strip().lower() != 'title'
+    llm_used = False
+    if use_llm and (unknown or want_name):
+        got = _light_option_llm(option_name, unknown, want_name)
+        llm_used = bool(got)
+        for v, d in (got.get('values') or {}).items():
+            for st in stores:
+                out[st]['values'][v] = d[st]
+        if got.get('name'):
+            for st in stores:
+                out[st]['name'] = got['name'][st]
+    untranslated = [v for v in unknown if v not in out['nl']['values']]
+    for v in untranslated:
+        for st in stores:
+            out[st]['values'][v] = v
+    for st in stores:
+        if not out[st]['name']:
+            if concept:
+                out[st]['name'] = _LIGHT_OPT_NAMES[concept][st]
+            elif option_name and str(option_name).strip().lower() != 'title':
+                out[st]['name'] = str(option_name).strip()
+            else:
+                out[st]['name'] = _LIGHT_OPT_NAMES['colour'][st]
+    notes = []
+    for st in stores:
+        # Two source values that land on the same word would be a duplicate
+        # variant — keep the source words for that market instead.
+        seen = [out[st]['values'][v].lower() for v in values]
+        if len(set(seen)) != len(seen):
+            out[st]['values'] = {v: v for v in values}
+            notes.append(f'{st}: two values translate to the same word — kept the source words')
+    out['untranslated'] = untranslated
+    out['llm'] = llm_used
+    out['concept'] = concept
+    out['notes'] = notes
+    return out
+
+
+def _light_option_for_store(given, computed_fn, option_name, option_values, store):
+    """(name, [value per variant]) for one store: what the operator saw/edited
+    at import when it covers every value, else the server's own translation."""
+    g = given.get(store) if isinstance(given, dict) else None
+    g = g if isinstance(g, dict) else {}
+    name = str(g.get('name') or '').strip()[:60]
+    gv = g.get('values') if isinstance(g.get('values'), dict) else {}
+    vals = [str(gv.get(v) or '').strip()[:80] for v in option_values]
+    if not name or not all(vals):
+        c = computed_fn().get(store) or {}
+        name = name or c.get('name') or option_name or 'Kleur'
+        vals = [x or (c.get('values') or {}).get(v) or v for x, v in zip(vals, option_values)]
+    if len({x.lower() for x in vals}) != len(vals):
+        vals = list(option_values)
+    return name, vals
+
+
 def _light_make_sku(product_name, value):
     n = (product_name or '').strip().replace(' ', '')
     v = (value or '').strip().replace(' ', '')
@@ -24376,6 +24660,136 @@ def api_lighting_status():
                     'brand': LIGHT_BRAND})
 
 
+_LIGHT_CHANNEL_SCOPES = ('read_publications', 'write_publications')
+_LIGHT_SCOPE_CACHE = {}      # store -> (ts, result)
+
+
+def _light_channel_scope(store, max_age=600):
+    """{'ok': True|False|None, 'missing': [...], 'detail': str} — can this store's
+    app open sales channels? None = could not check (never a verdict)."""
+    ent = _LIGHT_SCOPE_CACHE.get(store)
+    if ent and time.time() - ent[0] < max_age:
+        return ent[1]
+    shop = (_shop_entry(store) or {}).get('shop')
+    hdrs = shopify_headers(store)
+    if not shop or not hdrs.get('X-Shopify-Access-Token'):
+        return {'ok': None, 'missing': [], 'detail': 'store not connected'}
+    try:
+        r = req.get(f'https://{shop}/admin/oauth/access_scopes.json', headers=hdrs, timeout=15)
+        if r.status_code != 200:
+            return {'ok': None, 'missing': [], 'detail': f'could not check (HTTP {r.status_code})'}
+        have = {s.get('handle') for s in ((r.json() or {}).get('access_scopes') or [])}
+    except Exception as e:
+        return {'ok': None, 'missing': [], 'detail': f'could not check ({str(e)[:60]})'}
+    missing = [x for x in _LIGHT_CHANNEL_SCOPES if x not in have]
+    res = {'ok': not missing, 'missing': missing,
+           'detail': 'can open every sales channel' if not missing else
+                     'missing permission: ' + ', '.join(missing)}
+    _LIGHT_SCOPE_CACHE[store] = (time.time(), res)
+    return res
+
+
+@app.route('/api/lighting/channel_check')
+@require_droplet_token
+def api_lighting_channel_check():
+    """Per lighting store: can the app open sales channels? Read-only."""
+    fresh = request.args.get('fresh') in ('1', 'true')
+    return jsonify({'stores': {k: _light_channel_scope(k, max_age=0 if fresh else 600)
+                               for k in ('nl', 'de', 'com') if k in LIGHT_TOKENS}})
+
+
+LIGHT_CHANNELS_STATE_PATH = os.path.join(_BASE_DIR, 'lighting_channels.json')
+
+
+def _light_channels_heal_once(stores=None):
+    """Put every product the Home Decor portal created on every sales channel
+    of its store — once per (product, channel), so a channel the operator
+    later switches off by hand is not switched on again. Stores whose app
+    cannot manage channels are skipped with the reason. Returns a report."""
+    try:
+        with open(LIGHT_CHANNELS_STATE_PATH, encoding='utf-8') as f:
+            state = json.load(f) or {}
+    except Exception:
+        state = {}
+    by_store = {}
+    try:
+        with open(LIGHTING_HISTORY_PATH, encoding='utf-8') as f:
+            for line in f:
+                try:
+                    h = json.loads(line)
+                except Exception:
+                    continue
+                pid, st = h.get('product_id'), h.get('store')
+                if pid and st and pid not in by_store.setdefault(st, []):
+                    by_store[st].append(pid)
+    except FileNotFoundError:
+        pass
+    report = {}
+    for store in (stores or [k for k in ('nl', 'de', 'com') if k in LIGHT_TOKENS]):
+        pids = by_store.get(store) or []
+        if not pids:
+            report[store] = {'products': 0}
+            continue
+        hdrs = shopify_headers(store)
+        if not hdrs.get('X-Shopify-Access-Token'):
+            report[store] = {'skipped': 'no usable token'}
+            continue
+        pubs = _list_publications(store, hdrs)
+        if not pubs:
+            report[store] = {'skipped': _PUBLICATION_ERR.get(store) or 'no publications'}
+            continue
+        st_state = state.setdefault(store, {})
+        opened, errors, gone = 0, [], 0
+        for pid in pids:
+            done = set(st_state.get(str(pid)) or [])
+            if '*gone*' in done:
+                continue
+            todo = [p for p in pubs if str(p.get('id')) not in done]
+            if not todo:
+                continue
+            ok_pubs, errs = _publish_to_publications(store, pid, hdrs, todo)
+            if errs and not ok_pubs and all(re.search(r'does not exist|not found|invalid id', e, re.I) for e in errs):
+                st_state[str(pid)] = ['*gone*']
+                gone += 1
+                continue
+            st_state[str(pid)] = sorted(done | {str(p.get('id')) for p in ok_pubs})
+            opened += len(ok_pubs)
+            errors.extend(f'{pid} {e}' for e in errs[:3])
+        report[store] = {'products': len(pids), 'opened': opened, 'gone': gone, 'errors': errors[:8]}
+    try:
+        tmp = LIGHT_CHANNELS_STATE_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False)
+        os.replace(tmp, LIGHT_CHANNELS_STATE_PATH)
+    except Exception as e:
+        print(f'[lighting] channel heal state save failed: {e}')
+    return report
+
+
+def _light_channels_heal_loop():
+    time.sleep(300)
+    while True:
+        try:
+            rep = _light_channels_heal_once()
+            if any((v or {}).get('opened') for v in rep.values()):
+                print(f'[lighting] channel heal: {rep}')
+        except Exception as e:
+            print(f'[lighting] channel heal failed: {e}')
+        time.sleep(6 * 3600)
+
+
+threading.Thread(target=_light_channels_heal_loop, daemon=True, name='light-channels-heal').start()
+
+
+@app.route('/api/lighting/channels_heal', methods=['POST'])
+@require_droplet_token
+def api_lighting_channels_heal():
+    """Run the channel self-heal now (e.g. right after the permissions were granted)."""
+    for k in list(_LIGHT_SCOPE_CACHE):
+        _LIGHT_SCOPE_CACHE.pop(k, None)
+    return jsonify({'report': _light_channels_heal_once()})
+
+
 _LIGHT_SHOP_RE = re.compile(r'^[a-z0-9][a-z0-9-]*\.myshopify\.com$', re.I)
 
 
@@ -24444,6 +24858,18 @@ def api_lighting_credentials():
                     'results': results})
 
 
+@app.route('/api/lighting/option_i18n', methods=['POST'])
+@require_droplet_token
+def api_lighting_option_i18n():
+    """The variant option name + values per market, shown (and editable) at
+    import. Body: {option_name, values}. Never an error for unknown words:
+    they come back unchanged and listed in `untranslated`."""
+    data = request.get_json(silent=True) or {}
+    name = str(data.get('option_name') or '').strip()[:60]
+    values = [str(v).strip()[:80] for v in (data.get('values') or []) if str(v).strip()][:40]
+    return jsonify(_light_option_i18n(name, values))
+
+
 @app.route('/api/lighting/publish', methods=['POST'])
 @require_droplet_token
 def api_lighting_publish():
@@ -24473,6 +24899,16 @@ def api_lighting_publish():
 
     option_name   = (data.get('option_name') or '').strip()
     option_values = [str(v).strip() for v in (data.get('option_values') or []) if str(v).strip()]
+    # The option's words per market (Kleur/Zwart · Farbe/Schwarz · Color/Black).
+    # The import shows and lets the operator edit them; the server translates
+    # itself for any market the request does not cover (one call, cached).
+    option_i18n   = data.get('option_i18n') if isinstance(data.get('option_i18n'), dict) else {}
+    _opt_cache    = {}
+
+    def _opt_computed():
+        if 'v' not in _opt_cache:
+            _opt_cache['v'] = _light_option_i18n(option_name, option_values)
+        return _opt_cache['v']
     images        = data.get('images') or []
     images_by_val = data.get('images_by_value') or {}
     content       = data.get('content') or {}
@@ -24550,12 +24986,21 @@ def api_lighting_publish():
 
         c = content.get(store) or {}
         body_html = _publish_to_html(_md_strip(c.get('description') or ''), bold_leadin=True)
-        variants = ([{'option1': v, 'price': price, 'compare_at_price': compare_at,
-                      'sku': _light_make_sku(product_name, v),
-                      'inventory_management': None} for v in option_values]
+        opt_name_s, opt_vals_s = (_light_option_for_store(option_i18n, _opt_computed, option_name,
+                                                          option_values, store)
+                                  if option_values else (option_name, []))
+        src_by_local = dict(zip(opt_vals_s, option_values))     # local word → source word (photos)
+        # taxable=False: the lighting catalogues charge no tax on their products
+        # (97% of the live variants, measured 2026-09-28); Shopify's default is
+        # True, so every portal product had "charge tax" on (venek, 2026-09-28).
+        # The SKU keeps the SOURCE value: the same item carries the same SKU in
+        # all three stores.
+        variants = ([{'option1': lv, 'price': price, 'compare_at_price': compare_at,
+                      'sku': _light_make_sku(product_name, v), 'taxable': False,
+                      'inventory_management': None} for v, lv in zip(option_values, opt_vals_s)]
                     if option_values else
                     [{'price': price, 'compare_at_price': compare_at,
-                      'sku': _light_make_sku(product_name, ''),
+                      'sku': _light_make_sku(product_name, ''), 'taxable': False,
                       'inventory_management': None}])
         payload = {'product': {
             'title': product_name,
@@ -24567,8 +25012,8 @@ def api_lighting_publish():
             'variants': variants,
         }}
         if option_values:
-            payload['product']['options'] = [{'name': option_name or 'Kleur',
-                                              'values': option_values}]
+            payload['product']['options'] = [{'name': opt_name_s or option_name or 'Kleur',
+                                              'values': opt_vals_s}]
         if kaching:
             # Kaching Bundles heeft GEEN API. LET OP (gemeten 2026-07-16): het
             # producttemplate stuurt de bundel NIET aan — de app-embed injecteert
@@ -24630,9 +25075,10 @@ def api_lighting_publish():
             val = var.get('option1')
             if not val:
                 continue
-            wanted = [w for w in (images_by_val.get(val) or []) if w in url_to_img_id]
+            src_val = src_by_local.get(val, val)   # photos are keyed on the SOURCE word
+            wanted = [w for w in (images_by_val.get(src_val) or []) if w in url_to_img_id]
             if not wanted:
-                if images_by_val.get(val):
+                if images_by_val.get(src_val):
                     unlinked.append(val)      # foto bestond, maar is niet geüpload/geselecteerd
                 continue
             img_id = url_to_img_id[wanted[0]]
@@ -24652,8 +25098,13 @@ def api_lighting_publish():
         if mts:
             rich = _rich_text_value(mts)
             ok = False
+            # NL defines it as rich_text_field, DE and .com as single_line_text_field
+            # (measured 2026-09-28: DE failed "both rich_text and plain" on every lamp).
+            one_line = ' '.join(mts.split())[:255]
             for mf in ({'namespace': 'custom', 'key': 'm_title_specs',
                         'value': rich, 'type': 'rich_text_field'},
+                       {'namespace': 'custom', 'key': 'm_title_specs',
+                        'value': one_line, 'type': 'single_line_text_field'},
                        {'namespace': 'custom', 'key': 'm_title_specs',
                         'value': mts, 'type': 'multi_line_text_field'}):
                 try:
@@ -24665,7 +25116,7 @@ def api_lighting_publish():
                 except Exception as e:
                     print(f'[lighting] m_title_specs error: {e}')
             if not ok:
-                mf_errors.append('m_title_specs: both rich_text and plain failed')
+                mf_errors.append('m_title_specs: rich_text, single_line and multi_line all failed')
         meta_desc = (c.get('meta_description') or '').strip()
         if meta_desc:
             try:
@@ -24726,7 +25177,9 @@ def api_lighting_publish():
             'product_url': results[store]['admin_url'], 'source_url': source_url,
             'image_count': uploaded, 'metafield_errors': mf_errors,
             'product_type': product_type or None,
-            'option_name': option_name or None, 'option_values': option_values,
+            'option_name': (opt_name_s if option_values else option_name) or None,
+            'option_values': opt_vals_s if option_values else [],
+            'option_source': {'name': option_name, 'values': option_values} if option_values else None,
             'kaching': kaching, 'published_live': activated,
             # Wat de operator wist op het moment van publiceren.
             'claim_report': claim_report.get(store) or None,

@@ -54,6 +54,11 @@ export interface LightBrief {
   terms_dropped?: string[];
 }
 
+/** The variant option's words per market (Kleur/Zwart · Farbe/Schwarz ·
+ *  Color/Black), keyed by the competitor's own value. Filled at import from
+ *  /api/lighting/option_i18n; the operator may edit them before publishing. */
+export type LightOptionI18n = Partial<Record<LightStore, { name: string; values: Record<string, string> }>>;
+
 export interface LightImage {
   url: string;
   selected: boolean;
@@ -81,6 +86,8 @@ export interface LightDraft {
    *  light colour. NOT hardcoded to "colour" — the live catalogue uses all four. */
   optionName: string;
   optionValues: string[];
+  /** The option in each market's own words; null until translated. */
+  optionI18n?: LightOptionI18n | null;
   price: string;
   compareAtPrice: string;
   images: LightImage[];
@@ -105,6 +112,7 @@ export const EMPTY_DRAFT: LightDraft = {
   productType: "",
   optionName: "",
   optionValues: [],
+  optionI18n: null,
   price: "",
   compareAtPrice: "",
   images: [],
