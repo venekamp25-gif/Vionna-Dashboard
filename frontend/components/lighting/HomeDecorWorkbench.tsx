@@ -14,7 +14,7 @@ import {
   type LightPublishResult,
   type ScrapedProduct,
 } from "@/lib/api";
-import { useLightProduct, type LightBrief, type LightContent } from "@/lib/lightProduct";
+import { useLightProduct, type LightBrief, type LightContent, type LightOptionI18n } from "@/lib/lightProduct";
 import { LightWhatToList } from "./LightWhatToList";
 import { LightStoreConnect } from "./LightStoreConnect";
 import { ManualPasteModal } from "@/components/steps/ManualPasteModal";
@@ -119,6 +119,37 @@ export function HomeDecorWorkbench() {
   const [briefLoading, setBriefLoading] = useState(false);
   const [briefError, setBriefError] = useState<string | null>(null);
   const briefSeq = useRef(0);
+  // The variant option in each market's own words (Kleur/Zwart · Farbe/Schwarz).
+  const [optI18nLoading, setOptI18nLoading] = useState(false);
+  const optSeq = useRef(0);
+  // Can each store's app open sales channels? (read/write_publications)
+  const [channelInfo, setChannelInfo] = useState<Awaited<ReturnType<typeof lightingApi.channelCheck>> | null>(null);
+  const [channelBusy, setChannelBusy] = useState(false);
+  const [channelNote, setChannelNote] = useState<string | null>(null);
+  /** "I added the permissions — check again": re-checks and immediately opens
+   *  every channel for the lamps already published. */
+  const recheckChannels = async () => {
+    setChannelBusy(true);
+    setChannelNote(null);
+    try {
+      const heal = await lightingApi.channelsHeal();
+      const fresh = await lightingApi.channelCheck();
+      setChannelInfo(fresh);
+      const opened = Object.values(heal.report ?? {}).reduce((n, r) => n + (r?.opened ?? 0), 0);
+      const stillBlocked = Object.entries(fresh.stores ?? {})
+        .filter(([, v]) => v?.ok === false)
+        .map(([k]) => LIGHT_STORE_CONFIG[k as LightStore]?.label ?? k);
+      setChannelNote(
+        stillBlocked.length
+          ? `Still missing the permission for ${stillBlocked.join(", ")}. After approving it in Shopify, check again.`
+          : `Permission OK. Opened ${opened} channel${opened === 1 ? "" : "s"} for lamps published earlier.`
+      );
+    } catch (e) {
+      setChannelNote(`Could not check right now (${e instanceof Error ? e.message : String(e)}). Try again in a minute.`);
+    } finally {
+      setChannelBusy(false);
+    }
+  };
   // Bundle picker: your own collections + what the competitor runs.
   const [collections, setCollections] = useState<{ title: string; handle: string; products: number }[]>([]);
   const [bundleInfo, setBundleInfo] = useState<{
@@ -130,6 +161,8 @@ export function HomeDecorWorkbench() {
 
   useEffect(() => {
     lightingApi.status().then(setStatus).catch(() => setStatus(null));
+    // Never blocks anything: an unanswered check simply shows no warning.
+    lightingApi.channelCheck().then(setChannelInfo).catch(() => setChannelInfo(null));
   }, []);
 
   // Bundle collections come from the first connected store — the deal lives in
@@ -300,6 +333,7 @@ export function HomeDecorWorkbench() {
       productName: draft.productName || (p.title ?? ""),
       optionName,
       optionValues,
+      optionI18n: null,
       images: imgs,
       imagesByValue: byValue,
       price: draft.price || firstPrice,
@@ -308,6 +342,32 @@ export function HomeDecorWorkbench() {
       brief: null,
     });
     understandProduct(sourceText, p.title ?? "", typedType);
+    // The option in each market's own words: the competitor's "Color / Black"
+    // went to NL and DE unchanged (venek, 2026-09-28). Never blocks the import —
+    // without an answer the server translates each market at publish.
+    const oseq = ++optSeq.current;
+    if (optionValues.length) {
+      setOptI18nLoading(true);
+      lightingApi
+        .optionI18n({ option_name: optionName, values: optionValues })
+        .then((r) => {
+          if (oseq !== optSeq.current || r.error) return;
+          const pick: LightOptionI18n = {};
+          for (const st of STORES) {
+            const e = r[st];
+            if (e?.name && e.values) pick[st] = { name: e.name, values: e.values };
+          }
+          patch({ optionI18n: pick });
+        })
+        .catch(() => {
+          /* the server translates each market at publish anyway */
+        })
+        .finally(() => {
+          if (oseq === optSeq.current) setOptI18nLoading(false);
+        });
+    } else {
+      setOptI18nLoading(false);
+    }
     // Read the competitor's bundle so we can suggest a matching one of yours.
     // Never blocks the import — no readable bundle just means no suggestion.
     lightingApi
@@ -493,6 +553,7 @@ export function HomeDecorWorkbench() {
         source_url: draft.competitorUrl.trim(),
         option_name: draft.optionName,
         option_values: draft.optionValues,
+        option_i18n: draft.optionI18n ?? undefined,
         price: draft.price,
         compare_at_price: draft.compareAtPrice || undefined,
         images: selectedUrls,
@@ -822,6 +883,56 @@ export function HomeDecorWorkbench() {
                   <p className="text-[12px] text-text-faint mt-1.5">
                     One variant, no options — published as a single product.
                   </p>
+                )}
+                {draft.optionValues.length > 0 && draft.selectedStores.length > 0 && (
+                  <div className="mt-2.5 rounded-xl border border-border bg-bg-elev-2 p-3 space-y-2">
+                    <div className="text-[11px] text-text-dim">
+                      {optI18nLoading
+                        ? "Translating the option for each market…"
+                        : draft.optionI18n
+                          ? "What each store gets — edit a word if your catalogue uses another one."
+                          : "Not translated yet — the server translates each market when you publish."}
+                    </div>
+                    {draft.selectedStores.map((s) => {
+                      const e = draft.optionI18n?.[s];
+                      const setName = (name: string) =>
+                        patch((d) => {
+                          const cur = d.optionI18n ?? {};
+                          const ent = cur[s] ?? { name: "", values: {} };
+                          return { optionI18n: { ...cur, [s]: { ...ent, name } } };
+                        });
+                      const setValue = (v: string, word: string) =>
+                        patch((d) => {
+                          const cur = d.optionI18n ?? {};
+                          const ent = cur[s] ?? { name: "", values: {} };
+                          return { optionI18n: { ...cur, [s]: { ...ent, values: { ...ent.values, [v]: word } } } };
+                        });
+                      return (
+                        <div key={s} className="flex flex-wrap items-center gap-1.5">
+                          <span className="w-28 shrink-0 text-[11px] text-text-dim">
+                            {LIGHT_STORE_CONFIG[s].flag} {LIGHT_STORE_CONFIG[s].label}
+                          </span>
+                          <input
+                            value={e?.name ?? ""}
+                            placeholder={draft.optionName}
+                            onChange={(ev) => setName(ev.target.value)}
+                            aria-label={`Option name for ${LIGHT_STORE_CONFIG[s].label}`}
+                            className="w-28 px-2 h-7 rounded-lg bg-bg-elev border border-border text-[11.5px] font-medium focus:outline-none focus:border-accent"
+                          />
+                          {draft.optionValues.map((v) => (
+                            <input
+                              key={v}
+                              value={e?.values?.[v] ?? ""}
+                              placeholder={v}
+                              onChange={(ev) => setValue(v, ev.target.value)}
+                              aria-label={`${v} for ${LIGHT_STORE_CONFIG[s].label}`}
+                              className="w-28 px-2 h-7 rounded-lg bg-bg-elev border border-border text-[11.5px] focus:outline-none focus:border-accent"
+                            />
+                          ))}
+                        </div>
+                      );
+                    })}
+                  </div>
                 )}
                 {optionNote && <p className="text-[11.5px] text-warning mt-1.5">{optionNote}</p>}
                 <p className="text-[10.5px] text-text-faint mt-2">
@@ -1158,6 +1269,31 @@ export function HomeDecorWorkbench() {
                   </span>
                 </span>
               </label>
+
+              {(() => {
+                const blocked = draft.selectedStores.filter((s) => channelInfo?.stores?.[s]?.ok === false);
+                if (!blocked.length) return channelNote ? <p className="text-[11.5px] text-text-dim">{channelNote}</p> : null;
+                const names = blocked.map((s) => LIGHT_STORE_CONFIG[s].label).join(", ");
+                return (
+                  <div className="rounded-xl border border-warning/40 bg-warning/10 px-3.5 py-2.5 text-[11.5px] text-text leading-relaxed">
+                    <strong>Sales channels:</strong> the app for {names} can&apos;t open sales channels yet — Shopify
+                    permission missing: read_publications and write_publications. The product is still created, but
+                    only on the channels Shopify opens by itself. Add both permissions to that store&apos;s app and approve
+                    them; the dashboard then opens every channel on its own, for new and already published lamps.
+                    <div className="mt-2 flex items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={() => void recheckChannels()}
+                        disabled={channelBusy}
+                        className="px-3 h-7 rounded-lg border border-border bg-bg-elev text-[11.5px] hover:border-accent disabled:opacity-50"
+                      >
+                        {channelBusy ? "Checking…" : "I added the permissions — check again"}
+                      </button>
+                      {channelNote && <span className="text-text-dim">{channelNote}</span>}
+                    </div>
+                  </div>
+                );
+              })()}
 
               <button
                 // NOT onClick={runPublish}: that hands the MouseEvent to `ack`,

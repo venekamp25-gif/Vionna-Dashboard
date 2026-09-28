@@ -1852,6 +1852,35 @@ export const lightingApi = {
       authed: true,
     }),
 
+  /** The variant option name + values in each market's own words (Kleur/Zwart,
+   *  Farbe/Schwarz, Color/Black). Unknown words come back unchanged and are
+   *  listed in `untranslated` — never an error. */
+  optionI18n: (params: { option_name: string; values: string[] }) =>
+    call<
+      Partial<Record<LightStore, { name: string; values: Record<string, string> }>> & {
+        untranslated?: string[];
+        notes?: string[];
+        error?: string;
+      }
+    >("/api/lighting/option_i18n", { method: "POST", body: params, authed: true }),
+
+  /** Per store: can the app open sales channels (read/write_publications)?
+   *  ok=null means it could not be checked — not a "no". */
+  channelCheck: () =>
+    call<{ stores: Partial<Record<LightStore, { ok: boolean | null; missing: string[]; detail: string }>>; error?: string }>(
+      "/api/lighting/channel_check",
+      { authed: true }
+    ),
+
+  /** Open every sales channel for every lamp the portal ever published, now
+   *  (runs every 6 h on its own too). Stores without the permission are skipped
+   *  with the reason. */
+  channelsHeal: () =>
+    call<{
+      report: Partial<Record<LightStore, { products?: number; opened?: number; gone?: number; skipped?: string; errors?: string[] }>>;
+      error?: string;
+    }>("/api/lighting/channels_heal", { method: "POST", authed: true }),
+
   /** Read the competitor's title + description and say what the product IS
    *  (type per market, power, placement, features, search terms). One LLM call. */
   understand: (params: { source_text: string; product_title: string; product_type?: string }) =>
@@ -1881,6 +1910,9 @@ export const lightingApi = {
     /** The variant axis as the product really has it: Kleur / Color / Design / light colour. */
     option_name?: string;
     option_values?: string[];
+    /** The option in each market's own words, as shown/edited at import.
+     *  The server translates any market this does not cover. */
+    option_i18n?: Partial<Record<LightStore, { name: string; values: Record<string, string> }>>;
     price: string;
     compare_at_price?: string;
     images?: string[];
