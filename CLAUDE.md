@@ -206,6 +206,57 @@ this backend is the prerequisite for ever switching a store to Block.
 
 ---
 
+## 🧾 After Quotation (since v1.321.0)
+
+Fashion listings are made BEFORE the supplier quote: placeholder XS–XL and the
+competitor's chart (measured 29 Sep 2026: 49 DK shoe listings sold XS–XL
+against an EU 35–42 chart). Tools menu → **"After quotation"** opens
+`/after-quotation`: search a listing, upload/paste what the supplier sent (AI
+pre-fills the form), check sizes / size chart / colours / photos / material
+facts, preview per store, apply. Code: server.py section "AFTER QUOTATION"
+(`_aq_*`, routes `/api/aq/*`, all gated), `components/after-quotation/`,
+`lib/afterQuotation.ts`.
+
+- **Model it relies on:** one product = one colour in one store; title = name
+  (same in DK/FR/FI); size is the ONLY option; colour in `theme.cutline`, handle,
+  SKU and `global.title_tag`. A family = `theme.siblings` (same handle in every
+  store). Colours are lined up across stores by colour concept, then by creation
+  order (`_aq_rows`, `match: colour|order` — the page marks order matches ≈).
+- **Writes:** sizes = ONE product PUT with the full variant list — a size that
+  stays keeps its variant id (orders + COGS matching stay attached), a new size
+  copies price/compare-at/tax/inventory settings; verified by reading back.
+  Rename = cutline + title_tag + SKUs, **never the handle** (ads/links keep
+  working). Hide = status draft, never delete. New colour = `_publish_one_variant`
+  with the family's own copy/tags/price/siblings collection + uploaded photos.
+  Descriptions = model-edited HTML (`_aq_clean_html`), only when ticked.
+- **Safety:** apply re-reads Shopify and refuses when the listing's signature
+  (`_aq_state_sig`) moved since the preview; every touched product is written to
+  `backend/aq_backups/<id>.json` BEFORE the first write, and the backup records
+  per product WHAT the apply wrote (`writes`). `POST /api/aq/undo` restores only
+  those fields and only where Shopify still holds what was written (a field
+  changed since — by hand, a later apply, the chart self-heal, margin watch — is
+  left alone and named in the log); changes are undone newest first. Recreated
+  variants get new ids; new colours go to draft. Log: `backend/aq_history.jsonl`
+  (an `apply` line right after the backup + `apply_done` at the end — no done
+  line = `interrupted`, still undoable). Both gitignored, droplet-only, in
+  `_run_backup`; the self-updater waits for a running apply before restarting.
+  Jobs live in `_AQ_JOBS` with random ids behind the gated `/api/aq/job` — NOT
+  in `_JOBS` (the catalogue-job status route is open).
+- **Refuses (plan errors):** a colour group mixing products (`theme.siblings`
+  shared by e.g. a blouse and a jacket — 13 of 860 groups on 29 Sep), products
+  with ≠ 1 option, two variants with the same size, unsafe colour names.
+- **Untrusted input:** supplier files and model output. Description HTML goes
+  through `_aq_clean_html` (allow-list parser, no attributes except a safe
+  `<a href>`); .xlsx via a streaming stdlib parser with caps; per-route body
+  limits (`_AQ_BODY_LIMITS`, no-length bodies refused).
+- **Index:** `_aq_index` = all active+draft products per store (GraphQL, 250 per
+  page, ~10 s per store), served stale-while-revalidate (10 min), warmed 45 s
+  after start (skipped under pytest / DEV_LOCAL).
+- **Tests:** `backend/tests/test_after_quotation.py`,
+  `frontend/tests/afterQuotation.test.ts`.
+
+---
+
 ## 🐛 Codeword: "bug"
 
 When the user says **"bug"** (also accept "bugs", "/bug", "fix bugs", "work the

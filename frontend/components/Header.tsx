@@ -70,6 +70,7 @@ export function Header() {
     divider?: boolean;
   }[] = [
     { label: "What to list", desc: "Full research flow: types → stores → products (opens in a new tab)", action: () => window.open("/research", "_blank") },
+    { label: "After quotation", desc: "Supplier confirmed the real colours, sizes or size chart? Fix the listing (opens in a new tab)", action: () => window.open("/after-quotation", "_blank") },
     { label: "Margin watch", desc: "Products where the supplier cost eats too much of the price (opens in a new tab)", action: () => window.open("/cogs", "_blank") },
     { label: "Spy Shield", desc: "Who is spying on the stores — monitor log + beacon URL (opens in a new tab)", action: () => window.open("/spy-shield", "_blank") },
     { label: "Keyword research", desc: "Best keywords for a type you already picked", action: () => setResearchOpen(true) },

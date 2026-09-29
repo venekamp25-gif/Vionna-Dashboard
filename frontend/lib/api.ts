@@ -1945,3 +1945,215 @@ export const lightingApi = {
       error?: string;
     }>("/api/lighting/publish", { method: "POST", body: params, authed: true }),
 };
+
+// ── After Quotation ──────────────────────────────────────────────────────────
+// Correct fashion listings once the supplier's quote is in (server.py, the
+// "AFTER QUOTATION" section). Every call is authed: the page reads supplier
+// material and writes to the live stores.
+
+export type AqStoreKey = "dk" | "fr" | "fi";
+
+export interface AqFlag {
+  code: string;
+  hard: boolean;
+  text: string;
+}
+
+export interface AqFamilySummary {
+  key: string;
+  name: string;
+  cat: string;
+  type: string;
+  image: string;
+  created: string;
+  stores: Partial<Record<AqStoreKey, number>>;
+  active: number;
+  total: number;
+  sizes: string[];
+  colours: { row_id: string; labels: Partial<Record<AqStoreKey, string>>; status: Partial<Record<AqStoreKey, string>> }[];
+  flags: AqFlag[];
+  processed: string | null;
+}
+
+export interface AqSearchResponse {
+  families: AqFamilySummary[];
+  total: number;
+  store_errors: Partial<Record<AqStoreKey, string>>;
+  indexed: Partial<Record<AqStoreKey, number>>;
+}
+
+export interface AqCell {
+  id: number;
+  handle: string;
+  status: string;
+  colour: string;
+  sizes: string[];
+  options_count: number;
+  price: string | null;
+  compare_at: string | null;
+  images: string[];
+  image_count: number;
+  has_chart: boolean;
+  title_tag: string;
+  admin_url: string;
+  /** How this store's product was lined up with the row: base / colour / order. */
+  match: "base" | "colour" | "order";
+}
+
+export interface AqHistoryRow {
+  type: "apply";
+  key: string;
+  name: string;
+  user: string;
+  backup_id: string;
+  counts: Record<string, number>;
+  summary: Partial<Record<AqStoreKey, string[]>>;
+  errors: string[];
+  ts: string;
+  finished_ts?: string | null;
+  /** interrupted = the process stopped halfway (backup + Undo still there). */
+  status: "running" | "done" | "partial" | "interrupted" | "error";
+  undone: boolean;
+}
+
+export interface AqFamily {
+  key: string;
+  name: string;
+  cat: string;
+  type: string;
+  rows: { row_id: string; concept: string; cells: Partial<Record<AqStoreKey, AqCell>> }[];
+  stores: Partial<
+    Record<
+      AqStoreKey,
+      {
+        description: string;
+        description_shared: boolean;
+        chart: { headers: string[]; rows: string[][] } | null;
+        size_option: string;
+        count: number;
+      }
+    >
+  >;
+  store_errors: Partial<Record<AqStoreKey, string>>;
+  flags: AqFlag[];
+  sig: string;
+  history: AqHistoryRow[];
+}
+
+export interface AqExtracted {
+  colours: { supplier_name: string; english: string; labels: Record<AqStoreKey, string>; row_id: string | null }[];
+  sizes: string[];
+  size_chart: { headers: string[]; rows: string[][] } | null;
+  chart_unit: string | null;
+  models: { name: string; details: string }[];
+  material: string | null;
+  facts: string[];
+  price: { amount: number; currency: string } | null;
+  notes: string[];
+  confidence: "high" | "medium" | "low";
+}
+
+export interface AqUpload {
+  name: string;
+  /** data: URL */
+  data: string;
+}
+
+/** What the operator confirmed. `images` are data URLs on apply, and only a
+ *  COUNT on preview (the plan never needs the bytes). */
+export interface AqTarget {
+  stores: AqStoreKey[];
+  sizes: string[] | null;
+  size_chart: { headers: string[]; rows: string[][] } | null;
+  colours: { row_id: string; action: "keep" | "rename" | "drop"; labels?: Partial<Record<AqStoreKey, string>> }[];
+  new_colours: { labels: Partial<Record<AqStoreKey, string>>; images: string[] | number; activate: boolean }[];
+  photos: { row_id: string; mode: "append" | "front"; images: string[] | number }[];
+  descriptions: Partial<Record<AqStoreKey, string>>;
+  supplier_note?: string;
+}
+
+export interface AqOp {
+  op: "variants" | "rename" | "chart" | "description" | "photos" | "draft" | "add_colour";
+  store: AqStoreKey;
+  product_id?: number;
+  product_ids?: number[];
+  row_id?: string;
+  text: string;
+}
+
+export interface AqPlan {
+  ops: AqOp[];
+  errors: string[];
+  warnings: string[];
+  counts: Record<string, number>;
+  products: number;
+  sig: string;
+}
+
+export interface AqJob {
+  id: string;
+  kind: "apply" | "undo";
+  status: "running" | "done" | "partial" | "error";
+  step: string;
+  done: number;
+  total: number;
+  log: { store: string; text: string; ok: boolean }[];
+  errors: string[];
+  result: { backup_id: string; errors: string[] } | null;
+  backup_id?: string;
+}
+
+export interface AqCopy {
+  before: string;
+  after: string;
+  changes: string[];
+  warnings: string[];
+}
+
+export const aqApi = {
+  search: (q: string, view: "attention" | "recent" | "done", refresh = false) =>
+    call<AqSearchResponse>(
+      `/api/aq/search?q=${encodeURIComponent(q)}&view=${view}${refresh ? "&refresh=1" : ""}`,
+      { authed: true }
+    ),
+  family: (key: string, refresh = false) =>
+    call<AqFamily>(`/api/aq/family?key=${encodeURIComponent(key)}${refresh ? "&refresh=1" : ""}`, { authed: true }),
+  extract: (params: {
+    files: AqUpload[];
+    text: string;
+    context: {
+      name: string;
+      cat: string;
+      sizes: string[];
+      rows: { row_id: string; labels: Partial<Record<AqStoreKey, string>> }[];
+    };
+  }) =>
+    call<{ extracted: AqExtracted; files_used: string[]; files_skipped: string[] }>("/api/aq/extract", {
+      method: "POST",
+      body: params,
+      authed: true,
+    }),
+  copy: (params: {
+    key: string;
+    stores: AqStoreKey[];
+    material: string;
+    facts: string[];
+    models: { name: string; details: string }[];
+  }) =>
+    call<{ copy: Partial<Record<AqStoreKey, AqCopy>>; errors: Partial<Record<AqStoreKey, string>> }>("/api/aq/copy", {
+      method: "POST",
+      body: params,
+      authed: true,
+    }),
+  plan: (key: string, target: AqTarget) =>
+    call<AqPlan>("/api/aq/plan", { method: "POST", body: { key, target }, authed: true }),
+  apply: (key: string, target: AqTarget, sig: string) =>
+    call<{ job_id: string }>("/api/aq/apply", { method: "POST", body: { key, target, sig }, authed: true }),
+  undo: (backupId: string) =>
+    call<{ job_id: string }>("/api/aq/undo", { method: "POST", body: { backup_id: backupId }, authed: true }),
+  job: (id: string) => call<AqJob>(`/api/aq/job?id=${encodeURIComponent(id)}`, { authed: true }),
+  history: (key?: string) =>
+    call<{ history: AqHistoryRow[] }>(`/api/aq/history${key ? `?key=${encodeURIComponent(key)}` : ""}`, {
+      authed: true,
+    }),
+};
