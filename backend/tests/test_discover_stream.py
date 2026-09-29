@@ -293,3 +293,11 @@ def test_a_cached_www_zero_falls_back_to_the_bare_domain():
     assert server._wtl_traffic_lookup(cache, 'x.fr')['total_visits'] == 30000
     assert server._wtl_traffic_lookup({'www.y.fr': {'total_visits': 0}}, 'www.y.fr') == {'total_visits': 0}
     assert server._wtl_traffic_lookup({}, 'www.z.fr') is None
+
+
+def test_the_visit_bar_keeps_the_small_proven_sources():
+    """Calibration anchor: zentaro (3,961/mo) and vesperlorain (~4.8k/mo) are
+    stores venek imports from. A bar above them filters out the very kind of
+    store the list is for."""
+    assert server.GD_MIN_VISITS <= 3961
+    assert server.GD_MIN_VISITS >= 2000     # and the 'no real traffic' tail stays out

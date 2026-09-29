@@ -1070,7 +1070,7 @@ export function WhatToListWorkbench() {
               />
               <span
                 title={`Hides stores you never imported from whose measured SimilarWeb traffic is under ${(
-                  wtlStores?.gd_min_visits ?? 5000
+                  wtlStores?.gd_min_visits ?? 3000
                 ).toLocaleString("en")} visits/month (or who are unknown to SimilarWeb). Stores without a traffic measurement yet stay visible — press “Update traffic”. Stores you imported from always stay.`}
               >
                 Hide small stores
@@ -1291,7 +1291,7 @@ export function WhatToListWorkbench() {
               // Small = never imported from AND traffic measured (a cache entry exists)
               // below the discovery bar — incl. 0 = unknown to SimilarWeb. A store
               // without any measurement yet is NOT small: we just don't know.
-              const minVisits = wtlStores.gd_min_visits ?? 5000;
+              const minVisits = wtlStores.gd_min_visits ?? 3000;
               const isMeasuredSmall = (s: WtlStore) =>
                 s.products === 0 && s.traffic_age_days !== null && s.total_visits < minVisits;
               const passesBase = (s: WtlStore) =>

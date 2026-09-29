@@ -15382,9 +15382,11 @@ _GD_TRAFFIC_BATCH_S = 8  # seconds between SimilarWeb batches in a discovery run
 # of ~1.7k visits/month (50 of 237 unknown to SimilarWeb, 80 under 2k) against
 # ~27k for the 28 stores venek actually imports from. The July rule (300 visits,
 # unknown traffic allowed) let the young, empty stores in. Now a store must show
-# BOTH a real catalogue and measured traffic before the (slow) dropship check;
-# the smallest proven source (vesperlorain) sits at ~4.8k visits/month.
-GD_MIN_VISITS = 5000             # SimilarWeb total visits / month, measured
+# BOTH a real catalogue and measured traffic before the (slow) dropship check.
+# Calibrated on the proven sources (never reason a bar, measure it): 3,000 keeps
+# 18 of the 20 with SimilarWeb data — incl. zentaro 3,961 and vesperlorain ~4.8k,
+# which 5,000 would have shut out — and drops 150 of 237 discovered stores.
+GD_MIN_VISITS = 3000             # SimilarWeb total visits / month, measured
 GD_MIN_PRODUCTS = 60             # products in the public catalogue
 GD_MIN_EST_EUR = 0               # geen omzet-lat bij toelating
 # Unknown to SimilarWeb = no measurable traffic = not admitted any more. A FAILED
