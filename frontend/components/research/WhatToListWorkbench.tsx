@@ -167,6 +167,10 @@ export function WhatToListWorkbench() {
   // ON by default: a store the niche check says is NOT womenswear (home, sport,
   // beauty…) is hidden. Unchecked stores stay visible — unknown ≠ no.
   const [hideNonFashion, setHideNonFashion] = useState(true);
+  // ON by default (venek 2026-09-29: "only stores with real traffic and products"):
+  // a store you never imported from whose MEASURED traffic is under the discovery
+  // bar is hidden. Not measured yet = stays visible (unknown ≠ no).
+  const [hideSmall, setHideSmall] = useState(true);
   const [nicheChecking, setNicheChecking] = useState(false);
   const [nicheMsg, setNicheMsg] = useState<string | null>(null);
   const [addDomain, setAddDomain] = useState("");
@@ -1057,6 +1061,21 @@ export function WhatToListWorkbench() {
                 Hide non-fashion
               </span>
             </label>
+            <label className="flex items-center gap-1.5 text-text-dim cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={hideSmall}
+                onChange={(e) => setHideSmall(e.target.checked)}
+                className="h-3.5 w-3.5 accent-[var(--accent)]"
+              />
+              <span
+                title={`Hides stores you never imported from whose measured SimilarWeb traffic is under ${(
+                  wtlStores?.gd_min_visits ?? 5000
+                ).toLocaleString("en")} visits/month (or who are unknown to SimilarWeb). Stores without a traffic measurement yet stay visible — press “Update traffic”. Stores you imported from always stay.`}
+              >
+                Hide small stores
+              </span>
+            </label>
             <span className="flex items-center gap-1 text-text-dim">
               Markets
               {(["dk", "fr", "fi"] as StoreKey[]).map((m) => {
@@ -1193,8 +1212,8 @@ export function WhatToListWorkbench() {
               {discoverLive && discoverLive.found.length === 0 ? (
                 <p className="text-[11.5px] text-text-faint mt-1.5">
                   {discovering
-                    ? "Checking candidates — a store appears here the moment it passes the Shopify, locality and womenswear checks."
-                    : "No new womenswear stores passed the checks this run."}
+                    ? "Checking candidates — a store appears here the moment it passes the Shopify, catalogue (60+ products), locality and womenswear checks, then gets its traffic measured."
+                    : "No new womenswear stores with real traffic and a real catalogue passed the checks this run."}
                 </p>
               ) : discoverLive ? (
                 <ul className="mt-2 space-y-1">
@@ -1204,14 +1223,18 @@ export function WhatToListWorkbench() {
                         ? "text-green-600 dark:text-green-400"
                         : r.status === "added_unverified"
                           ? "text-amber-500"
-                          : r.status === "checking"
+                          : r.status === "checking" || r.status === "checking_traffic"
                             ? "text-text-dim"
                             : "text-text-faint line-through";
                     const label =
-                      r.status === "checking"
-                        ? "checking shipping policy…"
+                      r.status === "checking_traffic"
+                        ? "checking traffic…"
+                        : r.status === "checking"
+                        ? `${r.visits ? `${r.visits.toLocaleString("en")} visits/mo · ` : ""}checking shipping policy…`
                         : r.status === "added"
-                          ? `added ✓ dropshipper${r.overlap_matches ? " (supplier-catalog overlap)" : ""}`
+                          ? `added ✓ dropshipper${r.overlap_matches ? " (supplier-catalog overlap)" : ""}${
+                              r.visits ? ` · ${r.visits.toLocaleString("en")} visits/mo` : ""
+                            }`
                           : r.status === "added_unverified"
                             ? "added — dropship status unconfirmed"
                             : r.status === "rejected"
@@ -1265,6 +1288,12 @@ export function WhatToListWorkbench() {
               const isConfirmedNotDropshipper = (s: WtlStore) =>
                 !isDropshipper(s) &&
                 (s.verdict?.label === "Eigen voorraad" || s.verdict?.label === "Mogelijk eigen merk");
+              // Small = never imported from AND traffic measured (a cache entry exists)
+              // below the discovery bar — incl. 0 = unknown to SimilarWeb. A store
+              // without any measurement yet is NOT small: we just don't know.
+              const minVisits = wtlStores.gd_min_visits ?? 5000;
+              const isMeasuredSmall = (s: WtlStore) =>
+                s.products === 0 && s.traffic_age_days !== null && s.total_visits < minVisits;
               const passesBase = (s: WtlStore) =>
                 // Both opt-in. "0 new" only hides stores we ACTUALLY scanned —
                 // never-scanned ones (bs_new_count === null) always stay visible.
@@ -1272,7 +1301,8 @@ export function WhatToListWorkbench() {
                 (!hideMarked || !s.mark) &&
                 (!onlyDropshippers || !isConfirmedNotDropshipper(s)) &&
                 // Only a PROVEN non-fashion store is hidden; unchecked/unknown stays.
-                (!hideNonFashion || s.niche?.status !== "no");
+                (!hideNonFashion || s.niche?.status !== "no") &&
+                (!hideSmall || !isMeasuredSmall(s));
               const sortStores = (arr: WtlStore[]) =>
                 arr.slice().sort((a, b) => {
                   // Marked stores always sink, whatever the sort.

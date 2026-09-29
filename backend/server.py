@@ -13994,12 +13994,29 @@ def _similarweb_bulk(hosts):
                 continue
         out[dom] = {'total_visits': total, 'shares': shares, 'monthly': monthly[-6:],
                     'ts': datetime.datetime.utcnow().isoformat() + 'Z'}
-    # hosts the actor returned nothing for → cache an explicit zero (retry after TTL)
+    # Every REQUESTED host gets its answer under its own key. The actor reports
+    # the bare domain, so 'www.x.fr' must read 'x.fr' — before 2026-09-29 the
+    # fill below compared the raw host with the stripped keys, and every www-host
+    # got a fake 0 cached next to its real number (8 of 28 proven sources read
+    # 0 visits/month). Hosts the actor returned nothing for → an explicit zero
+    # (retry after TTL).
     for h in hosts:
-        if h not in out:
-            out[h] = {'total_visits': 0, 'shares': {},
-                      'ts': datetime.datetime.utcnow().isoformat() + 'Z'}
+        if h in out:
+            continue
+        bare = re.sub(r'^www\.', '', h.lower())
+        out[h] = dict(out[bare]) if bare in out else {
+            'total_visits': 0, 'shares': {}, 'ts': datetime.datetime.utcnow().isoformat() + 'Z'}
     return out
+
+
+def _wtl_traffic_lookup(cache, d):
+    """The traffic cache entry for domain `d`. 'www.x' and 'x' are one site:
+    a www-key cached as 0 by the pre-2026-09-29 bug falls back to the bare key."""
+    t = cache.get(d)
+    bare = re.sub(r'^www\.', '', d or '')
+    if bare != d and not (t or {}).get('total_visits'):
+        t = cache.get(bare) or t
+    return t
 
 
 # ── Niche: is dit een DAMESMODE-winkel? ─────────────────────────────────────
@@ -14517,7 +14534,7 @@ def api_wtl_stores():
     for d, c in comps.items():
         if d in blocked:
             continue
-        t = cache.get(d)
+        t = _wtl_traffic_lookup(cache, d)
         total = (t or {}).get('total_visits') or 0
         share = ((t or {}).get('shares') or {}).get(cc) or 0.0
         local = int(total * share)
@@ -14607,6 +14624,8 @@ def api_wtl_stores():
                         if (s.get('verdict') or {}).get('label') == 'Onbekend')
     niche_missing = sum(1 for s in out if not ((s.get('niche') or {}).get('fresh')))
     return jsonify({'store': store, 'country': cc, 'min_local': min_local,
+                    # the discovery bar — the stores tab hides never-used stores below it
+                    'gd_min_visits': GD_MIN_VISITS, 'gd_min_products': GD_MIN_PRODUCTS,
                     'stores': out, 'traffic_missing': missing,
                     'verdicts_missing': verdicts_missing,
                     'never_checked': never_checked,
@@ -15343,6 +15362,7 @@ _GD_RETAILERS = ('karwei', 'gamma', 'praxis', 'bonprix', 'azazie', 'whatnot', 'n
                  'zara', 'mango', 'only', 'veromoda', 'cellbes', 'bubbleroom')
 _GD_MIN_WOMENS = 5     # fewer bestsellers = not a womens-fashion store
 _GD_MAX_NEW = 25       # cap on new stores added per market per run (was 6)
+_GD_TRAFFIC_BATCH_S = 8  # seconds between SimilarWeb batches in a discovery run
 
 # TOELATING tot de lijst is iets anders dan GESCHIKT als bron.
 # De sourcing-drempels (TRAFFIC_THRESHOLD_EUR/TRAFFIC_MIN_VISITS, het doc-minimum)
@@ -15356,11 +15376,20 @@ _GD_MAX_NEW = 25       # cap on new stores added per market per run (was 6)
 # SimilarWeb) kwam er WEL in. Bewijs van leven strafte je dus af.
 # Kwaliteit wordt nu bepaald door de DROPSHIP-POORT, niet door omvang. Traffic is
 # alleen nog een levenscheck: helemaal dood = niet interessant.
-GD_MIN_VISITS = 300              # alleen 'is er iets van leven', geen omvangseis
-GD_MIN_EST_EUR = 0               # geen omzet-lat meer bij toelating
-# SimilarWeb geeft total_visits 0 voor élke host zonder profiel — precies de jonge
-# dropshipper. Zo'n store afwijzen op ontbrekende data is de fout omgekeerd maken.
-GD_ALLOW_UNKNOWN_TRAFFIC = True
+# 2026-09-29 (venek): "the new stores don't have a lot of products, and very low
+# visits a month if they even have any" → "only add stores with real traffic and
+# products". Measured on the live list: discovered fashion stores had a median
+# of ~1.7k visits/month (50 of 237 unknown to SimilarWeb, 80 under 2k) against
+# ~27k for the 28 stores venek actually imports from. The July rule (300 visits,
+# unknown traffic allowed) let the young, empty stores in. Now a store must show
+# BOTH a real catalogue and measured traffic before the (slow) dropship check;
+# the smallest proven source (vesperlorain) sits at ~4.8k visits/month.
+GD_MIN_VISITS = 5000             # SimilarWeb total visits / month, measured
+GD_MIN_PRODUCTS = 60             # products in the public catalogue
+GD_MIN_EST_EUR = 0               # geen omzet-lat bij toelating
+# Unknown to SimilarWeb = no measurable traffic = not admitted any more. A FAILED
+# SimilarWeb run is not a verdict: those candidates are retried next run.
+GD_ALLOW_UNKNOWN_TRAFFIC = False
 WTL_DISCOVER_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wtl_discover_state.json')
 # Al beoordeelde kandidaten. Zonder dit bevraagt elke run dezelfde ~30 dode
 # domeinen opnieuw (traag) en verbrandt hij zijn budget op oud nieuws i.p.v.
@@ -15377,6 +15406,7 @@ _GD_SEEN_TTL_DAYS = {'check failed': 1, 'check mislukt': 1,          # storing �
                      'too few bestsellers': 14, 'te weinig bestsellers': 14,
                      'not womenswear': 60, 'geen damesmode': 60,
                      'too little traffic': 14, 'onder de marktgrootte-lat': 14,
+                     'no measurable traffic': 30, 'too few products': 30,
                      'brand / own stock': 60, 'merk/eigen voorraad': 60}
 _GD_SEEN_DEFAULT_TTL = 14
 _GD_QUERIES_PER_RUN = 24     # per markt per run, uit een roulerende bank van ~150
@@ -15389,6 +15419,37 @@ _GD_SEEDS_PER_RUN = 3        # bekende dropshippers als 'lijkt op'-seed per mark
 # (bug #63). De seed-bron pagineert al wel dieper bij hergebruik (0/100/200);
 # dit geeft de zoekbank diezelfde uitweg.
 _GD_QUERY_DEPTHS = (30, 100, 200)
+
+
+def _gd_catalogue_at_least(domain, n, page_size=30, timeout=12):
+    """True when the store's public catalogue holds at least `n` products,
+    False when it holds fewer, None when that could not be read (never a
+    verdict). ONE extra products.json call: the page that holds product `n`."""
+    if n <= 0:
+        return True
+    page = (n - 1) // page_size + 1
+    need = n - (page - 1) * page_size
+    try:
+        r = _scrape_get(f'https://{domain}/products.json?limit={page_size}&page={page}', timeout=timeout)
+    except Exception:
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        prods = (r.json() or {}).get('products')
+    except Exception:
+        return None
+    if not isinstance(prods, list):
+        return None
+    return len(prods) >= need
+
+
+def _wtl_traffic_entry_fresh(t):
+    try:
+        ts = datetime.datetime.fromisoformat(str((t or {}).get('ts', '')).rstrip('Z'))
+        return (datetime.datetime.utcnow() - ts).total_seconds() < _WTL_TRAFFIC_TTL
+    except Exception:
+        return False
 
 
 def _gd_seen_load():
@@ -15763,6 +15824,8 @@ def _wtl_discover_run(markets, jid, ignore_seen):
         _job_set(jid, phase='Collecting candidates', total=0, processed=0)
     check_pool = _cf.ThreadPoolExecutor(max_workers=10)
     verdict_pool = _cf.ThreadPoolExecutor(max_workers=4)
+    traffic_q = []                          # (domain, market, term, row) waiting for SimilarWeb
+    collect_done = threading.Event()
 
     def _publish_counts():
         if jid:
@@ -15852,9 +15915,21 @@ def _wtl_discover_run(markets, jid, ignore_seen):
                     # 200 with an HTML body = password page / bot challenge;
                     # 0 / 5xx / 429 = storing. Neither is a verdict.
                     reason = f'check failed: {err or http}'
+            elif len(sample) < min(GD_MIN_PRODUCTS, _WTL_NICHE_SAMPLE):
+                reason = f'too few products ({len(sample)})'
             else:
-                local = _gd_is_local(d, m)
-                if local is None:
+                enough = (True if len(sample) >= GD_MIN_PRODUCTS
+                          else _gd_catalogue_at_least(d, GD_MIN_PRODUCTS))
+                local = None
+                if enough is None:
+                    reason = 'check failed: catalogue size unreadable'
+                elif not enough:
+                    reason = f'too few products (under {GD_MIN_PRODUCTS})'
+                else:
+                    local = _gd_is_local(d, m)
+                if reason:
+                    pass
+                elif local is None:
                     reason = 'check failed: homepage unreadable'
                 elif not local:
                     reason = 'not local'
@@ -15875,26 +15950,95 @@ def _wtl_discover_run(markets, jid, ignore_seen):
                 skipped.append({'domain': d, 'market': m, 'source': source,
                                 'reason': f'not local for {m.upper()}' if reason == 'not local' else reason})
             return
-        row = {'domain': d, 'market': m, 'term': term, 'source': source, 'status': 'checking',
-               'niche': _wtl_niche_public(niche), 'catalogue': len(sample or [])}
+        row = {'domain': d, 'market': m, 'term': term, 'source': source, 'status': 'checking_traffic',
+               'niche': _wtl_niche_public(niche), 'catalogue': f'{GD_MIN_PRODUCTS}+'}
         with lock:
-            if per_market_scanned[m] >= _GD_MAX_NEW * 3:
+            # More room than the add-cap: the traffic check still filters.
+            if per_market_scanned[m] >= _GD_MAX_NEW * 8:
                 return                      # genoeg voor deze markt; niet onthouden
+            if per_market_added[m] + inflight[m] >= _GD_MAX_NEW:
+                return                      # markt is vol voor deze run; niet onthouden
             per_market_scanned[m] += 1
             scanned[d] = (m, term)
             rows[d] = row
-            # Cap VOOR de dure dropship-check (~1 min): wat de cap toch weggooit
-            # hoeft niet geclassificeerd te worden. In-flight telt mee.
-            if per_market_added[m] + inflight[m] >= _GD_MAX_NEW:
-                row.update({'status': 'gated', 'reason': 'cap reached — next run'})
-                gated.append(dict(row))
-                if jid:
-                    _job_live_push(jid, row)
-                return
-            inflight[m] += 1
+            traffic_q.append((d, m, term, row))
         if jid:
             _job_live_push(jid, row)
+
+    def _gate_out(d, m, row, status, reason, remember=None, **extra):
+        row.update({'status': status, 'reason': reason, **extra})
+        with lock:
+            if remember:
+                _gd_remember(seen, d, m, remember)
+            gated.append(dict(row))
+        if jid:
+            _job_live_update(jid, d, status=status, reason=reason, **extra)
+
+    def _traffic_decide(d, m, term, row, t):
+        """Measured traffic decides BEFORE the dropship check (~1 min each)."""
+        if t is None:
+            # The SimilarWeb run failed — storing, not a verdict: retry tomorrow.
+            _gate_out(d, m, row, 'gated', 'traffic check failed — next run', remember='check failed: traffic')
+            return
+        visits = int(t.get('total_visits') or 0)
+        if visits < GD_MIN_VISITS:
+            if visits == 0 and GD_ALLOW_UNKNOWN_TRAFFIC:
+                pass
+            else:
+                why = ('no measurable traffic (unknown to SimilarWeb)' if visits == 0
+                       else f'too little traffic ({visits:,} visits/month, needs {GD_MIN_VISITS:,})')
+                _gate_out(d, m, row, 'gated', why,
+                          remember='no measurable traffic' if visits == 0 else 'too little traffic',
+                          visits=visits)
+                return
+        with lock:
+            # Cap VOOR de dure dropship-check: wat de cap toch weggooit hoeft niet
+            # geclassificeerd te worden. In-flight telt mee.
+            if per_market_added[m] + inflight[m] >= _GD_MAX_NEW:
+                full = True
+            else:
+                full = False
+                inflight[m] += 1
+        if full:
+            _gate_out(d, m, row, 'gated', 'cap reached — next run', visits=visits)
+            return
+        row.update({'status': 'checking', 'visits': visits, 'traffic_unknown': visits == 0})
+        if jid:
+            _job_live_update(jid, d, status='checking', visits=visits)
         verdict_pool.submit(_verdict_worker, d, m, term, row)
+
+    def _traffic_loop():
+        """Batches the passers of the catalogue/locality/niche checks into one
+        SimilarWeb run every few seconds (cheap, and a fresh cache entry skips
+        the run). Streams: the first batch goes out while the search still runs."""
+        while True:
+            done = collect_done.wait(timeout=_GD_TRAFFIC_BATCH_S)
+            with lock:
+                batch = traffic_q[:]
+                del traffic_q[:]
+            if batch:
+                cache = _wtl_traffic_load()
+                need = [d for d, *_ in batch if not _wtl_traffic_entry_fresh(_wtl_traffic_lookup(cache, d))]
+                fresh = _similarweb_bulk(need) if need else {}
+                if fresh:
+                    cache = _wtl_traffic_load()       # re-read: others may have written meanwhile
+                    cache.update(fresh)
+                    _wtl_traffic_save(cache)
+                for d, m, term, row in batch:
+                    if d in fresh:
+                        t = fresh[d]
+                    elif d not in need:
+                        t = _wtl_traffic_lookup(cache, d)
+                    else:
+                        t = None                      # asked, no answer: the run failed
+                    try:
+                        _traffic_decide(d, m, term, row, t)
+                    except Exception as e:
+                        _gate_out(d, m, row, 'error', f'traffic check failed: {str(e)[:60]}')
+            if done:
+                with lock:
+                    if not traffic_q:
+                        return
 
     def _consider(m, term, url, source):
         d = _gd_domain(url) or _gd_domain('https://' + str(url or ''))
@@ -15914,7 +16058,9 @@ def _wtl_discover_run(markets, jid, ignore_seen):
             _job_inc(jid, total=1)
         check_pool.submit(_check_worker, d, m, term, source)
 
+    traffic_thread = threading.Thread(target=lambda: _traffic_loop(), daemon=True, name='wtl-disc-traffic')
     try:
+        traffic_thread.start()
         # ── bron 1: 'lijkt op' bekende dropshippers (DataForSEO) — seconden ──
         dfs = _dfs_configured()
         if dfs:
@@ -15954,44 +16100,12 @@ def _wtl_discover_run(markets, jid, ignore_seen):
 
         check_pool.shutdown(wait=True)
         if jid:
-            _job_set(jid, phase='Dropship gate (shipping policy + brand signals)')
+            _job_set(jid, phase='Traffic check (SimilarWeb) + dropship gate')
+        collect_done.set()
+        traffic_thread.join()
         verdict_pool.shutdown(wait=True)
-        print(f'[wtl-disc] {len(scanned)} local Shopify womenswear stores found, {len(added)} added')
-
-        # ── levenscheck (SimilarWeb) pas aan het eind: verandert niets aan het
-        # eerste resultaat, en één bulk-run is goedkoper dan per winkel ──
-        if added:
-            if jid:
-                _job_set(jid, phase='SimilarWeb life-check')
-            fresh = _similarweb_bulk([a['domain'] for a in added])
-            if fresh:
-                cache = _wtl_traffic_load()
-                cache.update(fresh)
-                _wtl_traffic_save(cache)
-            still = []
-            for a in added:
-                m = a['market']
-                visits = (fresh.get(a['domain']) or {}).get('total_visits') or 0
-                ratio = min(1.0, (_TRAFFIC_POP_M.get(m) or _TRAFFIC_ANCHOR_POP_M) / _TRAFFIC_ANCHOR_POP_M)
-                floor = GD_MIN_VISITS * ratio
-                a['visits'] = visits
-                a['traffic_unknown'] = visits == 0
-                # Onbekende traffic mag door (SimilarWeb kent jonge winkels niet); een
-                # winkel met BEWEZEN te weinig bezoekers is dood en gaat er weer uit.
-                if visits and visits < floor:
-                    _gd_extra_change(remove=a['domain'])
-                    _gd_remember(seen, a['domain'], m, 'too little traffic')
-                    a['status'], a['reason'] = 'gated', 'too little traffic (dead store)'
-                    gated.append(dict(a))
-                    if jid:
-                        _job_live_update(jid, a['domain'], status='gated', reason='too little traffic (dead store)',
-                                         visits=visits)
-                    continue
-                if jid:
-                    _job_live_update(jid, a['domain'], visits=visits)
-                still.append(a)
-            added = still
-            uncertain = [u for u in uncertain if any(a['domain'] == u['domain'] for a in added)]
+        print(f'[wtl-disc] {len(scanned)} local Shopify womenswear stores with {GD_MIN_PRODUCTS}+ products, '
+              f'{len(added)} added (traffic >= {GD_MIN_VISITS})')
 
         _gd_seen_save(seen)
         for m in markets:
@@ -16008,10 +16122,17 @@ def _wtl_discover_run(markets, jid, ignore_seen):
         if uncertain:
             why.append(f'{len(uncertain)} store(s) added but NOT confirmed as dropshipper '
                        '(shipping policy unreadable) — check them with "Verify dropshippers"')
-        if gated:
-            why.append(f'{len(gated)} store(s) dead or over the cap')
+        small = sum(1 for g in gated if 'traffic' in str(g.get('reason') or '') and 'failed' not in str(g.get('reason')))
+        if small:
+            why.append(f'{small} store(s) left out: under {GD_MIN_VISITS:,} visits/month or unknown to SimilarWeb')
+        tfail = sum(1 for g in gated if 'traffic check failed' in str(g.get('reason') or ''))
+        if tfail:
+            why.append(f'{tfail} store(s) not judged: the SimilarWeb traffic check failed — retried next run')
+        few = sum(1 for s_ in skipped if str(s_.get('reason', '')).startswith('too few products'))
+        if few:
+            why.append(f'{few} candidate(s) left out: fewer than {GD_MIN_PRODUCTS} products')
         if skipped:
-            why.append(f'{len(skipped)} candidate(s) dropped: not Shopify / not local / not womenswear')
+            why.append(f'{len(skipped)} candidate(s) dropped: not Shopify / not local / not womenswear / too small')
 
         funnel = {}
         for m in markets:
@@ -16032,6 +16153,7 @@ def _wtl_discover_run(markets, jid, ignore_seen):
     finally:
         # Ook bij een exception: geen weesworkers die minutenlang aan een
         # 'error'-job blijven schrijven (normaal pad: al netjes gesloten).
+        collect_done.set()
         _pool_shutdown(check_pool)
         _pool_shutdown(verdict_pool)
 
@@ -16114,7 +16236,7 @@ def _wtl_traffic_loop():
                     floor = TRAFFIC_MIN_VISITS * ratio
                     ok = 0
                     for d in _wtl_all_domains():
-                        t = cache.get(d) or {}
+                        t = _wtl_traffic_lookup(cache, d) or {}
                         local = (t.get('total_visits') or 0) * ((t.get('shares') or {}).get(cc) or 0)
                         if local >= floor:
                             ok += 1

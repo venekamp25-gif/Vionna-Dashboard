@@ -1425,15 +1425,17 @@ export interface WtlNiche {
 }
 
 /** One row of a running discovery job: a store that passed the Shopify +
- *  locality + womenswear checks. `status` moves as the dropship gate finishes. */
+ *  catalogue-size + locality + womenswear checks. `status` moves through the
+ *  traffic check (checking_traffic) and the dropship gate (checking). */
 export interface DiscoverFoundRow {
   domain: string;
   market: string;
   term: string;
   source: "competitors" | "google";
-  status: "checking" | "added" | "added_unverified" | "rejected" | "gated" | "error";
+  status: "checking_traffic" | "checking" | "added" | "added_unverified" | "rejected" | "gated" | "error";
   niche: WtlNiche | null;
-  catalogue?: number;
+  /** "60+" once the one extra products.json page proved a real catalogue. */
+  catalogue?: number | string;
   verdict?: string;
   verdict_detail?: string;
   unverified?: boolean;
@@ -1456,6 +1458,10 @@ export interface WtlStoresResponse {
   store: string;
   country: string;
   min_local: number;
+  /** Discovery's admission bar (SimilarWeb total visits/month, catalogue size).
+   *  The stores list hides never-used stores measured below it. */
+  gd_min_visits?: number;
+  gd_min_products?: number;
   traffic_missing: number;
   verdicts_missing: number;
   /** Stores without a fresh niche verdict (womenswear or not). */

@@ -21,8 +21,8 @@ def _resp_products(n, title, ptype):
 
 
 SAMPLES = {
-    'newshop.dk': (_resp_products(12, 'Sommerkjole', 'Kjoler'), 200, None),
-    'homeshop.dk': (_resp_products(12, 'Duftlys', 'Home'), 200, None),
+    'newshop.dk': (_resp_products(30, 'Sommerkjole', 'Kjoler'), 200, None),
+    'homeshop.dk': (_resp_products(30, 'Duftlys', 'Home'), 200, None),
     'serpshop.dk': (None, 503, 'HTTP 503'),
     'notshop.dk': (None, 404, 'HTTP 404'),
 }
@@ -61,7 +61,10 @@ def _setup(monkeypatch, tmp_path, classify=None):
     monkeypatch.setattr(server, '_bs_scan_cached', lambda *a, **k: (_ for _ in ()).throw(AssertionError('scan in gate')))
     monkeypatch.setattr(server, '_wtl_catalog_overlap', lambda d: (_ for _ in ()).throw(AssertionError('overlap scan in gate')))
     monkeypatch.setattr(server, '_similarweb_bulk',
-                        lambda hosts: {h: {'total_visits': 5000, 'shares': {'DK': 1.0}, 'ts': 'x'} for h in hosts})
+                        lambda hosts: {h: {'total_visits': 12000, 'shares': {'DK': 1.0}, 'ts': 'x'} for h in hosts})
+    # A real catalogue (60+ products) — asked with ONE extra products.json page.
+    monkeypatch.setattr(server, '_gd_catalogue_at_least', lambda d, n, **kw: True)
+    monkeypatch.setattr(server, '_GD_TRAFFIC_BATCH_S', 0.05)
     import shipping_check
     monkeypatch.setattr(shipping_check, 'looks_like_brand', lambda d: (False, []))
 
@@ -89,7 +92,7 @@ def test_pipeline_end_to_end(monkeypatch, tmp_path):
     # The job carries the live list and the counters the UI shows.
     live = server._JOBS[jid]['live']
     assert [r['domain'] for r in live['found']] == ['newshop.dk']
-    assert live['found'][0]['status'] == 'added' and live['found'][0]['visits'] == 5000
+    assert live['found'][0]['status'] == 'added' and live['found'][0]['visits'] == 12000
     assert live['sources'] == {'competitors': 3, 'google': 1}
     assert server._JOBS[jid]['total'] == 4 and server._JOBS[jid]['processed'] == 4
 
@@ -121,7 +124,7 @@ def test_first_store_is_visible_before_the_dropship_gate_finishes(monkeypatch, t
             break
         time.sleep(0.05)
     assert found and found[0]['domain'] == 'newshop.dk'
-    assert found[0]['status'] == 'checking'      # shown while the gate still runs
+    assert found[0]['status'] in ('checking_traffic', 'checking')   # shown while the gates still run
     assert t.is_alive()
     gate.set()
     t.join(15)
@@ -148,16 +151,21 @@ def test_brand_is_rejected_and_remembered(monkeypatch, tmp_path):
     assert server._gd_seen_fresh(seen, 'legacy.dk')
 
 
-def test_dead_store_is_removed_after_the_life_check(monkeypatch, tmp_path):
+def test_a_store_with_little_traffic_is_never_added(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
     monkeypatch.setattr(server, '_similarweb_bulk',
-                        lambda hosts: {h: {'total_visits': 12, 'shares': {}, 'ts': 'x'} for h in hosts})
+                        lambda hosts: {h: {'total_visits': 1700, 'shares': {}, 'ts': 'x'} for h in hosts})
+    monkeypatch.setattr(server, '_wtl_classify_store',
+                        lambda d: (_ for _ in ()).throw(AssertionError('dropship check on a small store')))
     jid = server._job_new('wtl_discover', 'wtl')
     res = server._wtl_discover(['dk'], jid=jid)
     assert res['added'] == []
     assert [g['domain'] for g in res['gated']] == ['newshop.dk']
-    assert json.load(open(tmp_path / 'extra.json')) == []
+    assert 'too little traffic (1,700 visits/month' in res['gated'][0]['reason']
+    assert not (tmp_path / 'extra.json').exists() or json.load(open(tmp_path / 'extra.json')) == []
     assert server._JOBS[jid]['live']['found'][0]['status'] == 'gated'
+    seen = json.load(open(tmp_path / 'seen.json'))
+    assert seen['newshop.dk']['reason'] == 'too little traffic'
 
 
 def test_serp_is_read_at_the_depth_the_rotation_picked(monkeypatch, tmp_path):
@@ -175,9 +183,113 @@ def test_serp_is_read_at_the_depth_the_rotation_picked(monkeypatch, tmp_path):
     assert asked == [('kjole webshop', 'dk', 200)]
 
 
-def test_unknown_traffic_is_allowed(monkeypatch, tmp_path):
+def test_a_store_unknown_to_similarweb_is_not_added(monkeypatch, tmp_path):
+    """venek 2026-09-29: 'very low visits a month if they even have any'."""
+    _setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(server, '_similarweb_bulk',
+                        lambda hosts: {h: {'total_visits': 0, 'shares': {}, 'ts': 'x'} for h in hosts})
+    res = server._wtl_discover(['dk'])
+    assert res['added'] == []
+    assert res['gated'][0]['reason'] == 'no measurable traffic (unknown to SimilarWeb)'
+    seen = json.load(open(tmp_path / 'seen.json'))
+    assert seen['newshop.dk']['reason'] == 'no measurable traffic' and server._gd_seen_fresh(seen, 'newshop.dk')
+
+
+def test_a_failed_similarweb_run_is_not_a_verdict(monkeypatch, tmp_path):
     _setup(monkeypatch, tmp_path)
     monkeypatch.setattr(server, '_similarweb_bulk', lambda hosts: {})
     res = server._wtl_discover(['dk'])
-    assert [a['domain'] for a in res['added']] == ['newshop.dk']
-    assert res['added'][0]['traffic_unknown'] is True
+    assert res['added'] == [] and res['gated'][0]['reason'] == 'traffic check failed — next run'
+    seen = json.load(open(tmp_path / 'seen.json'))
+    two_days = (datetime.datetime.utcnow() - datetime.timedelta(days=2)).isoformat() + 'Z'
+    seen['newshop.dk']['ts'] = two_days
+    assert not server._gd_seen_fresh(seen, 'newshop.dk')        # retried after a day
+
+
+def test_a_small_catalogue_is_dropped_before_any_other_check(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    samples = dict(SAMPLES)
+    samples['newshop.dk'] = (_resp_products(12, 'Sommerkjole', 'Kjoler'), 200, None)
+    monkeypatch.setattr(server, '_gd_products_sample', lambda d, **kw: samples[d])
+    monkeypatch.setattr(server, '_gd_is_local', lambda d, m: (_ for _ in ()).throw(AssertionError('locality asked')))
+    res = server._wtl_discover(['dk'])
+    reasons = {x['domain']: x['reason'] for x in res['skipped']}
+    assert reasons['newshop.dk'] == 'too few products (12)'
+    # a full first page but under 60 in total: the one extra page says so
+    samples['newshop.dk'] = (_resp_products(30, 'Sommerkjole', 'Kjoler'), 200, None)
+    monkeypatch.setattr(server, '_gd_catalogue_at_least', lambda d, n, **kw: False)
+    res = server._wtl_discover(['dk'], ignore_seen=True)
+    reasons = {x['domain']: x['reason'] for x in res['skipped']}
+    assert reasons['newshop.dk'] == 'too few products (under 60)'
+    # an unreadable second page is a storing, not a verdict
+    monkeypatch.setattr(server, '_gd_catalogue_at_least', lambda d, n, **kw: None)
+    res = server._wtl_discover(['dk'], ignore_seen=True)
+    reasons = {x['domain']: x['reason'] for x in res['skipped']}
+    assert reasons['newshop.dk'].startswith('check failed')
+
+
+def test_cached_traffic_skips_the_similarweb_run(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    now = datetime.datetime.utcnow().isoformat() + 'Z'
+    monkeypatch.setattr(server, '_wtl_traffic_load', lambda: {'newshop.dk': {'total_visits': 40000, 'shares': {}, 'ts': now}})
+    monkeypatch.setattr(server, '_similarweb_bulk', lambda hosts: (_ for _ in ()).throw(AssertionError('paid run for a cached host')))
+    res = server._wtl_discover(['dk'])
+    assert [a['domain'] for a in res['added']] == ['newshop.dk'] and res['added'][0]['visits'] == 40000
+
+
+def test_catalogue_at_least_reads_the_page_that_holds_product_n(monkeypatch):
+    asked = []
+
+    class R:
+        status_code = 200
+
+        def __init__(self, n):
+            self.n = n
+
+        def json(self):
+            return {'products': [{}] * self.n}
+
+    def get(url, timeout=12):
+        asked.append(url)
+        return R(30 if 'page=2' in url else 0)
+    monkeypatch.setattr(server, '_scrape_get', get)
+    assert server._gd_catalogue_at_least('x.dk', 60) is True
+    assert asked == ['https://x.dk/products.json?limit=30&page=2']
+    monkeypatch.setattr(server, '_scrape_get', lambda url, timeout=12: R(29))
+    assert server._gd_catalogue_at_least('x.dk', 60) is False
+    monkeypatch.setattr(server, '_scrape_get', lambda url, timeout=12: type('E', (), {'status_code': 429})())
+    assert server._gd_catalogue_at_least('x.dk', 60) is None
+
+
+def test_similarweb_answer_for_a_www_host_is_not_a_fake_zero(monkeypatch):
+    """The actor reports 'boheme-infinity.com'; we asked for the www-host."""
+    monkeypatch.setenv('APIFY_TOKEN', 'x')
+
+    class R:
+        def __init__(self, body, status=200):
+            self._b, self.status_code = body, status
+
+        def json(self):
+            return self._b
+
+    def post(url, params=None, json=None, timeout=None):
+        return R({'data': {'id': 'r', 'defaultDatasetId': 'ds', 'status': 'SUCCEEDED'}}, 201)
+
+    def get(url, params=None, timeout=None):
+        return R([{'domain': 'boheme-infinity.com', 'totalVisits': 41000,
+                   'countryShare': [{'country': 'fr', 'share': 0.9}]}])
+    monkeypatch.setattr(server.req, 'post', post)
+    monkeypatch.setattr(server.req, 'get', get)
+    out = server._similarweb_bulk(['www.boheme-infinity.com', 'www.unknown-shop.fr'])
+    assert out['www.boheme-infinity.com']['total_visits'] == 41000
+    assert out['www.boheme-infinity.com']['shares'] == {'FR': 0.9}
+    assert out['www.unknown-shop.fr']['total_visits'] == 0
+
+
+def test_a_cached_www_zero_falls_back_to_the_bare_domain():
+    cache = {'www.x.fr': {'total_visits': 0, 'shares': {}, 'ts': 't'},
+             'x.fr': {'total_visits': 30000, 'shares': {'FR': 1.0}, 'ts': 't'}}
+    assert server._wtl_traffic_lookup(cache, 'www.x.fr')['total_visits'] == 30000
+    assert server._wtl_traffic_lookup(cache, 'x.fr')['total_visits'] == 30000
+    assert server._wtl_traffic_lookup({'www.y.fr': {'total_visits': 0}}, 'www.y.fr') == {'total_visits': 0}
+    assert server._wtl_traffic_lookup({}, 'www.z.fr') is None
