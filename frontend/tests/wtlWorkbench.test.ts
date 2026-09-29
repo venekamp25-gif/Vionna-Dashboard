@@ -27,7 +27,8 @@ test("discovery polls the job's live list and reloads stores as they get added",
   assert.match(wb, /r\.status\.startsWith\("added"\)/);
   assert.match(wb, /discoverLive\.found\.map/);
   assert.match(api, /live\?: DiscoverLive/);
-  assert.match(api, /"checking" \| "added" \| "added_unverified" \| "rejected" \| "gated" \| "error"/);
+  assert.match(api, /"checking_traffic" \| "checking" \| "added" \| "added_unverified" \| "rejected" \| "gated" \| "error"/);
+  assert.match(wb, /r\.status === "checking_traffic"/);
 });
 
 test("non-fashion stores are hidden only when PROVEN, never when unchecked", () => {
@@ -48,4 +49,11 @@ test("job pollers give up on a job the server no longer knows, and a stale store
 test("scan header names the non-fashion items the scan left out", () => {
   assert.match(wb, /scan\.dropped && Object\.keys\(scan\.dropped\)\.length > 0/);
   assert.match(api, /dropped\?: Record<string, number>;/);
+});
+
+test("small stores (measured traffic under the discovery bar) are hidden, unmeasured ones stay", () => {
+  assert.match(wb, /\[hideSmall, setHideSmall\] = useState\(true\)/); // default on
+  assert.match(wb, /s\.products === 0 && s\.traffic_age_days !== null && s\.total_visits < minVisits/);
+  assert.match(wb, /\(!hideSmall \|\| !isMeasuredSmall\(s\)\)/);
+  assert.match(api, /gd_min_visits\?: number;/);
 });
