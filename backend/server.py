@@ -225,12 +225,16 @@ def _run_backup():
                       'taxonomy_backfill.json', 'taxonomy_fill.json',
                       'wtl_store_marks.json', 'wtl_extra_stores.json',
                       'wtl_discover_seen.json', 'wtl_discover_state.json',
-                      'spy_shield.jsonl', 'lighting_channels.json'):
+                      'spy_shield.jsonl', 'lighting_channels.json', 'aq_history.jsonl'):
             src = os.path.join(_BASE_DIR, fname)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dest, fname))
         if os.path.isdir(DRAFTS_DIR):
             shutil.copytree(DRAFTS_DIR, os.path.join(dest, 'drafts'), dirs_exist_ok=True)
+        # After Quotation: the per-apply product snapshots ARE the undo button
+        _aqb = os.path.join(_BASE_DIR, 'aq_backups')
+        if os.path.isdir(_aqb):
+            shutil.copytree(_aqb, os.path.join(dest, 'aq_backups'), dirs_exist_ok=True)
         # Rotation: keep only the most recent _BACKUP_KEEP day-folders.
         days = sorted(d for d in os.listdir(BACKUP_DIR)
                       if os.path.isdir(os.path.join(BACKUP_DIR, d)))
@@ -17454,7 +17458,7 @@ def _publish_one_variant(
     }
     print(f"[publish] Color '{color}' handle='{product_handle}' images={len(img_payload)} (uploaded separately)")
 
-    prod_res = req.post(f"{base}products.json", headers=hdrs, json=product_payload)
+    prod_res = req.post(f"{base}products.json", headers=hdrs, json=product_payload, timeout=90)
     if prod_res.status_code not in (200, 201):
         return {'error': f'Product create failed ({prod_res.status_code}): {prod_res.text[:200]}',
                 'metafield_errors': [], 'image_errors': [], 'images_attached': None}
@@ -17489,7 +17493,7 @@ def _publish_one_variant(
         mf_res = req.post(
             shopify_url(store, f'products/{prod_id}/metafields.json'),
             headers=hdrs,
-            json={'metafield': mf}
+            json={'metafield': mf}, timeout=30
         )
         if mf_res.status_code not in (200, 201):
             # Retry once with the alternate text-field type
@@ -17497,7 +17501,7 @@ def _publish_one_variant(
             mf_res2 = req.post(
                 shopify_url(store, f'products/{prod_id}/metafields.json'),
                 headers=hdrs,
-                json={'metafield': {**mf, 'type': alt_type}}
+                json={'metafield': {**mf, 'type': alt_type}}, timeout=30
             )
             if mf_res2.status_code not in (200, 201):
                 mf_errors.append(f"{mf['key']} (both types failed): {mf_res2.text[:120]}")
@@ -17511,14 +17515,14 @@ def _publish_one_variant(
                 req.put(
                     shopify_url(store, f'variants/{variant["id"]}.json'),
                     headers=hdrs,
-                    json={'variant': {'id': variant['id'], 'image_id': first_image_id}}
+                    json={'variant': {'id': variant['id'], 'image_id': first_image_id}}, timeout=30
                 )
 
     # --- Add to siblings collection ---
     if collection_id:
         req.post(f"{base}collects.json", headers=hdrs, json={
             'collect': {'product_id': prod_id, 'collection_id': collection_id}
-        })
+        }, timeout=30)
 
     # --- Publish to default sales channels (Online Store, Facebook, Google) ---
     # Done unconditionally regardless of product status (draft or active) — the
@@ -18022,7 +18026,7 @@ def publish():
         }
         print(f"[publish] Product handle: '{product_handle}' | Sample SKU: '{make_sku(product_name, color, sizes[0] if sizes else 'M')}'")
 
-        prod_res = req.post(f"{base}products.json", headers=hdrs, json=product_payload)
+        prod_res = req.post(f"{base}products.json", headers=hdrs, json=product_payload, timeout=90)
         if prod_res.status_code in [200, 201]:
             prod_data  = prod_res.json()['product']
             prod_id    = prod_data['id']
@@ -19336,6 +19340,13 @@ def api_update():
     def _restart():
         import time, subprocess
         time.sleep(1.5)
+        # An After Quotation apply/undo cut in half leaves products half-written
+        # and no history row: wait for it (max 20 min) before restarting.
+        _aq_lock = globals().get('_AQ_APPLY_LOCK')
+        for _ in range(240):
+            if not (_aq_lock and _aq_lock.locked()):
+                break
+            time.sleep(5)
         subprocess.Popen([sys.executable] + sys.argv)
         os._exit(0)
 
@@ -26082,6 +26093,2173 @@ def api_lighting_bundle_suggest():
         'summary': (' · '.join(f"{t['qty']}x −{t['discount']}%" if t['type'] == 'percentage'
                                else f"{t['qty']}x" for t in real) if real else ''),
     })
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AFTER QUOTATION — correct fashion listings once the supplier's quote is in
+# ══════════════════════════════════════════════════════════════════════════════
+# venek 2026-09-29: "a portal where you can find every listing and, once the
+# supplier confirms the real models, colours, sizes and size charts, enter or
+# upload that info so the Shopify listing changes. Make it as good and smart
+# as possible."
+#
+# Listings are made BEFORE the quote, from the competitor page: placeholder
+# XS-XL sizes and the competitor's chart. Measured on DK 29 Sep: 49 shoe
+# listings carried XS-XL against an EU 35-42 chart; 2,299 products in 706
+# families, ~3.3 colours each.
+#
+# Shopify model (see _publish_one_variant): ONE product = one colour in one
+# store. title = the name, identical in DK/FR/FI. Size is the ONLY option.
+# The colour lives in theme.cutline, the handle, the SKU and global.title_tag.
+# theme.siblings = one collection per family, same handle in every store.
+#
+# Safety, in this order:
+#  * reads and writes are gated (the job-status route of the catalogue jobs is
+#    open, so these jobs live in their own registry with random ids);
+#  * every apply RE-READS Shopify and rebuilds the plan; if the listing changed
+#    since the operator's preview (someone edited it, another apply ran),
+#    nothing is written — preview again;
+#  * every product it touches is snapshotted to aq_backups/ BEFORE the first
+#    write, and /api/aq/undo restores it;
+#  * a colour is never deleted, it goes to draft; the URL (handle) never
+#    changes, so ads and links keep working.
+
+import collections
+import concurrent.futures as _aq_cf
+
+AQ_STORES = ('dk', 'fr', 'fi')
+_AQ_HERE = os.path.dirname(os.path.abspath(__file__))
+AQ_HISTORY_PATH = os.path.join(_AQ_HERE, 'aq_history.jsonl')
+AQ_BACKUP_DIR = os.path.join(_AQ_HERE, 'aq_backups')
+AQ_LANGUAGE_EN = {'dk': 'Danish', 'fr': 'French', 'fi': 'Finnish'}
+_AQ_MODEL = 'claude-sonnet-4-6'
+_AQ_MODEL_FALLBACK = 'claude-sonnet-4-5'
+_AQ_INDEX_TTL = 600                   # s — the search list; the family view always reads fresh
+_AQ_INDEX_PAGE = 250                  # measured: query cost 68 of 1000, 0.4 s per page
+_AQ_INDEX = {}
+_AQ_INDEX_LOCK = threading.Lock()
+_AQ_INDEX_BUILD = {s: threading.Lock() for s in AQ_STORES}
+_AQ_INDEX_REFRESHING = set()          # stores with a background refresh in flight
+_AQ_FORCE_MIN_S = 60                  # a forced rebuild within a minute of the last is served from memory
+_AQ_JOBS = {}
+_AQ_JOBS_LOCK = threading.Lock()
+_AQ_APPLY_LOCK = threading.Lock()     # one apply/undo at a time (shared Shopify budget + backups)
+_AQ_HISTORY_LOCK = threading.Lock()
+_AQ_MAX_BODY = 80_000_000             # request cap: an apply carries the new photos
+_AQ_MAX_FILE = 15_000_000             # one uploaded file
+_AQ_MAX_FILES = 12
+_AQ_ATTENTION_DAYS = 60
+_AQ_LETTER_SIZES = ['XXS', 'XS', 'S', 'M', 'L', 'XL', '2XL', '3XL', '4XL', '5XL']
+_AQ_SIZE_ALIASES = {
+    'XXL': '2XL', 'XXXL': '3XL', 'XXXXL': '4XL', 'XXXXXL': '5XL',
+    'SMALL': 'S', 'MEDIUM': 'M', 'LARGE': 'L', 'XSMALL': 'XS', 'XLARGE': 'XL',
+    'X-SMALL': 'XS', 'X-LARGE': 'XL', 'XX-LARGE': '2XL', 'XXLARGE': '2XL',
+}
+_AQ_ONE_SIZE_WORDS = {'ONESIZE', 'OS', 'FREESIZE', 'FREE', 'TAILLEUNIQUE', 'YKSIKOKO', 'ONESIZEFITSALL'}
+
+
+# ── sizes ─────────────────────────────────────────────────────────────────────
+
+def _aq_norm_size(s):
+    """One spelling per size: 'xxl'→'2XL', 'EU 38'→'38', 'Taille unique'→'One Size'.
+    Unknown spellings are kept (trimmed) — a supplier size we don't know is
+    still the supplier's size."""
+    t = re.sub(r'\s+', ' ', str(s or '')).strip()
+    if not t:
+        return ''
+    u = t.upper().replace(' ', '')
+    if u in _AQ_SIZE_ALIASES:
+        return _AQ_SIZE_ALIASES[u]
+    if u in _AQ_LETTER_SIZES:
+        return u
+    if _deaccent(u).upper() in _AQ_ONE_SIZE_WORDS:
+        return 'One Size'
+    m = re.fullmatch(r'(?:EU|EUR|FR|DK)?(\d{2,3}(?:[.,]5)?)', u)
+    if m:
+        return m.group(1).replace(',', '.')
+    return t[:20]
+
+
+def _aq_size_kind(sizes):
+    """'letter' | 'number' | 'one' | 'other' for a list of sizes."""
+    ns = [_aq_norm_size(x) for x in sizes or [] if str(x).strip()]
+    if not ns:
+        return 'other'
+    if all(x == 'One Size' for x in ns):
+        return 'one'
+    if all(x in _AQ_LETTER_SIZES for x in ns):
+        return 'letter'
+    if all(re.fullmatch(r'\d{2,3}(?:\.5)?', x) for x in ns):
+        return 'number'
+    return 'other'
+
+
+def _aq_sort_sizes(sizes):
+    """Smallest first for letter and numeric sizes; any other list keeps its order."""
+    ns = list(dict.fromkeys(x for x in (_aq_norm_size(s) for s in sizes or []) if x))
+    kind = _aq_size_kind(ns)
+    if kind == 'letter':
+        return sorted(ns, key=_AQ_LETTER_SIZES.index)
+    if kind == 'number':
+        return sorted(ns, key=float)
+    return ns
+
+
+def _aq_sizes_for_store(store, cat, sizes):
+    """The size values as THIS store writes them: One Size is localised, and an
+    accessory in clothing sizes collapses to One Size (_guard_accessory_sizes)."""
+    out = [STORE_ONE_SIZE.get(store, 'One Size') if _aq_norm_size(x) == 'One Size' else x
+           for x in sizes or []]
+    out, _changed = _guard_accessory_sizes(store, cat, out)
+    return list(out)
+
+
+def _aq_chart_sizes(chart):
+    """The sizes a chart describes — its first column, or its header row when the
+    chart is transposed (shoe charts often are). [] when neither looks like sizes."""
+    if not isinstance(chart, dict):
+        return []
+    firsts = [_aq_norm_size(r[0]) for r in chart.get('rows') or [] if r]
+    heads = [_aq_norm_size(h) for h in (chart.get('headers') or [])[1:]]
+
+    def sizeish(xs):
+        xs = [x for x in xs if x]
+        return len(xs) >= 2 and sum(1 for x in xs if _aq_size_kind([x]) != 'other') >= max(2, 0.7 * len(xs))
+    if sizeish(firsts):
+        return [x for x in firsts if x]
+    if sizeish(heads):
+        return [x for x in heads if x]
+    return []
+
+
+def _aq_sizes_vs_chart(sizes, chart_sizes):
+    """True/False when sizes and chart rows are the same KIND of size and can be
+    compared; None when they can't (letter sizes vs an EU-number chart is a
+    conversion table, not a contradiction — except for shoes, see the flags)."""
+    a = [_aq_norm_size(x) for x in sizes or [] if str(x).strip()]
+    b = [_aq_norm_size(x) for x in chart_sizes or [] if str(x).strip()]
+    if not a or not b:
+        return None
+    ka, kb = _aq_size_kind(a), _aq_size_kind(b)
+    if ka != kb or ka in ('other', 'one'):
+        return None
+    return set(a) == set(b)
+
+
+# ── Shopify reads ─────────────────────────────────────────────────────────────
+
+def _aq_gql(store, query, variables=None, timeout=60):
+    """Throttled GraphQL call. _shopify_call paces REST headers and retries 429,
+    but a GraphQL THROTTLED error arrives as HTTP 200 — retried here."""
+    url, hdrs = shopify_url(store, 'graphql.json'), shopify_headers(store)
+    for attempt in range(6):
+        r = _shopify_call('post', url, hdrs, json={'query': query, 'variables': variables or {}},
+                          timeout=timeout)
+        try:
+            d = r.json()
+        except Exception:
+            d = {}
+        errs = d.get('errors')
+        if r.status_code == 200 and errs and 'THROTTLED' in json.dumps(errs):
+            time.sleep(min(2.0 * (attempt + 1), 10.0))
+            continue
+        if r.status_code != 200 or errs:
+            raise RuntimeError(f'Shopify {store.upper()} GraphQL HTTP {r.status_code}: '
+                               f'{str(errs or r.text)[:180]}')
+        return d.get('data') or {}
+    raise RuntimeError(f'Shopify {store.upper()} kept throttling — try again in a minute')
+
+
+_AQ_Q_INDEX = ('query($c:String){ products(first:%d, after:$c, query:"status:active OR status:draft"){ '
+               'pageInfo{ hasNextPage endCursor } nodes{ id legacyResourceId title handle status '
+               'productType createdAt tags featuredImage{ url } options{ name values } '
+               'cut: metafield(namespace:"theme", key:"cutline"){ value } '
+               'sib: metafield(namespace:"theme", key:"siblings"){ value } '
+               'sc: metafield(namespace:"custom", key:"size_chart"){ value } } } }')
+
+_AQ_Q_NODES = ('query($ids:[ID!]!){ nodes(ids:$ids){ ... on Product { legacyResourceId '
+               'cut: metafield(namespace:"theme", key:"cutline"){ value } '
+               'sib: metafield(namespace:"theme", key:"siblings"){ value } '
+               'sc: metafield(namespace:"custom", key:"size_chart"){ value } '
+               'tt: metafield(namespace:"global", key:"title_tag"){ value } '
+               'dt: metafield(namespace:"global", key:"description_tag"){ value } '
+               'spec: metafield(namespace:"custom", key:"m_title_specs_multi_line_text_"){ value } } } }')
+
+
+def _aq_cat(tags):
+    return next((t[4:].strip() for t in tags or [] if str(t).startswith('cat:')), '')
+
+
+def _aq_index_node(n):
+    tags = n.get('tags') or []
+    opt = next((o for o in (n.get('options') or []) if (o.get('name') or '').lower() != 'title'), None)
+    chart = _size_chart_from_html(((n.get('sc') or {}).get('value')) or '')
+    return {
+        'id': int(n.get('legacyResourceId') or 0), 'title': (n.get('title') or '').strip(),
+        'handle': n.get('handle') or '', 'status': (n.get('status') or '').lower(),
+        'type': n.get('productType') or '', 'created': n.get('createdAt') or '',
+        'cat': _aq_cat(tags), 'image': ((n.get('featuredImage') or {}).get('url') or ''),
+        'sizes': list((opt or {}).get('values') or []),
+        'options_count': len([o for o in (n.get('options') or []) if (o.get('name') or '').lower() != 'title']),
+        'colour': (((n.get('cut') or {}).get('value')) or '').strip(),
+        'sib': (((n.get('sib') or {}).get('value')) or '').strip(),
+        'has_chart': bool(chart and chart.get('rows')),
+        'chart_sizes': _aq_chart_sizes(chart) if chart else [],
+    }
+
+
+def _aq_index(store, force=False):
+    """Every active + draft product of a fashion store, summarised. Served from
+    memory; an entry older than 10 min is returned AND rebuilt in the background
+    (the first build of DK took 33 s at 100/page — nobody should wait for it
+    twice). force=True rebuilds now."""
+    with _AQ_INDEX_LOCK:
+        hit = _AQ_INDEX.get(store)
+        start_bg = bool(hit and not force and time.time() - hit['ts'] >= _AQ_INDEX_TTL
+                        and store not in _AQ_INDEX_REFRESHING)
+        if start_bg:
+            _AQ_INDEX_REFRESHING.add(store)
+    if hit and not force:
+        if start_bg:
+            threading.Thread(target=_aq_index_rebuild_quietly, args=(store,), daemon=True).start()
+        return hit['products']
+    return _aq_index_build(store, min_age=_AQ_FORCE_MIN_S)
+
+
+def _aq_index_rebuild_quietly(store, min_age=0):
+    try:
+        _aq_index_build(store, min_age=min_age)
+    except Exception as e:
+        print(f'[aq] background index refresh {store} failed: {e}')
+    finally:
+        with _AQ_INDEX_LOCK:
+            _AQ_INDEX_REFRESHING.discard(store)
+
+
+def _aq_index_build(store, min_age=0):
+    """Rebuild one store's index. Skipped when an index younger than `min_age`
+    seconds exists, or one was finished while we waited for the build lock —
+    ten people pressing Refresh (or ten unknown keys) cost ONE rebuild."""
+    t0 = time.time()
+    with _AQ_INDEX_BUILD[store]:
+        with _AQ_INDEX_LOCK:
+            hit = _AQ_INDEX.get(store)
+            if hit and (hit['ts'] >= t0 or time.time() - hit['ts'] < min_age):
+                return hit['products']
+        out, cur = [], None
+        for _ in range(400):
+            d = _aq_gql(store, _AQ_Q_INDEX % _AQ_INDEX_PAGE, {'c': cur})
+            conn = d.get('products') or {}
+            out += [_aq_index_node(n) for n in conn.get('nodes') or []]
+            pg = conn.get('pageInfo') or {}
+            if not pg.get('hasNextPage'):
+                break
+            cur = pg.get('endCursor')
+        with _AQ_INDEX_LOCK:
+            _AQ_INDEX[store] = {'ts': time.time(), 'products': out}
+        return out
+
+
+def _aq_invalidate(stores=AQ_STORES):
+    """After a write: rebuild the touched stores now (the list must show the
+    change), keeping the old entry until the new one is ready."""
+    for s in stores:
+        if s in tokens:
+            threading.Thread(target=_aq_index_rebuild_quietly, args=(s, 0), daemon=True).start()
+
+
+def _aq_warm_loop():
+    """Build the three indexes shortly after start, so the first search is instant."""
+    time.sleep(45)
+    for s in AQ_STORES:
+        if s in tokens:
+            _aq_index_rebuild_quietly(s)
+
+
+if not (os.getenv('DEV_LOCAL') == '1' or 'pytest' in sys.modules):
+    threading.Thread(target=_aq_warm_loop, daemon=True, name='aq-warm').start()
+
+
+def _aq_indexes(force=False):
+    """All fashion stores in parallel. A store that can't be read is REPORTED,
+    never treated as 'has no products' (storing ≠ oordeel)."""
+    stores = [s for s in AQ_STORES if s in tokens]
+    indexes, errors = {}, {}
+    with _aq_cf.ThreadPoolExecutor(max(1, len(stores))) as ex:
+        futs = {s: ex.submit(_aq_index, s, force) for s in stores}
+        for s, f in futs.items():
+            try:
+                indexes[s] = f.result()
+            except Exception as e:
+                errors[s] = str(e)[:200]
+    return indexes, errors
+
+
+# ── families and colour rows ──────────────────────────────────────────────────
+
+def _aq_family_key(p):
+    """theme.siblings is the same collection handle in every store; products
+    without one fall back to their (accent-free) name."""
+    sib = (p.get('sib') or '').strip().lower()
+    return sib or ('name:' + _norm_name(p.get('title') or ''))
+
+
+def _aq_families(indexes):
+    fams = {}
+    for store, prods in indexes.items():
+        for p in prods:
+            k = _aq_family_key(p)
+            fams.setdefault(k, {}).setdefault(store, []).append(p)
+    return fams
+
+
+def _aq_concept(label):
+    c = _color_concept(label or '')
+    return c or ('~' + _deaccent(label or '').strip())
+
+
+def _aq_rows(stores_map):
+    """Line up one family's colour products across the stores. The colour word
+    is localised (Sort / Noir / Musta), so rows match on the colour CONCEPT
+    first, then — for colours the concept table doesn't know, or two greens in
+    one family — on creation order, which is the order the publish flow walked
+    the colours in every store. 'match' says which one it was."""
+    order = [s for s in AQ_STORES if stores_map.get(s)]
+    if not order:
+        return []
+    base = max(order, key=lambda s: (len(stores_map[s]), s == 'dk'))
+    rows = []
+    for p in sorted(stores_map[base], key=lambda x: (x.get('created') or '', x['id'])):
+        rows.append({'row_id': f'{base}-{p["id"]}', 'concept': _aq_concept(p.get('colour')),
+                     'cells': {base: p}, 'match': {base: 'base'}})
+    for s in order:
+        if s == base:
+            continue
+        left = sorted(stores_map[s], key=lambda x: (x.get('created') or '', x['id']))
+        for p in list(left):
+            c = _aq_concept(p.get('colour'))
+            if c.startswith('~'):
+                continue
+            cands = [r for r in rows if s not in r['cells'] and r['concept'] == c]
+            if len(cands) == 1 and sum(1 for q in left if _aq_concept(q.get('colour')) == c) == 1:
+                cands[0]['cells'][s] = p
+                cands[0]['match'][s] = 'colour'
+                left.remove(p)
+        free = [r for r in rows if s not in r['cells']]
+        if left and len(free) == len(left):
+            for r, p in zip(free, left):
+                r['cells'][s] = p
+                r['match'][s] = 'order'
+            left = []
+        for p in left:
+            rows.append({'row_id': f'{s}-{p["id"]}', 'concept': _aq_concept(p.get('colour')),
+                         'cells': {s: p}, 'match': {s: 'base'}})
+    return rows
+
+
+def _aq_flags(stores_map):
+    """Why this family probably still needs its after-quotation pass.
+    Hard flags are contradictions; soft ones are hints."""
+    prods = [p for ps in stores_map.values() for p in ps]
+    cat = next((p['cat'] for p in prods if p.get('cat')), '')
+    flags = []
+    if cat == 'shoes' and any(_aq_size_kind(p['sizes']) == 'letter' for p in prods):
+        flags.append({'code': 'shoe_letter_sizes', 'hard': True,
+                      'text': 'Shoes listed in clothing sizes (XS–XL)'})
+    if any(p.get('chart_sizes') and _aq_sizes_vs_chart(p['sizes'], p['chart_sizes']) is False
+           for p in prods):
+        flags.append({'code': 'sizes_vs_chart', 'hard': True,
+                      'text': "Sizes don't match the size-chart rows"})
+    if len({_norm_name(p['title']) for p in prods if p.get('title')}) > 1 \
+            or len({p['cat'] for p in prods if p.get('cat')}) > 1:
+        flags.append({'code': 'mixed_family', 'hard': True,
+                      'text': 'Colour group mixes different products — split it in Shopify'})
+    if any(p.get('options_count', 1) > 1 for p in prods):
+        flags.append({'code': 'multi_option', 'hard': False,
+                      'text': 'A colour has more than one option — edit that one in Shopify'})
+    if cat != 'accessory':
+        missing = [s for s, ps in stores_map.items() if any(not p.get('has_chart') for p in ps)]
+        if missing:
+            flags.append({'code': 'no_chart', 'hard': True,
+                          'text': 'No size chart in ' + '/'.join(s.upper() for s in missing)})
+    size_sets = {tuple(_aq_norm_size(x) for x in p['sizes']) for p in prods if p['status'] == 'active'}
+    if len(size_sets) > 1:
+        flags.append({'code': 'mixed_sizes', 'hard': False,
+                      'text': 'Sizes differ between colours or stores'})
+    present = [s for s in AQ_STORES if stores_map.get(s)]
+    if len(present) > 1:
+        rows = _aq_rows(stores_map)
+        gaps = [r for r in rows if len(r['cells']) < len(present)]
+        if gaps:
+            flags.append({'code': 'missing_colour', 'hard': False,
+                          'text': f'{len(gaps)} colour(s) not in every store'})
+    if all(tuple(p['sizes']) == ('XS', 'S', 'M', 'L', 'XL') for p in prods) and cat not in ('accessory',):
+        flags.append({'code': 'default_sizes', 'hard': False,
+                      'text': 'Still the listing default XS–XL'})
+    return flags
+
+
+# ── history ───────────────────────────────────────────────────────────────────
+
+_AQ_HISTORY_CACHE = {'mtime': None, 'rows': []}
+
+
+def _aq_history_raw():
+    """All log lines, re-read only when the file changed (every search asks)."""
+    try:
+        st = os.stat(AQ_HISTORY_PATH)
+    except OSError:
+        return []
+    # size too: two appends inside one clock tick keep the same mtime (Windows)
+    mt = (st.st_mtime_ns, st.st_size)
+    if _AQ_HISTORY_CACHE['mtime'] == (AQ_HISTORY_PATH, mt):
+        return _AQ_HISTORY_CACHE['rows']
+    rows = []
+    with open(AQ_HISTORY_PATH, encoding='utf-8') as f:
+        for line in f:
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+    _AQ_HISTORY_CACHE.update(mtime=(AQ_HISTORY_PATH, mt), rows=rows)
+    return rows
+
+
+def _aq_history_rows(key=None, limit=500):
+    """One row per apply: the 'apply' line written right after the backup,
+    completed by its 'apply_done' line; no done line = interrupted (or still
+    running). 'undone' when an undo line exists for its backup."""
+    rows = _aq_history_raw()
+    done = {r.get('backup_id'): r for r in rows if r.get('type') == 'apply_done'}
+    undone = {r.get('backup_id') for r in rows if r.get('type') == 'undo'}
+    with _AQ_JOBS_LOCK:
+        running = {j.get('backup_id') for j in _AQ_JOBS.values() if j['status'] == 'running'}
+    out = []
+    for r in rows:
+        if r.get('type') != 'apply' or (key is not None and r.get('key') != key):
+            continue
+        d = done.get(r.get('backup_id')) or {}
+        m = {**r, **{k: v for k, v in d.items() if k not in ('ts', 'type', 'key')}}
+        m['finished_ts'] = d.get('ts')
+        m['status'] = d.get('status') or ('running' if r.get('backup_id') in running else 'interrupted')
+        m['undone'] = r.get('backup_id') in undone
+        out.append(m)
+    return out[-limit:]
+
+
+def _aq_history_append(row):
+    try:
+        with _AQ_HISTORY_LOCK, open(AQ_HISTORY_PATH, 'a', encoding='utf-8') as f:
+            f.write(json.dumps({**row, 'ts': datetime.datetime.utcnow().isoformat() + 'Z'},
+                               ensure_ascii=False) + '\n')
+    except Exception as e:
+        print(f'[aq] history append failed: {e}')
+
+
+def _aq_processed():
+    """family key -> timestamp of its last after-quotation apply that still stands."""
+    out = {}
+    for r in _aq_history_rows(None, limit=100000):
+        if not r.get('undone') and r.get('status') in ('done', 'partial', 'interrupted'):
+            out[r.get('key')] = r.get('ts')
+    return out
+
+
+def _aq_user():
+    tok = request.headers.get('X-Droplet-Token', '') if request else ''
+    payload = _verify_droplet_token(tok) if tok else None
+    return (payload or {}).get('email') or 'local'
+
+
+# ── search ────────────────────────────────────────────────────────────────────
+
+def _aq_source_ids(q):
+    """Product ids whose publish-history source_url contains `q` — find a
+    listing by the competitor page it was copied from."""
+    ql = q.lower().strip()
+    ids = set()
+    if len(ql) < 5:
+        return ids
+    try:
+        with open(HISTORY_PATH, encoding='utf-8') as f:
+            for line in f:
+                if ql not in line.lower():
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if ql in str(r.get('source_url') or '').lower() and r.get('product_id'):
+                    try:
+                        ids.add(int(r['product_id']))
+                    except (TypeError, ValueError):
+                        pass
+    except FileNotFoundError:
+        pass
+    return ids
+
+
+def _aq_family_summary(key, stores_map, processed):
+    prods = [p for ps in stores_map.values() for p in ps]
+    active = [p for p in prods if p['status'] == 'active']
+    names = collections.Counter(p['title'] for p in prods if p['title'])
+    rows = _aq_rows(stores_map)
+    img = next((p['image'] for p in (active or prods) if p.get('image')), '')
+    first = (active or prods)[0]
+    return {
+        'key': key, 'name': names.most_common(1)[0][0] if names else key,
+        'cat': next((p['cat'] for p in prods if p.get('cat')), ''),
+        'type': first.get('type') or '', 'image': img,
+        'created': max((p.get('created') or '') for p in prods),
+        'stores': {s: len(ps) for s, ps in stores_map.items()},
+        'active': len(active), 'total': len(prods),
+        'sizes': first.get('sizes') or [],
+        'colours': [{'row_id': r['row_id'],
+                     'labels': {s: p.get('colour') or '' for s, p in r['cells'].items()},
+                     'status': {s: p.get('status') for s, p in r['cells'].items()}} for r in rows],
+        'flags': _aq_flags(stores_map),
+        'processed': processed.get(key),
+    }
+
+
+def _aq_search(q='', view='attention', force=False, limit=60):
+    indexes, errors = _aq_indexes(force)
+    fams = _aq_families(indexes)
+    processed = _aq_processed()
+    q = (q or '').strip()
+    ids, handles = set(), set()
+    if q:
+        m = re.search(r'/products/(\d{6,})', q)
+        if m:
+            ids.add(int(m.group(1)))
+        elif re.fullmatch(r'\d{8,}', q):
+            ids.add(int(q))
+        m2 = re.search(r'/products/([a-z0-9][a-z0-9\-]*)', q.lower())
+        if m2 and not m2.group(1).isdigit():
+            handles.add(m2.group(1))
+        if '.' in q and not ids and not handles:
+            ids |= _aq_source_ids(q)
+        elif re.match(r'https?://', q) and not ids:
+            ids |= _aq_source_ids(q)
+    needle = _deaccent(q)
+    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=_AQ_ATTENTION_DAYS)).isoformat()
+    scored = []
+    for key, sm in fams.items():
+        prods = [p for ps in sm.values() for p in ps]
+        score = 0
+        if q:
+            if ids and any(p['id'] in ids for p in prods):
+                score = 100
+            elif handles and any(p['handle'] in handles for p in prods):
+                score = 100
+            elif not ids and not handles:
+                names = {_deaccent(p['title']) for p in prods}
+                if needle in names:
+                    score = 90
+                elif any(n.startswith(needle) for n in names):
+                    score = 70
+                elif any(needle in n for n in names):
+                    score = 50
+                elif any(needle and (needle in _deaccent(p.get('colour')) or needle in p['handle'])
+                         for p in prods):
+                    score = 30
+            if not score:
+                continue
+        summary = _aq_family_summary(key, sm, processed)
+        if not q and view == 'attention':
+            hard = any(f['hard'] for f in summary['flags'])
+            fresh = (summary['created'] or '') >= cutoff
+            if summary['processed'] or not (hard or fresh) or summary['active'] == 0:
+                continue
+        if not q and view == 'done' and not summary['processed']:
+            continue
+        scored.append((score, summary))
+    # best match first, newest first within a score (no query: all score 0)
+    scored.sort(key=lambda x: (x[0], x[1]['created'] or ''), reverse=True)
+    return {'families': [s for _, s in scored[:limit]], 'total': len(scored),
+            'store_errors': errors, 'indexed': {s: len(v) for s, v in indexes.items()}}
+
+
+# ── one family, fresh ─────────────────────────────────────────────────────────
+
+def _aq_fetch_product(store, pid):
+    r = _shopify_call('get', shopify_url(
+        store, f'products/{pid}.json?fields=id,title,handle,status,product_type,tags,body_html,'
+               f'options,variants,images'), shopify_headers(store), timeout=30)
+    if r.status_code == 404:
+        return None
+    if r.status_code != 200:
+        raise RuntimeError(f'{store.upper()} product {pid}: HTTP {r.status_code}')
+    return r.json().get('product')
+
+
+def _aq_product_view(store, prod, mf, created=''):
+    opts = [o for o in prod.get('options') or [] if (o.get('name') or '').lower() != 'title']
+    variants = _aq_variants_view(prod)
+    tags = [t.strip() for t in str(prod.get('tags') or '').split(',') if t.strip()]
+    chart_html = mf.get('sc') or ''
+    return {
+        'id': prod['id'], 'title': (prod.get('title') or '').strip(), 'handle': prod.get('handle') or '',
+        'status': (prod.get('status') or '').lower(), 'type': prod.get('product_type') or '',
+        'tags': tags, 'cat': _aq_cat(tags), 'created': created,
+        'size_opt': (opts[0].get('name') if opts else '') or STORE_SIZE_OPTION.get(store, 'Size'),
+        'options_count': len(opts), 'variants': variants, 'sizes': [v['size'] for v in variants],
+        'images': [{'id': i['id'], 'src': i.get('src'), 'position': i.get('position')}
+                   for i in sorted(prod.get('images') or [], key=lambda i: i.get('position') or 0)],
+        'body_html': prod.get('body_html') or '',
+        'colour': (mf.get('cut') or '').strip(), 'sib': (mf.get('sib') or '').strip(),
+        'chart_html': chart_html, 'chart': _size_chart_from_html(chart_html) if chart_html else None,
+        'title_tag': mf.get('tt') or '', 'description_tag': mf.get('dt') or '',
+        'specs': mf.get('spec') or '',
+    }
+
+
+def _aq_family_state(key, force_index=False):
+    """The full, fresh state of one family (every colour × store) from Shopify.
+    None when no store has it. The index only says WHICH products; everything
+    the plan compares against is read now."""
+    indexes, errors = _aq_indexes(force_index)
+    members = {s: [p for p in idx if _aq_family_key(p) == key] for s, idx in indexes.items()}
+    members = {s: ps for s, ps in members.items() if ps}
+    if not members and not force_index:
+        return _aq_family_state(key, force_index=True)     # just listed? rebuild once
+    if not members:
+        return None
+    def read_store(s, ps):
+        mf = {}
+        gids = [f'gid://shopify/Product/{p["id"]}' for p in ps]
+        for i in range(0, len(gids), 50):
+            d = _aq_gql(s, _AQ_Q_NODES, {'ids': gids[i:i + 50]})
+            for n in d.get('nodes') or []:
+                if n and n.get('legacyResourceId'):
+                    mf[int(n['legacyResourceId'])] = {k: ((n.get(k) or {}).get('value'))
+                                                      for k in ('cut', 'sib', 'sc', 'tt', 'dt', 'spec')}
+        views = []
+        for p in ps:
+            prod = _aq_fetch_product(s, p['id'])
+            if prod:
+                views.append(_aq_product_view(s, prod, mf.get(p['id'], {}), p.get('created') or ''))
+        return views
+
+    state = {'key': key, 'stores': {}, 'store_errors': dict(errors)}
+    # one thread per store: each store has its own Shopify rate budget
+    with _aq_cf.ThreadPoolExecutor(len(members)) as ex:
+        futs = {s: ex.submit(read_store, s, ps) for s, ps in members.items()}
+        for s, f in futs.items():
+            views = f.result()        # a failed read raises: never plan on half a family
+            if views:
+                state['stores'][s] = views
+    return state if state['stores'] else None
+
+
+def _aq_state_sig(state):
+    """Fingerprint of everything a plan reads. Apply refuses when it moved."""
+    h = hashlib.sha256()
+    for s in sorted(state['stores']):
+        for p in sorted(state['stores'][s], key=lambda x: x['id']):
+            h.update(json.dumps([
+                s, p['id'], p['status'], p['colour'], p['title_tag'],
+                [(v['id'], v['size'], v['sku'], v['price'], v['compare_at']) for v in p['variants']],
+                hashlib.sha1(p['chart_html'].encode()).hexdigest(),
+                hashlib.sha1(p['body_html'].encode()).hexdigest(),
+                [i['id'] for i in p['images']],
+            ], ensure_ascii=False).encode())
+    return h.hexdigest()[:20]
+
+
+def _aq_name(state):
+    names = collections.Counter(p['title'] for ps in state['stores'].values() for p in ps if p['title'])
+    return names.most_common(1)[0][0] if names else ''
+
+
+def _aq_family_cat(state):
+    return next((p['cat'] for ps in state['stores'].values() for p in ps if p['cat']), '')
+
+
+def _aq_store_description(ps):
+    """The copy a store shows for this family — shared by every colour."""
+    bodies = collections.Counter(p['body_html'] for p in ps if p['body_html'])
+    return (bodies.most_common(1)[0][0] if bodies else ''), len(bodies) <= 1
+
+
+def _aq_family_payload(state):
+    rows = _aq_rows(state['stores'])
+    out_rows = []
+    for r in rows:
+        cells = {}
+        for s, p in r['cells'].items():
+            cells[s] = {
+                'id': p['id'], 'handle': p['handle'], 'status': p['status'], 'colour': p['colour'],
+                'sizes': p['sizes'], 'options_count': p['options_count'],
+                'price': (p['variants'][0]['price'] if p['variants'] else None),
+                'compare_at': (p['variants'][0]['compare_at'] if p['variants'] else None),
+                'images': [i['src'] for i in p['images']][:8], 'image_count': len(p['images']),
+                'has_chart': bool(p['chart']), 'title_tag': p['title_tag'],
+                'admin_url': f'https://{tokens.get(s, {}).get("shop", "")}/admin/products/{p["id"]}',
+                'match': r['match'].get(s),
+            }
+        out_rows.append({'row_id': r['row_id'], 'concept': r['concept'], 'cells': cells})
+    stores = {}
+    for s, ps in state['stores'].items():
+        desc, same = _aq_store_description(ps)
+        chart = next((p['chart'] for p in ps if p['chart'] and p['status'] == 'active'), None) \
+            or next((p['chart'] for p in ps if p['chart']), None)
+        stores[s] = {'description': desc, 'description_shared': same, 'chart': chart,
+                     'size_option': ps[0]['size_opt'], 'count': len(ps)}
+    flags_input = {s: [{**p, 'has_chart': bool(p['chart']),
+                        'chart_sizes': _aq_chart_sizes(p['chart']) if p['chart'] else []}
+                       for p in ps] for s, ps in state['stores'].items()}
+    first = next(iter(state['stores'].values()))[0]
+    return {
+        'key': state['key'], 'name': _aq_name(state), 'cat': _aq_family_cat(state),
+        'type': first['type'], 'rows': out_rows, 'stores': stores,
+        'store_errors': state.get('store_errors') or {},
+        'flags': _aq_flags(flags_input), 'sig': _aq_state_sig(state),
+        'history': list(reversed(_aq_history_rows(state['key'], limit=20))),
+    }
+
+
+# ── uploads + Claude ──────────────────────────────────────────────────────────
+
+def _aq_decode_upload(item):
+    """{name, data: data-URL or bare base64} -> (bytes, kind, name) where kind is
+    image/jpeg|png|gif|webp, pdf, xlsx, text — sniffed from the bytes, never
+    trusted from the name. Raises ValueError with an operator-readable reason."""
+    name = str((item or {}).get('name') or 'file')[:120]
+    data = str((item or {}).get('data') or '')
+    if ',' in data[:200] and data.startswith('data:'):
+        data = data.split(',', 1)[1]
+    if len(data) > _AQ_MAX_FILE * 4 // 3 + 16:          # checked BEFORE decoding
+        raise ValueError(f'{name}: larger than {_AQ_MAX_FILE // 1_000_000} MB')
+    try:
+        raw = _b64.b64decode(data, validate=False)
+    except Exception:
+        raise ValueError(f'{name}: not readable')
+    if not raw:
+        raise ValueError(f'{name}: empty')
+    if len(raw) > _AQ_MAX_FILE:
+        raise ValueError(f'{name}: larger than {_AQ_MAX_FILE // 1_000_000} MB')
+    if raw[:3] == b'\xff\xd8\xff':
+        return raw, 'image/jpeg', name
+    if raw[:8] == b'\x89PNG\r\n\x1a\n':
+        return raw, 'image/png', name
+    if raw[:6] in (b'GIF87a', b'GIF89a'):
+        return raw, 'image/gif', name
+    if raw[:4] == b'RIFF' and raw[8:12] == b'WEBP':
+        return raw, 'image/webp', name
+    if raw[:5] == b'%PDF-':
+        return raw, 'pdf', name
+    if raw[:2] == b'PK':
+        return raw, 'xlsx', name
+    if raw[4:12] in (b'ftypheic', b'ftypheix', b'ftypmif1', b'ftyphevc'):
+        raise ValueError(f'{name}: iPhone HEIC photo — export it as JPG first')
+    try:
+        return raw.decode('utf-8'), 'text', name
+    except UnicodeDecodeError:
+        try:
+            return raw.decode('cp1252'), 'text', name
+        except Exception:
+            raise ValueError(f'{name}: unsupported file type')
+
+
+def _aq_xlsx_text(raw, max_rows=400, max_cols=60):
+    """Plain-text dump (tab-separated) of an .xlsx — stdlib only: the droplet's
+    self-updater installs no new packages, so no openpyxl. Streaming parse with
+    hard caps: a cell ref like ZZZZZZZZ1 must not become a 2e11-wide row, and a
+    big sheet must not become a 1 GB tree (review 2026-09-29)."""
+    import zipfile, io
+    import xml.etree.ElementTree as ET
+    NS = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+    z = zipfile.ZipFile(io.BytesIO(raw))
+    names = z.namelist()
+    if 'xl/workbook.xml' not in names:
+        raise ValueError('not an Excel workbook (.xlsx) — save it as .xlsx or CSV')
+    if sum(i.file_size for i in z.infolist()) > 25_000_000:
+        raise ValueError('spreadsheet too large once unpacked')
+    shared = []
+    if 'xl/sharedStrings.xml' in names:
+        for _ev, el in ET.iterparse(io.BytesIO(z.read('xl/sharedStrings.xml')), events=('end',)):
+            if el.tag == NS + 'si':
+                shared.append(''.join(t.text or '' for t in el.iter(NS + 't'))[:500])
+                el.clear()
+                if len(shared) > 100_000:
+                    break
+    sheets = sorted((n for n in names if re.fullmatch(r'xl/worksheets/sheet\d+\.xml', n)),
+                    key=lambda n: int(re.search(r'(\d+)', n.rsplit('/', 1)[1]).group(1)))
+    out = []
+    for sh in sheets[:6]:
+        out.append(f'## {sh.rsplit("/", 1)[1]}')
+        for _ev, el in ET.iterparse(io.BytesIO(z.read(sh)), events=('end',)):
+            if el.tag != NS + 'row':
+                continue
+            cells = {}
+            for c in el.findall(NS + 'c'):
+                letters = re.match(r'[A-Z]{0,3}', c.get('r') or '').group(0)
+                col = 0
+                for ch in letters:
+                    col = col * 26 + (ord(ch) - 64)
+                col = col or (max(cells) + 1 if cells else 1)
+                if col > max_cols:
+                    continue
+                t, v = c.get('t'), c.find(NS + 'v')
+                if t == 's' and v is not None and (v.text or '').isdigit():
+                    i = int(v.text)
+                    val = shared[i] if i < len(shared) else ''
+                elif t == 'inlineStr':
+                    val = ''.join(x.text or '' for x in c.iter(NS + 't'))
+                else:
+                    val = (v.text or '') if v is not None else ''
+                if str(val).strip():
+                    cells[col] = str(val).strip()[:200]
+            el.clear()
+            if cells:
+                out.append('\t'.join(cells.get(i, '') for i in range(1, max(cells) + 1)))
+            if len(out) >= max_rows:
+                break
+        if len(out) >= max_rows:
+            break
+    return '\n'.join(out)
+
+
+def _aq_claude(content, *, system=None, max_tokens=3000, timeout=150):
+    """Messages API over plain HTTP (no SDK: the droplet pins an old anthropic
+    package, and a PDF 'document' block must pass through untouched)."""
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        raise RuntimeError('Anthropic API key missing on the server')
+    body = {'model': _AQ_MODEL, 'max_tokens': max_tokens,
+            'messages': [{'role': 'user', 'content': content}]}
+    if system:
+        body['system'] = system
+    last = ''
+    for attempt in range(4):
+        try:
+            r = req.post('https://api.anthropic.com/v1/messages', json=body, timeout=timeout,
+                         headers={'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01',
+                                  'content-type': 'application/json'})
+        except Exception as e:
+            last = f'network: {type(e).__name__}'
+            time.sleep(2 * (attempt + 1))
+            continue
+        if r.status_code in (404, 400) and 'model' in (r.text or '').lower() \
+                and body['model'] != _AQ_MODEL_FALLBACK:
+            body['model'] = _AQ_MODEL_FALLBACK
+            continue
+        if r.status_code in (429, 500, 502, 503, 529):
+            last = f'HTTP {r.status_code}'
+            time.sleep(3 * (attempt + 1))
+            continue
+        if r.status_code != 200:
+            raise RuntimeError(f'Claude HTTP {r.status_code}: {(r.text or "")[:200]}')
+        d = r.json() or {}
+        return ''.join(b.get('text') or '' for b in d.get('content') or [] if b.get('type') == 'text')
+    raise RuntimeError(f'Claude is not answering right now ({last}) — try again in a minute')
+
+
+def _aq_json(txt):
+    """First JSON object in a model answer, or None."""
+    s = str(txt or '')
+    i = s.find('{')
+    while i >= 0:
+        try:
+            obj, _end = json.JSONDecoder().raw_decode(s[i:])
+            if isinstance(obj, dict):
+                return obj
+        except ValueError:
+            pass
+        i = s.find('{', i + 1)
+    return None
+
+
+def _aq_clean_chart(chart):
+    """{headers, rows} with string cells, empty rows dropped; None when unusable."""
+    if not isinstance(chart, dict):
+        return None
+    headers = [re.sub(r'\s+', ' ', str(h or '')).strip()[:60] for h in chart.get('headers') or []]
+    rows = []
+    for r in chart.get('rows') or []:
+        if not isinstance(r, (list, tuple)):
+            continue
+        cells = [re.sub(r'\s+', ' ', str(c if c is not None else '')).strip()[:40] for c in r]
+        if any(cells):
+            rows.append(cells)
+    if not rows:
+        return None
+    width = max([len(headers)] + [len(r) for r in rows])
+    if headers:
+        headers += [''] * (width - len(headers))
+    rows = [r + [''] * (width - len(r)) for r in rows][:60]
+    return {'headers': headers[:20], 'rows': [r[:20] for r in rows]}
+
+
+_AQ_EXTRACT_SYSTEM = (
+    "You read supplier quotations for Vionna, a women's fashion webshop selling in Denmark, "
+    "France and Finland. The operator uploads what the supplier or sourcing agent sent after a "
+    "quote request: chat screenshots, size charts, spec sheets, Excel quotes, PDF catalogues or "
+    "pasted text. Extract ONLY what that material actually states. Never guess, never fill in "
+    "typical values, never invent a size chart. Answer with ONE JSON object and nothing else.")
+
+
+def _aq_extract_prompt(ctx, pasted, file_texts=()):
+    rows = ctx.get('rows') or []
+    listing = '\n'.join(
+        f'{i + 1}. ' + ' / '.join(f'{s.upper()} "{lab}"' for s, lab in (r.get('labels') or {}).items() if lab)
+        for i, r in enumerate(rows)) or '(no colours)'
+    return (
+        f'The listing being corrected: "{ctx.get("name") or ""}" (category: {ctx.get("cat") or "unknown"}).\n'
+        f'Colours it is listed in now (numbered):\n{listing}\n'
+        f'Sizes it is listed in now: {", ".join(ctx.get("sizes") or []) or "unknown"}\n\n'
+        + (f'Text pasted by the operator:\n<<<\n{pasted[:20000]}\n>>>\n\n' if pasted else '')
+        + ''.join(f'{t}\n\n' for t in file_texts)
+        + 'Return exactly this JSON shape:\n'
+        '{"colours":[{"supplier_name":"as the supplier wrote it","english":"plain English colour",'
+        '"labels":{"dk":"Danish","fr":"French","fi":"Finnish"},"matches_row":<number from the list above '
+        'that is the SAME colour, or null>}],'
+        '"sizes":["the sizes the supplier sells, smallest first"],'
+        '"size_chart":{"headers":["Size","Bust (cm)","..."],"rows":[["S","86","..."]]} or null,'
+        '"chart_unit":"cm"|"inch"|null,'
+        '"models":[{"name":"style/version name","details":"what differs"}],'
+        '"material":"composition exactly as stated, e.g. 95% polyester, 5% elastane" or null,'
+        '"facts":["short factual statements about the real product: length in cm, lining, stretch, '
+        'closure, pockets, fit"],'
+        '"price":{"amount":12.5,"currency":"USD"} or null,'
+        '"notes":["what the operator should know: missing info, contradictions, colours only visible in '
+        'photos, inch charts"],'
+        '"confidence":"high"|"medium"|"low"}\n\n'
+        'Rules:\n'
+        '- colours: every colour the supplier offers. labels = natural colour names a native fashion shop '
+        'uses (Danish: Sort, Hvid, Lyserød, Mørkegrøn, Marineblå; French: Noir, Blanc, Rose, Vert foncé, '
+        'Bleu marine; Finnish: Musta, Valkoinen, Vaaleanpunainen, Tummanvihreä, Tummansininen). Title '
+        'case, no codes, no numbers. When the colour is the same as a listed row, reuse that row\'s '
+        'exact names.\n'
+        '- sizes: as sold (S, M, L, XL, 2XL / 36, 38, 40 / One Size). Write XXL as 2XL. [] if not stated.\n'
+        '- size_chart: only if the material contains one; one row per size, size in the first column, '
+        'numbers exactly as written, unit in the header. Do NOT convert inches — say "inch".\n'
+        '- models: only when the supplier offers distinct styles of this item; otherwise [].\n'
+        '- facts: only facts stated in the material. No marketing words.\n')
+
+
+def _aq_extract(files, pasted, ctx):
+    """Supplier material -> structured facts. Returns (result, used, skipped)."""
+    blocks, used, skipped = [], [], []
+    texts = []
+    for item in (files or [])[:_AQ_MAX_FILES]:
+        try:
+            raw, kind, name = _aq_decode_upload(item)
+        except ValueError as e:
+            skipped.append(str(e))
+            continue
+        if kind.startswith('image/'):
+            if len(raw) > 4_800_000:
+                skipped.append(f'{name}: image over 5 MB — the page shrinks photos first, try again')
+                continue
+            blocks.append({'type': 'image', 'source': {'type': 'base64', 'media_type': kind,
+                                                       'data': _b64.b64encode(raw).decode('ascii')}})
+        elif kind == 'pdf':
+            blocks.append({'type': 'document', 'source': {'type': 'base64', 'media_type': 'application/pdf',
+                                                          'data': _b64.b64encode(raw).decode('ascii')}})
+        elif kind == 'xlsx':
+            try:
+                body = _aq_xlsx_text(raw)
+            except ValueError as e:
+                skipped.append(f'{name}: {e}')
+                continue
+            except Exception as e:
+                skipped.append(f'{name}: spreadsheet not readable ({type(e).__name__}) — save as .xlsx or CSV')
+                continue
+            texts.append((name, f'Spreadsheet "{name}"', body))
+        else:
+            texts.append((name, f'File "{name}"', raw))
+        used.append(name)
+    if len(files or []) > _AQ_MAX_FILES:
+        skipped.append(f'only the first {_AQ_MAX_FILES} files were read')
+    pasted = (pasted or '').strip()
+    file_texts, budget = [], 60000
+    for name, label, body in texts:
+        take = body[:min(30000, max(0, budget))]
+        budget -= len(take)
+        if len(take) < len(body):
+            skipped.append(f'{name}: only the first {len(take):,} characters were read')
+        if take:
+            file_texts.append(f'{label}:\n<<<\n{take}\n>>>')
+    if len(pasted) > 20000:
+        skipped.append(f'pasted text: only the first 20,000 characters were read')
+    if not blocks and not pasted and not file_texts:
+        raise ValueError('Upload a file or paste the supplier text first')
+    blocks.append({'type': 'text', 'text': _aq_extract_prompt(ctx or {}, pasted, file_texts)})
+    obj = _aq_json(_aq_claude(blocks, system=_AQ_EXTRACT_SYSTEM, max_tokens=4000))
+    if not obj:
+        raise RuntimeError('Could not read an answer from the model — try again')
+    return _aq_extract_post(obj, ctx or {}), used, skipped
+
+
+def _aq_extract_post(obj, ctx):
+    """Normalise what the model returned and match colours to the listing rows."""
+    notes = [str(n)[:300] for n in (obj.get('notes') or []) if str(n).strip()][:12]
+    rows = ctx.get('rows') or []
+    colours, seen = [], set()
+    for c in obj.get('colours') or []:
+        if not isinstance(c, dict):
+            continue
+        labels = {s: re.sub(r'\s+', ' ', str(((c.get('labels') or {}).get(s)) or '')).strip()[:40]
+                  for s in AQ_STORES}
+        english = str(c.get('english') or '').strip()[:40]
+        supplier = str(c.get('supplier_name') or english).strip()[:60]
+        row_id = None
+        mr = c.get('matches_row')
+        if isinstance(mr, int) and 1 <= mr <= len(rows):
+            row_id = rows[mr - 1].get('row_id')
+        if not row_id and english:
+            concept = _color_concept(english)
+            hits = [r for r in rows if concept and _aq_concept(
+                next(iter((r.get('labels') or {}).values()), '')) == concept]
+            if len(hits) == 1:
+                row_id = hits[0].get('row_id')
+        if row_id and row_id in seen:
+            notes.append(f'Two supplier colours look like the same listed colour ({supplier}) — check the match')
+            row_id = None
+        if row_id:
+            seen.add(row_id)
+        for s in AQ_STORES:
+            if not labels[s] and row_id:
+                r = next((r for r in rows if r.get('row_id') == row_id), {})
+                labels[s] = (r.get('labels') or {}).get(s, '')
+        colours.append({'supplier_name': supplier, 'english': english, 'labels': labels,
+                        'row_id': row_id})
+    chart = _aq_clean_chart(obj.get('size_chart'))
+    unit = str(obj.get('chart_unit') or '').lower() or None
+    if chart:
+        normed, fix = _size_chart_normalise(chart)
+        if fix and 'inches' in fix:
+            notes.append('The chart was in inches — converted to cm')
+        elif unit == 'inch':
+            notes.append('The supplier chart is in inches; check the converted numbers')
+        chart = _aq_clean_chart(normed) or chart
+    sizes = _aq_sort_sizes([s for s in obj.get('sizes') or [] if str(s).strip()])[:30]
+    chart_sizes = _aq_chart_sizes(chart) if chart else []
+    if not sizes and chart_sizes:
+        sizes = chart_sizes
+        notes.append('Sizes taken from the size chart rows')
+    elif sizes and chart_sizes and _aq_sizes_vs_chart(sizes, chart_sizes) is False:
+        notes.append(f'The sizes ({", ".join(sizes)}) and the chart rows ({", ".join(chart_sizes)}) differ')
+    price = obj.get('price') if isinstance(obj.get('price'), dict) else None
+    if price:
+        try:
+            price = {'amount': float(price.get('amount')), 'currency': str(price.get('currency') or '')[:5]}
+        except (TypeError, ValueError):
+            price = None
+    return {
+        'colours': colours[:20], 'sizes': sizes, 'size_chart': chart, 'chart_unit': unit,
+        'models': [{'name': str(m.get('name') or '')[:80], 'details': str(m.get('details') or '')[:300]}
+                   for m in (obj.get('models') or []) if isinstance(m, dict)][:10],
+        'material': (str(obj.get('material')).strip()[:200] if obj.get('material') else None),
+        'facts': [str(f).strip()[:300] for f in (obj.get('facts') or []) if str(f).strip()][:15],
+        'price': price, 'notes': notes,
+        'confidence': obj.get('confidence') if obj.get('confidence') in ('high', 'medium', 'low') else 'medium',
+    }
+
+
+# ── copy: make the description true to the supplier facts ─────────────────────
+
+_AQ_COPY_SYSTEM = (
+    "You edit an existing product description for Vionna, a women's fashion webshop. The supplier "
+    "has now confirmed facts about the real product. Make the description TRUE for those facts and "
+    "change nothing else. Answer with ONE JSON object and nothing else.")
+
+
+def _aq_copy_prompt(store, html, facts):
+    lang = AQ_LANGUAGE_EN.get(store, 'English')
+    return (
+        f'Language of the shop and of your output: {lang}. Write like a native {lang} fashion copywriter.\n\n'
+        f'Confirmed by the supplier:\n{facts}\n\n'
+        f'Current description (HTML):\n<<<\n{html[:20000]}\n>>>\n\n'
+        'Edit rules:\n'
+        '1. Correct or remove every sentence that contradicts the confirmed facts (material, length, '
+        'fit, lining, stretch, closure, details).\n'
+        '2. If the confirmed material is not mentioned, add it in ONE short natural sentence or bullet, '
+        'in the same style as the text around it.\n'
+        '3. Keep everything else word for word: HTML tags, structure, tone, keywords, length (within 15%).\n'
+        '4. Never name a colour — the text is shared by every colour of the product.\n'
+        '5. Never add a claim that is neither in the confirmed facts nor already in the text.\n'
+        '6. If nothing needs to change, return the current HTML unchanged.\n\n'
+        'Return: {"html":"the full edited HTML","changes":["one short English note per change"]}')
+
+
+def _aq_facts_text(body):
+    parts = []
+    if body.get('material'):
+        parts.append(f'- Material: {str(body["material"])[:200]}')
+    for f in (body.get('facts') or [])[:15]:
+        if str(f).strip():
+            parts.append(f'- {str(f).strip()[:300]}')
+    for m in (body.get('models') or [])[:10]:
+        if isinstance(m, dict) and (m.get('name') or m.get('details')):
+            parts.append(f'- Style offered: {str(m.get("name") or "")[:80]} — {str(m.get("details") or "")[:300]}')
+    return '\n'.join(parts)
+
+
+def _aq_new_colour_words(before, after):
+    """Colour words the rewrite introduced (the copy is shared by all colours)."""
+    tok = lambda h: set(re.split(r'[^a-z0-9]+', _deaccent(re.sub(r'<[^>]+>', ' ', h or ''))))
+    return sorted(t for t in tok(after) - tok(before) if t in _COLOR_WORDS)
+
+
+def _aq_copy_one(store, html, facts):
+    if not str(html or '').strip():
+        raise RuntimeError('this store has no description to correct')
+    obj = _aq_json(_aq_claude([{'type': 'text', 'text': _aq_copy_prompt(store, html, facts)}],
+                              system=_AQ_COPY_SYSTEM, max_tokens=6000))
+    if not obj or not str(obj.get('html') or '').strip():
+        raise RuntimeError('no usable answer')
+    # the operator reviews exactly what would be written: the cleaned HTML
+    after = _aq_clean_html(str(obj['html']))
+    warnings = []
+    new_tags = _aq_tags(after) - _aq_tags(html)
+    if new_tags:
+        warnings.append('The edit adds formatting the text did not have (' + ', '.join(sorted(new_tags))
+                        + ') — check it reads right')
+    added = _aq_new_colour_words(html, after)
+    if added:
+        warnings.append('The edit names a colour (' + ', '.join(added) + ') — remove it: the text is '
+                        'shared by every colour')
+    if html and not (0.6 <= len(after) / max(1, len(html)) <= 1.6):
+        warnings.append('The edit changed the length a lot — read it before applying')
+    return {'before': html, 'after': after,
+            'changes': [str(c)[:200] for c in (obj.get('changes') or [])][:12], 'warnings': warnings}
+
+
+# ── plan: current state + confirmed facts -> exact writes ─────────────────────
+
+def _aq_label_ok(lab):
+    """A colour name: letters (any language), digits, spaces and - ' / & . —
+    nothing that could break out of an HTML attribute in the theme."""
+    return bool(lab) and len(lab) <= 40 and bool(re.fullmatch(r"[^\W_](?:[^\W_]|[ '\-/&.])*", lab))
+
+
+def _aq_count(v):
+    if isinstance(v, int):
+        return max(0, v)
+    return len([x for x in (v or []) if x])
+
+
+_AQ_HTML_TAGS = {'p', 'br', 'ul', 'ol', 'li', 'strong', 'em', 'b', 'i', 'u', 'h2', 'h3', 'h4', 'h5', 'h6',
+                 'span', 'div', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'a', 'blockquote', 'hr',
+                 'sup', 'sub'}
+_AQ_HTML_VOID = {'br', 'hr'}
+_AQ_HTML_DROP = {'script', 'style', 'iframe', 'object', 'embed', 'noscript', 'template', 'svg', 'math',
+                 'form', 'textarea', 'select', 'button', 'title', 'head', 'frameset', 'frame', 'applet'}
+
+
+def _aq_clean_html(html):
+    """Allow-list HTML for body_html: known text tags only, NO attributes except a
+    plain http(s)/mailto/relative <a href>; the content of script/style/svg/…
+    goes with the tag. Model output and supplier material are untrusted and the
+    theme prints body_html raw — a regex blacklist was bypassable (review
+    2026-09-29: <img onerror=…>, unclosed <script src>, javascript: hrefs)."""
+    from html.parser import HTMLParser
+    import html as _h
+    out, stack, skip = [], [], [0]
+
+    class _P(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            t = tag.lower()
+            if t in _AQ_HTML_DROP:
+                skip[0] += 1
+                return
+            if skip[0] or t not in _AQ_HTML_TAGS:
+                return
+            if t == 'a':
+                href = (dict(attrs).get('href') or '').strip()
+                ok = re.match(r'(https?://|mailto:|/(?!/))', href, re.I) and not re.search(r'[\s"\'<>`]', href)
+                out.append(f'<a href="{_h.escape(href, quote=True)}">' if ok else '<a>')
+            else:
+                out.append(f'<{t}>')
+            if t not in _AQ_HTML_VOID:
+                stack.append(t)
+
+        def handle_startendtag(self, tag, attrs):
+            t = tag.lower()
+            if not skip[0] and t in _AQ_HTML_VOID:
+                out.append(f'<{t}>')
+
+        def handle_endtag(self, tag):
+            t = tag.lower()
+            if t in _AQ_HTML_DROP:
+                skip[0] = max(0, skip[0] - 1)
+                return
+            if skip[0] or t not in _AQ_HTML_TAGS or t in _AQ_HTML_VOID or t not in stack:
+                return
+            while stack:
+                x = stack.pop()
+                out.append(f'</{x}>')
+                if x == t:
+                    break
+
+        def handle_data(self, data):
+            if not skip[0]:
+                out.append(_h.escape(data, quote=False))
+
+    p = _P(convert_charrefs=True)
+    p.feed(str(html or ''))
+    p.close()
+    while stack:
+        out.append(f'</{stack.pop()}>')
+    return ''.join(out).strip()[:60000]
+
+
+def _aq_tags(html):
+    return set(t.lower() for t in re.findall(r'<\s*([a-zA-Z][a-zA-Z0-9]*)', html or ''))
+
+
+def _aq_plan(state, target):
+    """Pure function: what WILL change, product by product. No Shopify calls
+    except the size-chart localisation (a cached label translation)."""
+    wanted = target['stores'] if 'stores' in target else list(AQ_STORES)
+    stores = [s for s in wanted or [] if s in state['stores']]
+    rows = _aq_rows(state['stores'])
+    rows_by_id = {r['row_id']: r for r in rows}
+    name = _aq_name(state)
+    cat = _aq_family_cat(state)
+    ops, errors, warnings = [], [], []
+    if not stores:
+        errors.append('Choose at least one store')
+    # A siblings collection shared by two garments (_name_collision's force
+    # path: "Maeve Siblings" held 7 blouses and 4 jackets) would get one
+    # product's sizes, chart and copy on the other. Refuse.
+    titles = {_norm_name(p['title']) for ps in state['stores'].values() for p in ps if p['title']}
+    cats = {p['cat'] for ps in state['stores'].values() for p in ps if p['cat']}
+    if len(titles) > 1 or len(cats) > 1:
+        errors.append('This colour group mixes different products (' + ', '.join(sorted(titles | cats))
+                      + ') — split it in Shopify first; the tool would copy one product\'s sizes onto the other')
+
+    sizes = target.get('sizes')
+    if sizes is not None:
+        # smallest first for letter/number lists (a picker showing 36 before 35
+        # looks broken); a mixed list keeps the order the operator typed
+        sizes = _aq_sort_sizes(sizes)
+        if not sizes:
+            errors.append('Enter at least one size (or choose "keep sizes")')
+        elif len(sizes) > 30:
+            errors.append('More than 30 sizes — that is not a size list')
+        elif cat == 'shoes' and _aq_size_kind(sizes) == 'letter':
+            warnings.append('These are shoes in clothing sizes (XS–XL) — shoes are normally sold in EU sizes')
+
+    chart = None
+    if target.get('size_chart') is not None:
+        chart = _aq_clean_chart(target.get('size_chart'))
+        if not chart:
+            errors.append('The size chart is empty — add rows, or choose "keep size chart"')
+        else:
+            normed, fix = _size_chart_normalise(chart)
+            if fix:
+                warnings.append(f'Size chart will be stored in cm ({fix})')
+            chart = normed
+            cs = _aq_chart_sizes(chart)
+            check = sizes if sizes is not None else next(
+                (p['sizes'] for ps in state['stores'].values() for p in ps if p['status'] == 'active'), [])
+            if cs and check and _aq_sizes_vs_chart(check, cs) is False:
+                warnings.append(f'The chart rows ({", ".join(cs)}) don\'t match the sizes ({", ".join(check)})')
+            if cat == 'shoes' and cs and _aq_size_kind(check) == 'letter' and _aq_size_kind(cs) == 'number':
+                warnings.append(f'Shoe chart in EU sizes ({cs[0]}–{cs[-1]}) but the listing sells XS–XL')
+
+    actions = {}
+    for c in target.get('colours') or []:
+        if not isinstance(c, dict):
+            continue
+        rid = c.get('row_id')
+        if rid not in rows_by_id:
+            errors.append('A colour in the request is no longer on the listing — reload the product')
+            continue
+        actions[rid] = c
+
+    descriptions = {s: _aq_clean_html(h) for s, h in (target.get('descriptions') or {}).items()
+                    if s in AQ_STORES and str(h or '').strip()}
+
+    for s in stores:
+        ps = state['stores'][s]
+        store_sizes = _aq_sizes_for_store(s, cat, sizes) if sizes is not None else None
+        chart_html = _size_chart_html(chart, s) if chart else ''
+        chart_ids, desc_ids = [], []
+        live_after = 0
+        for r in rows:
+            p = r['cells'].get(s)
+            if not p:
+                continue
+            act = actions.get(r['row_id']) or {}
+            a = act.get('action') or 'keep'
+            if a == 'drop':
+                if p['status'] != 'draft':
+                    ops.append({'op': 'draft', 'store': s, 'product_id': p['id'], 'row_id': r['row_id'],
+                                'colour': p['colour'],
+                                'text': f'{p["colour"] or "(no colour)"}: set to draft — hidden from the shop, '
+                                        f'nothing deleted'})
+                continue
+            if p['status'] == 'active':
+                live_after += 1
+            new_label = None
+            if a == 'rename':
+                lab = re.sub(r'\s+', ' ', str(((act.get('labels') or {}).get(s)) or '')).strip()
+                if not lab:
+                    errors.append(f'{s.upper()}: type the new colour name for "{p["colour"]}"')
+                elif not _aq_label_ok(lab):
+                    errors.append(f'{s.upper()}: "{lab[:40]}" is not a colour name (letters, digits, spaces, - \' / & only)')
+                elif lab != p['colour']:
+                    new_label = lab
+            if (store_sizes is not None or new_label) and p['options_count'] != 1:
+                errors.append(f'{s.upper()} · {p["colour"]}: this product has {p["options_count"]} options '
+                              f'(the tool handles exactly one: size) — change it in Shopify')
+                continue
+            if store_sizes is not None and len({_aq_norm_size(v['size']) for v in p['variants']}) \
+                    < len(p['variants']):
+                errors.append(f'{s.upper()} · {p["colour"]}: two variants carry the same size '
+                              f'({" ".join(p["sizes"])}) — clean that up in Shopify first')
+                continue
+            if store_sizes is not None or new_label:
+                want = store_sizes if store_sizes is not None else p['sizes']
+                have_keys = {_aq_norm_size(v['size']) for v in p['variants']}
+                want_keys = {_aq_norm_size(x) for x in want}
+                if p['sizes'] != want or new_label:
+                    added = [x for x in want if _aq_norm_size(x) not in have_keys]
+                    removed = [v['size'] for v in p['variants'] if _aq_norm_size(v['size']) not in want_keys]
+                    if p['sizes'] != want:
+                        bits = []
+                        if added:
+                            bits.append('+' + ' '.join(added))
+                        if removed:
+                            bits.append('−' + ' '.join(removed))
+                        if not added and not removed:
+                            bits.append('new order/spelling')
+                        txt = f'{new_label or p["colour"]}: sizes {" ".join(p["sizes"]) or "—"} → ' \
+                              f'{" ".join(want)} ({", ".join(bits)})'
+                    else:
+                        txt = f'{new_label}: SKUs follow the new colour name'
+                    ops.append({'op': 'variants', 'store': s, 'product_id': p['id'], 'row_id': r['row_id'],
+                                'before': p['sizes'], 'after': want, 'added': added, 'removed': removed,
+                                'colour': new_label or p['colour'], 'rename_skus': bool(new_label),
+                                'text': txt})
+            if new_label:
+                ops.append({'op': 'rename', 'store': s, 'product_id': p['id'], 'row_id': r['row_id'],
+                            'before': p['colour'], 'after': new_label,
+                            'title_tag': _seo_page_title(p['title'] or name, new_label, p['specs']),
+                            'text': f'colour "{p["colour"]}" → "{new_label}" (swatch, page title, SKUs; '
+                                    f'URL unchanged)'})
+            # compare CONTENT, not markup: the same chart rendered by another
+            # version of the writer (<tr><th> vs <thead>) is not a change
+            if chart_html and _size_chart_from_html(p['chart_html']) != _size_chart_from_html(chart_html):
+                chart_ids.append(p['id'])
+            if s in descriptions and p['body_html'] != descriptions[s]:
+                desc_ids.append(p['id'])
+        if chart_ids:
+            ops.append({'op': 'chart', 'store': s, 'product_ids': chart_ids, 'html': chart_html,
+                        'text': f'size chart on {len(chart_ids)} colour(s)'})
+        if desc_ids:
+            ops.append({'op': 'description', 'store': s, 'product_ids': desc_ids, 'html': descriptions[s],
+                        'text': f'description on {len(desc_ids)} colour(s)'})
+        for i, ph in enumerate(target.get('photos') or []):
+            r = rows_by_id.get((ph or {}).get('row_id'))
+            n = _aq_count((ph or {}).get('images'))
+            if not r or not n:
+                continue
+            p = r['cells'].get(s)
+            if not p or (actions.get(r['row_id']) or {}).get('action') == 'drop':
+                continue
+            mode = 'front' if ph.get('mode') == 'front' else 'append'
+            ops.append({'op': 'photos', 'store': s, 'product_id': p['id'], 'row_id': r['row_id'],
+                        'photo_ref': i, 'n': n, 'mode': mode,
+                        'text': f'{p["colour"]}: {n} photo(s) {"in front" if mode == "front" else "added at the end"}'})
+        tpl = next((p for p in ps if p['status'] == 'active'), ps[0])
+        for j, nc in enumerate(target.get('new_colours') or []):
+            lab = re.sub(r'\s+', ' ', str(((nc or {}).get('labels') or {}).get(s) or '')).strip()
+            n = _aq_count((nc or {}).get('images'))
+            if not lab:
+                errors.append(f'{s.upper()}: type the name of the new colour')
+                continue
+            if not _aq_label_ok(lab):
+                errors.append(f'{s.upper()}: "{lab[:40]}" is not a colour name (letters, digits, spaces, - \' / & only)')
+                continue
+            handle = _publish_make_handle(name, lab)
+            if any(p['handle'] == handle for p in ps) or any(
+                    _aq_concept(p['colour']) == _aq_concept(lab) and not _aq_concept(lab).startswith('~')
+                    and p['colour'].lower() == lab.lower() for p in ps):
+                errors.append(f'{s.upper()}: "{lab}" already exists on this listing')
+                continue
+            if not n:
+                errors.append(f'New colour "{lab}": add at least one photo')
+                continue
+            new_sizes = store_sizes if store_sizes is not None else tpl['sizes']
+            ops.append({'op': 'add_colour', 'store': s, 'new_ref': j, 'label': lab, 'handle': handle,
+                        'sizes': new_sizes, 'n': n, 'activate': bool((nc or {}).get('activate')),
+                        'template_id': tpl['id'],
+                        'text': f'new colour "{lab}" ({" ".join(new_sizes)}, {n} photo(s), '
+                                f'{"live" if (nc or {}).get("activate") else "draft"})'})
+            if (nc or {}).get('activate'):
+                live_after += 1
+        if any(o['store'] == s and o['op'] == 'draft' for o in ops) and live_after == 0:
+            warnings.append(f'{s.upper()}: every colour would be hidden — the product disappears from that shop')
+
+    counts = collections.Counter(o['op'] for o in ops)
+    return {'ops': ops, 'errors': list(dict.fromkeys(errors)), 'warnings': list(dict.fromkeys(warnings)),
+            'counts': dict(counts),
+            'products': len({(o['store'], o.get('product_id')) for o in ops if o.get('product_id')}
+                            | {(o['store'], pid) for o in ops for pid in o.get('product_ids') or []})}
+
+
+def _aq_plan_public(plan):
+    """What the page shows: no HTML payloads."""
+    return {**plan, 'ops': [{k: v for k, v in o.items() if k != 'html'} for o in plan['ops']]}
+
+
+# ── writes ────────────────────────────────────────────────────────────────────
+
+_AQ_M_MF_SET = ('mutation($m:[MetafieldsSetInput!]!){ metafieldsSet(metafields:$m){ '
+                'metafields{ key } userErrors{ field message } } }')
+
+
+def _aq_metafields_set(store, items):
+    """metafieldsSet in batches of 25; an item whose existing definition has the
+    other text type is retried once with that type (single vs multi line).
+    Returns a list of error strings."""
+    errs = []
+    alt = {'single_line_text_field': 'multi_line_text_field',
+           'multi_line_text_field': 'single_line_text_field'}
+    for i in range(0, len(items), 25):
+        batch = items[i:i + 25]
+        try:
+            d = _aq_gql(store, _AQ_M_MF_SET, {'m': batch})
+        except Exception as e:
+            errs.append(f'metafields: {e}')
+            continue
+        ue = ((d.get('metafieldsSet') or {}).get('userErrors')) or []
+        if not ue:
+            continue
+        for it in batch:              # which one failed isn't reliable — redo one by one
+            try:
+                d1 = _aq_gql(store, _AQ_M_MF_SET, {'m': [it]})
+                ue1 = ((d1.get('metafieldsSet') or {}).get('userErrors')) or []
+                if ue1 and it['type'] in alt:
+                    d2 = _aq_gql(store, _AQ_M_MF_SET, {'m': [{**it, 'type': alt[it['type']]}]})
+                    ue1 = ((d2.get('metafieldsSet') or {}).get('userErrors')) or []
+                if ue1:
+                    errs.append(f'{it["namespace"]}.{it["key"]}: {ue1[0].get("message")}')
+            except Exception as e:
+                errs.append(f'{it["namespace"]}.{it["key"]}: {e}')
+    return errs
+
+
+def _aq_mf_delete(store, pid, ns, key):
+    """Remove one product metafield if it exists (undo of a chart that wasn't there)."""
+    hdrs = shopify_headers(store)
+    r = _shopify_call('get', shopify_url(store, f'products/{pid}/metafields.json?namespace={ns}&key={key}'),
+                      hdrs, timeout=30)
+    if r.status_code != 200:
+        return
+    for m in (r.json() or {}).get('metafields') or []:
+        if m.get('namespace') == ns and m.get('key') == key:
+            _shopify_call('delete', shopify_url(store, f'metafields/{m["id"]}.json'), hdrs, timeout=30)
+
+
+def _aq_mf(pid, ns, key, value, typ):
+    return {'ownerId': f'gid://shopify/Product/{pid}', 'namespace': ns, 'key': key,
+            'type': typ, 'value': value}
+
+
+def _aq_put_product(store, pid, product):
+    r = _shopify_call('put', shopify_url(store, f'products/{pid}.json'), shopify_headers(store),
+                      json={'product': {'id': pid, **product}}, timeout=60)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f'HTTP {r.status_code}: {(r.text or "")[:200]}')
+    return (r.json() or {}).get('product') or {}
+
+
+def _aq_variants_view(prod):
+    return [{
+        'id': v['id'], 'size': v.get('option1') or '', 'sku': v.get('sku') or '',
+        'price': v.get('price'), 'compare_at': v.get('compare_at_price'),
+        'taxable': v.get('taxable'), 'policy': v.get('inventory_policy'),
+        'mgmt': v.get('inventory_management'), 'image_id': v.get('image_id'),
+        'requires_shipping': v.get('requires_shipping'),
+    } for v in sorted(prod.get('variants') or [], key=lambda v: v.get('position') or 0)]
+
+
+_AQ_M_OPT_REORDER = ('mutation($pid:ID!, $opts:[OptionReorderInput!]!){ productOptionsReorder('
+                     'productId:$pid, options:$opts){ userErrors{ field message } } }')
+
+
+def _aq_respell_sku(sku, old, new):
+    """…-XXL -> …-2XL when only the size's spelling changes."""
+    old_c, new_c = str(old or '').replace(' ', ''), str(new or '').replace(' ', '')
+    if sku and old_c and sku.endswith('-' + old_c):
+        return sku[:-len(old_c)] + new_c
+    return None
+
+
+def _aq_put_variants(store, p, want, sku_for, tpl=None):
+    """Make one colour product sell exactly `want`, in that order, with ONE
+    product PUT: a size that stays keeps its variant id (orders, COGS matching
+    and stock stay attached); a new size copies price, compare-at, tax and
+    inventory settings from `tpl` (default: the product's first variant);
+    sizes not listed are removed. sku_for(size, existing_variant_or_None) gives
+    the SKU to write, or None to leave it. Verified by reading the answer back;
+    the size picker's value order (stored apart from variant order since the
+    2024 options model) is put right with productOptionsReorder.
+    Returns (product, warning or None); raises when Shopify shows other sizes."""
+    tpl = tpl or (p['variants'][0] if p['variants'] else {})
+    first_img = p['images'][0]['id'] if p['images'] else None
+    by_key = {}
+    for v in p['variants']:
+        by_key.setdefault(_aq_norm_size(v['size']), v)
+    out = []
+    for sz in want:
+        v = by_key.get(_aq_norm_size(sz))
+        sku = sku_for(sz, v)
+        if v:
+            item = {'id': v['id']}
+            if v['size'] != sz:
+                item['option1'] = sz
+            if sku and sku != v['sku']:
+                item['sku'] = sku
+        else:
+            item = {'option1': sz, 'price': tpl.get('price'), 'compare_at_price': tpl.get('compare_at'),
+                    'sku': sku or '', 'inventory_management': tpl.get('mgmt'),
+                    'inventory_policy': tpl.get('policy') or 'deny',
+                    'taxable': bool(tpl.get('taxable')),
+                    'requires_shipping': True if tpl.get('requires_shipping') is None else tpl['requires_shipping']}
+            if first_img:
+                item['image_id'] = first_img
+        out.append(item)
+    prod = _aq_put_product(store, p['id'], {'variants': out})
+
+    def sizes_of(pr):
+        return [v.get('option1') for v in sorted(pr.get('variants') or [], key=lambda v: v.get('position') or 0)]
+    got = sizes_of(prod)
+    if got != list(want) and sorted(map(str, got)) == sorted(want):
+        # right sizes, wrong order: one pure reorder PUT (ids only, in order)
+        ids = {v.get('option1'): v['id'] for v in prod.get('variants') or []}
+        prod = _aq_put_product(store, p['id'], {'variants': [{'id': ids[sz]} for sz in want]})
+        got = sizes_of(prod)
+    if got != list(want):
+        raise RuntimeError(f'Shopify now shows sizes {" ".join(map(str, got))} instead of {" ".join(want)}')
+    warning = None
+    opts = [o for o in prod.get('options') or [] if (o.get('name') or '').lower() != 'title']
+    vals = list((opts[0].get('values') if opts else None) or [])
+    if vals and vals != list(want):
+        try:
+            d = _aq_gql(store, _AQ_M_OPT_REORDER, {
+                'pid': f'gid://shopify/Product/{p["id"]}',
+                'opts': [{'name': opts[0].get('name'), 'values': [{'name': v} for v in want]}]})
+            ue = ((d.get('productOptionsReorder') or {}).get('userErrors')) or []
+            if ue:
+                warning = f'size picker order not set: {ue[0].get("message")}'
+        except Exception as e:
+            warning = f'size picker order not set ({str(e)[:120]})'
+    return prod, warning
+
+
+def _aq_photo_payload(images):
+    out = []
+    for i, item in enumerate(images or []):
+        raw, kind, name = _aq_decode_upload(item if isinstance(item, dict) else {'data': item})
+        if not kind.startswith('image/'):
+            raise ValueError(f'{name}: not a photo')
+        ext = {'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp'}[kind]
+        out.append({'attachment': _b64.b64encode(raw).decode('ascii'), 'filename': f'photo-{i + 1}.{ext}'})
+    return out
+
+
+def _aq_attach(store, pid, payload, front):
+    """Upload photos one per request ('front' puts them first). -> (new ids, errors).
+    The caller records the ids BEFORE anything else can fail."""
+    if front:
+        payload = [{**img, 'position': i + 1} for i, img in enumerate(payload)]
+    report = _new_image_report()
+    created = [c for c in _attach_images_one_by_one(store, pid, payload, shopify_headers(store), report=report) if c]
+    return [c['id'] for c in created if c.get('id')], _image_report_errors(report)
+
+
+def _aq_point_variants(store, pid, image_id, only=None):
+    """Make image_id the variants' photo (what the size picker shows). Reads the
+    CURRENT variant ids — a size change earlier in the same apply replaced them.
+    `only`: {variant_id: image_id} to set per variant instead. -> errors."""
+    prod = _aq_fetch_product(store, pid) or {}
+    hdrs, errs = shopify_headers(store), []
+    for v in prod.get('variants') or []:
+        img = (only or {}).get(v['id'], image_id) if only is not None else image_id
+        if not img or v.get('image_id') == img:
+            continue
+        r = _shopify_call('put', shopify_url(store, f'variants/{v["id"]}.json'), hdrs,
+                          json={'variant': {'id': v['id'], 'image_id': img}}, timeout=30)
+        if r.status_code not in (200, 201):
+            errs.append(f'photo not linked to size {v.get("option1")} (HTTP {r.status_code})')
+    return errs
+
+
+def _aq_job_new(kind, key):
+    jid = secrets.token_hex(12)
+    with _AQ_JOBS_LOCK:
+        if len(_AQ_JOBS) > 60:           # prune finished jobs only
+            done = [k for k, j in _AQ_JOBS.items() if j['status'] != 'running']
+            for old in sorted(done, key=lambda k: _AQ_JOBS[k]['started_at'])[:20]:
+                _AQ_JOBS.pop(old, None)
+        _AQ_JOBS[jid] = {'id': jid, 'kind': kind, 'key': key, 'status': 'running', 'step': 'starting',
+                         'done': 0, 'total': 0, 'log': [], 'errors': [], 'result': None,
+                         'started_at': datetime.datetime.utcnow().isoformat() + 'Z', 'finished_at': None}
+    return jid
+
+
+def _aq_job(jid, **fields):
+    with _AQ_JOBS_LOCK:
+        if jid in _AQ_JOBS:
+            _AQ_JOBS[jid].update(fields)
+
+
+def _aq_job_log(jid, store, text, ok=True):
+    with _AQ_JOBS_LOCK:
+        j = _AQ_JOBS.get(jid)
+        if j:
+            j['log'].append({'store': store, 'text': str(text)[:300], 'ok': bool(ok)})
+            if not ok:
+                j['errors'].append(f'{store.upper()}: {str(text)[:300]}')
+            j['done'] += 1
+
+
+def _aq_job_errors(jid):
+    with _AQ_JOBS_LOCK:
+        return list((_AQ_JOBS.get(jid) or {}).get('errors') or [])
+
+
+def _aq_backup_path(backup_id):
+    if not re.fullmatch(r'[0-9TZ\-]+_[a-z0-9\-]{1,60}_[0-9a-f]{6}', backup_id or ''):
+        raise ValueError('bad backup id')
+    return os.path.join(AQ_BACKUP_DIR, backup_id + '.json')
+
+
+def _aq_backup_write(backup_id, data):
+    os.makedirs(AQ_BACKUP_DIR, exist_ok=True)
+    path = _aq_backup_path(backup_id)
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _aq_short(v, n):
+    return str(v or '')[:n]
+
+
+def _aq_apply_run(jid, key, target, expected_sig, user):
+    """Background job: re-read, re-plan, refuse on drift, back up, write.
+    The backup records per product WHAT this apply wrote, so undo can restore
+    exactly those fields — and only while they still hold what was written."""
+    with _AQ_APPLY_LOCK:
+        backup_id = None
+        try:
+            _aq_job(jid, step='reading the listing from Shopify')
+            state = _aq_family_state(key)
+            if not state:
+                raise RuntimeError('This listing no longer exists in any store')
+            if expected_sig and _aq_state_sig(state) != expected_sig:
+                raise RuntimeError('The listing changed in Shopify since your preview — nothing was written. '
+                                   'Press "Preview changes" again.')
+            plan = _aq_plan(state, target)
+            if plan['errors']:
+                raise RuntimeError('; '.join(plan['errors'][:5]))
+            if not plan['ops']:
+                raise RuntimeError('Nothing to change')
+            name = _aq_name(state)
+            stamp = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+            backup_id = f'{stamp}_{(_publish_slug(name) or "product")[:60].strip("-") or "product"}_{secrets.token_hex(3)}'
+            touched = {(o['store'], pid) for o in plan['ops']
+                       for pid in ([o['product_id']] if o.get('product_id') else o.get('product_ids') or [])}
+            touched |= {(o['store'], o['template_id']) for o in plan['ops'] if o.get('template_id')}
+            backup = {'backup_id': backup_id, 'key': key, 'name': name, 'user': user, 'created_at': stamp,
+                      'products': {}, 'writes': {}, 'created': [], 'photos_added': []}
+            for s, ps in state['stores'].items():
+                for p in ps:
+                    if (s, p['id']) in touched:
+                        backup['products'].setdefault(s, {})[str(p['id'])] = p
+            _aq_backup_write(backup_id, backup)
+            # logged NOW: if the process dies halfway, the change still shows up
+            # (as 'interrupted') with its Undo button
+            _aq_history_append({'type': 'apply', 'key': key, 'name': name, 'user': user,
+                                'backup_id': backup_id, 'status': 'started', 'counts': plan['counts']})
+            _aq_job(jid, total=len(plan['ops']), step='writing to Shopify', backup_id=backup_id)
+
+            def wrote(s, pid, **fields):
+                backup['writes'].setdefault(s, {}).setdefault(str(pid), {}).update(fields)
+                _aq_backup_write(backup_id, backup)
+
+            by_id = {(s, p['id']): p for s, ps in state['stores'].items() for p in ps}
+            photos = target.get('photos') or []
+            new_colours = target.get('new_colours') or []
+            order = {'variants': 0, 'rename': 1, 'chart': 2, 'description': 3, 'photos': 4,
+                     'draft': 5, 'add_colour': 6}
+            for s in AQ_STORES:
+                ops = sorted((o for o in plan['ops'] if o['store'] == s), key=lambda o: order[o['op']])
+                mfs = []
+                for o in ops:
+                    try:
+                        if o['op'] == 'variants':
+                            p = by_id[(s, o['product_id'])]
+                            renamed = o['colour'] != p['colour']
+
+                            def sku_for(sz, v, p=p, renamed=renamed, colour=o['colour']):
+                                if v is None or renamed:
+                                    return _publish_make_sku(name, colour, sz)
+                                if v['size'] != sz:
+                                    return _aq_respell_sku(v['sku'], v['size'], sz)
+                                return None
+                            prod, warn = _aq_put_variants(s, p, o['after'], sku_for)
+                            p['variants'] = _aq_variants_view(prod)     # later ops need the NEW ids
+                            wrote(s, p['id'], variants_after=[[v['size'], v['sku']] for v in p['variants']])
+                            _aq_job_log(jid, s, o['text'] + (f' — {warn}' if warn else ''))
+                        elif o['op'] == 'rename':
+                            mfs.append(_aq_mf(o['product_id'], 'theme', 'cutline', o['after'], 'single_line_text_field'))
+                            fields = {'cutline': o['after']}
+                            if o.get('title_tag'):
+                                mfs.append(_aq_mf(o['product_id'], 'global', 'title_tag', o['title_tag'],
+                                                  'single_line_text_field'))
+                                fields['title_tag'] = o['title_tag']
+                            wrote(s, o['product_id'], **fields)
+                            _aq_job_log(jid, s, o['text'])
+                        elif o['op'] == 'chart':
+                            for pid in o['product_ids']:
+                                mfs.append(_aq_mf(pid, 'custom', 'size_chart', o['html'], 'multi_line_text_field'))
+                                wrote(s, pid, chart_html=o['html'])
+                            _aq_job_log(jid, s, o['text'])
+                        elif o['op'] == 'description':
+                            for pid in o['product_ids']:
+                                _aq_put_product(s, pid, {'body_html': o['html']})
+                                wrote(s, pid, body_html=o['html'])
+                            _aq_job_log(jid, s, o['text'])
+                        elif o['op'] == 'photos':
+                            p = by_id[(s, o['product_id'])]
+                            payload = _aq_photo_payload((photos[o['photo_ref']] or {}).get('images'))
+                            front = o['mode'] == 'front'
+                            ids, errs = _aq_attach(s, p['id'], payload, front)
+                            backup['photos_added'].append({'store': s, 'product_id': p['id'], 'image_ids': ids})
+                            _aq_backup_write(backup_id, backup)
+                            if front and ids:
+                                errs += _aq_point_variants(s, p['id'], ids[0])
+                                wrote(s, p['id'], photos_front=True)
+                            _aq_job_log(jid, s, o['text'] + (' — ' + '; '.join(errs) if errs else ''), ok=not errs)
+                        elif o['op'] == 'draft':
+                            _aq_put_product(s, o['product_id'], {'status': 'draft'})
+                            wrote(s, o['product_id'], status='draft')
+                            _aq_job_log(jid, s, o['text'])
+                        elif o['op'] == 'add_colour':
+                            _aq_add_colour(jid, s, o, by_id[(s, o['template_id'])], name,
+                                           new_colours[o['new_ref']], plan, backup, backup_id)
+                    except Exception as e:
+                        _aq_job_log(jid, s, f'{o["text"]}: FAILED — {e}', ok=False)
+                if mfs:
+                    for e in _aq_metafields_set(s, mfs):
+                        _aq_job_log(jid, s, f'metafield not saved: {e}', ok=False)
+            _aq_invalidate([s for s in AQ_STORES if any(o['store'] == s for o in plan['ops'])])
+            errors = _aq_job_errors(jid)
+            summary = {s: [o['text'] for o in plan['ops'] if o['store'] == s] for s in AQ_STORES}
+            _aq_history_append({
+                'type': 'apply_done', 'key': key, 'backup_id': backup_id,
+                'status': 'done' if not errors else 'partial', 'counts': plan['counts'],
+                'summary': {s: v for s, v in summary.items() if v}, 'errors': errors[:20],
+                'input': {'sizes': target.get('sizes'), 'size_chart': bool(target.get('size_chart')),
+                          'colours': [{'row_id': _aq_short(c.get('row_id'), 40), 'action': _aq_short(c.get('action'), 8),
+                                       'labels': {k: _aq_short(v, 40) for k, v in (c.get('labels') or {}).items()
+                                                  if k in AQ_STORES}}
+                                      for c in (target.get('colours') or []) if isinstance(c, dict)][:40],
+                          'new_colours': [{k: _aq_short(v, 40) for k, v in ((c or {}).get('labels') or {}).items()
+                                           if k in AQ_STORES} for c in new_colours if isinstance(c, dict)][:10],
+                          'photos': sum(_aq_count((p or {}).get('images')) for p in photos if isinstance(p, dict)),
+                          'descriptions': sorted(k for k in (target.get('descriptions') or {}) if k in AQ_STORES),
+                          'supplier': _aq_short(target.get('supplier_note'), 300) or None}})
+            _aq_job(jid, status='done' if not errors else 'partial', step='done',
+                    result={'backup_id': backup_id, 'errors': errors},
+                    finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+        except Exception as e:
+            if backup_id:
+                _aq_history_append({'type': 'apply_done', 'key': key, 'backup_id': backup_id,
+                                    'status': 'error', 'errors': [str(e)[:300]]})
+            _aq_job(jid, status='error', step='stopped', errors=[str(e)[:400]],
+                    finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+
+
+def _aq_add_colour(jid, s, o, tpl, name, nc, plan, backup, backup_id):
+    """A colour the supplier has that the listing lacks: a new product in the
+    family, built like the publish flow builds one (_publish_one_variant) from
+    the family's own copy, tags, price and siblings collection."""
+    hdrs = shopify_headers(s)
+    base = shopify_url(s, '')
+    payload = _aq_photo_payload((nc or {}).get('images'))   # a bad photo must fail BEFORE a product exists
+    # A family WITHOUT theme.siblings gets none either: inventing one would put
+    # the new colour under another family key than its sisters ('name:…').
+    coll_id, actual = None, ''
+    if tpl['sib']:
+        coll_id, actual, _reused = _ensure_siblings_collection(s, name, tpl['sib'], hdrs, base)
+    chart_html = next((c['html'] for c in plan['ops'] if c['op'] == 'chart' and c['store'] == s), '') \
+        or tpl['chart_html']
+    desc = next((c['html'] for c in plan['ops'] if c['op'] == 'description' and c['store'] == s), '') \
+        or tpl['body_html']
+    v0 = tpl['variants'][0] if tpl['variants'] else {}
+    try:
+        res = _publish_one_variant(
+            store=s, product_name=name, color=o['label'], sizes=o['sizes'],
+            description_html=desc, meta_description=tpl['description_tag'], m_title_specs=tpl['specs'],
+            price=v0.get('price'), compare_at_price=v0.get('compare_at'), product_type=tpl['type'],
+            cat_tags=tpl['tags'], images=[], collection_id=coll_id, actual_handle=actual,
+            size_chart_html=chart_html, activate=False, hdrs=hdrs, base=base)
+    except Exception:
+        try:                                  # created before it failed? then undo must know it
+            found = _find_product_by_handle(s, o['handle'], hdrs)
+            if found:
+                backup['created'].append({'store': s, 'product_id': found['id'], 'label': o['label']})
+                _aq_backup_write(backup_id, backup)
+        except Exception:
+            pass
+        raise
+    if res.get('error'):
+        raise RuntimeError(res['error'])
+    if res.get('reused'):
+        raise RuntimeError(f'a product at {o["handle"]} already exists — left untouched')
+    pid = res['product_id']
+    backup['created'].append({'store': s, 'product_id': pid, 'label': o['label']})
+    _aq_backup_write(backup_id, backup)
+    notes = [e for e in (res.get('metafield_errors') or []) if 'skipped (empty value)' not in e]
+    prod = _aq_fetch_product(s, pid) or {}
+    # the sister colours' tax + stock settings (the publish flow leaves tax at Shopify's default)
+    fix = [{'id': v['id'], 'taxable': bool(v0.get('taxable')), 'inventory_policy': v0.get('policy') or 'deny'}
+           for v in prod.get('variants') or []]
+    if fix:
+        try:
+            _aq_put_product(s, pid, {'variants': fix})
+        except Exception as e:
+            notes.append(f'tax/stock settings not copied ({str(e)[:80]})')
+    if coll_id:                               # the publish flow posts the swatch membership unchecked
+        r = _shopify_call('get', shopify_url(s, f'collects.json?product_id={pid}&collection_id={coll_id}'),
+                          hdrs, timeout=30)
+        if r.status_code == 200 and not (r.json() or {}).get('collects'):
+            r2 = _shopify_call('post', shopify_url(s, 'collects.json'), hdrs, timeout=30,
+                               json={'collect': {'product_id': pid, 'collection_id': coll_id}})
+            if r2.status_code not in (200, 201):
+                notes.append('not yet in the colour-swatch group (the daily siblings check adds it)')
+    ids, errs = _aq_attach(s, pid, payload, True)
+    if ids:
+        errs += _aq_point_variants(s, pid, ids[0])
+    if o['activate'] and ids:
+        _aq_put_product(s, pid, {'status': 'active'})
+    if o['activate'] and not ids:
+        notes.append('no photo landed, so it stays draft')
+    notes += errs
+    _aq_job_log(jid, s, o['text'] + (' — ' + '; '.join(notes) if notes else ''), ok=not errs)
+
+
+def _aq_html_text(h):
+    import html as _h
+    return re.sub(r'\s+', ' ', _h.unescape(re.sub(r'<[^>]+>', ' ', h or ''))).strip()
+
+
+def _aq_undo_run(jid, backup_id, user):
+    """Undo ONE apply, field by field: only what that apply wrote, and only
+    where Shopify still holds what it wrote. A field someone (or a later apply,
+    the chart self-heal, margin watch) changed since is left alone and named in
+    the log. Changes are undone newest first (the route and this job check)."""
+    with _AQ_APPLY_LOCK:
+        try:
+            with open(_aq_backup_path(backup_id), encoding='utf-8') as f:
+                bk = json.load(f)
+            key = bk.get('key')
+            rows = _aq_history_rows(key, limit=100000)
+            me = next((r for r in rows if r.get('backup_id') == backup_id), None)
+            if me and me.get('undone'):
+                raise RuntimeError('This change was already undone')
+            if me and any(r['backup_id'] != backup_id and not r.get('undone') and r.get('ts', '') > me.get('ts', '')
+                          and r.get('status') != 'error' for r in rows):
+                raise RuntimeError('Undo the newer change first — changes are undone newest first')
+            writes = bk.get('writes') or {}
+            total = sum(len(v) for v in writes.values()) + len(bk.get('created') or []) \
+                + len(bk.get('photos_added') or [])
+            _aq_job(jid, total=total, step='restoring')
+            for pa in bk.get('photos_added') or []:
+                s = pa['store']
+                for img in pa.get('image_ids') or []:
+                    _shopify_call('delete', shopify_url(s, f'products/{pa["product_id"]}/images/{img}.json'),
+                                  shopify_headers(s), timeout=30)
+                _aq_job_log(jid, s, f'removed {len(pa.get("image_ids") or [])} added photo(s)')
+            for s, prods in writes.items():
+                gids = [f'gid://shopify/Product/{pid}' for pid in prods]
+                cur_mf = {}
+                for i in range(0, len(gids), 50):
+                    for n in (_aq_gql(s, _AQ_Q_NODES, {'ids': gids[i:i + 50]}).get('nodes') or []):
+                        if n and n.get('legacyResourceId'):
+                            cur_mf[str(n['legacyResourceId'])] = {k: ((n.get(k) or {}).get('value'))
+                                                                  for k in ('cut', 'sib', 'sc', 'tt', 'dt', 'spec')}
+                mfs = []
+                for pid, w in prods.items():
+                    before = (bk['products'].get(s) or {}).get(pid)
+                    if not before:
+                        continue
+                    label = before.get('colour') or pid
+                    try:
+                        now = _aq_fetch_product(s, int(pid))
+                        if not now:
+                            _aq_job_log(jid, s, f'{label}: product is gone — skipped', ok=False)
+                            continue
+                        view = _aq_product_view(s, now, cur_mf.get(pid, {}))
+                        restored, skipped = [], []
+                        if 'variants_after' in w:
+                            if [[v['size'], v['sku']] for v in view['variants']] == w['variants_after']:
+                                skus = {_aq_norm_size(v['size']): v['sku'] for v in before['variants']}
+                                _aq_put_variants(s, view, [v['size'] for v in before['variants']],
+                                                 lambda sz, v: skus.get(_aq_norm_size(sz)) or None)
+                                restored.append('sizes')
+                                view = _aq_product_view(s, _aq_fetch_product(s, int(pid)) or now,
+                                                        cur_mf.get(pid, {}))
+                            else:
+                                skipped.append('sizes')
+                        if w.get('photos_front') or 'variants_after' in w:
+                            imgs = {i['id'] for i in view['images']}
+                            was = {_aq_norm_size(v['size']): v.get('image_id') for v in before['variants']}
+                            per = {v['id']: was.get(_aq_norm_size(v['size'])) for v in view['variants']
+                                   if was.get(_aq_norm_size(v['size'])) in imgs}
+                            if per:
+                                for e in _aq_point_variants(s, int(pid), None, only=per):
+                                    _aq_job_log(jid, s, f'{label}: {e}', ok=False)
+                        upd = {}
+                        if 'status' in w:
+                            if view['status'] == w['status']:
+                                upd['status'] = before['status']
+                                restored.append('status')
+                            else:
+                                skipped.append('status')
+                        if 'body_html' in w:
+                            if _aq_html_text(view['body_html']) == _aq_html_text(w['body_html']):
+                                upd['body_html'] = before['body_html'] or ''
+                                restored.append('description')
+                            else:
+                                skipped.append('description')
+                        if upd:
+                            _aq_put_product(s, int(pid), upd)
+                        for field, ns, k, typ, cur in (
+                                ('cutline', 'theme', 'cutline', 'single_line_text_field', view['colour']),
+                                ('title_tag', 'global', 'title_tag', 'single_line_text_field', view['title_tag']),
+                                ('chart_html', 'custom', 'size_chart', 'multi_line_text_field', view['chart_html'])):
+                            if field not in w:
+                                continue
+                            same = (_size_chart_from_html(cur) == _size_chart_from_html(w[field])
+                                    if field == 'chart_html' else (cur or '').strip() == (w[field] or '').strip())
+                            if not same:
+                                skipped.append(field.replace('_html', '').replace('_', ' '))
+                                continue
+                            old = before.get({'cutline': 'colour', 'title_tag': 'title_tag',
+                                              'chart_html': 'chart_html'}[field]) or ''
+                            if old:
+                                mfs.append(_aq_mf(pid, ns, k, old, typ))
+                            else:
+                                _aq_mf_delete(s, int(pid), ns, k)       # the apply created it
+                            restored.append(field.replace('_html', '').replace('_', ' '))
+                        msg = f'{label}: restored {", ".join(restored) or "nothing"}'
+                        if skipped:
+                            msg += f' — left alone because it changed since: {", ".join(skipped)}'
+                        _aq_job_log(jid, s, msg)
+                    except Exception as e:
+                        _aq_job_log(jid, s, f'{label}: FAILED — {e}', ok=False)
+                for e in (_aq_metafields_set(s, mfs) if mfs else []):
+                    _aq_job_log(jid, s, f'metafield not restored: {e}', ok=False)
+            for c in bk.get('created') or []:
+                try:
+                    _aq_put_product(c['store'], c['product_id'], {'status': 'draft'})
+                    _aq_job_log(jid, c['store'], f'new colour "{c["label"]}" set to draft '
+                                                 f'(delete it in Shopify if you don\'t want it)')
+                except Exception as e:
+                    _aq_job_log(jid, c['store'], f'new colour "{c["label"]}": FAILED — {e}', ok=False)
+            _aq_invalidate()
+            _aq_history_append({'type': 'undo', 'key': key, 'name': bk.get('name') or '', 'user': user,
+                                'backup_id': backup_id})
+            errors = _aq_job_errors(jid)
+            _aq_job(jid, status='done' if not errors else 'partial', step='done',
+                    result={'backup_id': backup_id, 'errors': errors},
+                    finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+        except Exception as e:
+            _aq_job(jid, status='error', step='stopped', errors=[str(e)[:400]],
+                    finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+
+
+# ── routes (all gated: supplier data + write access) ──────────────────────────
+
+_AQ_BODY_LIMITS = {'extract': 30_000_000, 'apply': _AQ_MAX_BODY, 'plan': 3_000_000,
+                   'copy': 1_000_000, 'undo': 100_000}
+
+
+def _aq_body_error(kind):
+    """None when the request body may be read, else a (response, status).
+    A body without a length (chunked) is refused: nothing below would bound it."""
+    cl = request.content_length
+    if cl is None:
+        return jsonify({'error': 'Request without a length — reload the page and try again'}), 411
+    if cl > _AQ_BODY_LIMITS[kind]:
+        return jsonify({'error': 'Too much at once — send fewer or smaller files/photos'}), 413
+    return None
+
+
+@app.route('/api/aq/search')
+@require_droplet_token
+def api_aq_search():
+    try:
+        return jsonify(_aq_search(request.args.get('q', ''), request.args.get('view', 'attention'),
+                                  force=request.args.get('refresh') == '1'))
+    except Exception as e:
+        return jsonify({'error': f'Search failed: {str(e)[:200]}'}), 500
+
+
+@app.route('/api/aq/family')
+@require_droplet_token
+def api_aq_family():
+    key = (request.args.get('key') or '').strip()[:200]
+    if not key:
+        return jsonify({'error': 'key required'}), 400
+    try:
+        state = _aq_family_state(key, force_index=request.args.get('refresh') == '1')
+    except Exception as e:
+        return jsonify({'error': f'Could not read the listing: {str(e)[:200]}'}), 500
+    if not state:
+        return jsonify({'error': 'Listing not found in any store'}), 404
+    return jsonify(_aq_family_payload(state))
+
+
+@app.route('/api/aq/extract', methods=['POST'])
+@require_droplet_token
+def api_aq_extract():
+    bad = _aq_body_error('extract')
+    if bad:
+        return bad
+    body = request.get_json(silent=True) or {}
+    try:
+        result, used, skipped = _aq_extract(body.get('files') or [], body.get('text') or '',
+                                            body.get('context') or {})
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': f'Reading the supplier info failed: {str(e)[:200]}'}), 502
+    return jsonify({'extracted': result, 'files_used': used, 'files_skipped': skipped})
+
+
+@app.route('/api/aq/copy', methods=['POST'])
+@require_droplet_token
+def api_aq_copy():
+    bad = _aq_body_error('copy')
+    if bad:
+        return bad
+    body = request.get_json(silent=True) or {}
+    key = (body.get('key') or '').strip()
+    if not key:
+        return jsonify({'error': 'key required'}), 400
+    facts = _aq_facts_text(body)
+    if not facts:
+        return jsonify({'error': 'Enter the material or at least one fact first'}), 400
+    try:
+        state = _aq_family_state(key)
+    except Exception as e:
+        return jsonify({'error': f'Could not read the listing: {str(e)[:200]}'}), 500
+    if not state:
+        return jsonify({'error': 'Listing not found'}), 404
+    stores = [s for s in (body.get('stores') or AQ_STORES) if s in state['stores']]
+    out, errors = {}, {}
+    with _aq_cf.ThreadPoolExecutor(max(1, len(stores))) as ex:
+        futs = {s: ex.submit(_aq_copy_one, s, _aq_store_description(state['stores'][s])[0], facts)
+                for s in stores}
+        for s, f in futs.items():
+            try:
+                out[s] = f.result()
+            except Exception as e:
+                errors[s] = str(e)[:200]
+    return jsonify({'copy': out, 'errors': errors})
+
+
+@app.route('/api/aq/plan', methods=['POST'])
+@require_droplet_token
+def api_aq_plan():
+    bad = _aq_body_error('plan')
+    if bad:
+        return bad
+    body = request.get_json(silent=True) or {}
+    key = (body.get('key') or '').strip()
+    if not key:
+        return jsonify({'error': 'key required'}), 400
+    try:
+        state = _aq_family_state(key)
+    except Exception as e:
+        return jsonify({'error': f'Could not read the listing: {str(e)[:200]}'}), 500
+    if not state:
+        return jsonify({'error': 'Listing not found'}), 404
+    try:
+        plan = _aq_plan(state, body.get('target') or {})
+    except Exception as e:
+        return jsonify({'error': f'Could not build the preview: {str(e)[:200]}'}), 500
+    return jsonify({**_aq_plan_public(plan), 'sig': _aq_state_sig(state)})
+
+
+@app.route('/api/aq/apply', methods=['POST'])
+@require_droplet_token
+def api_aq_apply():
+    bad = _aq_body_error('apply')
+    if bad:
+        return bad
+    body = request.get_json(silent=True) or {}
+    key = (body.get('key') or '').strip()
+    if not key or not body.get('sig'):
+        return jsonify({'error': 'Preview the changes first'}), 400
+    if _AQ_APPLY_LOCK.locked():
+        return jsonify({'error': 'Another change is being written right now — try again in a moment'}), 409
+    jid = _aq_job_new('apply', key)
+    threading.Thread(target=_aq_apply_run, args=(jid, key, body.get('target') or {}, body['sig'], _aq_user()),
+                     daemon=True).start()
+    return jsonify({'job_id': jid})
+
+
+@app.route('/api/aq/undo', methods=['POST'])
+@require_droplet_token
+def api_aq_undo():
+    bad = _aq_body_error('undo')
+    if bad:
+        return bad
+    body = request.get_json(silent=True) or {}
+    bid = str(body.get('backup_id') or '')
+    try:
+        path = _aq_backup_path(bid)
+    except ValueError:
+        return jsonify({'error': 'Unknown change'}), 400
+    if not os.path.exists(path):
+        return jsonify({'error': 'The backup of this change is not on the server'}), 404
+    rows = _aq_history_rows(None, limit=100000)
+    me = next((r for r in rows if r.get('backup_id') == bid), None)
+    if not me:
+        return jsonify({'error': 'This change is not in the log'}), 404
+    if me.get('undone'):
+        return jsonify({'error': 'This change was already undone'}), 409
+    newer = [r for r in rows if r.get('key') == me.get('key') and not r.get('undone')
+             and r.get('status') != 'error' and r.get('ts', '') > me.get('ts', '')]
+    if newer:
+        return jsonify({'error': 'Undo the newer change first — changes are undone newest first'}), 409
+    if _AQ_APPLY_LOCK.locked():
+        return jsonify({'error': 'Another change is being written right now — try again in a moment'}), 409
+    jid = _aq_job_new('undo', '')
+    threading.Thread(target=_aq_undo_run, args=(jid, bid, _aq_user()), daemon=True).start()
+    return jsonify({'job_id': jid})
+
+
+@app.route('/api/aq/job')
+@require_droplet_token
+def api_aq_job():
+    with _AQ_JOBS_LOCK:
+        j = _AQ_JOBS.get(request.args.get('id') or '')
+        j = json.loads(json.dumps(j)) if j else None
+    if not j:
+        return jsonify({'error': 'unknown job id'}), 404
+    return jsonify(j)
+
+
+@app.route('/api/aq/history')
+@require_droplet_token
+def api_aq_history():
+    key = (request.args.get('key') or '').strip() or None
+    return jsonify({'history': list(reversed(_aq_history_rows(key, limit=100)))})
 
 
 class _SpyShieldAccessLogFilter(logging.Filter):

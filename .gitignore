@@ -90,3 +90,9 @@ backend/hf_media/
 spy_shield.jsonl
 backend/spy_shield.jsonl
 backend/spy_shield_digest.json
+
+# After Quotation tool: change log + per-apply product backups (live data, droplet only)
+aq_history.jsonl
+backend/aq_history.jsonl
+aq_backups/
+backend/aq_backups/

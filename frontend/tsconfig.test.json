@@ -24,6 +24,7 @@
     "lib/scrapeError.ts",
     "lib/buildInfo.ts",
     "lib/spyShield.ts",
+    "lib/afterQuotation.ts",
     "tests/**/*.ts"
   ]
 }
