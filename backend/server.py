@@ -16465,7 +16465,20 @@ def _md_strip(s):
     # '* Eigenschap: …' / '• …' list markers → '- …' (the publish path only
     # knows '-' and '•'; the model sometimes answers with '*').
     s = re.sub(r'^[ \t]*[*•·][ \t]+', '- ', s, flags=re.M)
+    # No emoji ever reaches a store: Google Merchant Center disapproves them
+    # (.com had 22 descriptions with ✔/✅ bullets, venek 2026-09-29). A line
+    # that STARTS with one used it as a bullet marker → a '- ' bullet.
+    s = re.sub(r'^[ \t]*(?:' + _COPY_EMOJI_RE.pattern + r')+[ \t]*', '- ', s, flags=re.M)
+    s = _COPY_EMOJI_RE.sub('', s)
+    s = re.sub(r'(?<=\S)[ \t]{2,}', ' ', s)
+    s = re.sub(r'(?<=\S)[ \t]+$', '', s, flags=re.M)      # the space a trailing emoji leaves
     return s
+
+
+# Emoji + decorative symbols (✔ ✅ ★ ☀ 🌙 ✨ ➡ ● …) — never in shop copy.
+_COPY_EMOJI_RE = re.compile(
+    '[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U00002B00-\U00002BFF\U0000FE0F\U0000200D\U000020E3'
+    '\U00002190-\U000021FF\U00002300-\U000023FF\U000025A0-\U000025FF\U00003297\U00003299\U000024C2]')
 
 
 def _bullet_leadin_html(b):
@@ -25094,7 +25107,7 @@ def api_lighting_publish():
                              + ' (they show the main photo)')
         # m_title_specs is op de lighting-store een rich_text_field (bij Vionna
         # multi_line) — schrijf de juiste vorm, met fallback op platte tekst.
-        mts = (c.get('m_title_specs') or '').strip()
+        mts = _md_strip(c.get('m_title_specs') or '').strip()      # no markdown, no emoji
         if mts:
             rich = _rich_text_value(mts)
             ok = False
@@ -25117,7 +25130,7 @@ def api_lighting_publish():
                     print(f'[lighting] m_title_specs error: {e}')
             if not ok:
                 mf_errors.append('m_title_specs: rich_text, single_line and multi_line all failed')
-        meta_desc = (c.get('meta_description') or '').strip()
+        meta_desc = _md_strip(c.get('meta_description') or '').strip()   # no markdown, no emoji
         if meta_desc:
             try:
                 rr = req.post(shopify_url(store, f'products/{pid}/metafields.json'), headers=hdrs,
