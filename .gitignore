@@ -109,3 +109,24 @@ backend/aq_size_backfill.json
 # Name-pool watch: 'already warned' state (droplet only; survives deploy restarts)
 name_pool_watch.json
 backend/name_pool_watch.json
+# Other droplet state files written next to server.py (public repo: never commit)
+siblings_heal.json
+backend/siblings_heal.json
+lighting_md_fix.json
+backend/lighting_md_fix.json
+traffic_cache.json
+backend/traffic_cache.json
+taxonomy_backfill.json
+backend/taxonomy_backfill.json
+taxonomy_fill.json
+backend/taxonomy_fill.json
+product_snapshots/
+backend/product_snapshots/
+lighting_channels.json
+backend/lighting_channels.json
+blog_performance.jsonl
+backend/blog_performance.jsonl
+blog_views.json
+backend/blog_views.json
+blog_playbook.json
+backend/blog_playbook.json

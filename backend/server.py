@@ -20496,19 +20496,30 @@ def api_update():
         return jsonify({'success': False, 'updated': [], 'errors': errors,
                         'sha': sha, 'pinned': pinned}), 500
 
-    updated = []
+    updated, warnings = [], []
     for repo_path, dest, content in fetched:
         try:
             _write_file_atomic(dest, content)
             updated.append(repo_path)
         except Exception as e:
+            if repo_path in _UPDATER_OPTIONAL:
+                # A data file must never hold a code deploy hostage: if names.ts
+                # can't be written the new code still ships; the boot sync
+                # retries it and the name-pool status reports the list as stale.
+                warnings.append(f'{repo_path}: {e}')
+                print(f'[self-update] could not write {repo_path}: {e} — continuing')
+                continue
             # Stop before version.txt: the next tick sees the old version and retries.
             return jsonify({'success': False, 'updated': updated, 'errors': [f'{repo_path}: {e}'],
                             'sha': sha, 'pinned': pinned}), 500
 
     _schedule_restart()
-    return jsonify({'success': True, 'updated': updated, 'restarting': True,
+    return jsonify({'success': True, 'updated': updated, 'restarting': True, 'warnings': warnings,
                     'sha': sha, 'pinned': pinned})
+
+
+# Files whose write may fail without failing the deploy (data, not code).
+_UPDATER_OPTIONAL = {'frontend/lib/names.ts'}
 
 
 def _updater_files():

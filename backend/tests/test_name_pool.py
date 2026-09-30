@@ -306,6 +306,36 @@ def test_updater_writes_nothing_when_one_fetch_fails(monkeypatch, tmp_path):
     assert not (tmp_path / 'frontend').exists()
 
 
+def test_a_names_ts_write_failure_never_holds_the_code_deploy(monkeypatch, tmp_path):
+    # frontend/lib not writable on the droplet: the code still ships (the boot
+    # sync retries the list); a failing CODE file still stops before version.txt
+    restarts, writes = _updater(monkeypatch, tmp_path)
+    real_write = server._write_file_atomic
+
+    def picky(p, c):
+        if p.endswith('names.ts'):
+            raise PermissionError('read-only')
+        return real_write(p, c)
+    monkeypatch.setattr(server, '_write_file_atomic', picky)
+    r = server.app.test_client().post('/api/update')
+    body = r.get_json()
+    assert r.status_code == 200 and body['success'] and restarts == [1]
+    assert body['updated'][-1] == 'backend/version.txt' and 'frontend/lib/names.ts' not in body['updated']
+    assert any('names.ts' in w for w in body['warnings'])
+
+    (tmp_path / 'b').mkdir()
+    restarts2, _ = _updater(monkeypatch, tmp_path / 'b')
+
+    def broken_code(p, c):
+        if p.endswith('server.py'):
+            raise PermissionError('read-only')
+        return real_write(p, c)
+    monkeypatch.setattr(server, '_write_file_atomic', broken_code)
+    r = server.app.test_client().post('/api/update')
+    assert r.status_code == 500 and restarts2 == []
+    assert not (tmp_path / 'b' / 'backend' / 'version.txt').exists()
+
+
 def test_every_repo_file_server_reads_outside_backend_is_shipped_by_the_updater():
     shipped = {repo for repo, _ in server._updater_files()}
     backend = os.path.dirname(os.path.abspath(server.__file__))
