@@ -5305,11 +5305,18 @@ _TAXONOMY_MEMO_TTL = 6 * 3600
 _TAXONOMY_MEMO_LOCK = threading.Lock()
 
 
+def _taxonomy_memo_key(title, category=None):
+    """Family + the category it is published as: a re-publish after a type fix
+    (Carina: shoes -> trousers) must not get the old shoe verdict (sub:loafers)."""
+    name = _norm_name(title)
+    return (name, (category or '').strip().lower()) if name else None
+
+
 def _taxonomy_for_family(title, description, image_url=None, category=None):
-    """Memoised classification keyed on _norm_name(title) (TTL 6 h). Only a
-    successful verdict is memoised, so a transient failure is retried on the next
-    colour instead of poisoning the whole family."""
-    key = _norm_name(title)
+    """Memoised classification keyed on the family name and its category (TTL
+    6 h). Only a successful verdict is memoised, so a transient failure is
+    retried on the next colour instead of poisoning the whole family."""
+    key = _taxonomy_memo_key(title, category)
     now = time.time()
     if key:
         with _TAXONOMY_MEMO_LOCK:
@@ -5320,6 +5327,10 @@ def _taxonomy_for_family(title, description, image_url=None, category=None):
     if res and key:
         with _TAXONOMY_MEMO_LOCK:
             _TAXONOMY_MEMO[key] = (res, now)
+            # publish classifies first WITHOUT a category (_category_for_publish),
+            # then tags WITH the one it got: same verdict, same call
+            if not category and res.get('category'):
+                _TAXONOMY_MEMO[_taxonomy_memo_key(title, res['category'])] = (res, now)
     return res
 
 
@@ -5377,6 +5388,11 @@ def _category_for_publish(data, title, image_url=None):
     tag step right after it reuses the same verdict (one call per family)."""
     cat = (data.get('category') or '').strip().lower()
     if cat in CATEGORY_TAGS:
+        # The import's type check settled `category` (v1.324). If the operator
+        # re-typed the product type in Review afterwards, the latest word wins.
+        typed = _garment_cat(data.get('product_type'))
+        if typed and not _same_type(typed, cat):
+            return typed
         return cat
     raw = data.get('description', '') or ''
     if _taxonomy_enabled():
@@ -5782,6 +5798,403 @@ def _product_type_for_publish(incoming_pt, category):
 
 
 # ============================================================================
+# Import type check (v1.324)
+# ----------------------------------------------------------------------------
+# Carina (Sep 2026): the competitor's TITLE and description said moccasins, but
+# its own product_type ("Dress Pants Women"), its tags, its XS–XL sizes and its
+# photos all showed trousers. The import took the title, so 24 listings went
+# live in three languages as shoes. Keywords, copy, SEO title and sub-tag were
+# then all written FROM that wrong type, so nothing downstream could notice.
+#
+# The type is now decided ONCE, at import, before keywords and copy:
+#   1. deterministic signals from the competitor's own fields: title, product
+#      type, tags and sizes. The description only supports — it is full of
+#      styling words ("wear it with sneakers");
+#   2. when they disagree, the PHOTOS decide: one vision call that gets no
+#      competitor text (so it cannot anchor on the wrong words), accepted only
+#      when a signal of the competitor backs it;
+#   3. otherwise the operator picks. A failed vision call (429, timeout) is never
+#      read as agreement (storing ≠ oordeel).
+
+# Phrases that contain a type word but are not that type. Replaced by a space
+# before matching. "dress pants" = trousers (Carina's own product_type), a
+# "short jacket" is a jacket, "veste en jean" a jacket.
+_GT_NOISE_RE = re.compile(
+    r"\bdress[- ](?=(?:pants|trousers|shoes?|shirts?|slacks)\b)"
+    r"|\bshort[- ]sleeves?|\bmanches?\s+courtes?|\bpull[- ]on\b|\bbootcut\b|\ben\s+(?:jeans?|denim)\b|\bmarimekko\b"
+    # a jean/denim JACKET is a jacket ("veste jean oversize", "jean jacket")
+    r"|(?<=\bveste )(?:jeans?|denim)\b|(?<=\bvestes )(?:jeans?|denim)\b|\b(?:jeans?|denim)[- ](?=(?:jackets?|jakke|veste|blouson)\b)"
+    r"|\bgarde[- ]robe",
+    re.I)
+
+# Knitted ACCESSORIES: "bonnet tricoté", "strikhue", "neulepipo" — the knit word
+# is the material, the hat/scarf/glove is the product. Only when no knitted
+# GARMENT noun is there too ("pull à col écharpe" stays a sweater).
+_GT_KNIT_ACC_RE = re.compile(
+    r"bonnet|beanie|\bhuer?\b|strikhue|uldhue|pipo\b|pipot\b|hattu|mütze|muetze|\bschals?\b|[ée]charpe|"
+    r"t[øo]rkl[æa]de|scarf|scarves|huivi|\bsjal|handsk|vanter\b|lapas|käsine|kasine|\bgants?\b|handschuh|"
+    r"handschoen|headband|pannebånd|otsanauha", re.I)
+_GT_KNIT_NOUN_RE = re.compile(
+    r"sweaters?\b|cardigan|\bpulls?\b|pullover|\bjumpers?\b|hoodie|sweatshirt|\bsweats?\b|tr[øo]je|"
+    r"villapaita|\bgilets?\b|poncho|\btrui|\bneule\b|neulepusero|neuletakki|strikbluse|strikjakke|strikkjole", re.I)
+
+# First match wins. Dress/skirt/pants before shoes ("jupe ballerine"); shoes
+# before knitwear and tops ("knit sneakers", "bottes à talon haut", "high-top
+# sneakers"); accessories LAST ("robe portefeuille" is a wrap dress, "doudoune à
+# ceinture" a belted puffer — not a wallet, not a belt). Word-final
+# matching for DK/FI compounds ("sommerkjole", "farkkushortsit", "hjemmesko");
+# whole words where a short token hides in others ("robe" in "garderobe",
+# "hame" in "chameau", "sko" in "skotsk"). The singular "short" is an adjective
+# in English ("short faux fur jacket"), so it only counts when nothing else does.
+_GARMENT_CAT_RES = [
+    ('swim', re.compile(
+        r"bikini|tankini|monokini|swimsuit|swimwear|maillots?\s+de\s+bain|badedragt|badetøj|badetoj|badpak|"
+        r"uimapuku|uima-asu|badeanzug", re.I)),
+    ('dress', re.compile(
+        r"(?<!ad)dress(?:es)?\b|\brobes?\b|kjole|(?<!mari)mekko|jurk|kleid(?:er|chen)?\b|\bgowns?\b|jumpsuit|"
+        r"playsuit|combinaison|\bcombi[- ]?shorts?\b|buksedragt|haalari", re.I)),
+    ('skirt', re.compile(
+        r"skirts?\b|\bjupes?\b|nederdel|hame(?:et|en)?\b|\brok(?:je|ken)?\b|\bskorts?\b|shorts\b|bermuda|"
+        r"shortsit", re.I)),
+    ('pants', re.compile(
+        r"pants\b|trousers?\b|pantalons?\b|buks|housu|\bfarkut\b|\bjeans?\b|legging|jegging|\bchinos?\b|jogger|"
+        r"\bslacks\b|broek|\bhosen?\b|palazzo", re.I)),
+    ('shoes', re.compile(
+        r"shoe|sneaker|\btrainers\b|boots?\b|booties|loafer|mo[ck]{1,2}as{1,2}i{1,2}n|sandal|sandaal|"
+        r"\bheels?\b|\bpumps?\b|stiletto|espadrille|slipper|\bflats\b|ball[ae]rin|\bclogs?\b|\bmules?\b|brogue|"
+        r"oxfords\b|(?<!di)sko(?:en|ene)?\b|st[øo]vle|chaussure|\bbaskets?\b|\bbottes?\b|bottine|escarpin|"
+        r"\bsabots?\b|chausson|\btalons?\b|\btongs\b|keng|kenk|saapas|saappa|nilkkuri|tennari|"
+        r"lenkkari|tossu|(?<!hand)schoen|laars|laarzen|(?<!hand)schuh|stiefel|pantoufle", re.I)),
+    ('knitwear', re.compile(
+        r"sweaters?\b|cardigan|\bpulls?\b|pullover|\bjumpers?\b|hoodie|sweatshirt|\bsweats?\b|strik|tr[øo]je|"
+        r"neule|villapaita|\bmaille\b|tricot|\bgilets?\b|poncho|gebreid|\btrui(?:en)?\b|\bknit", re.I)),
+    ('outerwear', re.compile(
+        r"jackets?\b|\bcoats?\b|blazer|parka|trench|puffer|anorak|bomber|doudoune|manteau|\bvestes?\b|blouson|"
+        r"imperm[ée]able|frakke|jakke|overt[øo]j|takki|\bjas(?:je|sen)?\b|mantel|jacke|\bk[åa]ber?\b", re.I)),
+    ('top', re.compile(
+        r"blouse|bluse|chemisier|\bchemises?\b|shirts?\b|\btops?\b|\btee\b|camisole|\bcami\b|tuni(?:que|ka|c)|"
+        r"\bbody\b|bodysuit|skjorte|paita|pusero|toppi|overdel|d[ée]bardeur|\bhaut\b|bustier", re.I)),
+    ('accessory', None),                   # via _nb_category: bags, jewellery, hats, belts…
+    ('skirt', re.compile(r"\bshort\b", re.I)),
+]
+
+# Categories that overlap in real listings — a disagreement between them is not
+# a Carina: anything knitted may be typed "Knitwear" (knit dress, knit shorts),
+# shorts are "Pants" at many shops (our taxonomy files them under skirt), a
+# shirt jacket is both. Measured on 9,406 competitor products (30 Sep 2026).
+_GT_SOFT_PAIRS = {frozenset(p) for p in (
+    ('knitwear', 'top'), ('knitwear', 'outerwear'), ('knitwear', 'dress'), ('knitwear', 'skirt'),
+    ('knitwear', 'pants'), ('skirt', 'pants'), ('top', 'outerwear'))}
+
+# canonical English token per category — for the image steps and product_type
+_CAT_TYPE_TOKEN = {'dress': 'dress', 'top': 'blouse', 'skirt': 'skirt', 'pants': 'trousers',
+                   'knitwear': 'sweater', 'outerwear': 'jacket', 'shoes': 'shoes', 'swim': 'swimsuit',
+                   'accessory': 'accessory'}
+_TYPE_SIGNAL_SOURCES = ('title', 'product_type', 'tags', 'description')
+_TYPE_SOURCE_LABEL = {'title': 'title', 'product_type': 'product type', 'tags': 'tags',
+                      'description': 'description', 'sizes': 'sizes', 'photos': 'photos'}
+_TYPE_VISION_MODEL = 'claude-sonnet-4-6'
+
+
+def _garment_cat(text):
+    """The CATEGORY_TAGS category a piece of competitor text names, or None.
+    One lexicon for titles, product types, tags and keywords."""
+    t = _GT_NOISE_RE.sub(' ', str(text or '').lower())
+    if not t.strip():
+        return None
+    for cat, rx in _GARMENT_CAT_RES:
+        if rx is None:
+            if _nb_category(t) in ('bag', 'accessory'):
+                return cat
+        elif rx.search(t):
+            if cat == 'knitwear' and not _GT_KNIT_NOUN_RE.search(t) and (
+                    _GT_KNIT_ACC_RE.search(t) or _nb_category(t) in ('bag', 'accessory')):
+                return 'accessory'             # a knitted hat / scarf / glove
+            return cat
+    return None
+
+
+def _type_family(cat):
+    """Coarse family: shoes / accessory / swim / garment (None stays None)."""
+    return cat if cat in ('shoes', 'accessory', 'swim') or cat is None else 'garment'
+
+
+def _same_type(a, b):
+    return a == b or frozenset((a, b)) in _GT_SOFT_PAIRS
+
+
+def _tags_cat(tags):
+    """Category the competitor's tags name — only when they name exactly one
+    (collection tags often list several: 'robe, jupe, soldes')."""
+    if isinstance(tags, str):
+        tags = tags.split(',')
+    cats = {c for c in (_garment_cat(t) for t in (tags or [])[:80]) if c}
+    return cats.pop() if len(cats) == 1 else None
+
+
+def _size_evidence(options):
+    """'alpha' (XS–XL: not shoes) | 'even' (FR/EU clothing 36/38/40/42: every
+    number even — 0 of 427 shoe lists in the survey, 939 of 960 clothing lists)
+    | 'shoe' (a Pointure/shoe-size option) | 'one-size' | 'numeric' (consecutive
+    or half sizes: shoes or jeans — no vote) | None."""
+    opt = _listing_find_size_option(options)
+    if not opt:
+        return None
+    if _LS_SHOE_OPT_RE.search(opt.get('name') or ''):
+        return 'shoe'
+    norm = [n for n in (_listing_norm_size(v) for v in (opt.get('values') or [])) if n]
+    if not norm:
+        return None
+    if all(n == 'One Size' for n in norm):
+        return 'one-size'
+    letters = [n for n in norm if n.split('/')[0] in LISTING_LETTERS]
+    if len(letters) >= 2 and len(letters) >= 0.8 * len(norm):
+        return 'alpha'
+    nums = [n for n in norm if re.fullmatch(r'\d{2}', n)]
+    if len(nums) >= 3 and len(nums) == len(norm) and all(int(n) % 2 == 0 for n in nums):
+        return 'even'
+    return 'numeric'
+
+
+def _sizes_fit_garment(sizes):
+    return sizes in ('alpha', 'even')
+
+
+def _type_signals(p):
+    """Deterministic read of the competitor's own fields (no network)."""
+    desc = re.sub(r'<[^>]+>', ' ', str(p.get('description') or p.get('body_html') or ''))
+    desc = re.sub(r'\s+', ' ', desc).strip()[:600]
+    handle = str(p.get('handle') or '').replace('-', ' ')
+    return {
+        # the title's own word first; the handle only when the title has none
+        'title': _garment_cat(p.get('title')) or _garment_cat(handle),
+        'product_type': _garment_cat(p.get('product_type')),
+        'tags': _tags_cat(p.get('tags')),
+        'description': _garment_cat(desc),
+        'sizes': _size_evidence(p.get('options')),
+    }
+
+
+def _type_text_verdict(sig):
+    """-> (category or None, hard_conflict). The first of title / product type /
+    tags that names a category — never the description on its own: prose is
+    full of styling words and false friends ("egenskaber", "garde-robe",
+    "pendant"), so a type only the description names goes to the photos. A
+    conflict is two of the competitor's structured fields naming different
+    (non-overlapping) types, or sizes that cannot belong to that type. Tags are
+    the noisiest field, so they only vote when the title or type is silent."""
+    named = [sig[s] for s in ('title', 'product_type') if sig.get(s)]
+    if len(named) < 2 and sig.get('tags'):
+        named.append(sig['tags'])
+    primary = next((sig[s] for s in ('title', 'product_type', 'tags') if sig.get(s)), None)
+    hard = any(not _same_type(a, b) for a in named for b in named)
+    if primary == 'shoes' and _sizes_fit_garment(sig.get('sizes')):
+        hard = True                        # Carina: "moccasins" sold in XS–XL (or 36/38/40)
+    if sig.get('sizes') == 'shoe' and primary not in (None, 'shoes'):
+        hard = True                        # a "Pointure" option on a "dress"
+    return primary, hard
+
+
+def _type_photo_urls(urls):
+    out = []
+    for u in urls or []:
+        u = str(u or '').strip()
+        if u.startswith('//'):
+            u = 'https:' + u
+        if u.startswith(('http://', 'https://')) and u not in out:
+            out.append(u)
+    return out[:4]
+
+
+def _type_vision(image_urls):
+    """One vision call on 2-4 competitor photos, WITHOUT any competitor text.
+    -> {'category', 'item', 'confidence', 'evidence'}. Raises when the answer
+    could not be had (no key, 429, timeout, no JSON): the caller treats that as
+    BLOCKED, never as agreement."""
+    if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
+        raise RuntimeError('no Anthropic key')
+    urls = _type_photo_urls(image_urls)
+    if not urls:
+        raise RuntimeError('no photos')
+    import base64
+    import anthropic
+    blocks = []
+    for u in urls:
+        # the URLs come from the client: never fetch the droplet's own network
+        if not _public_host_ok(urllib.parse.urlparse(u).hostname or ''):
+            continue
+        sized = u + ('&' if '?' in u else '?') + 'width=800' if 'width=' not in u else u
+        try:
+            ir = _scrape_get(sized, timeout=12)
+            # Anthropic refuses images over ~5 MB — one would fail the whole call
+            if ir.status_code == 200 and ir.content and len(ir.content) <= 4_500_000:
+                header = (ir.headers.get('content-type') or '').split(';')[0].strip()
+                mime = _sniff_image_mime(ir.content, header if header.startswith('image/') else 'image/jpeg')
+                blocks.append({'type': 'image', 'source': {'type': 'base64', 'media_type': mime,
+                                                           'data': base64.b64encode(ir.content).decode()}})
+                continue
+        except Exception:
+            pass
+        blocks.append({'type': 'image', 'source': {'type': 'url', 'url': sized}})   # Anthropic fetches it
+    if not blocks:
+        raise RuntimeError('no usable photos')
+    prompt = (
+        f"These {len(blocks)} photos all come from ONE product page of a women's fashion webshop. The page sells "
+        "ONE item, in several colours. Which item is for sale? The item that CHANGES colour from photo to photo "
+        "is the product; things that stay the same (the rest of the outfit, shoes, bags) are only styling.\n"
+        "Categories: dress (also jumpsuit, playsuit), top (blouse, shirt, t-shirt, bodysuit), skirt (also shorts, "
+        "skort), pants (trousers, jeans, leggings), knitwear (sweater, cardigan, hoodie), outerwear (jacket, coat, "
+        "blazer), shoes, swim, accessory (bag, jewellery, sunglasses, belt, scarf, hat).\n"
+        'Answer ONLY with JSON: {"category": "<one category>", "item": "<short English name, e.g. wide-leg '
+        'trousers>", "confidence": "high|medium|low", "evidence": "<one short sentence: what you see>"}')
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    msg = client.messages.create(model=_TYPE_VISION_MODEL, max_tokens=300,
+                                 messages=[{'role': 'user', 'content': blocks + [{'type': 'text', 'text': prompt}]}])
+    txt = (msg.content[0].text if msg.content else '') or ''
+    m = re.search(r'\{.*\}', txt, re.S)
+    if not m:
+        raise RuntimeError('no JSON in the answer')
+    obj = json.loads(m.group(0))
+    cat = str(obj.get('category') or '').strip().lower()
+    conf = str(obj.get('confidence') or '').strip().lower()
+    if cat not in CATEGORY_TAGS:
+        raise RuntimeError(f'unknown category {cat!r}')
+    return {'category': cat, 'item': str(obj.get('item') or '')[:60],
+            'confidence': conf if conf in ('high', 'medium', 'low') else 'low',
+            'evidence': str(obj.get('evidence') or '')[:200]}
+
+
+# Garments that are plural-only nouns in the store's language. Without the hint
+# the writer produced "Carina er en bukser … gør den nem" (30 Sep 2026).
+_TYPE_GRAMMAR_HINT = {
+    ('dk', 'pants'): (' Let op, Deens: "bukser" is meervoud — schrijf "et par bukser" en verwijs ernaar met '
+                      '"de/dem" en meervoudige bijvoeglijke naamwoorden ("nemme", "elegante"), nooit "en bukser" of "den".'),
+    ('dk', 'shoes'): (' Let op, Deens: schoenen zijn "et par sko/støvler" (meervoud: "de/dem", "nemme"), '
+                      'nooit "en sko".'),
+    ('fi', 'pants'): ' Let op, Fins: "housut" is meervoud — gebruik meervoudsvormen ("ne", "niitä", "mukavat").',
+    ('fi', 'shoes'): ' Let op, Fins: "kengät"/"saappaat" zijn meervoud — gebruik meervoudsvormen ("ne", "mukavat").',
+    ('fr', 'shoes'): ' Let op, Frans: schrijf "une paire de …" of het meervoud ("ces mocassins sont…").',
+}
+
+
+def _fashion_type_conflict(keyword, category):
+    """True when a researched keyword is about another KIND of product than the
+    listing (a shoe keyword for trousers). Compared per family (garment / shoes /
+    accessory / swim): 'robe pantalon' or 'strikbukser' stay for trousers; the
+    keyword review shows the drops as type_dropped. A keyword without a type
+    word never conflicts."""
+    have = _garment_cat(keyword)
+    return bool(have and category) and _type_family(have) != _type_family(category)
+
+
+def _copy_type_problem(text, category):
+    """The category a generated identity line (m_title_specs) names when it is
+    not the product's, else None. Only this line: descriptions legitimately
+    name other garments ("pairs well with sneakers")."""
+    have = _garment_cat(text)
+    return have if have and category and not _same_type(have, category) else None
+
+
+def _type_token(category, guess):
+    """The product-type word for the image steps and Shopify: the title's own
+    word when it belongs to the category (more specific: 'coat', 'cardigan',
+    'sunglasses'), else the category's canonical word."""
+    if not category:
+        return guess or ''
+    g = (guess or '').strip()
+    if g and (_garment_cat(g) == category
+              or (category == 'accessory' and _nb_category(g) in ('accessory', 'bag'))):
+        return g
+    return _CAT_TYPE_TOKEN.get(category, category)
+
+
+def _resolve_type(p, vision=_type_vision):
+    """The whole decision, testable without a network (pass `vision`)."""
+    sig = _type_signals(p)
+    primary, hard = _type_text_verdict(sig)
+    out = {'signals': sig, 'conflict': hard, 'category': None, 'decided_by': 'unknown',
+           'misleading': [], 'vision': None, 'vision_error': None, 'candidates': []}
+    if not hard and primary:
+        out.update(category=primary, decided_by='text')
+        return out
+    photos = _type_photo_urls(p.get('images'))
+    v = None
+    if photos:
+        try:
+            v = vision(photos)
+            out['vision'] = v
+        except Exception as e:
+            out['vision_error'] = str(e)[:160]
+            print(f"[type-check] vision failed for {str(p.get('title'))[:60]!r}: {e}")
+    if not hard:
+        # no title / type / tags name a type: the photos decide (the
+        # description may name one, but it only counts as backing)
+        if v and v['confidence'] in ('high', 'medium'):
+            out.update(category=v['category'], decided_by='photos',
+                       misleading=['description'] if sig.get('description') and not _same_type(
+                           sig['description'], v['category']) else [])
+        elif out['vision_error']:
+            out['decided_by'] = 'unchecked'     # not a verdict — the operator is told
+        return out
+    backed = [s for s in _TYPE_SIGNAL_SOURCES if v and sig.get(s) and _same_type(sig[s], v['category'])]
+    # Sizes only speak for the family (XS–XL: some garment). They back the photos
+    # only when every text field names another family (Carina without type or
+    # tags: all "moccasins"); when a field names a DIFFERENT garment ("pants"
+    # vs photos "dress") that disagreement is the operator's call.
+    sizes_back = bool(v) and ((_sizes_fit_garment(sig.get('sizes')) and _type_family(v['category']) == 'garment')
+                              or (sig.get('sizes') == 'shoe' and v['category'] == 'shoes'))
+    sizes_back = sizes_back and not any(_type_family(sig[s]) == _type_family(v['category'])
+                                        for s in _TYPE_SIGNAL_SOURCES if sig.get(s))
+    # the photos win when the competitor itself backs them somewhere: one of its
+    # own fields names that type, or (sure answers only) its sizes fit it
+    if v and ((v['confidence'] in ('high', 'medium') and backed)
+              or (v['confidence'] == 'high' and sizes_back)):
+        out.update(category=v['category'], decided_by='photos',
+                   misleading=[s for s in _TYPE_SIGNAL_SOURCES
+                               if sig.get(s) and not _same_type(sig[s], v['category'])])
+        return out
+    # the operator decides: every category someone named, most-backed first
+    cands = {}
+    for s in _TYPE_SIGNAL_SOURCES:
+        if sig.get(s):
+            cands.setdefault(sig[s], []).append(s)
+    if _sizes_fit_garment(sig.get('sizes')):
+        for c in cands:
+            if _type_family(c) == 'garment':
+                cands[c].append('sizes')
+    if v:
+        cands.setdefault(v['category'], []).append('photos')
+    out['decided_by'] = 'operator'
+    out['candidates'] = [{'category': c, 'sources': s}
+                         for c, s in sorted(cands.items(), key=lambda kv: -len(kv[1]))]
+    return out
+
+
+@app.route('/api/resolve_type', methods=['POST'])
+@require_droplet_token
+def api_resolve_type():
+    """Import step (fashion): what IS this product? Body: the competitor product
+    {title, handle, description|body_html, product_type, tags, options, images:
+    [2-4 photo URLs, different colours], guess}. See _resolve_type."""
+    raw = request.get_json(silent=True)
+    raw = raw if isinstance(raw, dict) else {}
+    txt = lambda k: str(raw.get(k) or '')[:20000] if isinstance(raw.get(k), (str, int, float)) else ''
+    tags = raw.get('tags')
+    body = {
+        'title': txt('title'), 'handle': txt('handle'), 'product_type': txt('product_type'),
+        'description': txt('description') or txt('body_html'),
+        'tags': tags if isinstance(tags, str) else [str(t) for t in tags if isinstance(t, str)] if isinstance(tags, list) else '',
+        'options': [{'name': str(o.get('name') or ''), 'values': [str(v) for v in (o.get('values') or []) if isinstance(v, (str, int, float))]}
+                    for o in (raw.get('options') or []) if isinstance(o, dict) and isinstance(o.get('values') or [], list)]
+        if isinstance(raw.get('options'), list) else [],
+        'images': [u for u in (raw.get('images') or []) if isinstance(u, str)][:8] if isinstance(raw.get('images'), list) else [],
+    }
+    res = _resolve_type(body)
+    res['product_type'] = _type_token(res['category'], txt('guess'))
+    return jsonify(res)
+
+
+# ============================================================================
 # DataForSEO keyword research (auto per-market keyword ideas at import time)
 # ----------------------------------------------------------------------------
 # Google location codes. Fashion = dk/fr/fi, Home Decor = nl/de/com. The keys are
@@ -5991,11 +6404,20 @@ def _derive_seeds_llm(competitor_title, product_name, category, description, sto
                 "de: [\"steckdosenlampe\",\"nachtlicht steckdose\"]; com: [\"plug in night light\",\"plug in wall light\"].\n"
             )
         else:
+            # The import's type check (v1.324) settled the garment type; the
+            # competitor's title may name another one (Carina: "Mocassins" on
+            # a page that sells trousers). The type wins.
+            type_rule = (
+                f"The garment TYPE is \"{category}\" (settled at import). EVERY seed must be "
+                f"about THAT type — never another garment type, whatever the competitor title says.\n"
+                if (category or '').strip() else ''
+            )
             head = (
                 "You are a fashion e-commerce SEO researcher. For the product below, output 3-4 SHORT, BROAD "
                 "search SEED terms in the LOCAL language of each market — the kind of common terms shoppers "
                 "actually type, that other keywords contain. Use the garment TYPE and type+ONE attribute, "
                 "each 1-2 words max. Prefer common single compound words where the language uses them.\n"
+                + type_rule +
                 "NEVER use a fabric/material word (cashmere, wool, silk, linen, satin, leather, velvet...) unless the product info below explicitly names that exact material.\n"
                 "NEVER use a garment-length word (long, maxi, midi, mini, short, knee-length) unless the product info below explicitly states that length.\n"
                 "Examples — dk: [\"kjole\",\"sommerkjole\",\"blomsterkjole\"]; fr: [\"robe\",\"robe été\",\"robe fleurie\"]; "
@@ -6944,9 +7366,16 @@ def api_research_keywords():
     given = body.get('seed_terms') if isinstance(body.get('seed_terms'), dict) else {}
     seeds = {st: [str(t).strip() for t in (given.get(st) or []) if str(t).strip()][:6]
              for st in stores if isinstance(given.get(st), list) and given.get(st)}
+    # Fashion (v1.324): the import's type check sends the settled garment type
+    # (category slug + its product-type word). Lighting keeps sending its lamp
+    # type as `category`, as before.
+    fashion_cat = str(body.get('category') or '').strip().lower()
+    fashion_cat = fashion_cat if fashion_cat in CATEGORY_TAGS and not _is_light_market(stores[0]) else ''
+    seed_type = ((str(body.get('product_type') or '').strip() or CAT_TO_PRODUCT_TYPE.get(fashion_cat, ''))
+                 if fashion_cat else body.get('category', ''))
     if len(seeds) < len(stores):
         derived = _derive_seeds_llm(body.get('competitor_title', ''), body.get('product_name', ''),
-                                    body.get('category', ''), body.get('description', ''),
+                                    seed_type, body.get('description', ''),
                                     stores=[st for st in stores if st not in seeds]) or {}
         seeds.update({st: v for st, v in derived.items() if st not in seeds})
     if not _dfs_configured():
@@ -6999,6 +7428,9 @@ def api_research_keywords():
                 if light_power and _light_power_conflict(k, light_power):
                     type_dropped += 1          # 'oplaadbare lamp' for a plug-in lamp
                     continue
+                if fashion_cat and _fashion_type_conflict(k, fashion_cat):
+                    type_dropped += 1          # 'mocassins femme' for trousers
+                    continue
                 if k not in best or v > (best[k].get('volume') or 0):
                     kw['seed'] = seed
                     best[k] = kw
@@ -7018,8 +7450,8 @@ def api_research_keywords():
                        'recommended_count': sum(1 for k in kws if k.get('recommended')),
                        'materials_allowed': sorted(allowed_mats),
                        'materials_dropped': mats_dropped,
-                       # Keywords about a different lamp type than the product
-                       'type_dropped': type_dropped, 'product_type': light_type or None}
+                       # Keywords about a different lamp type / garment than the product
+                       'type_dropped': type_dropped, 'product_type': light_type or fashion_cat or None}
     return jsonify({'configured': True, 'results': results})
 
 
@@ -10825,7 +11257,31 @@ def generate():
     # claim cashmere when the dress is wool/polyester (user rule 2026-07-15).
     # Callers that don't send source_text keep the old behaviour.
     source_text   = str(data.get('source_text') or '')
-    if source_text.strip():
+    # Type check at import (v1.324): the settled garment type, and which of the
+    # competitor's own fields described ANOTHER product (Carina: title and
+    # description said moccasins, the page sold trousers). Those fields never
+    # reach the writer; the frontend already left them out of source_text.
+    type_word     = str(data.get('product_type') or '').strip()[:60]
+    type_cat      = str(data.get('garment_category') or '').strip().lower()
+    _typed        = _garment_cat(type_word)
+    # same rule as _category_for_publish: a product type re-typed in Review wins
+    type_cat      = _typed if (_typed and (type_cat not in CATEGORY_TAGS or not _same_type(_typed, type_cat))) \
+        else (type_cat if type_cat in CATEGORY_TAGS else _typed)
+    misleading    = [s for s in (data.get('type_source_misleading') or []) if s in _TYPE_SIGNAL_SOURCES]
+    if 'title' in misleading:
+        product_title = ''
+    type_line = ''
+    if type_word:
+        type_line = (f"\nProducttype (vastgesteld bij de import): {type_word}. Beschrijf het "
+                     f"product ALTIJD als dit type en noem het nooit een ander type kledingstuk of schoen.")
+        # plural-only nouns: the Carina repair came back as "Carina er en bukser"
+        type_line += _TYPE_GRAMMAR_HINT.get((store, type_cat), '')
+        if misleading:
+            type_line += (" De titel en/of beschrijving van de concurrent beschrijven per ongeluk een ANDER "
+                          "product — neem daar niets uit over.")
+    # With a misleading source the guards stay on even when nothing trustworthy
+    # is left: no fabric or length claim at all beats borrowing the wrong one.
+    if source_text.strip() or misleading:
         keywords = _strip_unverified_material_kws(keywords, source_text)
         # Lengte-keywords ('lange jurk') alleen als de bron die lengte noemt —
         # nooit een maxi claimen bij een knielange jurk (Millie, 2026-07-16).
@@ -10884,7 +11340,7 @@ Liviah er en bluse, som er nem at tage på, og som føles behagelig hele dagen."
         context_block = f"""Producttitel competitor: {product_title}
 Keywords (verwerk de relevantste): {', '.join(keywords[:12])}
 Productnaam: {product_name}
-Taal: {language}
+Taal: {language}{type_line}
 Regel: noem geen specifieke stof of materiaal tenzij die letterlijk in de keywords of de producttitel hierboven staat (verkeerde stofclaim = productfout)."""
 
         if only_field == 'description':
@@ -10952,13 +11408,16 @@ Antwoord ALLEEN als geldig JSON:
             _blob = ' '.join(str(out.get(k) or '') for k in
                              ('description', 'meta_description', 'm_title_specs'))
             out['unverified_length'] = _unverified_length_claims(_blob, _len_src)
+            wrong = _copy_type_problem(out.get('m_title_specs'), type_cat)
+            if wrong:
+                out['type_mismatch'] = wrong
             return jsonify(out)
         return jsonify({'error': 'Could not parse the response', 'raw': text}), 500
 
     # ── Full generation (default — all three fields at once) ──
     prompt = f"""Je bent een productschrijver voor een vrouwenmodezaak. Schrijf productcontent in het {language} voor een product genaamd "{product_name}".
 
-Competitor producttitel: {product_title}
+Competitor producttitel: {product_title}{type_line}
 Keywords (verwerk de relevantste): {', '.join(keywords[:12])}
 
 Schrijf exact in de stijl van dit voorbeeld:
@@ -10994,6 +11453,25 @@ Antwoord uitsluitend als geldig JSON zonder extra tekst:
     match = re.search(r'\{.*\}', text, re.DOTALL)
     if match:
         out = json.loads(match.group())
+        # The SEO line names another type (the writer followed the competitor's
+        # words anyway): one retry with the correction. A failed or worse retry
+        # keeps the first answer, flagged — a 429 is never a verdict.
+        wrong = _copy_type_problem(out.get('m_title_specs'), type_cat)
+        if wrong:
+            fix = (f"\n\nLET OP: je vorige versie noemde het product in m_title_specs een ander type "
+                   f"({CAT_TO_PRODUCT_TYPE.get(wrong, wrong)}). Het product is: {type_word}. Schrijf alle "
+                   f"velden opnieuw over dit type.")
+            try:
+                msg2 = client.messages.create(model='claude-sonnet-4-5', max_tokens=1200,
+                                              messages=[{'role': 'user', 'content': prompt + fix}])
+                m2 = re.search(r'\{.*\}', (msg2.content[0].text if msg2.content else '') or '', re.DOTALL)
+                out2 = json.loads(m2.group()) if m2 else {}
+                if str(out2.get('description') or '').strip() and not _copy_type_problem(out2.get('m_title_specs'), type_cat):
+                    out, wrong = out2, None
+            except Exception as e2:
+                print(f"[generate] {product_name!r}: type retry failed, keeping the first answer: {str(e2)[:120]}")
+            if wrong:
+                out['type_mismatch'] = wrong
         _blob = ' '.join(str(out.get(k) or '') for k in
                          ('description', 'meta_description', 'm_title_specs'))
         out['unverified_length'] = _unverified_length_claims(_blob, _len_src)
@@ -11130,6 +11608,16 @@ _SIZE_HEADER_MAP = {
     'schulter':         {'dk': 'Skulder',     'fr': 'Épaule',             'fi': 'Olkapää'},
     'schulterbreite':   {'dk': 'Skuldervidde', 'fr': "Largeur d'épaules", 'fi': 'Olkaleveys'},
     'breite':           {'dk': 'Vidde',       'fr': 'Largeur',            'fi': 'Leveys'},
+    # German compounds — "Brustumfang" stayed German on DK/FR/FI charts (Virginie, 30 Sep 2026)
+    'brustumfang':      {'dk': 'Brystomfang', 'fr': 'Tour de poitrine',   'fi': 'Rinnanympärys'},
+    'oberweite':        {'dk': 'Brystomfang', 'fr': 'Tour de poitrine',   'fi': 'Rinnanympärys'},
+    'taillenumfang':    {'dk': 'Taljeomfang', 'fr': 'Tour de taille',     'fi': 'Vyötärönympärys'},
+    'bundweite':        {'dk': 'Taljeomfang', 'fr': 'Tour de taille',     'fi': 'Vyötärönympärys'},
+    'hüftumfang':       {'dk': 'Hofteomfang', 'fr': 'Tour de hanches',    'fi': 'Lantionympärys'},
+    'innenbeinlänge':   {'dk': 'Skridtlængde', 'fr': 'Entrejambe',        'fi': 'Sisäpituus'},
+    'gesamtlänge':      {'dk': 'Længde',      'fr': 'Longueur totale',    'fi': 'Kokonaispituus'},
+    'fußlänge':         {'dk': 'Fodlængde',   'fr': 'Longueur du pied',   'fi': 'Jalan pituus'},
+    'schuhgröße':       {'dk': 'Skostørrelse', 'fr': 'Pointure',          'fi': 'Kengän koko'},
 }
 _SIZE_CHART_TITLE = {'dk': 'Størrelsesguide', 'fr': 'Guide des tailles', 'fi': 'Kokotaulukko'}
 
@@ -12549,7 +13037,7 @@ def _taxonomy_backfill_run(stores, dry_run=True, only_missing=True, limit=None, 
                 desc, image, hint = _taxonomy_family_inputs(fam)
                 key = fam['key']
                 with _TAXONOMY_MEMO_LOCK:
-                    memo_hit = _TAXONOMY_MEMO.get(key)
+                    memo_hit = _TAXONOMY_MEMO.get(_taxonomy_memo_key(fam['title'], hint))
                 if not (memo_hit and time.time() - memo_hit[1] < _TAXONOMY_MEMO_TTL):
                     state['llm_calls'] += 1
                 res = _taxonomy_for_family(fam['title'], desc, image_url=image, category=hint)
@@ -16600,7 +17088,9 @@ def _wtl_traffic_loop():
 
 
 try:
-    threading.Thread(target=_wtl_traffic_loop, daemon=True, name='wtl-traffic').start()
+    # droplet only: a laptop script or test must not spend SimilarWeb/DataForSEO calls
+    if _background_loops_allowed():
+        threading.Thread(target=_wtl_traffic_loop, daemon=True, name='wtl-traffic').start()
 except Exception as _e:
     print(f'[wtl] could not start traffic loop: {_e}')
 
@@ -16661,7 +17151,8 @@ def _wtl_classify_loop():
 
 
 try:
-    threading.Thread(target=_wtl_classify_loop, daemon=True, name='wtl-classify').start()
+    if _background_loops_allowed():
+        threading.Thread(target=_wtl_classify_loop, daemon=True, name='wtl-classify').start()
 except Exception as _e:
     print(f'[wtl] could not start classify loop: {_e}')
 
@@ -24319,7 +24810,11 @@ def _blog_scheduler_loop():
 
 
 try:
-    threading.Thread(target=_blog_scheduler_loop, daemon=True, name='blog-scheduler').start()
+    # droplet only: this loop creates author pages and blog drafts in the LIVE
+    # stores — it used to start on every import, local scripts and tests too
+    # (found 30 Sep 2026, review of v1.323)
+    if _background_loops_allowed():
+        threading.Thread(target=_blog_scheduler_loop, daemon=True, name='blog-scheduler').start()
 except Exception as _e:
     print(f'[blog] could not start scheduler thread: {_e}')
 
@@ -24498,7 +24993,8 @@ def _deletion_watch_loop():
 
 
 try:
-    threading.Thread(target=_deletion_watch_loop, daemon=True, name='deletion-watchdog').start()
+    if _background_loops_allowed():
+        threading.Thread(target=_deletion_watch_loop, daemon=True, name='deletion-watchdog').start()
 except Exception as _e:
     print(f'[delwatch] could not start watchdog thread: {_e}')
 

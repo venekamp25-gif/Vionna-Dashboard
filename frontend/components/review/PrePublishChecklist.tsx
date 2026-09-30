@@ -1,6 +1,7 @@
 "use client";
 
 import { sizeKind } from "@/lib/afterQuotation";
+import { describeTypeCheck } from "@/lib/typeCheck";
 import { nbCategory } from "@/lib/nbCategory";
 import { useEffect, useState } from "react";
 import { useProduct, colorLabelFor } from "@/lib/product";
@@ -75,6 +76,29 @@ export function buildPrePublishChecks(
       label: `Sizes ${data.sizes.join(" ")}${data.sizesSource === "manual" ? " (edited)" : ""}`,
       level: noted ? "warn" : "ok",
       detail: data.sizesNote ?? undefined,
+    });
+  }
+
+  // 2c. Type (v1.324, Carina): the copy must describe the type the import
+  // settled on; a corrected or unchecked type is worth a second look
+  const mismatched = data.selectedStores.filter((st) => data.contentByStore[st]?.typeMismatch);
+  const typeNote = describeTypeCheck(data.typeCheck);
+  if (mismatched.length) {
+    out.push({
+      id: "type",
+      label: `The ${mismatched.map((st) => st.toUpperCase()).join("/")} SEO line names another product type`,
+      level: "warn",
+      detail: `It says ${mismatched.map((st) => data.contentByStore[st]?.typeMismatch).join(", ")} — regenerate "M title specs" for that store (↻).`,
+    });
+  } else if (typeNote) {
+    out.push({
+      id: "type",
+      label:
+        data.typeCheck?.decided_by === "unchecked"
+          ? "Product type could not be checked at import"
+          : "Product type differs from the competitor's title — double-check",
+      level: "warn",
+      detail: typeNote,
     });
   }
 

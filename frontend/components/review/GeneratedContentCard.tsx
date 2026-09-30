@@ -9,7 +9,7 @@ import { api, GenerateField } from "@/lib/api";
 import { loadToneReferences } from "@/lib/toneReference";
 
 export function GeneratedContentCard() {
-  const { data, patch } = useProduct();
+  const { data, patch, setData } = useProduct();
   const { store } = useStore();
   const langFlag = { dk: "🇩🇰", fr: "🇫🇷", fi: "🇫🇮" }[store];
   const language = STORE_CONFIG[store].language;
@@ -42,6 +42,17 @@ export function GeneratedContentCard() {
         // Competitor's own info — keeps unverified fabric keywords out of
         // per-field regenerations too (absent on old saved sessions = old behaviour).
         source_text: data.competitor?.sourceText,
+        // the type the import settled on (v1.324) — and never the competitor
+        // title when it described another product
+        ...(data.typeCheck?.category
+          ? {
+              product_type: data.productType,
+              // re-typed in Review since the import? then the backend reads the
+              // category from the new word instead of the import's
+              ...(data.productType === data.typeCheck.product_type ? { garment_category: data.category } : {}),
+              type_source_misleading: data.typeCheck.misleading,
+            }
+          : {}),
       });
       if (res.error) throw new Error(res.error);
       if (field === "description" && res.description) {
@@ -53,13 +64,23 @@ export function GeneratedContentCard() {
       }
       // Keep the length warning honest after a regenerate — if the fresh text no
       // longer invents a length, the banner clears (and vice versa).
-      if (res.unverified_length && data.contentByStore[store]) {
-        patch({
-          contentByStore: {
-            ...data.contentByStore,
-            [store]: { ...data.contentByStore[store], unverifiedLength: res.unverified_length },
-          },
-        });
+      if (res.unverified_length || field === "m_title_specs") {
+        setData((prev) =>
+          prev.contentByStore[store]
+            ? {
+                ...prev,
+                contentByStore: {
+                  ...prev.contentByStore,
+                  [store]: {
+                    ...prev.contentByStore[store],
+                    ...(res.unverified_length ? { unverifiedLength: res.unverified_length } : {}),
+                    // a fresh SEO line clears (or re-raises) the "names another type" warning
+                    ...(field === "m_title_specs" ? { typeMismatch: res.type_mismatch ?? null } : {}),
+                  },
+                },
+              }
+            : prev
+        );
       }
     } catch (e) {
       alert(`Regenerate failed: ${e instanceof Error ? e.message : String(e)}`);

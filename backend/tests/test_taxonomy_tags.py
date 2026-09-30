@@ -293,7 +293,7 @@ def test_memo_expires_and_does_not_cache_failures(monkeypatch):
     assert len(calls) == 2, 'a failed verdict is retried on the next colour, not memoised'
     calls = _fake_classifier(monkeypatch, _verdict())
     server._publish_tags_for({'description': 'x'}, 'Zoé', 'dress')
-    key = server._norm_name('Zoé')
+    key = server._taxonomy_memo_key('Zoé', 'dress')
     res, ts = server._TAXONOMY_MEMO[key]
     server._TAXONOMY_MEMO[key] = (res, ts - server._TAXONOMY_MEMO_TTL - 1)
     server._publish_tags_for({'description': 'x'}, 'Zoé', 'dress')

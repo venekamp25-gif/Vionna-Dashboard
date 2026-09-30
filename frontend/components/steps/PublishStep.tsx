@@ -134,6 +134,9 @@ export function PublishStep() {
       competitorSizes: [],
       competitorSizesSource: null,
       sizesNote: null,
+      // the next product gets its own type check, never this one's category
+      category: null,
+      typeCheck: null,
       sizeChart: null,
       sizeChartStatus: null,
       sizeChartHint: null,

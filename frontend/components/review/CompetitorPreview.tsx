@@ -1,10 +1,13 @@
 "use client";
 
 import { useProduct } from "@/lib/product";
+import { describeTypeCheck } from "@/lib/typeCheck";
 
 export function CompetitorPreview() {
   const { data } = useProduct();
   if (!data.competitor) return null;
+  // the competitor's title may name another product than it sells (Carina)
+  const typeNote = describeTypeCheck(data.typeCheck);
 
   return (
     <div className="flex items-center gap-3 bg-bg-elev border border-border rounded-2xl px-5 py-4 mb-6">
@@ -20,6 +23,7 @@ export function CompetitorPreview() {
           {data.competitor.hostname} · {data.competitor.variants} variants · {data.competitor.price}
         </div>
         {data.importNote && <p className="text-[11px] text-warning mt-1 whitespace-normal">{data.importNote}</p>}
+        {typeNote && <p className="text-[12px] text-warning font-medium mt-1 whitespace-normal">{typeNote}</p>}
       </div>
       {data.competitorUrl ? (
         <a

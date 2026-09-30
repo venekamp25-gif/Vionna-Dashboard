@@ -209,6 +209,8 @@ export function ReviewStep() {
             price: storePrice,
             compare_at_price: compareAtPrice,
             product_type: data.productType,
+            // the category the import settled on (v1.324) — never re-read from our own copy
+            category: data.category,
             images: variantImages,
             collection_id: collectionId,
             actual_handle: actualHandle,

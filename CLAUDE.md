@@ -206,6 +206,54 @@ this backend is the prerequisite for ever switching a store to Block.
 
 ---
 
+## 🔎 Import type check (since v1.324.0)
+
+Carina (30 Sep 2026): the competitor page's TITLE and description said
+moccasins, but its own product_type ("Dress Pants Women"), tags, XS–XL sizes
+and photos said trousers. The import took the title → 24 listings live as
+shoes in three languages, and keywords, copy, SEO title, sub-tag and chart were
+all written FROM that wrong type (so no later check on our own copy can see it).
+
+The type is now decided ONCE at import (`POST /api/resolve_type`, gated;
+`_resolve_type` in server.py, `lib/typeCheck.ts`, `GenerateStep.checkType`):
+- `_garment_cat` = one lexicon (EN/FR/DK/FI/NL/DE) for titles, product types,
+  tags and keywords. Order matters (dress/skirt/pants before shoes, shoes before
+  knitwear/tops, accessories last via `_nb_category`); DK/FI compounds match
+  word-final. Table test: `backend/tests/test_type_check.py`.
+- Hard conflict = title vs the competitor's own product_type (tags only when
+  one of those is silent), or "shoes" sold in XS–XL / a Pointure option on a
+  garment. Overlaps (knit dress typed Knitwear, shorts typed Pants, shirt
+  jacket) are soft (`_GT_SOFT_PAIRS`). The DESCRIPTION never decides alone
+  (prose is noisy: "egenskaber", "garde-robe"): with no type in title / type /
+  tags the photos decide and the description only backs them. Measured on
+  9,406 competitor products: 0.56% hard conflicts + ~12% naming no type → a
+  photo check on ~1 in 8 imports (3–5 s, ~1–2 ct). Even-only numeric sizes
+  (36/38/40) count as clothing, like XS–XL. Photo URLs: public hosts only.
+- On conflict ONE vision call (sonnet-4-6, 2–4 photos of different colours, NO
+  competitor text: "the item that changes colour is the product"). The photos
+  win only when a competitor field backs them; otherwise — or when the call
+  fails (429/timeout = BLOCKED, never agreement) — the operator picks in
+  `TypeChoiceModal` before anything is researched or written.
+- Everything follows the settled type: keyword seeds (type rule) and
+  `_fashion_type_conflict` drops other-family keywords; `/api/generate` gets a
+  type line, never the misleading title/description (fabric/length guards stay
+  on), and retries once when m_title_specs names another type (`type_mismatch`
+  flag otherwise); sizes via `competitorSizes(nbCategory(productType))`;
+  publish sends `category` (`_category_for_publish` honours it unless the
+  operator re-typed product_type). Taxonomy memo keyed on (family, category).
+- Verified live 30 Sep: Dejana → trousers, Tatjana (title boots) → jacket,
+  meshki Maddi (typed Tops) → shoes; ~3–5 s per checked import.
+- Plural-only garments get a grammar hint in the copy prompt
+  (`_TYPE_GRAMMAR_HINT`: DK "et par bukser/sko", FI "housut/kengät") — the
+  Carina repair first came back as "Carina er en bukser".
+- The live repair of 30 Sep (Carina 24, Stella FI 7, Virginie 24 type/chart,
+  Gaia DK 1) is backed up per product in `~/Documents/type-fix-2026-09-30/`.
+- Also fixed here: the blog scheduler, the WTL traffic/classify loops and the
+  deletion watchdog started on EVERY import of server.py (local scripts, tests)
+  — now behind `_background_loops_allowed()` like the other write loops.
+
+---
+
 ## 🧾 After Quotation (since v1.321.0)
 
 Fashion listings are made BEFORE the supplier quote: placeholder XS–XL and the

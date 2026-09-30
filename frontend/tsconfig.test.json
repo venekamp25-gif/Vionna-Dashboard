@@ -26,6 +26,7 @@
     "lib/spyShield.ts",
     "lib/afterQuotation.ts",
     "lib/competitorSizes.ts",
+    "lib/typeCheck.ts",
     "tests/**/*.ts"
   ]
 }
