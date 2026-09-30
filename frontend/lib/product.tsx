@@ -1,6 +1,7 @@
 "use client";
 
 import type { SizeSource } from "./competitorSizes";
+import type { TypeCheck } from "./typeCheck";
 import { createContext, useContext, useState, useCallback, useEffect, useRef, ReactNode } from "react";
 import { StoreKey } from "./store";
 import { draftsApi, fetchCurrentUser, snapshotsApi, type SizeChart, type ProductSnapshotMeta } from "./api";
@@ -131,6 +132,9 @@ export interface StoreContent {
    *  verify (["long"] etc.). Drives the amber length warning in the review so a
    *  wrong length (the Millie case) is caught before publish. */
   unverifiedLength?: string[];
+  /** The SEO line of this store's copy names another type than the product's
+   *  (after one retry) — the category it names (v1.324). */
+  typeMismatch?: string | null;
 }
 
 const DEFAULT_PRICE_BY_STORE: Record<StoreKey, string> = {
@@ -229,6 +233,13 @@ export interface ProductData {
   importNote: string | null;
   bgReferenceUrl: string;
   productType: string;
+  /** The category the import settled on (dress, pants, shoes…) — sent at
+   *  publish so the store category never comes from re-reading our own copy.
+   *  null = unknown (publish classifies, as before). */
+  category: string | null;
+  /** How the import decided the type (v1.324, Carina): which competitor fields
+   *  agreed, which described another product, what the photos showed. */
+  typeCheck: TypeCheck | null;
   nbResults: Record<number, NbResult[]>;
   nbResultsPerColor: Record<string, NbResult[]>;
   colorRefsByColor: Record<string, string[]>;
@@ -288,6 +299,8 @@ const DEFAULT_DATA: ProductData = {
   // started without a reload also gets a fresh model.
   bgReferenceUrl: pickRandomBgReferenceUrl(),
   productType: "dress",
+  category: null,
+  typeCheck: null,
   nbResults: {},
   nbResultsPerColor: {},
   colorRefsByColor: {},
@@ -351,6 +364,9 @@ function snapshotActive(prev: ProductData): StoreContent {
     colorLabels[canonical] = prev.colors[i] ?? canonical;
   });
   return {
+    // keep the store's flags (typeMismatch, unverifiedLength): switching tabs
+    // used to drop them, and the pre-publish check then stayed silent
+    ...prev.contentByStore[prev.activeViewStore],
     description: prev.description,
     metaDescription: prev.metaDescription,
     mTitleSpecs: prev.mTitleSpecs,

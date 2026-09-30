@@ -338,6 +338,14 @@ def test_write_loops_never_start_on_a_laptop_or_in_tests():
     src = open(server.__file__, encoding='utf-8').read()
     assert server._background_loops_allowed() is False                     # pytest is loaded
     for loop in ('_size_chart_fill_loop', '_siblings_heal_loop', '_light_channels_heal_loop',
-                 '_higgsfield_ready_loop', '_aq_warm_loop'):
+                 '_higgsfield_ready_loop', '_aq_warm_loop',
+                 # blog drafts + author pages in the live stores, paid API calls, Slack pings
+                 '_blog_scheduler_loop', '_wtl_traffic_loop', '_wtl_classify_loop', '_deletion_watch_loop'):
         start = re.search(r'\n([ \t]*)threading\.Thread\(target=' + loop, src)
         assert start and start.group(1), f'{loop} starts at module level without a guard'
+        # and the guard is the droplet-only one, not just a try:
+        before = src[max(0, start.start() - 400):start.start()]
+        assert '_background_loops_allowed()' in before or "getenv('DEV_LOCAL')" in before, loop
+    import threading
+    running = {t.name for t in threading.enumerate()}
+    assert not running & {'blog-scheduler', 'wtl-traffic', 'wtl-classify', 'deletion-watchdog'}, running

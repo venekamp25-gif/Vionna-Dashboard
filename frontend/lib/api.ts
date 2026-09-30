@@ -11,6 +11,7 @@ import {
   fetchProductJsonFromBrowser,
 } from "./browserScrape";
 import type { SsStoreSummary, SsByAction } from "./spyShield";
+import type { TypeCheck } from "./typeCheck";
 
 const BACKEND_URL =
   process.env.NEXT_PUBLIC_BACKEND_URL?.replace(/\/+$/, "") || "http://localhost:5000";
@@ -374,6 +375,10 @@ export interface ScrapedProduct {
      *  for fabric claims: fabric keywords are only offered/used when the competitor
      *  names that fabric here or in the title. */
     body_html?: string;
+    /** The competitor's own product type and tags (Shopify .json) — the import
+     *  type check compares them with the title (Carina, v1.324). */
+    product_type?: string;
+    tags?: string | string[];
     options?: { name: string; values: string[]; position?: number }[];
     variants?: {
       id?: number;
@@ -439,6 +444,9 @@ export interface GenerateResponse {
    *  did (e.g. ["long"] when the dress is knee-length). Warn-only — the reviewer
    *  decides. Empty/absent when nothing was invented. */
   unverified_length?: string[];
+  /** The SEO line still names another type than the one the import settled on
+   *  (after one retry) — the category it names. Warn-only. */
+  type_mismatch?: string;
   error?: string;
 }
 
@@ -780,7 +788,25 @@ export const api = {
      *  the backend strips fabric keywords the competitor never mentions — never
      *  claim cashmere when the dress is wool/polyester. */
     source_text?: string;
+    /** The type the import settled on (v1.324): the copy is always about it. */
+    product_type?: string;
+    garment_category?: string | null;
+    /** Competitor fields that described ANOTHER product — never shown to the writer. */
+    type_source_misleading?: string[];
   }) => call<GenerateResponse>("/api/generate", { method: "POST", body: params, authed: true }),
+
+  /** Import type check (v1.324): what IS this product? The competitor's own
+   *  title / product type / tags / sizes, and its photos when those disagree. */
+  resolveType: (params: {
+    title?: string;
+    handle?: string;
+    description?: string;
+    product_type?: string;
+    tags?: string | string[];
+    options?: { name: string; values: string[] }[];
+    images: string[];
+    guess: string;
+  }, signal?: AbortSignal) => call<TypeCheck>("/api/resolve_type", { method: "POST", body: params, authed: true, signal }),
 
   /** Translate colour-variant names into a store's language. Dedicated (not folded
    *  into /api/generate) so the model returns them reliably. Response `colors` is
@@ -803,7 +829,10 @@ export const api = {
     stores: ("dk" | "fr" | "fi" | LightStore)[];
     product_name: string;
     competitor_title: string;
+    /** Fashion: the category the import settled on (dress, pants…); Home Decor: the lamp type. */
     category?: string;
+    /** Fashion: the product-type word ("trousers") the seeds are anchored on. */
+    product_type?: string;
     description?: string;
     /** Seeds per market from the import-time understanding (Home Decor). When
      *  given, these replace the LLM-derived seeds for that market: they come
@@ -1302,6 +1331,9 @@ export const api = {
     price: string;
     compare_at_price?: string | null;
     product_type: string;
+    /** The category the import settled on (v1.324) — the publish uses it instead of
+     *  classifying our own copy again (which only repeats a wrong import). */
+    category?: string | null;
     images: string[];
     collection_id?: number | null;
     actual_handle: string;

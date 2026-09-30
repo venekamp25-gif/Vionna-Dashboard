@@ -12,6 +12,15 @@ import { api, ScrapedProduct } from "@/lib/api";
 import { notify } from "@/lib/notifications";
 import { ManualPasteModal } from "./ManualPasteModal";
 import { KeywordReviewModal, ReviewKw } from "./KeywordReviewModal";
+import { TypeChoiceModal } from "./TypeChoiceModal";
+import {
+  misleadingFor,
+  tokenFor,
+  trustedSourceText,
+  typeCheckPhotos,
+  type GarmentCategory,
+  type TypeCheck,
+} from "@/lib/typeCheck";
 import {
   extractColors,
   extractVariantsByColor,
@@ -46,6 +55,8 @@ type PendingCtx = {
   chosenName: string;
   canonicalColors: string[];
   productType: string;
+  /** How the import settled the type (v1.324) — the copy follows it. */
+  typeCheck: TypeCheck;
   competitor: { title: string; hostname: string; variants: number; price: string; sourceText: string };
   images: { url: string; selected: boolean; variantIds: number[] }[];
   variantsByColor: ReturnType<typeof extractVariantsByColor>;
@@ -62,6 +73,19 @@ function competitorSourceText(product: ScrapedProduct["product"]): string {
     .replace(/\s+/g, " ")
     .trim();
   return [product?.title ?? "", body].join(" ").trim().slice(0, 4000);
+}
+
+/** The garment category a guessProductType() token belongs to ("coat" -> outerwear). */
+function nbCategoryToGarment(token: string): string {
+  const t = (token || "").toLowerCase();
+  if (!t) return "";
+  if (nbCategory(t) === "shoes") return "shoes";
+  if (nbCategory(t) !== "garment") return "accessory";
+  const map: Record<string, string> = {
+    dress: "dress", jumpsuit: "dress", blouse: "top", skirt: "skirt", trousers: "pants", swimsuit: "swim",
+    jacket: "outerwear", coat: "outerwear", blazer: "outerwear", cardigan: "knitwear", sweater: "knitwear",
+  };
+  return map[t] ?? "";
 }
 
 /** Title-case a colour string for use as a canonical key. */
@@ -87,6 +111,55 @@ export function GenerateStep() {
   const [pending, setPending] = useState<PendingCtx | null>(null);
   const [reviewByStore, setReviewByStore] = useState<Partial<Record<StoreKey, ReviewKw[]>>>({});
   const started = useRef(false);
+  // "What is this product?" — open while the import waits for the operator
+  const [typeAsk, setTypeAsk] = useState<{ check: TypeCheck; photos: string[] } | null>(null);
+  const typeAnswer = useRef<((c: GarmentCategory | null) => void) | null>(null);
+  // false once the operator left this step (Cancel): a run still in flight
+  // must not write its result over whatever they started next
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+      typeAnswer.current?.(null);
+    };
+  }, []);
+
+  /** The import type check (v1.324). A check that cannot run never blocks the
+   *  import — it is marked "unchecked" and Review says so (storing ≠ oordeel). */
+  const checkType = async (
+    product: NonNullable<ScrapedProduct["product"]>,
+    photos: string[],
+    guess: string
+  ): Promise<TypeCheck> => {
+    const body = {
+      title: product.title,
+      handle: product.handle,
+      description: product.body_html,
+      product_type: product.product_type,
+      tags: product.tags,
+      options: product.options,
+      images: photos,
+      guess,
+    };
+    for (let i = 0; i < 2; i++) {
+      // the photo check takes 3–5 s; one that hangs must not hold the import
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 45_000);
+      try {
+        return await api.resolveType(body, ctl.signal);
+      } catch {
+        if (ctl.signal.aborted) break; // timed out: carry on unchecked, don't wait twice
+        /* retry once, then carry on unchecked */
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    return {
+      category: null, decided_by: "unchecked", conflict: false, signals: {}, misleading: [],
+      vision: null, vision_error: null, candidates: [], product_type: guess,
+    };
+  };
 
   /**
    * PHASE 1 — scrape → name → keyword research, then STOP at the keyword-review
@@ -106,19 +179,9 @@ export function GenerateStep() {
         : (["dk"] as StoreKey[]);
       const primary = selectedStores[0];
 
-      const competitor = {
-        title: product?.title ?? "Unknown product",
-        hostname: safeHostname(data.competitorUrl),
-        variants: product?.variants?.length ?? 0,
-        price: product?.variants?.[0]?.price ? `€${product.variants[0].price}` : "—",
-        sourceText: competitorSourceText(product),
-      };
-      const productType = guessProductType(product);
+      // the title's own type word — only a guess until the type check below
+      const guess = guessProductType(product);
       const canonicalColors = extractColors(product).map(canonicalize);
-      // The competitor's own sizes (v1.323) — the listing used to get XS–XL
-      // whatever the competitor sold (shoes in XS–XL, 3XL never offered).
-      // (the competitor's domain decides whether bare numbers are UK, AU or unknown)
-      const sizes = competitorSizes(product?.options, nbCategory(productType), safeHostname(data.competitorUrl));
 
       // ImagesCard "From competitor" shows just 8 thumbnails — enough for the
       // user to pick a reference for steps 1-4. Nothing is pre-selected.
@@ -134,6 +197,10 @@ export function GenerateStep() {
       // Compute per-colour image groups from the FULL scraped image set so the
       // ColorRefPicker has every back/detail shot — not just the cap-of-8.
       const imagesByColor = groupImagesByColor(product, canonicalColors);
+
+      // ── 1b. What IS this product? (v1.324, Carina) — in parallel with the names
+      const photos = typeCheckPhotos(product, imagesByColor);
+      const typeCheckP = checkType(product, photos, guess);
 
       // ── 2. Pick unique product name (checked against ALL selected stores) ──
       setStage("names");
@@ -168,6 +235,39 @@ export function GenerateStep() {
         );
       }
 
+      // The competitor's own fields disagree and the photos could not settle
+      // it: the operator picks before anything is researched or written.
+      let typeCheck = await typeCheckP;
+      if (!alive.current) return;
+      if (typeCheck.decided_by === "operator") {
+        const picked = await new Promise<GarmentCategory | null>((resolve) => {
+          typeAnswer.current = resolve;
+          setTypeAsk({ check: typeCheck, photos });
+        });
+        setTypeAsk(null);
+        if (!alive.current) return;
+        if (!picked) throw new Error("Import stopped — pick what the product is to continue (↻ Try again).");
+        typeCheck = {
+          ...typeCheck,
+          category: picked,
+          misleading: misleadingFor(typeCheck, picked),
+          product_type: tokenFor(picked, guess, nbCategoryToGarment(guess)),
+        };
+      }
+      const productType = typeCheck.product_type || guess;
+      const competitor = {
+        title: product?.title ?? "Unknown product",
+        hostname: safeHostname(data.competitorUrl),
+        variants: product?.variants?.length ?? 0,
+        price: product?.variants?.[0]?.price ? `€${product.variants[0].price}` : "—",
+        // only the competitor fields that describe THIS product feed keywords and copy
+        sourceText: typeCheck.misleading.length ? trustedSourceText(product, typeCheck.misleading) : competitorSourceText(product),
+      };
+      // The competitor's own sizes (v1.323) — the listing used to get XS–XL
+      // whatever the competitor sold (shoes in XS–XL, 3XL never offered).
+      // (the competitor's domain decides whether bare numbers are UK, AU or unknown)
+      const sizes = competitorSizes(product?.options, nbCategory(productType), safeHostname(data.competitorUrl));
+
       const ctx: PendingCtx = {
         product,
         selectedStores,
@@ -175,6 +275,7 @@ export function GenerateStep() {
         chosenName,
         canonicalColors,
         productType,
+        typeCheck,
         competitor,
         images,
         variantsByColor,
@@ -190,10 +291,14 @@ export function GenerateStep() {
         const kr = await api.researchKeywords({
           stores: selectedStores,
           product_name: chosenName,
-          competitor_title: product?.title ?? "",
+          // a title that described another product never seeds the research
+          competitor_title: typeCheck.misleading.includes("title") ? "" : product?.title ?? "",
           // Competitor's own info — fabric keywords the competitor never mentions
           // are dropped server-side before they reach the review popup.
-          description: competitorSourceText(product),
+          description: competitor.sourceText,
+          // the settled type anchors the seeds; keywords about another kind of
+          // product ("mocassins" for trousers) are dropped server-side
+          ...(typeCheck.category ? { category: typeCheck.category, product_type: productType } : {}),
         });
         if (kr.configured && kr.results) {
           configured = true;
@@ -214,6 +319,7 @@ export function GenerateStep() {
         /* dormant / network error → generate with manual/legacy keywords */
       }
 
+      if (!alive.current) return;
       if (!configured) {
         // DataForSEO off → nothing to review, keep today's behaviour.
         await finishGeneration(ctx, null);
@@ -274,6 +380,7 @@ export function GenerateStep() {
       chosenName,
       canonicalColors,
       productType,
+      typeCheck,
       competitor,
       images,
       variantsByColor,
@@ -318,6 +425,14 @@ export function GenerateStep() {
           keywords: storeKeywords,
           tone_references: toneRefs[store],
           source_text: competitor.sourceText,
+          // the settled type is a rule for the writer; an unchecked guess is not
+          ...(typeCheck.category
+            ? {
+                product_type: productType,
+                garment_category: typeCheck.category,
+                type_source_misleading: typeCheck.misleading,
+              }
+            : {}),
         });
         if (gen.error) throw new Error(`${store.toUpperCase()}: ${gen.error}`);
 
@@ -353,9 +468,11 @@ export function GenerateStep() {
           price: existingPrice || defaultPriceByStore[store],
           colorLabels,
           unverifiedLength: gen.unverified_length ?? [],
+          typeMismatch: gen.type_mismatch ?? null,
         };
       }
 
+      if (!alive.current) return; // the operator left: never write over the next product
       // ── 4. Done — patch everything ──
       setStage("done");
       setSubStage("");
@@ -372,6 +489,9 @@ export function GenerateStep() {
         colors: primaryColors,
         siblingsHandle: autoSiblingsHandle(chosenName),
         productType,
+        // ALWAYS written: product B never inherits A's category
+        category: typeCheck.category,
+        typeCheck,
         // ALWAYS written (fallback included): product B must never inherit A's sizes
         sizes: sizes.sizes,
         sizesSource: sizes.source,
@@ -416,7 +536,7 @@ export function GenerateStep() {
     (async () => {
       try {
         // nothing of the previous product may survive a failed scrape
-        patch({ sizeChart: null, sizeChartStatus: null, sizeChartHint: null });
+        patch({ sizeChart: null, sizeChartStatus: null, sizeChartHint: null, category: null, typeCheck: null });
         const scraped = await api.scrape(data.competitorUrl);
         if (scraped.error || !scraped.product) throw new Error(scraped.error || "Scrape failed");
         // Carry the competitor's size chart through to publish (appended, localised,
@@ -592,6 +712,14 @@ export function GenerateStep() {
   }
 
   const inReview = stage === "review";
+  const typeModal = typeAsk && (
+    <TypeChoiceModal
+      check={typeAsk.check}
+      photos={typeAsk.photos}
+      onPick={(c) => typeAnswer.current?.(c)}
+      onCancel={() => typeAnswer.current?.(null)}
+    />
+  );
 
   return (
     <>
@@ -650,6 +778,7 @@ export function GenerateStep() {
           if (pending) void finishGeneration(pending, selectedByStore);
         }}
       />
+      {typeModal}
     </>
   );
 }
