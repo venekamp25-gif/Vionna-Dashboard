@@ -305,6 +305,25 @@ def test_a_store_level_failure_does_not_burn_a_second_topic(monkeypatch, shops):
     assert tried == ['mest elskede styles lige nu']
 
 
+def test_a_writer_failure_comes_back_as_that_topics_error_not_an_exception(monkeypatch, pipeline):
+    # The write step only knows its own topic; moving on to another candidate is
+    # the run loop's job. 30 Sep 2026 a writer fall-through merged into the write
+    # step silently read the run's `candidates` there: every writer failure
+    # became a NameError and the reason never reached Slack or the result.
+    _candidates(monkeypatch, bestsellers=False)
+
+    def no_shopify(*a, **k):
+        raise AssertionError('a failed writer must not reach Shopify')
+    monkeypatch.setattr(server, '_shopify_call', no_shopify)
+    written = []
+    monkeypatch.setattr(server, '_blog_write',
+                        lambda store, topic, products, **kw: written.append(topic['keyword']))
+    res = server._blog_generate_one('dk')
+    assert written == ['støvler']                  # a regular topic does not buy a second paid run
+    assert res['error'].startswith('writer failed') and res['topic']['keyword'] == 'støvler'
+    assert server._blog_read_jsonl(server.BLOG_FAILURES_PATH) == []   # the scheduler records the day
+
+
 def test_a_topic_refused_on_two_days_this_month_is_not_tried_first_again(monkeypatch, shops):
     _candidates(monkeypatch)
     month = datetime.datetime.utcnow().strftime('%Y-%m')
