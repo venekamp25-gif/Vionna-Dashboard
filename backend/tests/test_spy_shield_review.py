@@ -374,7 +374,7 @@ def test_digest_tick_posts_once_per_day_across_restarts_and_prunes(client, _sand
     post = lambda url, text: posts.append(text)
     at_0905 = datetime.datetime(2026, 9, 25, 9, 6)
     assert server._spy_shield_digest_tick(at_0905, post) == ['pruned 1', 'posted']
-    assert len(posts) == 1 and posts[0].startswith('🛡️ Spy Shield (14d)')
+    assert len(posts) == 1 and posts[0].startswith('🛡️ Spy Shield (data sinds ')
     # A "restart" (fresh loop state) the same morning must not post again: the day is on disk.
     assert server._spy_shield_digest_tick(at_0905 + datetime.timedelta(minutes=10), post) == []
     assert len(posts) == 1
