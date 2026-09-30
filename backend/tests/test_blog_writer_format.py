@@ -8,7 +8,12 @@ hand-written JSON under a fixed 4,500-token cap: Finnish pillars were cut off at
 the cap, and even complete answers broke on an unescaped quote inside the HTML
 ('"half tuck"', 'href=\\"/blogs/...">'). No retry, and the log showed only the
 first 150 characters, identical for both causes.
+
+A failed PILLAR hands the slot to the next candidate inside _blog_generate_one's
+loop (shared bound with a refused create, fix/blog-dk-handle) and is written to
+blog_failures.jsonl, plus one Slack line when the next topic covers the day.
 """
+import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -169,9 +174,16 @@ class _Reached(Exception):
 
 
 @pytest.fixture()
-def pipeline(monkeypatch):
+def slack(monkeypatch):
+    sent = []
+    monkeypatch.setattr(server, '_blog_slack', lambda text, blocks=None: sent.append(text))
+    return sent
+
+
+@pytest.fixture()
+def pipeline(monkeypatch, slack):
     """Every step before the writer faked; the editor stops the run, so nothing
-    after the writer (and certainly no Shopify write) is exercised."""
+    after the writer (and certainly no Shopify write or Slack ping) is exercised."""
     def _no_shopify(*a, **k):
         raise AssertionError('no Shopify calls in this test')
     monkeypatch.setattr(server, '_shopify_call', _no_shopify)
@@ -219,21 +231,120 @@ def test_generate_one_error_carries_the_writer_reason_and_the_topic(claude, pipe
     assert res['topic']['keyword'] == 'neuleet'
 
 
+def _failures():
+    return [(r['store'], r['topic'], r['step'])
+            for r in server._blog_read_jsonl(server.BLOG_FAILURES_PATH)]
+
+
+def test_the_write_step_reports_a_writer_failure_without_the_runs_candidate_list(pipeline):
+    # Integration with fix/blog-dk-handle (30 Sep 2026): the fall-through used to
+    # recurse with `candidates`, which does not exist inside _blog_write_and_publish,
+    # so EVERY writer failure became a NameError and the real reason was lost.
+    pipeline(fail={'pusero'})
+    res = server._blog_write_and_publish('fi', dict(FI_PILLAR), PRODUCTS,
+                                         {'X-Shopify-Access-Token': 'x'}, False)
+    assert res['writer_failed'] is True
+    assert res['writer_error'] == 'output cut off at max_tokens (writing pusero)'
+    assert res['error'] == "writer failed: output cut off at max_tokens (writing pusero) (topic 'pusero')"
+
+
 def test_a_failed_pillar_writer_hands_the_slot_to_the_next_candidate(pipeline):
     written = pipeline(fail={'pusero'})
     with pytest.raises(_Reached) as hit:
         server._blog_generate_one('fi', published=False)
     assert written == ['pusero', 'neuleet']
     assert hit.value.args[0]['title'] == 'neuleet'
+    assert _failures() == [('fi', 'pusero', 'writer')]     # on disk before the next topic runs
 
 
-def test_when_the_next_candidate_fails_too_both_reasons_are_reported(pipeline):
+def _next_topic_publishes(monkeypatch):
+    """The pillar goes through the real write step; any other topic 'publishes'."""
+    real = server._blog_write_and_publish
+
+    def run(store, topic, products, hdrs, published):
+        if topic.get('pillar'):
+            return real(store, topic, products, hdrs, published)
+        return {'store': store, 'topic': topic, 'published': True,
+                'article': {'storefront_url': f"https://fi.example/blogs/journal/{topic['keyword']}"}}
+    monkeypatch.setattr(server, '_blog_write_and_publish', run)
+
+
+def test_a_pillar_failure_the_next_topic_covers_is_recorded_and_sent_to_slack(pipeline, slack, monkeypatch):
+    # The day succeeds, so the scheduler and the slot alert see nothing: without
+    # this, a pillar that fails on every run silently stops cluster-building.
+    pipeline(fail={'pusero'})
+    _next_topic_publishes(monkeypatch)
+    res = server._blog_generate_one('fi', published=False)
+    assert 'error' not in res and res['article']['storefront_url'].endswith('/neuleet')
+    assert res['pillar_writer_failed'] == {'keyword': 'pusero',
+                                           'error': 'output cut off at max_tokens (writing pusero)'}
+    rows = server._blog_read_jsonl(server.BLOG_FAILURES_PATH)
+    assert _failures() == [('fi', 'pusero', 'writer')]
+    assert 'writer failed: output cut off at max_tokens (writing pusero)' in rows[0]['error']
+    assert len(slack) == 1
+    assert '[FI]' in slack[0] and "'pusero'" in slack[0] and "'neuleet'" in slack[0]
+    assert 'max_tokens' in slack[0]
+
+
+def test_the_scheduler_keeps_a_covered_pillar_failure_on_disk_and_records_no_failed_day(
+        pipeline, slack, monkeypatch):
+    pipeline(fail={'pusero'})
+    _next_topic_publishes(monkeypatch)
+    monkeypatch.setattr(server, 'STORES', {'fi': 'fi.myshopify.com'})
+    monkeypatch.setattr(server, 'BLOG_SCHED_STORES', ['fi'])
+    monkeypatch.setattr(server, '_blog_sync_history_from_shopify', lambda st, hdrs=None: 0)
+    server._blog_scheduled_tick(datetime.datetime(2026, 9, 29, server.BLOG_SCHED_HOUR, 0))   # a Tuesday
+    assert _failures() == [('fi', 'pusero', 'writer')]
+    assert server._BLOG_TRIED == {} and server._BLOG_LAST['scheduled']['error'] is None
+    assert len(slack) == 1 and "'pusero'" in slack[0]
+
+
+def test_when_the_next_candidate_fails_too_both_reasons_are_reported(pipeline, slack):
     written = pipeline(fail={'pusero', 'neuleet'})
     res = server._blog_generate_one('fi', published=False)
     assert written == ['pusero', 'neuleet']            # only a pillar falls through
     assert res['error'].startswith("writer failed: output cut off at max_tokens (writing neuleet) (topic 'neuleet')")
     assert "after pillar 'pusero' writer failed" in res['error'] and 'writing pusero' in res['error']
     assert res['pillar_writer_failed']['keyword'] == 'pusero'
+    # the pillar is on disk now; the day's failure is the scheduler's to record,
+    # and its slot alert is the Slack line
+    assert _failures() == [('fi', 'pusero', 'writer')]
+    assert slack == []
+
+
+def test_when_nothing_else_fits_after_a_failed_pillar_the_error_names_the_pillar(pipeline, slack, monkeypatch):
+    written = pipeline(fail={'pusero'})
+    monkeypatch.setattr(server, '_blog_products_fit_topic',
+                        lambda store, cand, prods: prods if cand.get('pillar') else [])
+    res = server._blog_generate_one('fi', published=False)
+    assert written == ['pusero']
+    assert res['error'] == ("no candidate topic has enough genuinely fitting products "
+                            "(after pillar 'pusero' writer failed: output cut off at max_tokens "
+                            "(writing pusero))")
+    assert _failures() == [('fi', 'pusero', 'writer')] and slack == []
+
+
+def test_a_refused_create_and_a_failed_pillar_share_one_fallthrough_budget(pipeline, monkeypatch):
+    written = pipeline(fail={'pusero'})
+    monkeypatch.setattr(server, 'BLOG_CREATE_FALLTHROUGH', 1)
+    monkeypatch.setattr(server, '_blog_bestsellers_topic', lambda *a, **k: {
+        'keyword': 'rakastetuimmat tyylit juuri nyt', 'category': None, 'source': 'bestsellers',
+        'products_override': list(PRODUCTS)})
+    real, tried = server._blog_write_and_publish, []
+
+    def run(store, topic, products, hdrs, published):
+        tried.append(topic['keyword'])
+        if topic.get('source') == 'bestsellers':
+            raise server._BlogCreateRejected('article create failed HTTP 422', status=422)
+        return real(store, topic, products, hdrs, published)
+    monkeypatch.setattr(server, '_blog_write_and_publish', run)
+    res = server._blog_generate_one('fi', published=False)
+    assert tried == ['rakastetuimmat tyylit juuri nyt', 'pusero']     # no third full run
+    assert written == ['pusero']
+    assert res['error'] == "writer failed: output cut off at max_tokens (writing pusero) (topic 'pusero')"
+    assert 'pillar_writer_failed' not in res
+    # the refusal recorded itself; this last failure is the day's, the scheduler records it
+    assert _failures() == [('fi', 'rakastetuimmat tyylit juuri nyt', 'create')]
 
 
 def test_a_caller_supplied_pillar_has_no_other_candidate_to_fall_back_to(pipeline):
@@ -241,3 +352,4 @@ def test_a_caller_supplied_pillar_has_no_other_candidate_to_fall_back_to(pipelin
     res = server._blog_generate_one('fi', topic=dict(FI_PILLAR), published=False)
     assert written == ['pusero']
     assert res['error'] == "writer failed: output cut off at max_tokens (writing pusero) (topic 'pusero')"
+    assert _failures() == []

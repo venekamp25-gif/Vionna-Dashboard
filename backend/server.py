@@ -24178,12 +24178,10 @@ def _blog_slack_article(store, created, publish, qa_slim, topic):
         print(f"[blog] slack article notify failed: {e}")
 
 
-def _blog_generate_one(store, topic=None, published=None, _candidates=None):
+def _blog_generate_one(store, topic=None, published=None):
     """Full pipeline for one store → one article. published: True/False force the
     state; None = auto mode — publish only when the QA gate passes (and
-    BLOG_AUTO_PUBLISH isn't 0), else save as draft. Returns a result dict.
-    _candidates: internal — the rest of this run's topic list after a pillar's
-    writer failed."""
+    BLOG_AUTO_PUBLISH isn't 0), else save as draft. Returns a result dict."""
     hdrs = shopify_headers(store)
     if not hdrs.get('X-Shopify-Access-Token'):
         return {'store': store, 'error': 'no Shopify token for this store'}
@@ -24193,8 +24191,6 @@ def _blog_generate_one(store, topic=None, published=None, _candidates=None):
     # dress is not wedding wear — reject and try the next subject instead).
     if topic is not None:
         candidates = [topic]
-    elif _candidates:
-        candidates = list(_candidates)
     else:
         candidates = [{**t, 'source': 'dataforseo'} for t in _blog_hot_topics(store, k=3, hdrs=hdrs)]
         fb = _blog_fallback_topic(store, hdrs=hdrs)
@@ -24222,28 +24218,63 @@ def _blog_generate_one(store, topic=None, published=None, _candidates=None):
     # every slot while it is due, so its 422 kept DK silent for 6 slots (Sep
     # 2026). A content-level refusal is recorded and the next candidate gets
     # the slot, bounded to BLOG_CREATE_FALLTHROUGH extra full runs.
-    remaining, rejection = list(candidates), None
-    for _ in range(1 + BLOG_CREATE_FALLTHROUGH):
+    remaining, rejection, pillar_fail = list(candidates), None, None
+    for attempt in range(1 + BLOG_CREATE_FALLTHROUGH):
         topic, products = _blog_pick_topic(store, remaining, hdrs, exclude)
         if topic is None:
             break
         try:
-            return _blog_write_and_publish(store, topic, products, hdrs, published)
+            res = _blog_write_and_publish(store, topic, products, hdrs, published)
         except _BlogCreateRejected as e:
             e.topic_keyword, e.recorded = topic.get('keyword'), True
             _blog_record_failure(store, topic.get('keyword'), 'create', e)
             print(f"[blog] {store}: create refused for topic '{topic.get('keyword')}': {e}")
             rejection = e
             remaining = [c for c in remaining if c is not topic]
+            continue
+        # 29 Sep 2026: FI lost its Tuesday article on a PILLAR whose writer failed.
+        # A pillar is due by rule, not the day's only option, so it hands the slot
+        # to the next candidate (same bound as a refused create). Recorded right
+        # here: when the next topic succeeds, nothing downstream sees this failure.
+        rest = [c for c in remaining if c is not topic]
+        if (res.get('writer_failed') and topic.get('pillar') and rest
+                and attempt < BLOG_CREATE_FALLTHROUGH):
+            kw = topic.get('keyword')
+            _blog_record_failure(store, kw, 'writer', res['error'])
+            print(f"[blog] {store}: pillar '{kw}' writer failed ({res.get('writer_error')}) "
+                  f"— trying the next topic")
+            pillar_fail = {'keyword': kw, 'error': res.get('writer_error')}
+            remaining = rest
+            continue
+        return _blog_after_pillar_failure(store, res, pillar_fail)
     if rejection is not None:
         raise rejection
-    return {'store': store, 'topic': candidates[0],
-            'error': 'no candidate topic has enough genuinely fitting products'}
+    return _blog_after_pillar_failure(store, {
+        'store': store, 'topic': candidates[0],
+        'error': 'no candidate topic has enough genuinely fitting products'}, pillar_fail)
 
 
-# Extra topics tried in the same run after Shopify refuses an article. Each one
-# is a full writer → editor → QA → hero run, hence the bound.
+# Extra topics tried in the same run after Shopify refuses an article or a due
+# pillar's writer fails (one shared budget). Each one is a full writer → editor
+# → QA → hero run, hence the bound.
 BLOG_CREATE_FALLTHROUGH = 1
+
+
+def _blog_after_pillar_failure(store, res, pillar_fail):
+    """Carry a pillar writer failure that handed its slot on into the run's result.
+    On an error it joins the reason. On a success it would otherwise vanish, and
+    _blog_pillar_candidate hands back the same due pillar every run, so a pillar
+    that always fails would silently stop cluster-building: say so in Slack."""
+    if not pillar_fail:
+        return res
+    res['pillar_writer_failed'] = pillar_fail
+    kw, why = pillar_fail['keyword'], pillar_fail['error']
+    if res.get('error'):
+        res['error'] += f" (after pillar '{kw}' writer failed: {why})"
+    else:
+        _blog_slack(f"⚠️ Blog [{store.upper()}]: pillar '{kw}' kon niet geschreven worden, "
+                    f"vandaag '{_blog_topic_kw(res.get('topic'))}' in de plaats. Reden: {str(why)[:300]}")
+    return res
 
 
 def _blog_topics_failing_create(store, now=None):
@@ -24284,7 +24315,8 @@ def _blog_pick_topic(store, candidates, hdrs, exclude):
 
 def _blog_write_and_publish(store, topic, products, hdrs, published):
     """Write → edit → QA → assemble → create one article for a chosen topic.
-    Raises _BlogCreateRejected when Shopify refuses the article itself."""
+    A writer that gives nothing usable returns an error marked 'writer_failed';
+    raises _BlogCreateRejected when Shopify refuses the article itself."""
     faqs = _blog_faq_questions(store, topic.get('keyword'))
     concerns = _blog_reddit_concerns(store, topic)
     brief = _blog_serp_brief(store, topic)
@@ -24296,19 +24328,11 @@ def _blog_write_and_publish(store, topic, products, hdrs, published):
     if not art or not art.get('title') or not art.get('body_html'):
         # 29 Sep 2026: FI lost its Tuesday article on a pillar whose writer failed
         # twice, and Slack only said 'writer failed'. The reason and the subject
-        # now travel with the error, and a failed PILLAR (a due-by-rule piece, not
-        # the day's only option) hands the slot to the next candidate.
+        # now travel with the error; 'writer_failed' lets _blog_generate_one hand
+        # a failed PILLAR's slot to the next candidate in its own loop.
         why = (art or {}).get('error') or 'empty title/body'
-        kw = topic.get('keyword')
-        rest = [c for c in candidates if c is not topic]
-        if topic.get('pillar') and rest:
-            print(f"[blog] {store}: pillar '{kw}' writer failed ({why}) — trying the next topic")
-            res = _blog_generate_one(store, published=published, _candidates=rest)
-            res['pillar_writer_failed'] = {'keyword': kw, 'error': why}
-            if res.get('error'):
-                res['error'] += f" (after pillar '{kw}' writer failed: {why})"
-            return res
-        return {'store': store, 'topic': topic, 'error': f"writer failed: {why} (topic '{kw}')"}
+        return {'store': store, 'topic': topic, 'writer_failed': True, 'writer_error': why,
+                'error': f"writer failed: {why} (topic '{topic.get('keyword')}')"}
     art['primary_keyword'] = topic.get('keyword')
     art = _blog_edit(store, art, products)
     # Deterministic style gate: models under-obey the dash/length budget when merely
