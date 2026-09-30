@@ -297,12 +297,24 @@ def test_updater_ships_names_ts_and_writes_version_txt_last(monkeypatch, tmp_pat
     assert restarts == [1]
 
 
-def test_updater_writes_nothing_when_one_fetch_fails(monkeypatch, tmp_path):
-    restarts, writes = _updater(monkeypatch, tmp_path, fail='frontend/lib/names.ts')
+def test_updater_writes_nothing_when_one_code_fetch_fails(monkeypatch, tmp_path):
+    restarts, writes = _updater(monkeypatch, tmp_path, fail='backend/shipping_check.py')
     r = server.app.test_client().post('/api/update')
     assert r.status_code == 500 and r.get_json()['success'] is False
     assert writes == [] and restarts == []
     assert os.listdir(tmp_path / 'backend') == []          # not even version.txt moved on
+    assert not (tmp_path / 'frontend').exists()
+
+
+def test_a_missing_names_ts_on_main_never_stops_code_deploys(monkeypatch, tmp_path):
+    # names.ts renamed/moved/deleted on main (404): the code still ships —
+    # otherwise even the commit that fixes the list could never reach the droplet
+    restarts, writes = _updater(monkeypatch, tmp_path, fail='frontend/lib/names.ts')
+    r = server.app.test_client().post('/api/update')
+    body = r.get_json()
+    assert r.status_code == 200 and body['success'] and restarts == [1]
+    assert body['updated'][-1] == 'backend/version.txt' and 'frontend/lib/names.ts' not in body['updated']
+    assert any('names.ts' in w for w in body['warnings'])
     assert not (tmp_path / 'frontend').exists()
 
 

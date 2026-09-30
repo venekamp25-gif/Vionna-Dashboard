@@ -214,7 +214,7 @@ def test_ready_verdict_is_yes_after_14_calendar_days_with_a_clean_checked_order(
     s = server._spy_shield_summary(days=14)
     assert s['ready']['dk'] == {'ready': True, 'days_live': 14, 'why_not': []}
     line = server._spy_shield_digest_line(14)
-    assert line.endswith('· KLAAR VOOR DK: ja')
+    assert '· KLAAR VOOR DK: ja (check nog in het tabblad: would-be blocks < 0,5% van de DK-sessies)' in line
 
 
 def test_operator_sim_tests_cannot_flip_a_ready_verdict(_sandbox, monkeypatch):

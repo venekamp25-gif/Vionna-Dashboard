@@ -515,3 +515,15 @@ def test_status_shows_recent_failures_and_the_cadence_per_store(monkeypatch, sho
     assert dk['last_error']['topic'] == 'mest elskede styles lige nu'
     assert body['per_store']['fi'] == {'last_article_at': None, 'last_article_title': None,
                                        'missed_slots': 0, 'last_error': None}
+
+
+def test_retiring_only_hits_articles_whose_handle_starts_with_the_keyword_slug():
+    # retire UNPUBLISHES: a normal article that merely contains the words is safe
+    assert server._blog_is_bestsellers('dk', {'handle': 'mest-elskede-styles-lige-nu-2'}, strict=True)
+    assert server._blog_is_bestsellers('fr', {'handle': 'styles-preferes-du-moment-vionna'}, strict=True)
+    assert not server._blog_is_bestsellers('dk', {'handle': 'saadan-styler-du-mest-elskede-styles-lige-nu'}, strict=True)
+    assert not server._blog_is_bestsellers('dk', {'handle': 'vores-mest-elskede-styles-lige-nu'}, strict=True)
+    # the tag still counts in strict mode (every piece created since v1.325 has it)
+    assert server._blog_is_bestsellers('dk', {'handle': 'vores-mest-elskede-styles-lige-nu', 'tags': 'vionna-bestsellers'}, strict=True)
+    # the due-check stays permissive: at worst a month's piece is skipped
+    assert server._blog_is_bestsellers('dk', {'handle': 'vores-mest-elskede-styles-lige-nu'})

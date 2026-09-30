@@ -48,6 +48,11 @@ Nothing else. The droplet installs it itself within ~10 minutes:
   deploy (`_UPDATER_OPTIONAL`); `_name_pool_sync()` also repairs it at boot.
   Watch loops keep their "already warned" state ON DISK (the process restarts
   on every deploy): e.g. `backend/name_pool_watch.json`.
+- **The RUNNING version's list ships the next release.** A release that adds
+  a new local `.py` module or runtime file must go in two steps (first a
+  release that adds it to `_updater_files()`, then the one that imports it),
+  or the droplet boots without it. Data files (`_UPDATER_OPTIONAL`) may fail
+  to fetch or write without blocking the code deploy.
 - Kill switch: set `SELF_UPDATE=0` in the droplet's `.env` (or environment).
   Local dev (`start.bat`) and pytest skip the updater automatically
   (`DEV_LOCAL=1` / pytest import guard) — otherwise it would overwrite your
@@ -286,7 +291,9 @@ failures found 30 Sep 2026:
   by `max_tokens=4500` (Finnish ≈ 4.8 tokens/word) or broken by an unescaped
   quote. The writer (and editor) now return through a FORCED TOOL call (the API
   parses it), with a per-language budget, one retry on any failure, and the
-  real reason in the error ("writer failed: <reason> (topic …)").
+  real reason in the error ("writer failed: <reason> (topic …)"). NOTE: forced
+  `tool_choice` works on claude-sonnet-4-6 but returns 400 on some newer
+  models — changing the blog model string needs a check of every tool call.
 - Every failure is appended to `backend/blog_failures.jsonl` (NOT the history
   file: `_blog_store_posted_on` would count it as posted); `/api/blog/status`
   shows `recent_failures` and per store `last_article_at` / `missed_slots` /

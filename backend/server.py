@@ -10237,7 +10237,9 @@ def _spy_shield_digest_line(days=14):
     if t.get('operator_tests'):
         line += f", {t['operator_tests']} operator tests (sim/op, niet meegeteld)"
     v = (s.get('ready') or {}).get('dk') or _ss_ready_verdict(s, 'dk', now)
-    line += ' · KLAAR VOOR DK: ' + ('ja' if v['ready'] else 'nee (' + '; '.join(v['why_not']) + ')')
+    # 'ja' still leaves one check that needs the sessions (Shopify Analytics)
+    line += ' · KLAAR VOOR DK: ' + ('ja (check nog in het tabblad: would-be blocks < 0,5% van de DK-sessies)'
+                                    if v['ready'] else 'nee (' + '; '.join(v['why_not']) + ')')
     if t.get('pt_alarm_active'):
         pct = round(100.0 * t['pt_alarm'] / max(1, t['total']))
         line += (f" ⚠️ {pct}% van de records komt uit een preview-thema (ss_pt=1) — test je nu geen "
@@ -11179,7 +11181,10 @@ def _name_pool_sync():
                       f'— refused to shrink the list')
     except Exception as e:
         print(f'[names] sync failed: {e}')
-    _NAME_POOL_SYNC.update({'at': now, 'result': result})
+    # a failed or unreached fetch is retried after 10 min, not 6 h: one GitHub
+    # blip at boot must not leave the old list in place for the rest of the day
+    ttl_now = _NAME_POOL_SYNC_TTL if result['remote_pool'] is not None or not _background_loops_allowed() else 600
+    _NAME_POOL_SYNC.update({'at': now - (_NAME_POOL_SYNC_TTL - ttl_now), 'result': result})
     return result
 
 
@@ -20482,7 +20487,7 @@ def api_update():
     # Fetch EVERYTHING first, write only when every fetch succeeded, version.txt
     # last. Writing each file as it arrived let version.txt move on while another
     # file had failed, and the updater then never retried the missing one.
-    fetched, errors = [], []
+    fetched, errors, warnings = [], [], []
     for repo_path, dest in _updater_files():
         try:
             r = req.get(f'{fetch_base}/{repo_path}', timeout=15,
@@ -20491,12 +20496,17 @@ def api_update():
             r.raise_for_status()
             fetched.append((repo_path, dest, r.content))
         except Exception as e:
+            if repo_path in _UPDATER_OPTIONAL:
+                # A data file that is gone or moved on main (404) must never
+                # stop code deploys for good — including the one that fixes it.
+                warnings.append(f'{repo_path}: {e}')
+                continue
             errors.append(f'{repo_path}: {e}')
     if errors:
-        return jsonify({'success': False, 'updated': [], 'errors': errors,
+        return jsonify({'success': False, 'updated': [], 'errors': errors, 'warnings': warnings,
                         'sha': sha, 'pinned': pinned}), 500
 
-    updated, warnings = [], []
+    updated = []
     for repo_path, dest, content in fetched:
         try:
             _write_file_atomic(dest, content)
@@ -21871,7 +21881,7 @@ def _blog_is_article_row(row):
     return bool(row.get('article_id')) and not row.get('maint') and not row.get('refresh')
 
 
-def _blog_is_bestsellers(store, row):
+def _blog_is_bestsellers(store, row, strict=False):
     """Is this history row or Shopify article the store's monthly bestsellers
     piece? Our own log, the fixed tag, or the keyword slug in the handle all
     count, so a row that only came back via the Shopify sync counts too."""
@@ -21884,7 +21894,13 @@ def _blog_is_bestsellers(store, row):
         return True
     kw = _blog_slug(BLOG_BESTSELLER_TITLEKW.get(store) or '')
     handle = (row.get('article_handle') or row.get('handle') or '').lower()
-    return bool(kw and handle) and f'-{kw}-' in f'-{handle}-'
+    if not (kw and handle):
+        return False
+    if strict:
+        # retiring UNPUBLISHES: only a handle that starts with the keyword slug
+        # (the real ones do: '-2', '-vionna'), never one that merely contains it
+        return handle == kw or handle.startswith(kw + '-')
+    return f'-{kw}-' in f'-{handle}-'
 
 
 def _blog_bestsellers_topic(store, hdrs, n=5):
@@ -25202,14 +25218,14 @@ def _blog_retire_previous_bestsellers(store, hdrs, created):
         olds = {}   # article_id -> handle
         for r in _blog_read_jsonl(BLOG_HISTORY_PATH):
             if (r.get('store') == store and _blog_is_article_row(r) and r['article_id'] != new_id
-                    and _blog_is_bestsellers(store, r)):
+                    and _blog_is_bestsellers(store, r, strict=True)):
                 olds[r['article_id']] = r.get('article_handle')
         blog_id = _blog_ensure(store, hdrs)
         # Shopify itself too: a bestsellers article without our history row (it
         # came back as source='shopify-sync') was never retired before 30 Sep 2026.
         for h, a in (_blog_existing_handles(store, blog_id, hdrs) or {}).items():
             if (a.get('id') and a['id'] != new_id and h != (created.get('handle') or '').lower()
-                    and _blog_is_bestsellers(store, a)):
+                    and _blog_is_bestsellers(store, a, strict=True)):
                 olds[a['id']] = h   # the live handle beats a stale history row
         if not olds:
             return
