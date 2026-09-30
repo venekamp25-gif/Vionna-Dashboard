@@ -38,6 +38,9 @@ Thumbs.db
 plans.jsonl
 backend/plans.jsonl
 backend/blog_history.jsonl
+# Blog engine: failed runs (reason + topic per attempt) — droplet state
+blog_failures.jsonl
+backend/blog_failures.jsonl
 backend/deletion_log.jsonl
 backend/deletion_watch_state.json
 backend/plans.jsonl

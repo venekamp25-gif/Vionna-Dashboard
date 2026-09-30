@@ -245,7 +245,7 @@ def _run_backup():
         dest = os.path.join(BACKUP_DIR, day)
         os.makedirs(dest, exist_ok=True)
         for fname in ('publish_history.jsonl', 'lighting_history.jsonl', 'bug_reports.jsonl',
-                      'blog_history.jsonl',
+                      'blog_history.jsonl', 'blog_failures.jsonl',
                       'blog_performance.jsonl', 'blog_views.json', 'blog_playbook.json',
                       'bs_snapshots.jsonl', 'known_sources.json', 'blocked_sources.json',
                       'wtl_verdicts.json', 'wtl_traffic.json', 'size_chart_fill.json',
@@ -21650,6 +21650,46 @@ def _blog_ensure_author_page(store, hdrs):
 
 BLOG_BESTSELLER_TITLEKW = {'dk': 'mest elskede styles lige nu', 'fr': 'styles préférés du moment',
                            'fi': 'rakastetuimmat tyylit juuri nyt'}
+# Fixed marker on every bestsellers article. Until 30 Sep 2026 only a history row
+# with source='bestsellers' said "this month's piece exists"; an article that got
+# into the store without one (laptop run, or a create whose bookkeeping never ran)
+# came back as source='shopify-sync' and the topic stayed due.
+BLOG_BESTSELLER_TAG = 'vionna-bestsellers'
+
+# Handle transliteration: Danish/Finnish/French letters must not fall out of a
+# slug. The writer sanitiser dropped them ('de-sko-der-l-fter-ethvert-outfit').
+_BLOG_SLUG_MAP = {'æ': 'ae', 'ø': 'oe', 'å': 'aa', 'ä': 'a', 'ö': 'o', 'ü': 'u', 'ß': 'ss',
+                  'œ': 'oe', 'ð': 'd', 'þ': 'th', 'ł': 'l'}
+
+
+def _blog_slug(text):
+    """URL slug for an article handle: lowercase ascii with hyphens. Nordic letters
+    are transliterated (æ→ae, ø→oe, å→aa, ä→a, ö→o), accents fold (é→e, ç→c)."""
+    t = ''.join(_BLOG_SLUG_MAP.get(c, c) for c in (text or '').lower())
+    t = ''.join(c for c in unicodedata.normalize('NFKD', t) if not unicodedata.combining(c))
+    return re.sub(r'[^a-z0-9]+', '-', t).strip('-')[:80].strip('-')
+
+
+def _blog_is_article_row(row):
+    """A history row that stands for a created article (not a maintenance or
+    refresh note about an existing one)."""
+    return bool(row.get('article_id')) and not row.get('maint') and not row.get('refresh')
+
+
+def _blog_is_bestsellers(store, row):
+    """Is this history row or Shopify article the store's monthly bestsellers
+    piece? Our own log, the fixed tag, or the keyword slug in the handle all
+    count, so a row that only came back via the Shopify sync counts too."""
+    if row.get('source') == 'bestsellers' or (row.get('levers') or {}).get('format') == 'bestsellers':
+        return True
+    tags = row.get('tags') or []
+    if isinstance(tags, str):
+        tags = tags.split(',')
+    if BLOG_BESTSELLER_TAG in {str(t).strip().lower() for t in tags}:
+        return True
+    kw = _blog_slug(BLOG_BESTSELLER_TITLEKW.get(store) or '')
+    handle = (row.get('article_handle') or row.get('handle') or '').lower()
+    return bool(kw and handle) and f'-{kw}-' in f'-{handle}-'
 
 
 def _blog_bestsellers_topic(store, hdrs, n=5):
@@ -21659,8 +21699,7 @@ def _blog_bestsellers_topic(store, hdrs, n=5):
     month = datetime.datetime.utcnow().strftime('%Y-%m')
     for r in _blog_read_jsonl(BLOG_HISTORY_PATH):
         if (r.get('store') == store and (r.get('ts') or '').startswith(month)
-                and (r.get('source') == 'bestsellers'
-                     or (r.get('levers') or {}).get('format') == 'bestsellers')):
+                and _blog_is_article_row(r) and _blog_is_bestsellers(store, r)):
             return None
     since = (datetime.datetime.utcnow() - datetime.timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
     counts = {}
@@ -21836,6 +21875,10 @@ def _blog_article_jsonld(store, art):
     except Exception:
         return ''
 BLOG_HISTORY_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blog_history.jsonl')
+# Failed runs get their own file: DK missed 6 slots in a row (11-29 Sep 2026) and
+# nothing on disk said why — only successes were logged. NOT blog_history.jsonl:
+# _blog_store_posted_on counts every row there as "posted today".
+BLOG_FAILURES_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blog_failures.jsonl')
 BLOG_VIEWS_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blog_views.json')
 _BLOG_VIEWS_LOCK    = threading.Lock()
 BLOG_PERF_PATH      = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blog_performance.jsonl')
@@ -22240,6 +22283,21 @@ def _blog_log(store, topic, article):
             }, ensure_ascii=False) + '\n')
     except Exception as e:
         print(f"[blog] history write failed: {e}")
+
+
+def _blog_record_failure(store, topic_keyword, step, error):
+    """Append one failed attempt to blog_failures.jsonl (why + which topic).
+    2026-09: DK failed 6 slots on the same 422 and only 2 one-off Slack lines
+    ever said so; a restart wiped the in-memory _BLOG_LAST. Never raises."""
+    try:
+        with open(BLOG_FAILURES_PATH, 'a', encoding='utf-8') as f:
+            f.write(json.dumps({
+                'ts': datetime.datetime.utcnow().isoformat() + 'Z',
+                'store': store, 'topic': topic_keyword, 'step': step,
+                'error': str(error)[:400],
+            }, ensure_ascii=False) + '\n')
+    except Exception as e:
+        print(f"[blog] failure log write failed: {e}")
 
 
 # ============================================================================
@@ -22970,15 +23028,100 @@ def _blog_repetition_violations(body, prev_texts, min_words=BLOG_REPEAT_SHINGLE,
             f"rewrite it completely in different words: \"{h[:180]}\"" for h in hits[:max_hits]]
 
 
+# Output format + budget (incident 29 Sep 2026: the FI Tuesday article never
+# appeared, Slack only said 'writer failed'). The writer returned its ~10k-char
+# HTML article as ONE string inside hand-written JSON, which broke two ways with
+# no retry: cut off at the fixed 4,500-token cap (Finnish ~4.8 tokens/word, the
+# pillar/SERP targets grew to 1,400 words on 22 Jul, the cap never followed),
+# and an unescaped quote inside the HTML ('"half tuck"', 'href=\"/blogs/..">')
+# even on a clean end_turn — 5 of 12 reproduced FI pillar calls were unusable.
+# A forced tool call makes the API hand back a parsed dict (it owns the escaping),
+# and stop_reason tells truncation apart from everything else.
+BLOG_TOKENS_PER_WORD = {'fi': 4.8, 'dk': 3.2, 'fr': 2.8}   # measured 30-09-2026 on writer output
+BLOG_WRITER_MAX_TOKENS = 16000     # same ceiling as the editor (non-streaming stays under the SDK timeout)
+
+
+def _blog_writer_budget(store, wc_target):
+    """Output-token cap for one article: target words × tokens/word for this
+    language + 20% slack + room for the metadata. Billing is per generated
+    token, so a generous cap costs nothing extra; a tight one loses the day."""
+    return max(6000, min(BLOG_WRITER_MAX_TOKENS,
+                         int(wc_target * 1.2 * BLOG_TOKENS_PER_WORD.get(store, 3.5)) + 1500))
+
+
+def _blog_tool(name, description, props, required=None):
+    """Tool definition for one forced structured answer (all string fields
+    unless props says otherwise)."""
+    return {'name': name, 'description': description,
+            'input_schema': {'type': 'object', 'properties': props,
+                             'required': list(required or props)}}
+
+
+_BLOG_TAGS_PROP = {'type': 'array', 'items': {'type': 'string'}}
+# No 'faq' array: the FAQ already lives in body_html (<h2>/<h3>/<p>) and
+# _blog_faq_from_body reads it from there — the duplicate cost ~1k tokens per
+# FI article and only raised the truncation risk.
+BLOG_ARTICLE_TOOL = _blog_tool(
+    'article', 'Deliver the finished blog article.',
+    {'title': {'type': 'string'},
+     'handle': {'type': 'string', 'description': 'url slug: lowercase ascii, hyphens, no year'},
+     'meta_description': {'type': 'string'},
+     'excerpt': {'type': 'string'},
+     'tags': _BLOG_TAGS_PROP,
+     'body_html': {'type': 'string', 'description': 'the complete article as HTML, FAQ section included'}})
+BLOG_EDITED_TOOL = _blog_tool(
+    'edited_article', 'Deliver the corrected article.',
+    {'title': {'type': 'string'}, 'meta_description': {'type': 'string'},
+     'excerpt': {'type': 'string'}, 'tags': _BLOG_TAGS_PROP,
+     'body_html': {'type': 'string', 'description': 'the complete corrected article as HTML'}})
+BLOG_REFRESH_TOOL = _blog_tool(
+    'updated_body', 'Deliver the strengthened article body.',
+    {'body_html': {'type': 'string', 'description': 'the complete updated article as HTML'}})
+BLOG_MAINT_TOOL = _blog_tool(
+    'maintained_article', 'Deliver the improved article.',
+    {'title': {'type': 'string'}, 'meta_description': {'type': 'string'},
+     'body_html': {'type': 'string', 'description': 'the complete improved article as HTML'},
+     'changes': {'type': 'array', 'items': {'type': 'string'},
+                 'description': 'short note per change'}})
+
+
+def _blog_llm_tool(client, prompt, tool, max_tokens, need=('body_html',), model='claude-sonnet-4-6'):
+    """ONE forced tool call. Returns (input_dict, None, msg) on success, else
+    (None, why, msg): why names the real failure — truncation, no tool block or
+    an empty required field (each with stop_reason + output tokens), or the API
+    exception — never just 'no JSON'. Never raises."""
+    try:
+        msg = client.messages.create(model=model, max_tokens=max_tokens, tools=[tool],
+                                     tool_choice={'type': 'tool', 'name': tool['name']},
+                                     messages=[{'role': 'user', 'content': prompt}])
+    except Exception as e:
+        return None, f"API error {type(e).__name__}: {str(e)[:160]}", None
+    stop = getattr(msg, 'stop_reason', None)
+    used = getattr(getattr(msg, 'usage', None), 'output_tokens', None)
+    ctx = f"stop_reason={stop}, {used} output tokens, max_tokens={max_tokens}"
+    if stop == 'max_tokens':
+        return None, f"output cut off at max_tokens ({ctx})", msg
+    block = next((b for b in (getattr(msg, 'content', None) or [])
+                  if getattr(b, 'type', None) == 'tool_use'), None)
+    data = getattr(block, 'input', None)
+    if not isinstance(data, dict):
+        return None, f"no '{tool['name']}' tool call in the answer ({ctx})", msg
+    empty = [k for k in need if not str(data.get(k) or '').strip()]
+    if empty:
+        return None, f"tool answer has empty {', '.join(empty)} ({ctx})", msg
+    return data, None, msg
+
+
 def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns=None,
                 serp_brief=None, fmt=None, avoid_phrases=None):
     """Claude writes the SEO article in the store's language. Returns a dict:
-    {title, handle, meta_description, excerpt, tags[], body_html, faq[]}. None on
-    failure. avoid: QA findings from a rejected earlier attempt (rewrite mode).
+    {title, handle, meta_description, excerpt, tags[], body_html, faq[]}, or
+    {'error': why} on failure (why = the real reason, for Slack and the logs).
+    avoid: QA findings from a rejected earlier attempt (rewrite mode).
     faq_questions: real question-style searches to build the FAQ section from.
     concerns: real consumer doubts from fashion forums (English) to address."""
     if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
-        return None
+        return {'error': 'no Anthropic API key configured'}
     lang = DFS_LANG_NAME.get(store, 'Danish')
     kw = topic.get('keyword') or ''
     cluster = [c for c in (topic.get('cluster') or []) if c]
@@ -23116,36 +23259,38 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns
         f"8. tags: 2-3 short {lang} topical tags, never more (they are data for archive pages, "
         "not shown on the storefront cards).\n"
         "9. handle: url slug from the title, lowercase, ascii, hyphens, NO year.\n\n"
-        "Return ONLY compact JSON with EXACTLY these keys: "
-        '{"title": "...", "handle": "...", "meta_description": "...", "excerpt": "...", '
-        '"tags": ["..."], "body_html": "...", '
-        '"faq": [{"q": "plain-text question", "a": "plain-text answer"}]}'
+        "Deliver the article by calling the `article` tool with: title, handle, meta_description, "
+        "excerpt, tags and body_html (the complete HTML article, the FAQ section from requirement 4 "
+        "included)."
     )
+    # Budget per language, and ONE retry at the full ceiling on ANY failure: a
+    # fresh sample succeeds in ~75% of the cases, so one bad answer no longer
+    # burns one of the scheduler's only 2 attempts per store per day.
+    caps = (_blog_writer_budget(store, wc_target), BLOG_WRITER_MAX_TOKENS)
+    data, whys, used_cap, msg = None, [], None, None
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=4500,
-                                      messages=[{'role': 'user', 'content': prompt}])
-        txt = (msg.content[0].text if msg.content else '') or ''
-        data = _blog_first_json(txt)
-        if data is None:
-            print(f"[blog] writer returned no JSON: {txt[:150]}")
-            return None
     except Exception as e:
-        print(f"[blog] writer failed: {e}")
-        return None
+        return {'error': f"API client error {type(e).__name__}: {str(e)[:160]}"}
+    for cap in caps:
+        data, why, msg = _blog_llm_tool(client, prompt, BLOG_ARTICLE_TOOL, cap, need=('title', 'body_html'))
+        if data is not None:
+            used_cap = cap
+            break
+        whys.append(why)
+        print(f"[blog] {store}: writer attempt {len(whys)}/{len(caps)} failed "
+              f"({lang}, target {wc_target} words): {why}")
+    if data is None:
+        return {'error': ' | retry: '.join(whys) + f" [{lang}, target {wc_target} words]"}
     # sanitise
     tags = data.get('tags') or []
     if isinstance(tags, str):
         tags = [t.strip() for t in tags.split(',') if t.strip()]
-    faq = []
-    for f in (data.get('faq') or [])[:5]:
-        if isinstance(f, dict) and (f.get('q') or '').strip() and (f.get('a') or '').strip():
-            faq.append({'q': re.sub(r'<[^>]+>', '', f['q']).strip()[:200],
-                        'a': re.sub(r'<[^>]+>', '', f['a']).strip()[:600]})
-    handle = re.sub(r'[^a-z0-9]+', '-', (data.get('handle') or data.get('title') or 'post').lower()).strip('-')[:80]
+    handle = _blog_slug(data.get('handle') or data.get('title') or 'post')
     title = (data.get('title') or '').strip()[:120]
     body = data.get('body_html') or ''
+    faq = _blog_faq_from_body(store, body)
     # Levers — the writing knobs the feedback loop later correlates with performance.
     words = len(re.findall(r"[\wÀ-ÿ]+", re.sub(r'<[^>]+>', ' ', body)))
     levers = {
@@ -23169,6 +23314,10 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns
         'product_cards': True,
         'format': ('bestsellers' if topic.get('source') == 'bestsellers'
                    else 'pillar' if topic.get('pillar') else fmt),
+        # headroom per article: FI sat at 90-96% of the old cap for weeks unnoticed
+        'writer_output_tokens': getattr(getattr(msg, 'usage', None), 'output_tokens', None),
+        'writer_max_tokens': used_cap,
+        'writer_retried': bool(whys),
     }
     return {
         'title': title,
@@ -23417,20 +23566,18 @@ def _blog_edit(store, art, products=None, violations=None):
         f"EXCERPT: {art.get('excerpt')}\n"
         f"TAGS: {json.dumps(art.get('tags'), ensure_ascii=False)}\n"
         f"BODY_HTML:\n{art.get('body_html')}\n\n"
-        "Return ONLY compact JSON: {\"title\": \"...\", \"meta_description\": \"...\", "
-        "\"excerpt\": \"...\", \"tags\": [\"...\"], \"body_html\": \"...\"}"
+        "Deliver the corrected article by calling the `edited_article` tool with: title, "
+        "meta_description, excerpt, tags and body_html (the complete corrected HTML)."
     )
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=16000,
-                                      messages=[{'role': 'user', 'content': prompt}])
-        txt = (msg.content[0].text if msg.content else '') or ''
-        data = _blog_first_json(txt)
+        # forced tool call: the full HTML body no longer travels as a hand-escaped
+        # JSON string (see BLOG_TOKENS_PER_WORD for the 29 Sep incident)
+        data, why, _msg = _blog_llm_tool(client, prompt, BLOG_EDITED_TOOL, 16000)
         if data is None:
-            # usually output-cap truncation (the editor must echo the FULL body);
             # keeping the writer version is safe but skips the fixes
-            print('[blog] editor returned no JSON; keeping writer version')
+            print(f'[blog] editor unusable ({why}); keeping writer version')
             return art
         body = data.get('body_html') or ''
         # Safety: the edit must not lose product links; if it did, keep the original.
@@ -23455,8 +23602,90 @@ def _blog_edit(store, art, products=None, violations=None):
         return art
 
 
+class _BlogCreateRejected(RuntimeError):
+    """Shopify refused THIS article (a content-level 4xx such as a 422 on a
+    field). Unlike auth/scope errors, 429 or 5xx, another topic can still work."""
+
+    def __init__(self, msg, status=None):
+        super().__init__(msg)
+        self.status = status
+
+
+# 4xx codes that are about the store or the moment, not about this article: a
+# different topic hits them just the same, so they never trigger a fall-through.
+_BLOG_STORE_LEVEL_4XX = (401, 402, 403, 404, 408, 423, 429)
+
+
+def _blog_existing_handles(store, blog_id, hdrs):
+    """Every article in the journal blog (any status) as {handle: article}, with
+    Link pagination. None when the listing fails — an unreadable list is NOT an
+    empty one, so callers must not treat it as 'every handle is free'."""
+    url = shopify_url(store, f'blogs/{blog_id}/articles.json?published_status=any'
+                             '&fields=id,handle,title,tags,created_at&limit=250')
+    out = {}
+    try:
+        while url:
+            r = _shopify_call('get', url, hdrs, timeout=30)
+            if r.status_code != 200:
+                print(f"[blog] {store}: article handle list HTTP {r.status_code}")
+                return None
+            for a in (r.json().get('articles') or []):
+                h = (a.get('handle') or '').lower()
+                if h:
+                    out[h] = a
+            m = re.search(r'<([^>]+)>;\s*rel="next"', r.headers.get('Link') or '')
+            url = m.group(1) if m else None
+    except Exception as e:
+        print(f"[blog] {store}: article handle list failed: {e}")
+        return None
+    return out
+
+
+def _blog_unique_handle(handle, title, taken):
+    """A handle that is free in this blog. The writer derives the handle from the
+    title, so a fixed keyword gives the same slug every time: DK's monthly
+    bestsellers piece came back as 'mest-elskede-styles-lige-nu', taken since
+    24 Jul 2026, and Shopify refused 6 slots in a row with 422 'handle has
+    already been taken'. Order: the writer's handle if free → the full title
+    re-slugged (transliterated) → handle-2, -3, … (unbounded: a monthly piece
+    converges on the same slug, a cap would only move the 422 a year out)."""
+    base = _blog_slug(handle) or _blog_slug(title) or 'post'
+    if base not in taken:
+        return base
+    alt = _blog_slug(title)
+    if alt and alt not in taken:
+        return alt
+    n = 2
+    while f'{base}-{n}' in taken:
+        n += 1
+    return f'{base}-{n}'
+
+
+def _blog_handle_taken(resp):
+    """Shopify's 422 for a duplicate handle: {"errors": {"handle": [...]}}."""
+    if resp.status_code != 422:
+        return False
+    try:
+        errs = (resp.json() or {}).get('errors')
+    except Exception:
+        errs = None
+    if isinstance(errs, dict):
+        return 'handle' in errs
+    return 'handle' in str(errs or resp.text or '').lower()
+
+
+def _blog_jsonld_retarget(body, handle):
+    """Point the Article JSON-LD's mainEntityOfPage at `handle` — the body is
+    assembled before the create call, so a handle change there must follow."""
+    return re.sub(r'("mainEntityOfPage":\s*"[^"]*/blogs/%s/)[^"]*"' % re.escape(BLOG_HANDLE),
+                  lambda m: m.group(1) + handle + '"', body or '')
+
+
 def _blog_create_article(store, blog_id, art, hdrs, published=False, featured_img=None):
-    """Create the Shopify article (DRAFT by default) with SEO metafields + image."""
+    """Create the Shopify article (DRAFT by default) with SEO metafields + image.
+    A 422 on the handle (another run took it between our check and this POST)
+    is re-resolved and retried ONCE; any other content-level 4xx raises
+    _BlogCreateRejected, everything else a plain RuntimeError."""
     article = {
         'title': art['title'],
         'author': BLOG_AUTHOR_STORE.get(store, BLOG_AUTHOR),
@@ -23479,8 +23708,19 @@ def _blog_create_article(store, blog_id, art, hdrs, published=False, featured_im
         article['image'] = {'src': featured_img, 'alt': art['title']}
     r = _shopify_call('post', shopify_url(store, f'blogs/{blog_id}/articles.json'), hdrs,
                       json={'article': article}, timeout=30)
+    if art.get('handle') and _blog_handle_taken(r):
+        taken = set(_blog_existing_handles(store, blog_id, hdrs) or ()) | {art['handle']}
+        new = _blog_unique_handle(art['handle'], art['title'], taken)
+        print(f"[blog] {store}: handle '{art['handle']}' taken at create — retrying as '{new}'")
+        art['handle'] = article['handle'] = new
+        art['body_html'] = article['body_html'] = _blog_jsonld_retarget(article['body_html'], new)
+        r = _shopify_call('post', shopify_url(store, f'blogs/{blog_id}/articles.json'), hdrs,
+                          json={'article': article}, timeout=30)
     if r.status_code not in (200, 201):
-        raise RuntimeError(f'article create failed HTTP {r.status_code}: {r.text[:300]}')
+        msg = f'article create failed HTTP {r.status_code}: {r.text[:300]}'
+        if 400 <= r.status_code < 500 and r.status_code not in _BLOG_STORE_LEVEL_4XX:
+            raise _BlogCreateRejected(msg, status=r.status_code)
+        raise RuntimeError(msg)
     a = r.json().get('article') or {}
     shop = tokens.get(store, {}).get('shop') or STORES.get(store)
     return {
@@ -23601,15 +23841,20 @@ def _blog_faq_jsonld(faq):
 BLOG_READALSO = {'dk': 'Læs også', 'fr': 'À lire aussi', 'fi': 'Lue myös'}
 
 
-def _blog_related_links(store, category, hdrs, exclude_handle=None, max_links=3):
+def _blog_related_links(store, category, hdrs, exclude_handle=None, max_links=3,
+                        exclude_bestsellers=False):
     """'Read also' block linking this store's other PUBLISHED articles (same
     category first, then newest), each verified live (HTTP 200) so a parked
-    draft never gets linked. '' until at least 2 verified candidates exist."""
+    draft never gets linked. '' until at least 2 verified candidates exist.
+    exclude_bestsellers: a new bestsellers piece retires (301s) the earlier ones
+    to itself, so linking them would be a link back to the same page."""
     latest = {}
     for r in _blog_read_jsonl(BLOG_HISTORY_PATH):
         h = r.get('article_handle')
         if r.get('store') == store and h and h != exclude_handle:
             latest[h] = r     # file order = chronological; last row per handle wins
+    if exclude_bestsellers:
+        latest = {h: r for h, r in latest.items() if not _blog_is_bestsellers(store, r)}
     rows = [r for r in latest.values() if r.get('published')]
     rows.sort(key=lambda r: r.get('ts') or '', reverse=True)
     # pillar of this category first, then same-category spokes, then newest rest
@@ -24136,8 +24381,93 @@ def _blog_generate_one(store, topic=None, published=None):
             candidates.insert(0, bt)
         if not candidates:
             return {'store': store, 'error': 'no topics available (no DataForSEO + no fallback)'}
+        # Circuit breaker: a topic Shopify refused on two different days this
+        # month is not tried first a third time (each try is a full paid run).
+        blocked = _blog_topics_failing_create(store)
+        kept = [c for c in candidates if (c.get('keyword') or '').lower() not in blocked]
+        if kept and len(kept) < len(candidates):
+            print(f"[blog] {store}: skipping topic(s) refused at create this month: {sorted(blocked)}")
+            candidates = kept
     exclude = _blog_recent_product_handles(store)
-    topic, products = None, []
+    # One topic must not block a store: bestsellers sits at index 0 and takes
+    # every slot while it is due, so its 422 kept DK silent for 6 slots (Sep
+    # 2026). A content-level refusal is recorded and the next candidate gets
+    # the slot, bounded to BLOG_CREATE_FALLTHROUGH extra full runs.
+    remaining, rejection, pillar_fail = list(candidates), None, None
+    for attempt in range(1 + BLOG_CREATE_FALLTHROUGH):
+        topic, products = _blog_pick_topic(store, remaining, hdrs, exclude)
+        if topic is None:
+            break
+        try:
+            res = _blog_write_and_publish(store, topic, products, hdrs, published)
+        except _BlogCreateRejected as e:
+            e.topic_keyword, e.recorded = topic.get('keyword'), True
+            _blog_record_failure(store, topic.get('keyword'), 'create', e)
+            print(f"[blog] {store}: create refused for topic '{topic.get('keyword')}': {e}")
+            rejection = e
+            remaining = [c for c in remaining if c is not topic]
+            continue
+        # 29 Sep 2026: FI lost its Tuesday article on a PILLAR whose writer failed.
+        # A pillar is due by rule, not the day's only option, so it hands the slot
+        # to the next candidate (same bound as a refused create). Recorded right
+        # here: when the next topic succeeds, nothing downstream sees this failure.
+        rest = [c for c in remaining if c is not topic]
+        if (res.get('writer_failed') and topic.get('pillar') and rest
+                and attempt < BLOG_CREATE_FALLTHROUGH):
+            kw = topic.get('keyword')
+            _blog_record_failure(store, kw, 'writer', res['error'])
+            print(f"[blog] {store}: pillar '{kw}' writer failed ({res.get('writer_error')}) "
+                  f"— trying the next topic")
+            pillar_fail = {'keyword': kw, 'error': res.get('writer_error')}
+            remaining = rest
+            continue
+        return _blog_after_pillar_failure(store, res, pillar_fail)
+    if rejection is not None:
+        raise rejection
+    return _blog_after_pillar_failure(store, {
+        'store': store, 'topic': candidates[0],
+        'error': 'no candidate topic has enough genuinely fitting products'}, pillar_fail)
+
+
+# Extra topics tried in the same run after Shopify refuses an article or a due
+# pillar's writer fails (one shared budget). Each one is a full writer → editor
+# → QA → hero run, hence the bound.
+BLOG_CREATE_FALLTHROUGH = 1
+
+
+def _blog_after_pillar_failure(store, res, pillar_fail):
+    """Carry a pillar writer failure that handed its slot on into the run's result.
+    On an error it joins the reason. On a success it would otherwise vanish, and
+    _blog_pillar_candidate hands back the same due pillar every run, so a pillar
+    that always fails would silently stop cluster-building: say so in Slack."""
+    if not pillar_fail:
+        return res
+    res['pillar_writer_failed'] = pillar_fail
+    kw, why = pillar_fail['keyword'], pillar_fail['error']
+    if res.get('error'):
+        res['error'] += f" (after pillar '{kw}' writer failed: {why})"
+    else:
+        _blog_slack(f"⚠️ Blog [{store.upper()}]: pillar '{kw}' kon niet geschreven worden, "
+                    f"vandaag '{_blog_topic_kw(res.get('topic'))}' in de plaats. Reden: {str(why)[:300]}")
+    return res
+
+
+def _blog_topics_failing_create(store, now=None):
+    """Keywords (lowercase) whose article create was refused on >= 2 different
+    days this month, from blog_failures.jsonl."""
+    month = (now or datetime.datetime.utcnow()).strftime('%Y-%m')
+    days = {}
+    for f in _blog_read_jsonl(BLOG_FAILURES_PATH):
+        ts = f.get('ts') or ''
+        if (f.get('store') == store and f.get('step') == 'create' and f.get('topic')
+                and ts.startswith(month)):
+            days.setdefault(str(f['topic']).lower(), set()).add(ts[:10])
+    return {k for k, d in days.items() if len(d) >= 2}
+
+
+def _blog_pick_topic(store, candidates, hdrs, exclude):
+    """First candidate with enough genuinely fitting products → (topic, products),
+    or (None, [])."""
     # Relax ladder when nothing passes: (1) strict, (2) drop the variety-exclusions,
     # (3) accept 2 fitting products. Publishing beats the variety rule; product-topic
     # FIT itself never relaxes (that is a correctness rule, not a preference).
@@ -24146,8 +24476,7 @@ def _blog_generate_one(store, topic=None, published=None):
                           (None, 2)):
         for cand in candidates:
             if cand.get('products_override'):
-                topic, products = cand, cand['products_override']
-                break
+                return cand, cand['products_override']
             prods = _blog_match_products(store, cand.get('category'), hdrs, n=6,
                                          keyword=cand.get('keyword'), exclude=excl)
             prods = _blog_products_fit_topic(store, cand, prods)
@@ -24155,13 +24484,14 @@ def _blog_generate_one(store, topic=None, published=None):
                 print(f"[blog] {store}: topic '{cand.get('keyword')}' rejected — "
                       f"only {len(prods)} genuinely fitting (need {min_fit})")
                 continue
-            topic, products = cand, prods
-            break
-        if topic is not None:
-            break
-    if topic is None:
-        return {'store': store, 'topic': candidates[0],
-                'error': 'no candidate topic has enough genuinely fitting products'}
+            return cand, prods
+    return None, []
+
+
+def _blog_write_and_publish(store, topic, products, hdrs, published):
+    """Write → edit → QA → assemble → create one article for a chosen topic.
+    A writer that gives nothing usable returns an error marked 'writer_failed';
+    raises _BlogCreateRejected when Shopify refuses the article itself."""
     faqs = _blog_faq_questions(store, topic.get('keyword'))
     concerns = _blog_reddit_concerns(store, topic)
     brief = _blog_serp_brief(store, topic)
@@ -24171,7 +24501,13 @@ def _blog_generate_one(store, topic=None, published=None):
     art = _blog_write(store, topic, products, faq_questions=faqs, concerns=concerns,
                       serp_brief=brief, fmt=fmt, avoid_phrases=avoid_phrases)
     if not art or not art.get('title') or not art.get('body_html'):
-        return {'store': store, 'topic': topic, 'error': 'writer failed'}
+        # 29 Sep 2026: FI lost its Tuesday article on a pillar whose writer failed
+        # twice, and Slack only said 'writer failed'. The reason and the subject
+        # now travel with the error; 'writer_failed' lets _blog_generate_one hand
+        # a failed PILLAR's slot to the next candidate in its own loop.
+        why = (art or {}).get('error') or 'empty title/body'
+        return {'store': store, 'topic': topic, 'writer_failed': True, 'writer_error': why,
+                'error': f"writer failed: {why} (topic '{topic.get('keyword')}')"}
     art['primary_keyword'] = topic.get('keyword')
     art = _blog_edit(store, art, products)
     # Deterministic style gate: models under-obey the dash/length budget when merely
@@ -24219,9 +24555,26 @@ def _blog_generate_one(store, topic=None, published=None):
                                        'qa': qa and {'score': qa['score'], 'critical': qa['critical'][:3]}}
     else:
         publish = bool(published)
+    # Final handle BEFORE the body is assembled: the related-links exclusion and
+    # the Article JSON-LD (mainEntityOfPage) both bake it in. A handle already in
+    # the blog was sent as-is until 30 Sep 2026 → 422 on 6 DK slots in a row.
+    blog_id = _blog_ensure(store, hdrs)
+    existing = _blog_existing_handles(store, blog_id, hdrs)
+    if existing is None:
+        print(f"[blog] {store}: handle list unavailable — keeping '{art.get('handle')}' "
+              f"(create re-resolves on a 422)")
+    else:
+        final = _blog_unique_handle(art.get('handle'), art.get('title'), existing)
+        if final != art.get('handle'):
+            print(f"[blog] {store}: handle '{art.get('handle')}' is taken — using '{final}'")
+        art['handle'] = final
+    is_bestsellers = topic.get('source') == 'bestsellers'
+    if is_bestsellers:
+        art['tags'] = list(dict.fromkeys(list(art.get('tags') or []) + [BLOG_BESTSELLER_TAG]))
     art['body_html'] = _blog_fix_anchors(art['body_html'], products)
     art['body_html'] = _blog_inline_product_images(art['body_html'], products, store=store)
-    related = _blog_related_links(store, topic.get('category'), hdrs, exclude_handle=art.get('handle'))
+    related = _blog_related_links(store, topic.get('category'), hdrs, exclude_handle=art.get('handle'),
+                                  exclude_bestsellers=is_bestsellers)
     art['body_html'] += related
     art['body_html'] += _blog_newsletter_block(store)
     art['body_html'] += _blog_cta_buttons(store, topic, products, hdrs)
@@ -24238,7 +24591,6 @@ def _blog_generate_one(store, topic=None, published=None):
         art['levers']['n_internal_links'] = related.count('<li>')
         if qa:
             art['levers']['qa_score'] = qa['score']
-    blog_id = _blog_ensure(store, hdrs)
     hero = _blog_hero_image(store, topic, products) if publish else None
     featured = hero or next((p.get('image') for p in products if p.get('image')), None)
     if isinstance(art.get('levers'), dict):
@@ -24334,7 +24686,13 @@ def api_blog_status():
         return jsonify({'error': str(e)[:120]}), 500
     perf = _blog_perf_latest()
     perf_sorted = sorted(perf, key=lambda p: -(p.get('score') or 0))
+    # Cadence per store + failures from disk: DK's month of empty slots (Sep
+    # 2026) never showed here — only successes were ever written down.
+    failures = _blog_read_jsonl(BLOG_FAILURES_PATH)
+    now = datetime.datetime.now()
     return jsonify({
+        'recent_failures': failures[-10:],
+        'per_store': {st: _blog_store_health(st, now, recent, failures) for st in BLOG_SCHED_STORES},
         'dataforseo_configured': _dfs_configured(),
         'reddit_enrichment': ('reddit-api' if os.getenv('REDDIT_CLIENT_ID', '').strip() else
                               'apify' if os.getenv('APIFY_TOKEN', '').strip() else 'off'),
@@ -24459,6 +24817,98 @@ def _blog_store_posted_on(store, date_str):
     return False
 
 
+# The slot alert looks back this many hours after BLOG_SCHED_HOUR: long enough to
+# survive a slow run spilling past the hour, short enough that a restart in the
+# afternoon (self-update) does not send the same alert again.
+BLOG_ALERT_WINDOW_H = 3
+_BLOG_SLOT_ALERTED = {}   # {'day': YYYY-MM-DD} — slot alert already sent today
+
+
+def _blog_parse_ts(ts):
+    """History timestamp ('…Z' from us, '…+02:00' from Shopify) → naive UTC
+    datetime, or None."""
+    try:
+        d = datetime.datetime.fromisoformat(str(ts or '').replace('Z', '+00:00'))
+    except Exception:
+        return None
+    if d.tzinfo is not None:
+        d = d.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return d
+
+
+def _blog_last_article(store, rows):
+    """(datetime, row) of the store's newest created article, or (None, None)."""
+    best, best_row = None, None
+    for r in rows:
+        if r.get('store') != store or not _blog_is_article_row(r):
+            continue
+        d = _blog_parse_ts(r.get('ts'))
+        if d and (best is None or d > best):
+            best, best_row = d, r
+    return best, best_row
+
+
+def _blog_missed_slots(store, now, rows):
+    """Scheduled slots (BLOG_SCHED_DAYS) since the store's last article that
+    produced nothing; today's slot counts once its hour is over. Pure: history
+    rows in, a number out. DK (last article 8 Sep 2026) was at 6 on 30 Sep while
+    every individual alert had looked like a one-off."""
+    last, _ = _blog_last_article(store, rows)
+    if last is None:
+        return 0
+    n, d, today = 0, last.date() + datetime.timedelta(days=1), now.date()
+    while d <= today:
+        if d.weekday() in BLOG_SCHED_DAYS and (d < today or now.hour > BLOG_SCHED_HOUR):
+            n += 1
+        d += datetime.timedelta(days=1)
+    return n
+
+
+def _blog_store_health(store, now, rows, failures):
+    """Per-store cadence: last article, empty slots since, and the newest failure
+    AFTER that article (an older one is already solved)."""
+    last, last_row = _blog_last_article(store, rows)
+    last_err = None
+    for f in failures:
+        if f.get('store') != store:
+            continue
+        d = _blog_parse_ts(f.get('ts'))
+        if last is None or (d is not None and d > last):
+            last_err = f
+    return {'last_article_at': (last_row or {}).get('ts'),
+            'last_article_title': (last_row or {}).get('title'),
+            'missed_slots': _blog_missed_slots(store, now, rows),
+            'last_error': last_err}
+
+
+def _blog_slot_alerts(now, stores=None):
+    """Slack texts after today's slot: one per scheduled store without an article
+    today, with the recorded reason + topic; escalated once >= 2 slots in a row
+    are empty. Until 30 Sep 2026 Slack only spoke after 2 failures inside the
+    same hour, which stayed silent on 4 of DK's 6 empty slots."""
+    today = now.strftime('%Y-%m-%d')
+    rows = _blog_read_jsonl(BLOG_HISTORY_PATH)
+    fails = _blog_read_jsonl(BLOG_FAILURES_PATH)
+    out = []
+    for st in (BLOG_SCHED_STORES if stores is None else stores):
+        if st not in STORES or _blog_store_posted_on(st, today):
+            continue
+        if not shopify_headers(st).get('X-Shopify-Access-Token'):
+            continue    # the scheduler skips a store without a token too
+        h = _blog_store_health(st, now, rows, fails)
+        err = h['last_error']
+        reason = (f"{err.get('error')} (onderwerp: {err.get('topic') or 'onbekend'}, "
+                  f"stap: {err.get('step')})" if err else
+                  'geen fout vastgelegd (herstart tijdens de run of overgeslagen?)')
+        if h['missed_slots'] >= 2:
+            out.append(f"🚨 Blog [{st.upper()}]: {h['missed_slots']} geplande dagen zonder artikel "
+                       f"(laatste: {(h['last_article_at'] or '?')[:10]}, "
+                       f"'{h['last_article_title'] or '?'}'). Laatste fout: {reason}")
+        else:
+            out.append(f"🚨 Blog [{st.upper()}]: vandaag geen artikel. Reden: {reason}")
+    return out
+
+
 def _blog_refresh_one(store):
     """Content refresh (highest-ROI SEO move): take one article stuck at position
     5-20, add one section targeting the queries it ALMOST ranks for (from our own
@@ -24506,17 +24956,19 @@ def _blog_refresh_one(store):
         kws = ', '.join(f"\"{k.get('keyword')}\" (pos {k.get('position')})" for k in near)
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=16000,
-            messages=[{'role': 'user', 'content':
+        data, why, _msg = _blog_llm_tool(client,
             f"You are updating an existing {lang} fashion-blog article that ranks positions 5-20 "
             f"for these searches: {kws}. Strengthen it so it can reach the top: add ONE new <h2> "
             "section (120-220 words) that directly and naturally serves those searches, and where "
             "an existing sentence can weave one of those phrasings in naturally, do so. Do NOT "
             "change the title, links, structure or tone otherwise; keep every <a href> exactly. "
             f"Same writing rules as always:\n{BLOG_ANTI_AI_RULES}\n\nBODY_HTML:\n{body}\n\n"
-            'Return ONLY compact JSON: {"body_html": "..."}'}])
-        data = _blog_first_json((msg.content[0].text if msg.content else '') or '')
-        new_body = (data or {}).get('body_html') or ''
+            "Deliver the complete updated article by calling the `updated_body` tool.",
+            BLOG_REFRESH_TOOL, 16000)
+        if data is None:
+            print(f"[blog] refresh {store}: update unusable ({why}), skipped")
+            return
+        new_body = data.get('body_html') or ''
         if not new_body or new_body.count('/products/') < body.count('/products/'):
             print(f"[blog] refresh {store}: update unusable, skipped")
             return
@@ -24552,18 +25004,22 @@ def _blog_retire_previous_bestsellers(store, hdrs, created):
     unpublish the earlier ones and 301 them to it. Never raises."""
     try:
         new_id = created.get('id')
-        olds = []
+        olds = {}   # article_id -> handle
         for r in _blog_read_jsonl(BLOG_HISTORY_PATH):
-            if (r.get('store') == store and r.get('article_id') and r['article_id'] != new_id
-                    and (r.get('source') == 'bestsellers'
-                         or (r.get('levers') or {}).get('format') == 'bestsellers')):
-                olds.append(r)
+            if (r.get('store') == store and _blog_is_article_row(r) and r['article_id'] != new_id
+                    and _blog_is_bestsellers(store, r)):
+                olds[r['article_id']] = r.get('article_handle')
+        blog_id = _blog_ensure(store, hdrs)
+        # Shopify itself too: a bestsellers article without our history row (it
+        # came back as source='shopify-sync') was never retired before 30 Sep 2026.
+        for h, a in (_blog_existing_handles(store, blog_id, hdrs) or {}).items():
+            if (a.get('id') and a['id'] != new_id and h != (created.get('handle') or '').lower()
+                    and _blog_is_bestsellers(store, a)):
+                olds[a['id']] = h   # the live handle beats a stale history row
         if not olds:
             return
-        blog_id = _blog_ensure(store, hdrs)
         target = '/blogs/%s/%s' % (BLOG_HANDLE, created.get('handle'))
-        for r in {x['article_id']: x for x in olds}.values():
-            aid, handle = r['article_id'], r.get('article_handle')
+        for aid, handle in olds.items():
             u = _shopify_call('put', shopify_url(store, f'blogs/{blog_id}/articles/{aid}.json'),
                               hdrs, json={'article': {'id': aid, 'published': False}}, timeout=30)
             if u.status_code == 200 and handle:
@@ -24700,8 +25156,7 @@ def _blog_maintain_one(store, hdrs=None):
             return 'no anthropic key'
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=16000,
-            messages=[{'role': 'user', 'content':
+        data, why, _msg = _blog_llm_tool(client,
                 f"You are maintaining a PUBLISHED article on a {lang}-language womenswear shop blog "
                 f"(Vionna). Improve it on three axes without changing its subject or structure:\n"
                 f"1. LANGUAGE — fix every grammar, agreement, spelling and idiom error; make it read "
@@ -24720,10 +25175,14 @@ def _blog_maintain_one(store, hdrs=None):
                 "keep the FAQ section; do not change the URL handle; keep the same headings unless "
                 "one is genuinely wrong.\n\n"
                 f"CURRENT TITLE: {title}\n\nCURRENT HTML:\n{head}\n\n"
-                'Return ONLY compact JSON: {"title": "...", "meta_description": "...", '
-                '"body_html": "...", "changes": ["short note per change"]}'}])
-        data = _blog_first_json((msg.content[0].text if msg.content else '') or '')
-        new_head = (data or {}).get('body_html') or ''
+                "Deliver the result by calling the `maintained_article` tool with: title, "
+                "meta_description, body_html (the complete improved HTML) and changes (a short "
+                "note per change).",
+                BLOG_MAINT_TOOL, 16000)
+        if data is None:
+            print(f"[blog] maint {store}/{handle}: unusable result ({why}), skipped")
+            return f'unusable ({why[:120]})'
+        new_head = data.get('body_html') or ''
         if not new_head or new_head.count('/products/') < n_links:
             print(f"[blog] maint {store}/{handle}: unusable result, skipped")
             return 'unusable'
@@ -24856,15 +25315,23 @@ def _blog_sync_history_from_shopify(store, hdrs=None):
         if not hdrs.get('X-Shopify-Access-Token'):
             return 0
         blog_id = _blog_ensure(store, hdrs)
-        r = _shopify_call('get', shopify_url(store, f'blogs/{blog_id}/articles.json?limit=50'),
-                          hdrs, timeout=30)
-        if r.status_code != 200:
-            return 0
+        # all pages: a single limit=50 page silently stops seeing new articles
+        # once a store passes 50 (FR/FI were at 27/26 on 30 Sep 2026)
+        url, articles = shopify_url(store, f'blogs/{blog_id}/articles.json?limit=250'), []
+        while url:
+            r = _shopify_call('get', url, hdrs, timeout=30)
+            if r.status_code != 200:
+                if not articles:
+                    return 0
+                break
+            articles += r.json().get('articles', [])
+            m = re.search(r'<([^>]+)>;\s*rel="next"', r.headers.get('Link') or '')
+            url = m.group(1) if m else None
         known = {row.get('article_id') for row in _blog_read_jsonl(BLOG_HISTORY_PATH)
                  if row.get('store') == store}
         shop = tokens.get(store, {}).get('shop') or STORES.get(store)
         added = 0
-        for a in r.json().get('articles', []):
+        for a in articles:
             if a.get('id') in known:
                 continue
             body = a.get('body_html') or ''
@@ -24889,6 +25356,9 @@ def _blog_sync_history_from_shopify(store, hdrs=None):
                     'url': f"https://{shop}/blogs/{BLOG_HANDLE}/{a.get('handle')}",
                     'published': a.get('published_at') is not None,
                     'products': handles[:8] or None,
+                    # carries the bestsellers marker, so the monthly due-check
+                    # still sees an article that never got our own history row
+                    'tags': a.get('tags') or None,
                 }, ensure_ascii=False) + '\n')
             added += 1
         if added:
@@ -24923,10 +25393,13 @@ def _blog_scheduler_loop():
                 boots[st] = {'error': res.get('error'), 'url': art.get('storefront_url')}
                 print(f"[blog] bootstrap {st}: {res.get('error') or art.get('storefront_url')}")
                 if res.get('error'):
+                    _blog_record_failure(st, _blog_topic_kw(res.get('topic')), 'bootstrap', res['error'])
                     _blog_slack(f"🚨 Blog bootstrap [{st.upper()}] faalde: {res['error']}")
             except Exception as e:
                 boots[st] = {'error': str(e)[:200]}
                 print(f"[blog] bootstrap {st} failed: {e}")
+                if not getattr(e, 'recorded', False):
+                    _blog_record_failure(st, getattr(e, 'topic_keyword', None), 'bootstrap', e)
                 _blog_slack(f"🚨 Blog bootstrap [{st.upper()}] crashte: {str(e)[:180]}")
         if boots:
             _BLOG_LAST['bootstrap'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z', **boots}
@@ -24943,45 +25416,63 @@ def _blog_scheduler_loop():
                 last_learn_day = now.strftime('%Y-%m-%d')
                 print('[blog] weekly learn cycle…')
                 _blog_run_learn_cycle()
-            if now.weekday() in BLOG_SCHED_DAYS and now.hour == BLOG_SCHED_HOUR:
-                today = now.strftime('%Y-%m-%d')
-                for st in BLOG_SCHED_STORES:
-                    if st not in STORES or _blog_store_posted_on(st, today):
-                        continue
-                    if not shopify_headers(st).get('X-Shopify-Access-Token'):
-                        continue
-                    # max 2 attempts per store per day: the 10-min tick otherwise
-                    # retries a structural failure all hour and spams Slack each time
-                    fails = _BLOG_TRIED.get((st, today), 0)
-                    if fails >= 2:
-                        continue
-                    try:
-                        _blog_sync_history_from_shopify(st)
-                        if _blog_store_posted_on(st, today):
-                            continue    # someone already posted today (laptop/manual)
-                        print(f'[blog] scheduled article for {st}…')
-                        res = _blog_generate_one(st)
-                        art = (res.get('article') or {})
-                        _BLOG_LAST['scheduled'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
-                                                   'store': st, 'error': res.get('error'),
-                                                   'url': art.get('storefront_url')}
-                        print(f"[blog] {st}: {res.get('error') or art.get('storefront_url')}")
-                        if res.get('error'):
-                            _BLOG_TRIED[(st, today)] = fails + 1
-                            if fails + 1 >= 2:
-                                _blog_slack(f"🚨 Blog-run [{st.upper()}] faalde 2x, opgegeven voor vandaag: "
-                                            f"{res['error']}")
-                    except Exception as e:
-                        _BLOG_LAST['scheduled'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
-                                                   'store': st, 'error': str(e)[:200]}
-                        print(f'[blog] scheduled {st} failed: {e}')
-                        _BLOG_TRIED[(st, today)] = fails + 1
-                        if fails + 1 >= 2:
-                            _blog_slack(f"🚨 Blog-run [{st.upper()}] crashte 2x, opgegeven voor vandaag: "
-                                        f"{str(e)[:150]}")
+            _blog_scheduled_tick(now)
         except Exception as e:
             print(f'[blog] scheduler error: {e}')
         time.sleep(600)
+
+
+def _blog_topic_kw(topic):
+    """Keyword of a result's topic (a dict from the candidate list, or a bare string)."""
+    return topic.get('keyword') if isinstance(topic, dict) else topic
+
+
+def _blog_scheduled_tick(now):
+    """One 10-minute tick of the Tue/Fri schedule. During BLOG_SCHED_HOUR: write
+    for every store without an article today (max 2 attempts, each failure on
+    disk). In the hours after it, once per day: one Slack alert per store that
+    still has none, with the recorded reason — this replaces the old ping that
+    only fired after 2 failures inside the same hour."""
+    if now.weekday() not in BLOG_SCHED_DAYS:
+        return
+    today = now.strftime('%Y-%m-%d')
+    if now.hour == BLOG_SCHED_HOUR:
+        for st in BLOG_SCHED_STORES:
+            if st not in STORES or _blog_store_posted_on(st, today):
+                continue
+            if not shopify_headers(st).get('X-Shopify-Access-Token'):
+                continue
+            # max 2 attempts per store per day: the 10-min tick otherwise
+            # retries a structural failure all hour
+            fails = _BLOG_TRIED.get((st, today), 0)
+            if fails >= 2:
+                continue
+            try:
+                _blog_sync_history_from_shopify(st)
+                if _blog_store_posted_on(st, today):
+                    continue    # someone already posted today (laptop/manual)
+                print(f'[blog] scheduled article for {st}…')
+                res = _blog_generate_one(st)
+                art = (res.get('article') or {})
+                _BLOG_LAST['scheduled'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
+                                           'store': st, 'error': res.get('error'),
+                                           'url': art.get('storefront_url')}
+                print(f"[blog] {st}: {res.get('error') or art.get('storefront_url')}")
+                if res.get('error'):
+                    _BLOG_TRIED[(st, today)] = fails + 1
+                    _blog_record_failure(st, _blog_topic_kw(res.get('topic')), 'scheduled', res['error'])
+            except Exception as e:
+                _BLOG_LAST['scheduled'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
+                                           'store': st, 'error': str(e)[:200]}
+                print(f'[blog] scheduled {st} failed: {e}')
+                _BLOG_TRIED[(st, today)] = fails + 1
+                if not getattr(e, 'recorded', False):   # a refused create logs itself
+                    _blog_record_failure(st, getattr(e, 'topic_keyword', None), 'scheduled', e)
+    elif (BLOG_SCHED_HOUR < now.hour <= BLOG_SCHED_HOUR + BLOG_ALERT_WINDOW_H
+            and _BLOG_SLOT_ALERTED.get('day') != today):
+        _BLOG_SLOT_ALERTED['day'] = today
+        for text in _blog_slot_alerts(now):
+            _blog_slack(text)
 
 
 try:
