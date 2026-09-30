@@ -1,5 +1,7 @@
 "use client";
 
+import { sizeKind } from "@/lib/afterQuotation";
+import { nbCategory } from "@/lib/nbCategory";
 import { useEffect, useState } from "react";
 import { useProduct, colorLabelFor } from "@/lib/product";
 import { StoreKey, STORE_CONFIG } from "@/lib/store";
@@ -44,6 +46,35 @@ export function buildPrePublishChecks(
       id: "colors",
       label: `${data.canonicalColors.length} ${data.canonicalColors.length === 1 ? "colour" : "colours"} ready`,
       level: "ok",
+    });
+  }
+
+  // 2b. Sizes (v1.323): taken from the competitor; say so when they weren't
+  if (data.sizes.length === 0) {
+    out.push({ id: "sizes", label: "No sizes — add at least one", level: "fail" });
+  } else if (nbCategory(data.productType) === "shoes" && sizeKind(data.sizes) === "letter") {
+    out.push({
+      id: "sizes",
+      label: `Shoes in clothing sizes (${data.sizes.join(" ")})`,
+      level: "warn",
+      detail: "Shoes are sold in EU sizes (35, 36, …) — change them on the Sizes line above.",
+    });
+  } else if (data.sizesSource === "default" || data.sizesSource === "shoe-default" || data.sizesSource === null) {
+    out.push({
+      id: "sizes",
+      label: `Sizes ${data.sizes.join(" ")} — not taken from the competitor`,
+      level: "warn",
+      detail: data.sizesNote ?? "Imported before competitor sizes existed — check the sizes.",
+    });
+  } else {
+    // a note means something was converted, dropped or assumed: worth a look
+    // (an ok line never shows in the popup). After a hand edit it is stale.
+    const noted = !!data.sizesNote && data.sizesSource !== "manual";
+    out.push({
+      id: "sizes",
+      label: `Sizes ${data.sizes.join(" ")}${data.sizesSource === "manual" ? " (edited)" : ""}`,
+      level: noted ? "warn" : "ok",
+      detail: data.sizesNote ?? undefined,
     });
   }
 
@@ -214,7 +245,10 @@ export function PrePublishChecklistPopup({
   const warns = checks.filter((c) => c.level === "warn");
   const hasFails = fails.length > 0;
   const missingPhotos = fails.find((c) => c.id === POOL_COVERAGE_ID) ?? null;
-  const blocked = missingPhotos !== null && !acknowledgedNoPhotos;
+  // No sizes cannot be published at all: the server used to quietly turn it into
+  // XS–XL — even for shoes (review, 30 Sep). Back to review, add a size.
+  const noSizes = fails.some((c) => c.id === "sizes");
+  const blocked = (missingPhotos !== null && !acknowledgedNoPhotos) || noSizes;
 
   return (
     <div
@@ -277,6 +311,10 @@ export function PrePublishChecklistPopup({
               </span>
             </label>
           </div>
+        )}
+
+        {noSizes && (
+          <div className="px-6 pb-1 text-[12px] text-danger">Add at least one size on the Sizes line first — a listing without sizes can&apos;t be published.</div>
         )}
 
         <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-border bg-bg-elev-2 rounded-b-2xl">

@@ -16,7 +16,14 @@ export interface AqChart {
   rows: string[][];
 }
 
-export const LETTER_SIZES = ["XXS", "XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL"];
+export const LETTER_SIZES = ["3XS", "XXS", "XS", "S", "M", "L", "XL", "0XL", "1XL", "2XL", "3XL", "4XL", "5XL", "6XL", "7XL"];
+const PLUS_SCALE = ["0XL", "1XL"];
+/** The ladder a range ("S-2XL") or a pair ("XL/2XL") walks: the plus-size
+ *  scale (0XL, 1XL, 2XL…) only when it starts or ends on it. */
+function ladderFor(x: string, y: string): string[] {
+  const plus = PLUS_SCALE.includes(x) || PLUS_SCALE.includes(y);
+  return LETTER_SIZES.filter((s) => (plus ? LETTER_SIZES.indexOf(s) >= LETTER_SIZES.indexOf("0XL") : !PLUS_SCALE.includes(s)));
+}
 
 const ALIASES: Record<string, string> = {
   XXL: "2XL",
@@ -32,8 +39,13 @@ const ALIASES: Record<string, string> = {
   "X-LARGE": "XL",
   "XX-LARGE": "2XL",
   XXLARGE: "2XL",
+  "2XS": "XXS",
+  XXXS: "3XS", // 1XL stays 1XL: not the same size as XL
+  "XX-SMALL": "XXS",
 };
-const ONE_SIZE = new Set(["ONESIZE", "OS", "FREESIZE", "FREE", "TAILLEUNIQUE", "YKSIKOKO", "ONESIZEFITSALL"]);
+const ONE_SIZE = new Set([
+  "ONESIZE", "OS", "FREESIZE", "FREE", "TAILLEUNIQUE", "YKSIKOKO", "ONESIZEFITSALL", "OSFA", "TU", "ONE-SIZE", "O/S",
+]);
 
 /** One spelling per size: "xxl" → "2XL", "EU 38" → "38", "one size" → "One Size". */
 export function normSize(raw: string): string {
@@ -43,8 +55,8 @@ export function normSize(raw: string): string {
   if (ALIASES[u]) return ALIASES[u];
   if (LETTER_SIZES.includes(u)) return u;
   if (ONE_SIZE.has(u.normalize("NFKD").replace(/[̀-ͯ]/g, ""))) return "One Size";
-  const m = u.match(/^(?:EU|EUR|FR|DK)?(\d{2,3}(?:[.,]5)?)$/);
-  if (m) return m[1].replace(",", ".");
+  const m = u.replace("½", ".5").match(/^(?:EU|EUR|FR|DK)?(\d{2,3}(?:[.,][05])?)$/);
+  if (m) return String(parseFloat(m[1].replace(",", "."))); // "36.0" → "36", "37½" → "37.5"
   return t.slice(0, 20);
 }
 
@@ -54,7 +66,8 @@ export function sizeKind(sizes: string[]): SizeKind {
   const ns = sizes.map(normSize).filter(Boolean);
   if (!ns.length) return "other";
   if (ns.every((x) => x === "One Size")) return "one";
-  if (ns.every((x) => LETTER_SIZES.includes(x))) return "letter";
+  // combined sizes ("S/M") count as letter sizes when both halves are letters
+  if (ns.every((x) => x.split("/").every((y) => LETTER_SIZES.includes(y)))) return "letter";
   if (ns.every((x) => /^\d{2,3}(\.5)?$/.test(x))) return "number";
   return "other";
 }
@@ -63,7 +76,10 @@ export function sizeKind(sizes: string[]): SizeKind {
 export function sortSizes(sizes: string[]): string[] {
   const ns = [...new Set(sizes.map(normSize).filter(Boolean))];
   const kind = sizeKind(ns);
-  if (kind === "letter") return ns.sort((a, b) => LETTER_SIZES.indexOf(a) - LETTER_SIZES.indexOf(b));
+  if (kind === "letter") {
+    const idx = (x: string) => LETTER_SIZES.indexOf(x.split("/")[0]);
+    return ns.sort((a, b) => idx(a) - idx(b) || a.length - b.length);
+  }
   if (kind === "number") return ns.sort((a, b) => parseFloat(a) - parseFloat(b));
   return ns;
 }
@@ -100,20 +116,24 @@ export function parseSizeList(text: string): string[] {
     // backend keeps them; "S/M/L" is a list; "S-2XL" a letter range
     const slash = tok.split("/").filter(Boolean);
     if (slash.length === 2) {
-      const a = LETTER_SIZES.indexOf(normSize(slash[0]));
-      const b = LETTER_SIZES.indexOf(normSize(slash[1]));
+      const [x, y] = [normSize(slash[0]), normSize(slash[1])];
+      const ladder = ladderFor(x, y);
+      const a = ladder.indexOf(x);
+      const b = ladder.indexOf(y);
       if (a >= 0 && b === a + 1) {
-        out.push(`${LETTER_SIZES[a]}/${LETTER_SIZES[b]}`);
+        out.push(`${x}/${y}`);
         continue;
       }
     }
     for (const p of slash) {
       const r = p.match(/^([A-Z0-9]{1,6})-([A-Z0-9]{1,6})$/i);
       if (r) {
-        const a = LETTER_SIZES.indexOf(normSize(r[1]));
-        const b = LETTER_SIZES.indexOf(normSize(r[2]));
+        const [x, y] = [normSize(r[1]), normSize(r[2])];
+        const ladder = ladderFor(x, y);
+        const a = ladder.indexOf(x);
+        const b = ladder.indexOf(y);
         if (a >= 0 && b >= a) {
-          out.push(...LETTER_SIZES.slice(a, b + 1));
+          out.push(...ladder.slice(a, b + 1));
           continue;
         }
       }

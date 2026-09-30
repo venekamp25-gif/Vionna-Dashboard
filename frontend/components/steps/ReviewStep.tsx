@@ -202,6 +202,7 @@ export function ReviewStep() {
             product_name: data.name,
             color: localisedLabel,
             sizes: data.sizes,
+            sizes_source: data.sizesSource,
             description: storeContent.description,
             meta_description: storeContent.metaDescription,
             m_title_specs: storeContent.mTitleSpecs,

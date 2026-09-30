@@ -1,5 +1,6 @@
 "use client";
 
+import type { SizeSource } from "./competitorSizes";
 import { createContext, useContext, useState, useCallback, useEffect, useRef, ReactNode } from "react";
 import { StoreKey } from "./store";
 import { draftsApi, fetchCurrentUser, snapshotsApi, type SizeChart, type ProductSnapshotMeta } from "./api";
@@ -173,6 +174,17 @@ export interface ProductData {
   /** Localised labels for the ACTIVE view, derived from contentByStore[activeViewStore]. */
   colors: string[];
   sizes: string[];
+  /** Where `sizes` came from (v1.323): the competitor's size option, UK/AU sizes
+   *  converted, One Size (accessory), the fallback, or edited by hand.
+   *  null = imported before this existed — the sizes are then the old XS–XL default. */
+  sizesSource: SizeSource | null;
+  /** The sizes the competitor really sells — "↺ Competitor sizes" restores them.
+   *  [] when it sells none: a fallback we made up is never restorable. */
+  competitorSizes: string[];
+  /** The source those sizes come back with (competitor / converted-uk). */
+  competitorSizesSource: SizeSource | null;
+  /** What the operator should know (converted, assumed, only one size…). */
+  sizesNote: string | null;
   price: string;
   discount: 0 | 25 | 50;
   siblingsHandle: string;
@@ -246,6 +258,10 @@ const DEFAULT_DATA: ProductData = {
   canonicalColors: [],
   colors: [],
   sizes: ["XS", "S", "M", "L", "XL"],
+  sizesSource: null,
+  competitorSizes: [],
+  competitorSizesSource: null,
+  sizesNote: null,
   price: "349,00 DKK",
   discount: 25,
   description: "",

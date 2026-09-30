@@ -1,5 +1,7 @@
 "use client";
 
+import { competitorSizes, type CompetitorSizes } from "@/lib/competitorSizes";
+import { nbCategory } from "@/lib/nbCategory";
 import { useEffect, useRef, useState } from "react";
 import { Spinner } from "@/components/ui/Spinner";
 import { Button } from "@/components/ui/Button";
@@ -48,6 +50,7 @@ type PendingCtx = {
   images: { url: string; selected: boolean; variantIds: number[] }[];
   variantsByColor: ReturnType<typeof extractVariantsByColor>;
   imagesByColor: ReturnType<typeof groupImagesByColor>;
+  sizes: CompetitorSizes;
 };
 
 /** Plain-text competitor info (title + description). Source of truth for fabric
@@ -112,6 +115,10 @@ export function GenerateStep() {
       };
       const productType = guessProductType(product);
       const canonicalColors = extractColors(product).map(canonicalize);
+      // The competitor's own sizes (v1.323) — the listing used to get XS–XL
+      // whatever the competitor sold (shoes in XS–XL, 3XL never offered).
+      // (the competitor's domain decides whether bare numbers are UK, AU or unknown)
+      const sizes = competitorSizes(product?.options, nbCategory(productType), safeHostname(data.competitorUrl));
 
       // ImagesCard "From competitor" shows just 8 thumbnails — enough for the
       // user to pick a reference for steps 1-4. Nothing is pre-selected.
@@ -172,6 +179,7 @@ export function GenerateStep() {
         images,
         variantsByColor,
         imagesByColor,
+        sizes,
       };
 
       // ── 3. Keyword research (DataForSEO) ── build the review candidates.
@@ -270,6 +278,7 @@ export function GenerateStep() {
       images,
       variantsByColor,
       imagesByColor,
+      sizes,
     } = ctx;
     try {
       setReviewOpen(false);
@@ -363,6 +372,14 @@ export function GenerateStep() {
         colors: primaryColors,
         siblingsHandle: autoSiblingsHandle(chosenName),
         productType,
+        // ALWAYS written (fallback included): product B must never inherit A's sizes
+        sizes: sizes.sizes,
+        sizesSource: sizes.source,
+        competitorSizes: sizes.restore,
+        competitorSizesSource: sizes.restoreSource,
+        sizesNote: sizes.note
+          ? `${sizes.note}${sizes.raw.length ? ` (competitor: ${sizes.raw.slice(0, 12).join(" · ")})` : ""}`
+          : null,
         competitorImages: images,
         competitorVariantsByColor: variantsByColor,
         competitorImagesByColor: imagesByColor,
@@ -398,6 +415,8 @@ export function GenerateStep() {
     started.current = true;
     (async () => {
       try {
+        // nothing of the previous product may survive a failed scrape
+        patch({ sizeChart: null, sizeChartStatus: null, sizeChartHint: null });
         const scraped = await api.scrape(data.competitorUrl);
         if (scraped.error || !scraped.product) throw new Error(scraped.error || "Scrape failed");
         // Carry the competitor's size chart through to publish (appended, localised,
@@ -555,7 +574,12 @@ export function GenerateStep() {
           onClose={() => setManualPasteOpen(false)}
           onSuccess={(product) => {
             setManualPasteOpen(false);
+            // a paste has no HTML page, so no size chart — and never the chart of
+            // the product imported before this one ("← New product")
             patch({
+              sizeChart: null,
+              sizeChartStatus: null,
+              sizeChartHint: null,
               importNote:
                 "Pasted from your browser — this captures only the colour at this URL: for shops where each colour is its own product page, import the other colours separately.",
             });
