@@ -67,10 +67,13 @@ export function buildPrePublishChecks(
       detail: data.sizesNote ?? "Imported before competitor sizes existed — check the sizes.",
     });
   } else {
+    // a note means something was converted, dropped or assumed: worth a look
+    // (an ok line never shows in the popup). After a hand edit it is stale.
+    const noted = !!data.sizesNote && data.sizesSource !== "manual";
     out.push({
       id: "sizes",
       label: `Sizes ${data.sizes.join(" ")}${data.sizesSource === "manual" ? " (edited)" : ""}`,
-      level: "ok",
+      level: noted ? "warn" : "ok",
       detail: data.sizesNote ?? undefined,
     });
   }
@@ -242,7 +245,10 @@ export function PrePublishChecklistPopup({
   const warns = checks.filter((c) => c.level === "warn");
   const hasFails = fails.length > 0;
   const missingPhotos = fails.find((c) => c.id === POOL_COVERAGE_ID) ?? null;
-  const blocked = missingPhotos !== null && !acknowledgedNoPhotos;
+  // No sizes cannot be published at all: the server used to quietly turn it into
+  // XS–XL — even for shoes (review, 30 Sep). Back to review, add a size.
+  const noSizes = fails.some((c) => c.id === "sizes");
+  const blocked = (missingPhotos !== null && !acknowledgedNoPhotos) || noSizes;
 
   return (
     <div
@@ -305,6 +311,10 @@ export function PrePublishChecklistPopup({
               </span>
             </label>
           </div>
+        )}
+
+        {noSizes && (
+          <div className="px-6 pb-1 text-[12px] text-danger">Add at least one size on the Sizes line first — a listing without sizes can&apos;t be published.</div>
         )}
 
         <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-border bg-bg-elev-2 rounded-b-2xl">

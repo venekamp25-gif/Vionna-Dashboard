@@ -2211,9 +2211,11 @@ export interface AqSizeRow {
   competitor_url: string | null;
   /** orders on file for this colour group — sold groups start unticked */
   orders: number;
+  /** false = listed before the ~60 days of orders we read: sales unknown, starts unticked */
+  orders_known?: boolean;
   stores: AqStoreKey[];
   raw?: string[];
-  /** change | same | no_source | gone | failed */
+  /** change | unreadable | mixed | same | no_source | gone | failed */
   status: string;
 }
 

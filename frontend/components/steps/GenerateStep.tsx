@@ -117,7 +117,8 @@ export function GenerateStep() {
       const canonicalColors = extractColors(product).map(canonicalize);
       // The competitor's own sizes (v1.323) — the listing used to get XS–XL
       // whatever the competitor sold (shoes in XS–XL, 3XL never offered).
-      const sizes = competitorSizes(product?.options, nbCategory(productType));
+      // (the competitor's domain decides whether bare numbers are UK, AU or unknown)
+      const sizes = competitorSizes(product?.options, nbCategory(productType), safeHostname(data.competitorUrl));
 
       // ImagesCard "From competitor" shows just 8 thumbnails — enough for the
       // user to pick a reference for steps 1-4. Nothing is pre-selected.
@@ -374,7 +375,8 @@ export function GenerateStep() {
         // ALWAYS written (fallback included): product B must never inherit A's sizes
         sizes: sizes.sizes,
         sizesSource: sizes.source,
-        competitorSizes: sizes.sizes,
+        competitorSizes: sizes.restore,
+        competitorSizesSource: sizes.restoreSource,
         sizesNote: sizes.note
           ? `${sizes.note}${sizes.raw.length ? ` (competitor: ${sizes.raw.slice(0, 12).join(" · ")})` : ""}`
           : null,
@@ -413,6 +415,8 @@ export function GenerateStep() {
     started.current = true;
     (async () => {
       try {
+        // nothing of the previous product may survive a failed scrape
+        patch({ sizeChart: null, sizeChartStatus: null, sizeChartHint: null });
         const scraped = await api.scrape(data.competitorUrl);
         if (scraped.error || !scraped.product) throw new Error(scraped.error || "Scrape failed");
         // Carry the competitor's size chart through to publish (appended, localised,
@@ -570,7 +574,12 @@ export function GenerateStep() {
           onClose={() => setManualPasteOpen(false)}
           onSuccess={(product) => {
             setManualPasteOpen(false);
+            // a paste has no HTML page, so no size chart — and never the chart of
+            // the product imported before this one ("← New product")
             patch({
+              sizeChart: null,
+              sizeChartStatus: null,
+              sizeChartHint: null,
               importNote:
                 "Pasted from your browser — this captures only the colour at this URL: for shops where each colour is its own product page, import the other colours separately.",
             });

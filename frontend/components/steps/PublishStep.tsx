@@ -132,6 +132,7 @@ export function PublishStep() {
       sizes: ["XS", "S", "M", "L", "XL"],
       sizesSource: null,
       competitorSizes: [],
+      competitorSizesSource: null,
       sizesNote: null,
       sizeChart: null,
       sizeChartStatus: null,

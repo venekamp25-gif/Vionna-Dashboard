@@ -178,8 +178,11 @@ export interface ProductData {
    *  converted, One Size (accessory), the fallback, or edited by hand.
    *  null = imported before this existed — the sizes are then the old XS–XL default. */
   sizesSource: SizeSource | null;
-  /** The sizes the competitor import suggested — "↺ Competitor sizes" restores them. */
+  /** The sizes the competitor really sells — "↺ Competitor sizes" restores them.
+   *  [] when it sells none: a fallback we made up is never restorable. */
   competitorSizes: string[];
+  /** The source those sizes come back with (competitor / converted-uk). */
+  competitorSizesSource: SizeSource | null;
   /** What the operator should know (converted, assumed, only one size…). */
   sizesNote: string | null;
   price: string;
@@ -257,6 +260,7 @@ const DEFAULT_DATA: ProductData = {
   sizes: ["XS", "S", "M", "L", "XL"],
   sizesSource: null,
   competitorSizes: [],
+  competitorSizesSource: null,
   sizesNote: null,
   price: "349,00 DKK",
   discount: 25,

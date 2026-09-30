@@ -322,6 +322,12 @@ const inputCls =
 export function AfterQuotationWorkbench() {
   // the page's two tabs: one listing at a time, or the size backfill for many
   const [mode, setMode] = useState<"listings" | "sizes">("listings");
+  // mounted once opened, then only hidden: switching tabs mid-write must not
+  // lose the size job's progress or its result (review, 30 Sep)
+  const [sizesOpened, setSizesOpened] = useState(false);
+  useEffect(() => {
+    if (mode === "sizes") setSizesOpened(true);
+  }, [mode]);
   // the list: downloaded once, filtered in the browser while you type
   const [view, setView] = useState<View>("recommended");
   const [q, setQ] = useState("");
@@ -391,7 +397,10 @@ export function AfterQuotationWorkbench() {
   const [jobErr, setJobErr] = useState<string | null>(null);
   const [applying, setApplying] = useState(false);
 
-  const jobRunning = applying || job?.status === "running";
+  // the size backfill writes to Shopify too: the listings are locked meanwhile
+  const [sizeJobRunning, setSizeJobRunning] = useState(false);
+  const listingJobRunning = applying || job?.status === "running";
+  const jobRunning = listingJobRunning || sizeJobRunning;
 
   // ── the list ──
   const loadList = useCallback(async (refresh = false) => {
@@ -909,7 +918,7 @@ export function AfterQuotationWorkbench() {
           <span className="flex-1" />
           <div className="flex items-center gap-1.5">
             <Pill on={mode === "listings"} onClick={() => setMode("listings")}>Listings</Pill>
-            <Pill on={mode === "sizes"} onClick={() => setMode("sizes")} disabled={jobRunning} title="Give every listing still on XS–XL the competitor's sizes">
+            <Pill on={mode === "sizes"} onClick={() => setMode("sizes")} disabled={listingJobRunning} title="Give every listing still on XS–XL the competitor's sizes">
               Sizes from competitors
             </Pill>
           </div>
@@ -919,9 +928,15 @@ export function AfterQuotationWorkbench() {
         </div>
       </div>
 
-      {mode === "sizes" && (
-        <div className="max-w-[1400px] mx-auto px-5 lg:px-8 py-6">
-          <SizeBackfillPanel onDone={() => void loadList()} />
+      {sizesOpened && (
+        <div className={`max-w-[1400px] mx-auto px-5 lg:px-8 py-6 ${mode === "sizes" ? "" : "hidden"}`}>
+          <SizeBackfillPanel
+            onDone={() => {
+              void loadList();
+              if (family) void loadFamily(family.key, { keepForm: true }); // the open listing shows the new sizes
+            }}
+            onRunningChange={setSizeJobRunning}
+          />
         </div>
       )}
       <div className={`max-w-[1400px] mx-auto px-5 lg:px-8 py-6 grid grid-cols-1 lg:grid-cols-[360px_minmax(0,1fr)] gap-6 ${mode === "sizes" ? "hidden" : ""}`}>

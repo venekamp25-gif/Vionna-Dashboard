@@ -418,7 +418,7 @@ export function ProductInfoCard() {
           {data.competitorSizes.length > 0 && data.competitorSizes.join("|") !== data.sizes.join("|") && (
             <button
               type="button"
-              onClick={() => patch({ sizes: data.competitorSizes, sizesSource: "competitor" })}
+              onClick={() => patch({ sizes: data.competitorSizes, sizesSource: data.competitorSizesSource ?? "competitor" })}
               className="text-[11px] text-text-dim hover:text-accent transition whitespace-nowrap"
               title={`Back to the competitor's sizes: ${data.competitorSizes.join(" ")}`}
             >

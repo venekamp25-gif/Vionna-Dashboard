@@ -16,7 +16,14 @@ export interface AqChart {
   rows: string[][];
 }
 
-export const LETTER_SIZES = ["XXS", "XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL", "6XL", "7XL"];
+export const LETTER_SIZES = ["3XS", "XXS", "XS", "S", "M", "L", "XL", "0XL", "1XL", "2XL", "3XL", "4XL", "5XL", "6XL", "7XL"];
+const PLUS_SCALE = ["0XL", "1XL"];
+/** The ladder a range ("S-2XL") or a pair ("XL/2XL") walks: the plus-size
+ *  scale (0XL, 1XL, 2XL…) only when it starts or ends on it. */
+function ladderFor(x: string, y: string): string[] {
+  const plus = PLUS_SCALE.includes(x) || PLUS_SCALE.includes(y);
+  return LETTER_SIZES.filter((s) => (plus ? LETTER_SIZES.indexOf(s) >= LETTER_SIZES.indexOf("0XL") : !PLUS_SCALE.includes(s)));
+}
 
 const ALIASES: Record<string, string> = {
   XXL: "2XL",
@@ -33,8 +40,7 @@ const ALIASES: Record<string, string> = {
   "XX-LARGE": "2XL",
   XXLARGE: "2XL",
   "2XS": "XXS",
-  XXXS: "XXS",
-  "1XL": "XL",
+  XXXS: "3XS", // 1XL stays 1XL: not the same size as XL
   "XX-SMALL": "XXS",
 };
 const ONE_SIZE = new Set([
@@ -110,20 +116,24 @@ export function parseSizeList(text: string): string[] {
     // backend keeps them; "S/M/L" is a list; "S-2XL" a letter range
     const slash = tok.split("/").filter(Boolean);
     if (slash.length === 2) {
-      const a = LETTER_SIZES.indexOf(normSize(slash[0]));
-      const b = LETTER_SIZES.indexOf(normSize(slash[1]));
+      const [x, y] = [normSize(slash[0]), normSize(slash[1])];
+      const ladder = ladderFor(x, y);
+      const a = ladder.indexOf(x);
+      const b = ladder.indexOf(y);
       if (a >= 0 && b === a + 1) {
-        out.push(`${LETTER_SIZES[a]}/${LETTER_SIZES[b]}`);
+        out.push(`${x}/${y}`);
         continue;
       }
     }
     for (const p of slash) {
       const r = p.match(/^([A-Z0-9]{1,6})-([A-Z0-9]{1,6})$/i);
       if (r) {
-        const a = LETTER_SIZES.indexOf(normSize(r[1]));
-        const b = LETTER_SIZES.indexOf(normSize(r[2]));
+        const [x, y] = [normSize(r[1]), normSize(r[2])];
+        const ladder = ladderFor(x, y);
+        const a = ladder.indexOf(x);
+        const b = ladder.indexOf(y);
         if (a >= 0 && b >= a) {
-          out.push(...LETTER_SIZES.slice(a, b + 1));
+          out.push(...ladder.slice(a, b + 1));
           continue;
         }
       }

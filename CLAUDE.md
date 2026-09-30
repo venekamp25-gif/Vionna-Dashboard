@@ -275,8 +275,27 @@ facts, preview per store, apply. Code: server.py section "AFTER QUOTATION"
   its cost budget from `extensions.cost.throttleStatus` (it used to force a
   global 0.55 s gap after every GraphQL call). JSON under `/api/` is gzipped;
   CORS preflights cached 2 h.
-- **Tests:** `backend/tests/test_after_quotation.py`,
-  `frontend/tests/afterQuotation.test.ts`.
+- **Sizes from competitors (v1.323):** a new listing takes the competitor's
+  sizes (`lib/competitorSizes.ts`, server twin `_competitor_sizes` — the SAME
+  case table runs in `backend/tests/test_listing_sizes.py` and
+  `frontend/tests/competitorSizes.test.ts`; 0 differences on 28,218 sample
+  cases). Bare numbers are converted only when the shop is UK (.co.uk / "UK")
+  or AU (.com.au / "AU"; AU shoes 5 = EU 36); otherwise XS–XL with a note —
+  the same "8" is a UK S, a US M and an AU shoe 38. A letter carrying an EU
+  number in a list of numbers keeps the NUMBER ("Lady S (46)" = 46). 1XL/0XL
+  and 3XS are sizes of their own, never merged. Accessories = One Size, but the
+  competitor's real sizes stay restorable ("↺ Competitor sizes" never restores
+  a fallback). An explicitly empty size list is refused at publish.
+  The **Sizes from competitors** tab backfills listings still on XS–XL: check
+  (dry run) → tick → apply through the normal apply (backup + undo). A group is
+  only proposed when EVERY colour and store is on XS–XL (else `mixed`);
+  unreadable competitor sizes are `unreadable`, never "already right"; rows
+  with sales, or sales we can't see (listed before `tracking_since`), start
+  unticked. Apply skips a group when its quotation was applied since the check,
+  any colour's sizes or the colour list changed (per-product `snapshot`), or a
+  store can't be read — and schedules ONE index rebuild per store at the end.
+- **Tests:** `backend/tests/test_after_quotation.py`, `test_listing_sizes.py`,
+  `frontend/tests/afterQuotation.test.ts`, `competitorSizes.test.ts`.
 
 ---
 

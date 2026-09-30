@@ -5433,6 +5433,7 @@ STORE_ONE_SIZE = {'dk': 'One Size', 'fr': 'Taille unique', 'fi': 'Yksi koko'}
 _CLOTHING_ALPHA_SIZES = {
     'xxs', 'xs', 's', 'm', 'l', 'xl', 'xxl', 'xxxl', '2xl', '3xl', '4xl',
     'x-small', 'small', 'medium', 'large', 'x-large', 'xx-large',
+    '3xs', '0xl', '1xl', '5xl', '6xl', '7xl', 's/m', 'm/l', 'l/xl', 'xs/s',
 }
 
 
@@ -5444,7 +5445,8 @@ _CLOTHING_ALPHA_SIZES = {
 # their letter lists are exactly XS–XL; shoes come in EU 35–43; some UK/AU
 # shops use dress sizes 6–18 (venek: convert those to letters).
 
-LISTING_LETTERS = ['XXS', 'XS', 'S', 'M', 'L', 'XL', '2XL', '3XL', '4XL', '5XL', '6XL', '7XL']
+# 0XL/1XL: the plus-size scale some shops use — kept as they are (1XL is not XL)
+LISTING_LETTERS = ['3XS', 'XXS', 'XS', 'S', 'M', 'L', 'XL', '0XL', '1XL', '2XL', '3XL', '4XL', '5XL', '6XL', '7XL']
 LISTING_DEFAULT_SIZES = ['XS', 'S', 'M', 'L', 'XL']
 LISTING_SHOE_FALLBACK = ['36', '37', '38', '39', '40', '41']
 _LS_SIZE_OPT_RE = re.compile(
@@ -5454,10 +5456,12 @@ _LS_NOT_SIZE_OPT_RE = re.compile(r'forst[øo]rrelse|length|l[æa]ngde|longueur|p
 _LS_COLOUR_OPT_RE = re.compile(r'colou?r|kleur|farve|farbe|färg|couleur|colore|colori|väri|farba', re.I)
 _LS_SHOE_OPT_RE = re.compile(r'pointure|sko|shoe|chaussure|kenk|schuh|schoen', re.I)
 _LS_LETTER_ALIASES = {
-    'XXL': '2XL', 'XXXL': '3XL', 'XXXXL': '4XL', 'XXXXXL': '5XL', '2XS': 'XXS', 'XXXS': 'XXS', '1XL': 'XL',
+    'XXL': '2XL', 'XXXL': '3XL', 'XXXXL': '4XL', 'XXXXXL': '5XL', '2XS': 'XXS', 'XXXS': '3XS',
     'SMALL': 'S', 'MEDIUM': 'M', 'LARGE': 'L', 'XSMALL': 'XS', 'XLARGE': 'XL', 'X-SMALL': 'XS', 'X-LARGE': 'XL',
     'XX-LARGE': '2XL', 'XXLARGE': '2XL', 'XX-SMALL': 'XXS',
+    'LILLE': 'S', 'STOR': 'L', 'EKSTRASTOR': 'XL',                  # DK
 }
+_LS_PLACEHOLDER_RE = re.compile(r'(taille|size|koko|størrelse|maat|personnalisée|custom|sur mesure)', re.I)
 _LS_ONE_SIZE_RE = re.compile(
     r'^(one[\s-]?size(\s+fits\s+all)?|onesize|os|osfa|o/s|tu|t\.u\.?|free[\s-]?size|taille[\s-]?unique|unique|'
     r'yksi[\s-]?koko|einheitsgr(ö|oe)(ss|ß)e|str\.?\s*one\s*size)$', re.I)
@@ -5465,8 +5469,25 @@ _LS_STOCK_RE = re.compile(
     r'\s*[-–(]?\s*(\(?\s*(presque|quasi)\s+épuisé\)?|\(?\s*\d+\s+en\s+stock\)?|udsolgt|sold\s*out|'
     r'loppu(unmyyty)?|épuisé|restock|ny|new)\)?\s*$', re.I)
 _LS_UK_DRESS = {'4': 'XXS', '6': 'XS', '8': 'S', '10': 'M', '12': 'L', '14': 'XL', '16': '2XL', '18': '3XL',
-                '20': '4XL', '22': '5XL'}
+                '20': '4XL', '22': '5XL', '24': '6XL', '26': '7XL'}
 _LS_UK_SHOE = {'2': '35', '3': '36', '4': '37', '5': '38', '6': '39', '7': '40', '8': '41', '9': '42', '10': '43'}
+# AU (= US) women's shoes → EU (Billy J's own guide: AU 5 = EU 36 … AU 10 = EU 41)
+_LS_AU_SHOE = {'5': '36', '6': '37', '7': '38', '8': '39', '9': '40', '10': '41'}
+
+
+def _size_region(host, option_name, raw):
+    """'uk' | 'au' | 'us' | None — whose system bare numbers are in. The same
+    '8' is a UK S, a US M and an AU shoe 38: only a UK or AU shop (or a label
+    that says so) converts."""
+    h = (host or '').lower().rstrip('.')
+    said = f"{option_name or ''} {' '.join(raw or [])}"
+    if re.search(r'\bUK\b', said, re.I) or re.search(r'\.(co\.)?uk$', h):
+        return 'uk'
+    if re.search(r'\bAU\b', said, re.I) or re.search(r'\.(com\.)?au$', h):
+        return 'au'
+    if re.search(r'\bUS\b', said, re.I):
+        return 'us'
+    return None
 
 
 def _ls_is_uk_number(s):
@@ -5499,7 +5520,7 @@ def _listing_norm_size(raw):
         return _ls_num(eu.group(1) or eu.group(2))
     if not v or len(v) > 24 or len(v.split(' ')) > 4:
         return None
-    if re.fullmatch(r'(taille|size|koko|størrelse|maat|personnalisée|custom|sur mesure)', v, re.I):
+    if _LS_PLACEHOLDER_RE.fullmatch(v):
         return None
     if _LS_ONE_SIZE_RE.match(v):
         return 'One Size'
@@ -5510,7 +5531,9 @@ def _listing_norm_size(raw):
             return f'{a}/{b}'
     if re.fullmatch(r'(SM|ML)', v, re.I):
         return 'S/M' if v.upper() == 'SM' else 'M/L'
-    m = (re.match(r'^([0-9]?X{0,4}[SML]|X{1,4}L|\dXL|\dXS)\s*[(/]\s*(EU\s*)?\d', v, re.I)
+    # a letter with something next to it: keep the LETTER ("S (36)", "S(US 6-8)",
+    # "XS 32/34", "M - 38", "M | 38"); in a list of EU numbers the list decides
+    m = (re.match(r'^([0-9]?X{0,4}[SML]|X{1,4}L|\dXL|\dXS)(?=\s*[(/|:\-–]|\s+\S)', v, re.I)
          or re.match(r'^\d{1,2}(?:[/-]\d{1,2})?\s*[(-]\s*([0-9]?X{0,4}[SML]|\dXL)\)?$', v, re.I))
     if m:
         l = _ls_letter(m.group(1))
@@ -5522,9 +5545,20 @@ def _listing_norm_size(raw):
     n = re.fullmatch(r'(?:EUR?\s*)?(\d{2}(?:[.,](?:0|5))?)(?:\s*EUR?)?', v.replace('½', '.5'), re.I)
     if n:
         return _ls_num(n.group(1))
+    rng = re.fullmatch(r'(\d{2})\s*[-/–]\s*(\d{2})', v)       # socks, tights: "36-38", "41/45"
+    if rng and int(rng.group(1)) < int(rng.group(2)):
+        return f'{rng.group(1)}-{rng.group(2)}'
     if _ls_is_uk_number(v):
         return v
     return None
+
+
+def _ls_attached_number(raw):
+    """The EU number written next to a letter ('Lady S (46)', 'M (EU 38)', 'XS 32/34' -> '32')."""
+    v = _LS_STOCK_RE.sub('', str(raw or '')).strip()
+    v = re.sub(r'^lady\s+', '', v, flags=re.I)
+    m = re.match(r'^(?:[0-9]?X{0,4}[SML]|X{1,4}L|\dXL|\dXS)\s*[(/|\-–:]?\s*(?:EUR?\s*)?(\d{2})\b', v, re.I)
+    return m.group(1) if m else None
 
 
 def _listing_sort_sizes(sizes):
@@ -5566,16 +5600,32 @@ def _listing_find_size_option(options):
     return None
 
 
-def _competitor_sizes(options, category):
+def _ls_is_letter(s):
+    return all(p in LISTING_LETTERS for p in s.split('/'))
+
+
+def _ls_is_eu(s):
+    return bool(re.fullmatch(r'\d{2,3}(\.5)?', s))
+
+
+def _competitor_sizes(options, category, host=''):
     """-> {'sizes', 'source', 'raw', 'note'} — source: competitor | converted-uk |
-    one-size | default | shoe-default. Same answers as the frontend helper."""
+    one-size | default | shoe-default. Same answers as the frontend helper
+    (`host` = the competitor's domain: decides UK / AU / unknown numbers)."""
     cat = (category or '').lower()
+    if cat in ('accessory', 'bag'):
+        g = _competitor_sizes(options, 'garment', host)
+        sold = g['source'] in ('competitor', 'converted-uk') and len(g['sizes']) >= 2
+        return {'sizes': ['One Size'], 'source': 'one-size', 'raw': g['raw'],
+                'note': (f"Listed as One Size because it reads as an accessory, but the competitor sells sizes "
+                         f"({' '.join(g['sizes'])})") if sold else None}
     opt = _listing_find_size_option(options)
     raw = [str(v) for v in ((opt or {}).get('values') or [])]
-    if cat in ('accessory', 'bag'):
-        return {'sizes': ['One Size'], 'source': 'one-size', 'raw': raw, 'note': None}
     is_shoe = cat == 'shoes' or bool(_LS_SHOE_OPT_RE.search((opt or {}).get('name') or ''))
-    norm = list(dict.fromkeys(n for n in (_listing_norm_size(v) for v in raw) if n))
+    pairs = [(v, _listing_norm_size(v)) for v in raw]
+    norm = list(dict.fromkeys(n for _, n in pairs if n))
+    dropped = [v.strip() for v, n in pairs if not n and not _LS_PLACEHOLDER_RE.fullmatch(v.strip())]
+    dropped_note = f"Not read at the competitor: {', '.join(dropped[:5])}" if dropped else None
 
     def fallback(why):
         if is_shoe:
@@ -5583,30 +5633,47 @@ def _competitor_sizes(options, category):
                     'note': f'{why} — shoes default to EU 36–41, check the sizes'}
         return {'sizes': list(LISTING_DEFAULT_SIZES), 'source': 'default', 'raw': raw,
                 'note': f'{why} — XS–XL used, check the sizes'}
+
+    def found(sizes, source, note=None):
+        return {'sizes': sizes, 'source': source, 'raw': raw,
+                'note': '. '.join(x for x in (note, dropped_note) if x) or None}
     if not opt:
         return fallback('The competitor lists no sizes')
     if not norm:
         return fallback("The competitor's sizes couldn't be read")
+    # EU numbers plus a few letters carrying their own number ("32 … 44, Lady S (46)")
+    if any(_ls_is_eu(s) for s in norm) and any(_ls_is_letter(s) for s in norm):
+        renorm = [(_ls_attached_number(v) if _ls_is_letter(n) else n) for v, n in pairs if n]
+        if all(x and _ls_is_eu(x) for x in renorm):
+            norm = list(dict.fromkeys(renorm))
+        else:
+            return fallback('The competitor mixes letter and number sizes')
     bare = [s for s in norm if _ls_is_uk_number(s)]
     if bare:
-        if len(bare) != len(norm):
+        if len(bare) != len(norm) or dropped:
             return fallback('The competitor mixes size systems')
+        region = _size_region(host, opt.get('name') or '', raw)
         if is_shoe:
-            eu = [_LS_UK_SHOE.get(s) for s in bare]
+            table = _LS_UK_SHOE if region == 'uk' else _LS_AU_SHOE if region in ('au', 'us') else None
+            if not table:
+                return fallback('Bare shoe numbers — UK, US or AU sizes? Not converted')
+            eu = [table.get(s) for s in bare]
             if all(eu):
-                return {'sizes': _listing_sort_sizes(list(dict.fromkeys(eu))), 'source': 'converted-uk', 'raw': raw,
-                        'note': 'Converted from UK shoe sizes to EU'}
+                return found(_listing_sort_sizes(list(dict.fromkeys(eu))), 'converted-uk',
+                             f'Converted from {region.upper()} shoe sizes to EU')
             return fallback('Unusual shoe sizes at the competitor')
+        if region not in ('uk', 'au'):
+            return fallback(f"Bare numbers ({', '.join(bare[:4])}…) — UK or US dress sizes? Not converted")
         letters = [_LS_UK_DRESS.get(s) for s in bare]
         if all(letters):
-            return {'sizes': _listing_sort_sizes(list(dict.fromkeys(letters))), 'source': 'converted-uk', 'raw': raw,
-                    'note': 'Converted from UK/AU dress sizes (6 = XS, 8 = S, 10 = M…)'}
+            return found(_listing_sort_sizes(list(dict.fromkeys(letters))), 'converted-uk',
+                         'Converted from UK/AU dress sizes (6 = XS, 8 = S, 10 = M…)')
         return fallback("The competitor uses numeric sizes that can't be converted (jeans?)")
-    if is_shoe and all(s.split('/')[0] in LISTING_LETTERS for s in norm):
-        return fallback('Shoes listed in clothing sizes at the competitor')
     sizes = _listing_sort_sizes(norm)[:30]
-    return {'sizes': sizes, 'source': 'competitor', 'raw': raw,
-            'note': 'The competitor sells only one size' if len(sizes) == 1 and sizes[0] != 'One Size' else None}
+    if is_shoe and all(_ls_is_letter(s) for s in sizes):
+        return found(sizes, 'competitor', 'Clothing sizes on a product listed as shoes — check the type and the sizes')
+    return found(sizes, 'competitor',
+                 'The competitor sells only one size' if len(sizes) == 1 and sizes[0] != 'One Size' else None)
 
 
 def _listing_sizes(raw):
@@ -17955,6 +18022,11 @@ def publish_create_variant():
 
     product_name     = data.get('product_name', '')
     color            = data.get('color', '')
+    # An EXPLICITLY empty list is the operator removing every size chip — refuse
+    # it instead of quietly publishing XS–XL (for shoes too). Callers that omit
+    # 'sizes' (old drafts) keep the XS–XL fallback.
+    if isinstance(data.get('sizes'), list) and not [v for v in data['sizes'] if str(v or '').strip()]:
+        return jsonify({'error': 'No sizes — add at least one size before publishing.'}), 400
     sizes, _sizes_fell_back = _listing_sizes(data.get('sizes'))
     description_html = _publish_to_html(data.get('description', ''))
     # Competitor size chart → the custom.size_chart metafield (shown via a theme
@@ -18066,7 +18138,7 @@ def publish_create_variant():
         'tags':               _cat_tags,
         'product_type':       product_type or None,
         'sizes':              sizes,
-        'sizes_source':       data.get('sizes_source') or ('default' if _sizes_fell_back else 'unknown'),
+        'sizes_source':       'default' if _sizes_fell_back else (data.get('sizes_source') or 'unknown'),
         'sizes_in':           data.get('sizes'),
         'size_guard_applied': _size_guarded,   # accessory clothing-size collapse fired
         'size_chart_applied': bool(size_chart_html),
@@ -26453,12 +26525,12 @@ _AQ_ORDERS_LOCK = threading.Lock()
 _AQ_ORDERS_SYNC = {s: threading.Lock() for s in AQ_STORES}
 _AQ_SUMMARY_CACHE = {'sig': None, 'items': None}
 _AQ_SUMMARY_LOCK = threading.Lock()
-_AQ_LETTER_SIZES = ['XXS', 'XS', 'S', 'M', 'L', 'XL', '2XL', '3XL', '4XL', '5XL', '6XL', '7XL']
+_AQ_LETTER_SIZES = ['3XS', 'XXS', 'XS', 'S', 'M', 'L', 'XL', '0XL', '1XL', '2XL', '3XL', '4XL', '5XL', '6XL', '7XL']
 _AQ_SIZE_ALIASES = {
     'XXL': '2XL', 'XXXL': '3XL', 'XXXXL': '4XL', 'XXXXXL': '5XL',
     'SMALL': 'S', 'MEDIUM': 'M', 'LARGE': 'L', 'XSMALL': 'XS', 'XLARGE': 'XL',
     'X-SMALL': 'XS', 'X-LARGE': 'XL', 'XX-LARGE': '2XL', 'XXLARGE': '2XL',
-    '2XS': 'XXS', 'XXXS': 'XXS', '1XL': 'XL', 'XX-SMALL': 'XXS',
+    '2XS': 'XXS', 'XXXS': '3XS', 'XX-SMALL': 'XXS',          # 1XL stays 1XL: not the same size as XL
 }
 _AQ_ONE_SIZE_WORDS = {'ONESIZE', 'OS', 'FREESIZE', 'FREE', 'TAILLEUNIQUE', 'YKSIKOKO', 'ONESIZEFITSALL',
                       'OSFA', 'TU', 'ONE-SIZE', 'O/S'}
@@ -26794,17 +26866,19 @@ def _aq_invalidate(stores=AQ_STORES):
             threading.Thread(target=_aq_index_rebuild_quietly, args=(s, 0), daemon=True).start()
 
 
-def _aq_refresh_after_write(pids_by_store):
+def _aq_refresh_after_write(pids_by_store, rebuild=True):
     """Before a job reports done: the products it wrote (and created) re-read by
     id into the index — the list the page reloads right after already shows the
     change (it used to show the old sizes for ~11 s). A full rebuild follows in
-    90 s, once Shopify's search index has caught up, to catch anything else."""
+    90 s, once Shopify's search index has caught up, to catch anything else.
+    A bulk job (the size backfill) passes rebuild=False and schedules ONE
+    rebuild per store at its end — not one per group, back to back."""
     for s, pids in pids_by_store.items():
         try:
             _aq_index_patch(s, pids)
         except Exception as e:
             print(f'[aq] patch after write {s} failed: {e}')
-    if 'pytest' in sys.modules:
+    if 'pytest' in sys.modules or not rebuild:
         return
     for s in pids_by_store:
         if s in tokens:
@@ -28642,7 +28716,7 @@ def _aq_apply_run(jid, key, target, expected_sig, user):
                 written.setdefault(st_, set()).add(pid)
             for c in backup['created']:
                 written.setdefault(c['store'], set()).add(c['product_id'])
-            _aq_refresh_after_write(written)
+            _aq_refresh_after_write(written, rebuild=target.get('kind') != 'size_backfill')
             errors = _aq_job_errors(jid)
             summary = {s: [o['text'] for o in plan['ops'] if o['store'] == s] for s in AQ_STORES}
             _aq_history_append({
@@ -29148,27 +29222,70 @@ def _aq_competitor_options(url):
     return [{'name': o.get('name'), 'values': o.get('values') or []} for o in prod.get('options') or []], 'ok'
 
 
+def _aq_size_members():
+    """family key -> {'sizes': {store: {pid: [sizes]}} of every live colour
+    (drafts too: the apply writes them), 'members': [(store, product)] incl.
+    archived colours (their sales count)}. From the index copies in memory."""
+    with _AQ_INDEX_LOCK:
+        snap = {s: _AQ_INDEX[s] for s in AQ_STORES if s in _AQ_INDEX and s in tokens}
+    out = {}
+    for s, e in snap.items():
+        for p in e['products']:
+            m = out.setdefault(_aq_family_key(p), {'sizes': {}, 'members': []})
+            m['sizes'].setdefault(s, {})[str(p['id'])] = list(p.get('sizes') or [])
+            m['members'].append((s, p))
+        for a in e.get('archived') or []:
+            out.setdefault(_aq_family_key(a), {'sizes': {}, 'members': []})['members'].append((s, a))
+    return out
+
+
+def _aq_sales_known(members, meta):
+    """True when 'no order on file' really means 'never sold': every colour
+    (archived too) was created after we started reading that store's orders
+    (~60 days back), and that store's order sync has no error. Older groups may
+    have sold before the window — their sizes can be linked at the fulfilment
+    agent, so they start unticked as 'sales unknown'."""
+    for s, p in members:
+        m = meta.get(s) or {}
+        if m.get('error') or not m.get('tracking_since') or (p.get('created') or '') < m['tracking_since']:
+            return False
+    return True
+
+
 def _aq_size_check_run(jid, user):
     """Dry run: every live, not-yet-done colour group still on XS–XL (or shoes
-    in letter sizes) against its competitor page. Writes the report file."""
+    in letter sizes) in EVERY colour and store, against its competitor page.
+    Writes the report file."""
     with _AQ_SIZE_LOCK:
         try:
             _aq_job(jid, step='reading the listings')
+            try:
+                _aq_orders_ensure(wait=True)         # the freshest "sold?" signal
+            except Exception as e:
+                print(f'[aq] size check: order sync failed: {e}')
             items, errors = _aq_summaries()
+            _agg, meta = _aq_orders_agg()
+            fam = _aq_size_members()
             sources = _aq_source_urls()
-            cands = []
+            cands, mixed = [], []
             for it in items:
                 sm = it['s']
                 if sm['active'] == 0 or sm['processed']:
                     continue
                 cat = _aq_size_category(sm['cat'])
-                sizes = tuple(sm['sizes'] or ())
-                shoe_letters = cat == 'shoes' and _aq_size_kind(list(sizes)) == 'letter'
-                if sizes != _AQ_DEFAULT_SIZES and not shoe_letters:
+                m = fam.get(sm['key']) or {'sizes': {}, 'members': []}
+                sets = {tuple(v) for per in m['sizes'].values() for v in per.values()} or {tuple(sm['sizes'] or ())}
+                if not any(t == _AQ_DEFAULT_SIZES or (cat == 'shoes' and _aq_size_kind(list(t)) == 'letter')
+                           for t in sets):
                     continue
                 url = next((sources[(s, pid)] for s in ('dk', 'fr', 'fi') for pid in sorted(it['ids'])
                             if (s, pid) in sources), None)
-                cands.append((sm, cat, url))
+                if len(sets) > 1:
+                    # colours or stores already differ: one proposal for all
+                    # would overwrite the ones that were fixed by hand
+                    mixed.append((sm, url, sorted(' '.join(t) for t in sets)))
+                    continue
+                cands.append((sm, cat, url, m))
             _aq_job(jid, total=len(cands), step='reading the competitor pages')
             rows, by_url = [], {}
             import concurrent.futures as _cf
@@ -29180,11 +29297,15 @@ def _aq_size_check_run(jid, user):
                 return by_url[url]
 
             def one(c):
-                sm, cat, url = c
+                sm, cat, url, m = c
+                orders = (sm.get('orders') or {}).get('count') or 0
+                sets = {tuple(v) for per in m['sizes'].values() for v in per.values()}
                 row = {'key': sm['key'], 'name': sm['name'], 'cat': sm['cat'], 'image': sm['image'],
-                       'current': list(sm['sizes'] or []), 'proposed': None, 'source': None, 'note': None,
-                       'competitor_url': url, 'orders': (sm.get('orders') or {}).get('count') or 0,
-                       'stores': sorted(sm['stores'])}
+                       'current': list(next(iter(sets)) if sets else (sm['sizes'] or [])),
+                       'proposed': None, 'source': None, 'note': None,
+                       'competitor_url': url, 'orders': orders,
+                       'orders_known': orders > 0 or _aq_sales_known(m['members'], meta),
+                       'stores': sorted(sm['stores']), 'snapshot': m['sizes']}
                 if not url:
                     row['status'] = 'no_source'
                     return row
@@ -29192,15 +29313,26 @@ def _aq_size_check_run(jid, user):
                 if st != 'ok':
                     row['status'] = st
                     return row
-                r = _competitor_sizes(opts, cat)
+                r = _competitor_sizes(opts, cat, urllib.parse.urlparse(url).netloc)
                 row.update(proposed=r['sizes'], source=r['source'], note=r['note'], raw=r['raw'][:20])
-                row['status'] = 'same' if r['sizes'] == row['current'] else 'change'
+                if r['source'] in ('default', 'shoe-default'):
+                    # we could not tell what the competitor sells: never "already
+                    # right", never a made-up proposal — the operator looks
+                    row['status'] = 'unreadable'
+                else:
+                    row['status'] = 'same' if r['sizes'] == row['current'] else 'change'
                 return row
             with _cf.ThreadPoolExecutor(4) as ex:
                 for row in ex.map(one, cands):
                     rows.append(row)
-                    _aq_job_log(jid, 'dk', f"{row['name']}: {row['status']}")
-            order = {'change': 0, 'same': 1, 'no_source': 2, 'gone': 3, 'failed': 4}
+                    _aq_job(jid, done=len(rows))
+            for sm, url, sets in mixed:
+                rows.append({'key': sm['key'], 'name': sm['name'], 'cat': sm['cat'], 'image': sm['image'],
+                             'current': list(sm['sizes'] or []), 'proposed': None, 'source': None,
+                             'note': 'Colours or stores already have different sizes: ' + ' | '.join(sets[:4]),
+                             'competitor_url': url, 'orders': (sm.get('orders') or {}).get('count') or 0,
+                             'orders_known': False, 'stores': sorted(sm['stores']), 'status': 'mixed'})
+            order = {'change': 0, 'unreadable': 1, 'mixed': 2, 'same': 3, 'no_source': 4, 'gone': 5, 'failed': 6}
             rows.sort(key=lambda r: (order.get(r['status'], 9), -r['orders'], r['name']))
             report = {'generated_at': datetime.datetime.utcnow().isoformat() + 'Z', 'user': user,
                       'rows': rows, 'store_errors': errors,
@@ -29218,28 +29350,47 @@ def _aq_size_check_run(jid, user):
 
 def _aq_size_apply_run(jid, keys, user):
     """Apply the checked proposal to each chosen group — each through the
-    normal apply (backup + history + Undo). A group whose sizes changed since
-    the check is skipped, never overwritten."""
+    normal apply (backup + history + Undo). A group is skipped, never
+    overwritten, when anything moved since the check: the supplier's quotation
+    was applied, any colour's sizes changed, a colour was added, or a store
+    could not be read."""
     with _AQ_SIZE_LOCK:
+        touched = set()
         try:
             with open(AQ_SIZE_REPORT_PATH, encoding='utf-8') as f:
                 report = json.load(f)
             rows = {r['key']: r for r in report.get('rows') or [] if r.get('status') == 'change'}
             todo = [k for k in keys if k in rows]
             _aq_job(jid, total=len(todo), step='writing to Shopify')
-            for key in todo:
+            processed = _aq_processed()
+            for n, key in enumerate(todo, 1):
                 row = rows[key]
+                _aq_job(jid, done=n - 1)
                 try:
+                    if processed.get(key):
+                        _aq_job_log(jid, 'dk', f"{row['name']}: the supplier's quotation was applied since the "
+                                               f"check — its sizes stay, skipped", ok=False)
+                        continue
                     state = _aq_family_state(key)
                     if not state:
                         _aq_job_log(jid, 'dk', f"{row['name']}: listing no longer exists — skipped", ok=False)
                         continue
-                    now = next((p['sizes'] for ps in state['stores'].values() for p in ps
-                                if p['status'] == 'active'), None)
-                    if now != row['current']:
-                        _aq_job_log(jid, 'dk', f"{row['name']}: sizes changed since the check "
-                                               f"({' '.join(now or [])}) — skipped", ok=False)
+                    bad = sorted(set(state.get('store_errors') or {}) | (set(row['stores']) - set(state['stores'])))
+                    if bad:
+                        _aq_job_log(jid, 'dk', f"{row['name']}: {', '.join(x.upper() for x in bad)} couldn't be "
+                                               f"read — skipped, nothing written", ok=False)
                         continue
+                    now = {s: {str(p['id']): list(p['sizes']) for p in ps} for s, ps in state['stores'].items()}
+                    snap = row.get('snapshot') or {}
+                    if snap and now != snap:
+                        _aq_job_log(jid, 'dk', f"{row['name']}: sizes or colours changed since the check — skipped",
+                                    ok=False)
+                        continue
+                    if not snap and next((p['sizes'] for ps in state['stores'].values() for p in ps
+                                          if p['status'] == 'active'), None) != row['current']:
+                        _aq_job_log(jid, 'dk', f"{row['name']}: sizes changed since the check — skipped", ok=False)
+                        continue
+                    touched |= set(state['stores'])
                     sub = _aq_job_new('apply', key)
                     _aq_apply_run(sub, key, {'sizes': row['proposed'], 'stores': sorted(state['stores']),
                                              'kind': 'size_backfill',
@@ -29253,11 +29404,18 @@ def _aq_size_apply_run(jid, keys, user):
                 except Exception as e:
                     _aq_job_log(jid, 'dk', f"{row['name']}: FAILED — {e}", ok=False)
             errors = _aq_job_errors(jid)
-            _aq_job(jid, status='done' if not errors else 'partial', step='done',
+            _aq_job(jid, status='done' if not errors else 'partial', step='done', done=len(todo),
                     result={'errors': errors}, finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
         except Exception as e:
             _aq_job(jid, status='error', step='stopped', errors=[str(e)[:400]],
                     finished_at=datetime.datetime.utcnow().isoformat() + 'Z')
+        finally:
+            # one full rebuild per store for the whole run (each group already
+            # patched its own products by id)
+            if touched and 'pytest' not in sys.modules:
+                for st in touched:
+                    if st in tokens:
+                        threading.Timer(90, _aq_index_rebuild_quietly, args=(st, 0)).start()
 
 
 @app.route('/api/aq/size_backfill/check', methods=['POST'])
