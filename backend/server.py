@@ -9705,15 +9705,55 @@ def api_spy_shield_beacon(token):
     return ('', 204)
 
 
-def _ss_read_rows(days):
+# Block-tier redenen die de snippet zelf uit een spy-tool-signaal afleidt
+# (tool-verwijzer, extensie-probe, DOM-marker, <script>/<link>-tag, postMessage,
+# of de 24-u-cookie die zo'n signaal onthoudt). Al het andere in de block-tier is
+# geen tool-signaal (een vervalst record — het token is publiek — of een nieuw
+# soort signaal dat eerst bekeken moet worden) en houdt "KLAAR VOOR DK" op nee.
+_SS_TOOL_REASON_PREFIXES = ('ref:', 'ext:', 'dom:', 'tag:', 'msg:', 'cookie:persist')
+# Minimaal aantal kalenderdagen sinds het eerste live record vóór Blokkeren
+# (README/SPEC R5; frontend SS_MONITOR_DAYS).
+_SS_READY_DAYS = 14
+
+
+def _ss_is_operator_test(r):
+    """True voor records uit venek's eigen tests: ?ss_sim=… (reden of signaal
+    'sim:*' — sim kan alleen mét geldige _ss_op-cookie, dus altijd de eigenaar)
+    en de op_cookie/bypass-records van ?ss_debug=1. Digest 30-09-2026: zulke
+    records telden mee als would-be block en in de koper-join, terwijl die
+    browser in het echt nooit geblokkeerd wordt (op_cookie → allow)."""
+    reason = str(r.get('ss_reason') or '')
+    if reason.startswith('sim:') or reason in ('op_cookie', 'bypass'):
+        return True
+    return any(p.startswith('sim:') for p in str(r.get('ss_signals') or '').split('|'))
+
+
+def _ss_is_tool_reason(reason):
+    return str(reason or '').startswith(_SS_TOOL_REASON_PREFIXES)
+
+
+def _ss_read_rows(days, first_seen=None):
     """Records van vandaag + de `days`-1 UTC-dagen ervoor (days=7 = 7 kalender-
-    dagen incl. vandaag), kapotte regels overgeslagen."""
+    dagen incl. vandaag), kapotte regels overgeslagen.
+
+    first_seen (dict, optioneel) wordt in dezelfde leesronde gevuld met per
+    winkel de ts van het oudste LIVE record in het hele log (90 dagen bewaard),
+    los van het venster. Digest 30-09-2026 zei "(14d)" terwijl het log pas op
+    28-09 begon (dag 2 van 14) — de 14-dagen-klok moet dus bij de go-live
+    starten, niet bij de venstergrens. Operator-tests en preview-thema-records
+    (ss_pt=1: de README-checklist test het DK-duplicaat vóór go-live) starten
+    die klok niet."""
     cutoff = (_ss_utcnow() - datetime.timedelta(days=max(1, int(days)) - 1)).strftime('%Y-%m-%d')
     rows = []
     for r in _blog_read_jsonl(SPY_SHIELD_LOG_PATH):
         if not isinstance(r, dict):
             continue
         day = str(r.get('day') or r.get('ts') or '')[:10]
+        if first_seen is not None and r.get('ss_pt') != 1 and not _ss_is_operator_test(r):
+            ts = str(r.get('ts') or '')
+            code = r.get('store') or 'unknown'
+            if ts and (code not in first_seen or ts < first_seen[code]):
+                first_seen[code] = ts
         if day >= cutoff:
             rows.append(r)
     return rows
@@ -9787,14 +9827,22 @@ def _spy_shield_orders(store, since_days):
     return rows
 
 
-def _spy_shield_buyers(rows, stores, days):
+def _spy_shield_buyers(rows, stores, days, first_seen=None):
     """Rode teller: orders waarvan de sessie landde op een pad waar een
     block-tier record (ss_tier == 'block') van dezelfde winkel binnen ±60 min
     zat. Alleen Vionna (tokens hier). count None = minstens één gevraagde
-    Vionna-winkel kon niet gecontroleerd worden — dan is '0' geen bewijs."""
+    Vionna-winkel kon niet gecontroleerd worden — dan is '0' geen bewijs.
+
+    Operator-tests (sim:*) doen niet mee. orders_checked telt alleen orders
+    vanaf het eerste live record van die winkel (first_seen): digest 30-09-2026
+    — het venster haalt 14 dagen orders op, maar het log begon pas op 28-09,
+    dus orders van vóór de go-live zouden als 'gecontroleerd' tellen terwijl ze
+    nooit konden matchen. Een winkel zonder block-tier records wordt niet
+    gecontroleerd (geen fetch) en staat in not_checked — geen kale 0."""
     wanted = [s for s in _SS_BUYER_STORES if s in stores]
+    first_seen = first_seen or {}
     out = {'supported_stores': list(_SS_BUYER_STORES), 'count': 0, 'orders': [],
-           'orders_checked': {}, 'note': '',
+           'orders_checked': {}, 'not_checked': [], 'note': '',
            # Hoeveel verschillende browsers (dag-hashes) achter de gematchte
            # records zitten: het beacon-token is publiek, dus één bron kan een
            # rode teller vervalsen — "alle N treffers uit 1 browser" is het
@@ -9805,10 +9853,12 @@ def _spy_shield_buyers(rows, stores, days):
     matched_keys = set()
     block_keys = set()
     for st in wanted:
-        blocks = [r for r in rows if r.get('store') == st and r.get('ss_tier') == 'block']
+        blocks = [r for r in rows if r.get('store') == st and r.get('ss_tier') == 'block'
+                  and not _ss_is_operator_test(r)]
         block_keys |= {r.get('browser_key') for r in blocks if r.get('browser_key')}
         if not blocks:
             out['orders_checked'][st] = 0
+            out['not_checked'].append(st)
             continue
         try:
             orders = _spy_shield_orders(st, days)
@@ -9819,7 +9869,16 @@ def _spy_shield_buyers(rows, stores, days):
             unreadable.append(st)
             out['orders_checked'][st] = None
             continue
-        out['orders_checked'][st] = len(orders)
+        since = _ss_parse_ts(first_seen.get(st))
+        if since is None:
+            stamps = [t for t in (_ss_parse_ts(r.get('ts')) for r in blocks) if t]
+            since = min(stamps) if stamps else None
+        checked = 0
+        for o in orders:
+            ot = _ss_parse_ts(o.get('created_at'))
+            if ot and (since is None or ot >= since):
+                checked += 1
+        out['orders_checked'][st] = checked
         by_path = {}
         for r in blocks:
             t = _ss_parse_ts(r.get('ts'))
@@ -9847,7 +9906,11 @@ def _spy_shield_buyers(rows, stores, days):
     notes = ['Buyer check covers Vionna DK/FR/FI only (Light Supplier not wired up yet). '
              'Match = same store, same landing path, order within ±60 min of a block-tier '
              'signal — by page and time, not by cookie, so a coincidence is possible: '
-             'open the order before you conclude anything.']
+             'open the order before you conclude anything. Orders checked = orders placed '
+             'since the store\'s first live record; operator tests (?ss_sim) never join.']
+    if out['not_checked']:
+        notes.append('Not checked (no block-tier records, nothing to match): '
+                     + ', '.join(s.upper() for s in out['not_checked']) + '.')
     if unreadable:
         out['count'] = None
         notes.append('Orders not readable for ' + ', '.join(s.upper() for s in unreadable)
@@ -9876,12 +9939,21 @@ def _ss_pt_alarm_active(pt_alarm, total, pt_last_at, now=None):
 def _spy_shield_summary(days=14, store='all', with_buyers=True, with_url=True):
     """Aggregatie voor de tab + de Slack-regel. Nooit browser_key in last_hits.
     with_url=False laat beacon_url weg (X-Notify-Token-lezers hebben het
-    schrijf-token niet nodig)."""
+    schrijf-token niet nodig).
+
+    block_tier_hits zijn RECORDS (de snippet stuurt 1-4 records per
+    paginaweergave: head/late/final), dus naast elkaar block_tier_browsers
+    (dag-hashes = browser-dagen). Operator-tests (sim:*/op_cookie) tellen apart
+    als operator_tests en nooit als would-be block. first_seen/first_seen_at =
+    het oudste live record in het HELE log (de 14-dagen-klok), first_hit_at
+    blijft het oudste record binnen het venster."""
     days = max(1, min(int(days or 14), 90))
-    rows = _ss_read_rows(days)
+    first_seen = {}
+    rows = _ss_read_rows(days, first_seen=first_seen)
     store = (store or 'all').lower()
     if store != 'all':
         rows = [r for r in rows if r.get('store') == store]
+        first_seen = {k: v for k, v in first_seen.items() if k == store}
     stores = {}
     for r in rows:
         code = r.get('store') or 'unknown'
@@ -9891,8 +9963,11 @@ def _spy_shield_summary(days=14, store='all', with_buyers=True, with_url=True):
                                 'by_action': {'allow': 0, 'monitor': 0, 'block': 0},
                                 '_reasons': {}, '_browsers': set(), 'repeat_hits': 0,
                                 'pt_alarm': 0, 'pt_last_at': None, 'block_tier_hits': 0,
+                                '_block_browsers': set(), 'block_tier_non_tool': 0,
+                                'operator_tests': 0,
                                 'utm_hits': 0, '_daily': {}, 'last_hits': [],
-                                'last_hit_at': None, 'first_hit_at': None, 'active_days': 0}
+                                'last_hit_at': None, 'first_hit_at': None, 'active_days': 0,
+                                'first_seen_at': first_seen.get(code)}
         s['total'] += 1
         act = r.get('ss_action') if r.get('ss_action') in _SS_ACTIONS else 'allow'
         s['by_action'][act] += 1
@@ -9909,8 +9984,14 @@ def _spy_shield_summary(days=14, store='all', with_buyers=True, with_url=True):
             s['pt_alarm'] += 1
             if not s['pt_last_at'] or ts > s['pt_last_at']:
                 s['pt_last_at'] = ts
-        if r.get('ss_tier') == 'block':
+        if _ss_is_operator_test(r):
+            s['operator_tests'] += 1
+        elif r.get('ss_tier') == 'block':
             s['block_tier_hits'] += 1
+            if r.get('browser_key'):
+                s['_block_browsers'].add(r['browser_key'])
+            if not _ss_is_tool_reason(r.get('ss_reason')):
+                s['block_tier_non_tool'] += 1
         day = str(r.get('day') or r.get('ts') or '')[:10]
         d = s['_daily'].setdefault(day, {'day': day, 'monitor': 0, 'block': 0, 'allow': 0})
         d[act] += 1
@@ -9920,15 +10001,21 @@ def _spy_shield_summary(days=14, store='all', with_buyers=True, with_url=True):
             s['first_hit_at'] = ts
     totals = {'total': 0, 'by_action': {'allow': 0, 'monitor': 0, 'block': 0},
               'unique_browsers': 0, 'repeat_hits': 0, 'pt_alarm': 0, 'pt_last_at': None,
-              'pt_alarm_active': False, 'block_tier_hits': 0, 'utm_hits': 0,
-              'last_hit_at': None}
+              'pt_alarm_active': False, 'block_tier_hits': 0, 'block_tier_browsers': 0,
+              'block_tier_non_tool': 0, 'operator_tests': 0, 'utm_hits': 0,
+              'last_hit_at': None,
+              'first_seen_at': min(first_seen.values()) if first_seen else None}
     all_browsers = set()
+    all_block_browsers = set()
     for code, s in stores.items():
         s['by_reason'] = sorted(s.pop('_reasons').items(), key=lambda kv: (-kv[1], kv[0]))[:25]
         s['by_reason'] = [[k, v] for k, v in s['by_reason']]
         browsers = s.pop('_browsers')
         all_browsers |= browsers
         s['unique_browsers'] = len(browsers)
+        block_browsers = s.pop('_block_browsers')
+        all_block_browsers |= block_browsers
+        s['block_tier_browsers'] = len(block_browsers)
         daily = s.pop('_daily')
         s['daily'] = [daily[k] for k in sorted(daily)]
         s['active_days'] = len(daily)          # dagen mét records = "dagen data" voor de 14-dagen-eis
@@ -9944,22 +10031,26 @@ def _spy_shield_summary(days=14, store='all', with_buyers=True, with_url=True):
         if s['pt_last_at'] and (not totals['pt_last_at'] or s['pt_last_at'] > totals['pt_last_at']):
             totals['pt_last_at'] = s['pt_last_at']
         totals['block_tier_hits'] += s['block_tier_hits']
+        totals['block_tier_non_tool'] += s['block_tier_non_tool']
+        totals['operator_tests'] += s['operator_tests']
         if s['last_hit_at'] and (not totals['last_hit_at'] or s['last_hit_at'] > totals['last_hit_at']):
             totals['last_hit_at'] = s['last_hit_at']
     totals['unique_browsers'] = len(all_browsers)
+    totals['block_tier_browsers'] = len(all_block_browsers)
     totals['pt_alarm_active'] = _ss_pt_alarm_active(totals['pt_alarm'], totals['total'], totals['pt_last_at'])
     wanted = list(_SS_BUYER_STORES) if store == 'all' else [store]
     if with_buyers:
         try:
-            buyers = _spy_shield_buyers(rows, wanted, days)
+            buyers = _spy_shield_buyers(rows, wanted, days, first_seen=first_seen)
         except Exception as e:
             print(f'[spy_shield] buyers join failed: {type(e).__name__}')
             buyers = {'supported_stores': list(_SS_BUYER_STORES), 'count': None, 'orders': [],
-                      'orders_checked': {}, 'note': 'Buyer check failed — see server log.'}
+                      'orders_checked': {}, 'not_checked': [],
+                      'note': 'Buyer check failed — see server log.'}
     else:
         buyers = {'supported_stores': list(_SS_BUYER_STORES), 'count': None, 'orders': [],
-                  'orders_checked': {}, 'note': 'Buyer check skipped.'}
-    return {
+                  'orders_checked': {}, 'not_checked': [], 'note': 'Buyer check skipped.'}
+    out = {
         'configured': bool(_ss_token()),
         'beacon_url': _ss_beacon_url() if with_url else None,
         'days': days,
@@ -9973,7 +10064,48 @@ def _spy_shield_summary(days=14, store='all', with_buyers=True, with_url=True):
         'accepted_since_start': _SS_ACCEPTED[0],
         'log_full': _ss_log_full(),
         'limits': {k: _SS_LIMITS[k] for k in ('per_ip_min', 'per_ip_day', 'per_day', 'retention_days')},
+        'first_seen': dict(first_seen),
     }
+    out['ready'] = {c: _ss_ready_verdict(out, c) for c in _SS_BUYER_STORES if c in wanted}
+    return out
+
+
+def _ss_ready_verdict(summary, code='dk', now=None):
+    """Klaar voor Blokkeren? Dezelfde criteria als de omzet-checklist, zodat de
+    Slack-regel het oordeel zelf geeft in plaats van dat "(14d)" als "twee weken
+    schoon" gelezen wordt (digest 30-09-2026: dag 2 van 14, koper-check op 1
+    DK-order). Alle vier moeten kloppen:
+      1. ≥ 14 kalenderdagen sinds het eerste live record (hele log, stille
+         dagen tellen mee — niet active_days);
+      2. ≥ 1 gecontroleerde order van die winkel en 0 matches;
+      3. operator-tests (sim:*) tellen niet mee — gegarandeerd doordat
+         _spy_shield_summary/_spy_shield_buyers ze vóór het tellen uitsluiten;
+      4. alle block-tier redenen zijn tool-signalen (_SS_TOOL_REASON_PREFIXES).
+    why_not bevat alleen eigen tekst + getallen (nooit poster-tekst: gaat naar Slack)."""
+    now = now or _ss_utcnow()
+    up = code.upper()
+    why = []
+    first = _ss_parse_ts((summary.get('first_seen') or {}).get(code))
+    days_live = (now.date() - first.date()).days if first else 0
+    if not first:
+        why.append(f'geen live {up}-data')
+    elif days_live < _SS_READY_DAYS:
+        why.append(f'dag {days_live} van {_SS_READY_DAYS}')
+    b = summary.get('buyers_flagged') or {}
+    checked = (b.get('orders_checked') or {}).get(code)
+    matches = sum(1 for o in (b.get('orders') or []) if o.get('store') == code)
+    if code in (b.get('not_checked') or []):
+        why.append(f'{up}-orders niet gecontroleerd (geen block-tier records)')
+    elif checked is None:
+        why.append(f'{up}-orders niet gecontroleerd (niet leesbaar)')
+    elif matches:
+        why.append(f"{matches} {up}-koper{'s' if matches != 1 else ''} in flagged sessions")
+    elif checked < 1:
+        why.append(f'0 {up}-orders gecontroleerd')
+    non_tool = ((summary.get('stores') or {}).get(code) or {}).get('block_tier_non_tool') or 0
+    if non_tool:
+        why.append(f'{non_tool} block-tier records zonder tool-signaal')
+    return {'ready': not why, 'days_live': days_live, 'why_not': why}
 
 
 def require_droplet_or_notify_token(f):
@@ -10033,27 +10165,79 @@ def api_spy_shield_setup():
                     'beacon_url': _ss_beacon_url()})
 
 
+def _ss_orders_checked_txt(b):
+    """'DK 1, FR 4, FI 1 orders gecontroleerd' (+ welke winkels niet
+    gecontroleerd/niet leesbaar zijn) — digest 30-09-2026: de kale '0 buyers'
+    rustte op 6 orders (DK 1) en zei dat nergens."""
+    checked = b.get('orders_checked') or {}
+    skipped = set(b.get('not_checked') or [])
+    ok, unread = [], []
+    for code in _SS_BUYER_STORES:
+        if code not in checked or code in skipped:
+            continue
+        if checked[code] is None:
+            unread.append(code.upper())
+        else:
+            ok.append(f'{code.upper()} {checked[code]}')
+    bits = []
+    if ok:
+        bits.append(', '.join(ok) + ' orders gecontroleerd')
+    if unread:
+        bits.append('/'.join(unread) + ' niet leesbaar')
+    if skipped:
+        bits.append('/'.join(c.upper() for c in _SS_BUYER_STORES if c in skipped)
+                    + ' niet gecontroleerd: geen block-tier records')
+    return '; '.join(bits)
+
+
 def _spy_shield_digest_line(days=14):
     """Eén Slack-regel, of None als er (nog) geen records zijn — een lege
     pijplijn mag nooit als 'schoon' klinken, dus dan zeggen we niets. Zelfde
-    woorden als de tab-tegels (Would-be blocks / Buyers in flagged sessions)."""
+    woorden als de tab-tegels (Would-be blocks / Buyers in flagged sessions).
+
+    Digest 30-09-2026 werd verkeerd gelezen: "(14d)" was alleen de venster-
+    grootte (het log begon op 28-09, dag 2 van 14), "96 would-be blocks" waren
+    records (1-4 per paginaweergave, eigen ?ss_sim-tests incl.), de winkellijst
+    was álle records per winkel en "0 buyers" rustte op 6 orders. Nu: echte
+    dekking, records naast browser-dagen, winkellijst op would-be blocks,
+    gecontroleerde orders per winkel, operator-tests apart en één oordeel
+    "KLAAR VOOR DK: ja/nee" (_ss_ready_verdict)."""
     s = _spy_shield_summary(days=days, store='all', with_buyers=True, with_url=False)
     t = s['totals']
     if not t['total']:
         return None
+    now = _ss_utcnow()
+    first = _ss_parse_ts(t.get('first_seen_at'))
+    if first:
+        n = (now.date() - first.date()).days
+        cov = f"data sinds {first.strftime('%d-%m')}, {n} dag{'en' if n != 1 else ''}"
+        if n >= days:
+            cov += f'; cijfers over laatste {days}d'
+    else:
+        cov = 'nog geen live data, alleen tests/preview'
     b = s['buyers_flagged']
     buyers = b['count']
+    checked_txt = _ss_orders_checked_txt(b)
     if buyers is None:
-        buyers_txt = 'buyers in flagged sessions: n/a (orders niet leesbaar)'
+        buyers_txt = 'buyers in flagged sessions: n/a (' + (checked_txt or 'orders niet leesbaar') + ')'
     else:
         buyers_txt = f'{buyers} buyers in flagged sessions'
         if buyers and b.get('matched_browsers'):
             buyers_txt += f" (uit {b['matched_browsers']} browser{'s' if b['matched_browsers'] != 1 else ''} — eerst de order bekijken)"
-    per_store = ' / '.join(f"{code.upper()} {st['total']}" for code, st in
-                           sorted(s['stores'].items(), key=lambda kv: -kv[1]['total']))
-    line = (f"🛡️ Spy Shield ({days}d): {t['block_tier_hits']} would-be blocks, "
-            f"{t['by_action']['block']} 502s getoond, {buyers_txt}, "
-            f"{t['unique_browsers']} browser-dagen · {per_store}")
+        if checked_txt:
+            buyers_txt += f' ({checked_txt})'
+    flagged = sorted(((code, st) for code, st in s['stores'].items() if st['block_tier_hits']),
+                     key=lambda kv: (-kv[1]['block_tier_hits'], kv[0]))
+    per_store = ', '.join(f"{code.upper()} {st['block_tier_hits']}/{st['block_tier_browsers']}"
+                          for code, st in flagged)
+    line = (f"🛡️ Spy Shield ({cov}): would-be blocks {t['block_tier_hits']} records / "
+            f"{t['block_tier_browsers']} browser-dagen" + (f' ({per_store})' if per_store else '')
+            + f", {t['by_action']['block']} 502s getoond, {buyers_txt}, "
+            f"{t['unique_browsers']} browser-dagen in het log")
+    if t.get('operator_tests'):
+        line += f", {t['operator_tests']} operator tests (sim/op, niet meegeteld)"
+    v = (s.get('ready') or {}).get('dk') or _ss_ready_verdict(s, 'dk', now)
+    line += ' · KLAAR VOOR DK: ' + ('ja' if v['ready'] else 'nee (' + '; '.join(v['why_not']) + ')')
     if t.get('pt_alarm_active'):
         pct = round(100.0 * t['pt_alarm'] / max(1, t['total']))
         line += (f" ⚠️ {pct}% van de records komt uit een preview-thema (ss_pt=1) — test je nu geen "
