@@ -249,9 +249,32 @@ facts, preview per store, apply. Code: server.py section "AFTER QUOTATION"
   through `_aq_clean_html` (allow-list parser, no attributes except a safe
   `<a href>`); .xlsx via a streaming stdlib parser with caps; per-route body
   limits (`_AQ_BODY_LIMITS`, no-length bodies refused).
-- **Index:** `_aq_index` = all active+draft products per store (GraphQL, 250 per
-  page, ~10 s per store), served stale-while-revalidate (10 min), warmed 45 s
-  after start (skipped under pytest / DEV_LOCAL).
+- **Index (v1.322):** `_aq_index` = all active+draft products per store (GraphQL,
+  250 per page) + archived ones on the side (their orders count), served
+  stale-while-revalidate (10 min), saved to `backend/aq_index_<store>.json`
+  (gitignored) so a deploy restart serves the list in ~0.2 s instead of ~12 s;
+  warmed 3 s after start. A write is patched in BY ID (`_aq_index_patch` —
+  Shopify's product search lags writes) and replayed into builds for 180 s;
+  a build that suddenly finds < half the products is refused (last good copy).
+  Summaries are built once per data version (`_aq_summaries`); a search only
+  filters (1–2 ms, was 2.3 s — `_color_concept` is memoised).
+- **Page:** downloads the slim list once (`GET /api/aq/list`, gzipped) and
+  filters in the browser while typing; links/ids/competitor URLs go to
+  `/api/aq/search` (cancellable). Last list cached in localStorage for an
+  instant open. Default view **Recommended** = colour groups whose first order
+  just came in (newest first; "first order known" first), then the rest of
+  Needs attention.
+- **Orders:** `backend/aq_orders.json` (gitignored, in `_run_backup`) — per
+  order: created, cancelled, test, product ids (currentQuantity > 0). No
+  customer data. The app has `read_orders` but not `read_all_orders`, so
+  Shopify shows 60 days: `tracking_since` = first sync − 59 d; a first order is
+  only "known" when every colour (archived too) was created after that.
+  Incremental sync every 10 min (updated_at cursor), full window daily; a
+  failing store backs off and is reported, never shown as "no orders".
+- **Shopify pacing (all callers):** `_shopify_call` paces per shop, GraphQL on
+  its cost budget from `extensions.cost.throttleStatus` (it used to force a
+  global 0.55 s gap after every GraphQL call). JSON under `/api/` is gzipped;
+  CORS preflights cached 2 h.
 - **Tests:** `backend/tests/test_after_quotation.py`,
   `frontend/tests/afterQuotation.test.ts`.
 

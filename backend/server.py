@@ -1,4 +1,4 @@
-import os, sys, json, re, hashlib, hmac, base64, secrets, urllib.parse, subprocess, tempfile, shutil, platform, unicodedata, datetime, time, threading, logging
+import os, sys, json, re, hashlib, hmac, base64, secrets, urllib.parse, subprocess, tempfile, shutil, platform, unicodedata, datetime, time, threading, logging, functools
 from functools import wraps
 from flask import Flask, request, redirect, session, jsonify, send_from_directory, g
 from flask_cors import CORS
@@ -35,7 +35,34 @@ _allowed_origins = [
     'https://fashion-listing-dashboard.netlify.app',  # previous name — kept (harmless)
 ] + [o.strip() for o in os.environ.get('FRONTEND_URL', '').split(',') if o.strip()]
 CORS(app, resources={r'/api/*': {'origins': [o for o in _allowed_origins if o]}}, supports_credentials=True,
-     allow_headers=['Content-Type', 'X-Droplet-Token'])
+     allow_headers=['Content-Type', 'X-Droplet-Token'],
+     # the X-Droplet-Token header makes every authed call "non-simple": without a
+     # max age Chrome re-sends the OPTIONS preflight after 5 s (measured 30 Sep)
+     max_age=7200)
+
+
+@app.after_request
+def _gzip_json(resp):
+    """gzip JSON answers from /api/ (Werkzeug sends none; measured 30 Sep: the
+    After Quotation list 69.5 KB raw vs 6.8 KB gzip). Small, streamed, already
+    encoded or non-JSON answers pass untouched."""
+    try:
+        if (not request.path.startswith('/api/') or resp.direct_passthrough or resp.is_streamed
+                or resp.mimetype != 'application/json' or resp.headers.get('Content-Encoding')
+                or 'gzip' not in (request.headers.get('Accept-Encoding') or '').lower()):
+            return resp
+        body = resp.get_data()
+        if len(body) < 2048:
+            return resp
+        import gzip as _gz
+        resp.set_data(_gz.compress(body, compresslevel=5))
+        resp.headers['Content-Encoding'] = 'gzip'
+        resp.headers['Content-Length'] = str(len(resp.get_data()))
+        vary = resp.headers.get('Vary')
+        resp.headers['Vary'] = (vary + ', Accept-Encoding') if vary else 'Accept-Encoding'
+    except Exception as e:
+        print(f'[gzip] skipped: {e}')
+    return resp
 
 @app.errorhandler(Exception)
 def handle_error(e):
@@ -225,7 +252,8 @@ def _run_backup():
                       'taxonomy_backfill.json', 'taxonomy_fill.json',
                       'wtl_store_marks.json', 'wtl_extra_stores.json',
                       'wtl_discover_seen.json', 'wtl_discover_state.json',
-                      'spy_shield.jsonl', 'lighting_channels.json', 'aq_history.jsonl'):
+                      'spy_shield.jsonl', 'lighting_channels.json', 'aq_history.jsonl',
+                      'aq_orders.json'):
             src = os.path.join(_BASE_DIR, fname)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dest, fname))
@@ -305,6 +333,14 @@ def _self_update_loop():
         except Exception as e:
             print(f"[self-update] check failed, retrying in {_SELF_UPDATE_INTERVAL}s: {e}")
         time.sleep(_SELF_UPDATE_INTERVAL)
+
+
+def _background_loops_allowed():
+    """Loops that WRITE to the live stores (size charts, siblings, sales channels)
+    run on the droplet only. They used to start on every import: a local script
+    or test process alive for 5+ minutes ran the siblings self-heal from a
+    laptop (found 30 Sep 2026 — harmless that time: fake test credentials)."""
+    return os.getenv('DEV_LOCAL') != '1' and 'pytest' not in sys.modules
 
 
 if os.getenv('DEV_LOCAL') == '1' or os.getenv('SELF_UPDATE') == '0' or 'pytest' in sys.modules:
@@ -2061,8 +2097,9 @@ def _higgsfield_ready_loop():
         time.sleep(3600)
 
 
-threading.Thread(target=_higgsfield_ready_loop, daemon=True,
-                 name='higgsfield-ready').start()
+if _background_loops_allowed():
+    threading.Thread(target=_higgsfield_ready_loop, daemon=True,
+                     name='higgsfield-ready').start()
 
 
 def _sane_image_url(u):
@@ -4424,9 +4461,42 @@ def backfill_list_products():
 # Flask request threads (e.g. "Save all" firing many rows) can't collectively
 # exceed the limit either.
 _SHOPIFY_THROTTLE_LOCK = threading.Lock()
-_shopify_last_call_at  = [0.0]      # monotonic time of the last call (guarded by the lock)
-_shopify_next_gap      = [0.0]      # required spacing before the NEXT call, set adaptively
+# Per pacing key: '<shop host>' for REST, '<shop host>:gql' for GraphQL. Each
+# store has its own REST bucket and its own GraphQL cost bucket; one global
+# spacing made a GraphQL call (no REST header → "pace defensively") slow every
+# REST call of every store to 0.55 s — measured 30 Sep: the 3-store index build
+# took 11 s instead of ~6, opening a listing 3.8 s.
+_shopify_last_call_at  = {}         # key -> monotonic time reserved for its last call
+_shopify_next_gap      = {}         # key -> required spacing before its NEXT call
 _SHOPIFY_MIN_INTERVAL  = 0.55       # spacing once the bucket is filling → ~1.8 req/s, under the 2/s cap
+
+
+def _shopify_pace_key(url):
+    p = urllib.parse.urlparse(str(url or ''))
+    return p.netloc + (':gql' if p.path.endswith('/graphql.json') else '')
+
+
+def _shopify_gap_after(resp, gql):
+    """Spacing the budget in this answer asks for before the next call."""
+    hdr = (getattr(resp, 'headers', None) or {}).get('X-Shopify-Shop-Api-Call-Limit', '')
+    if hdr:
+        try:
+            used, cap = (int(x) for x in hdr.split('/'))
+            return _SHOPIFY_MIN_INTERVAL if cap and used >= cap * 0.7 else 0.0
+        except Exception:
+            return _SHOPIFY_MIN_INTERVAL
+    if gql:
+        # GraphQL reports its cost bucket in the body (extensions.cost), not a header
+        try:
+            txt = resp.text or ''
+            avail = float(re.search(r'"currentlyAvailable"\s*:\s*([\d.]+)', txt).group(1))
+            rate = float(re.search(r'"restoreRate"\s*:\s*([\d.]+)', txt).group(1)) or 50.0
+            m = re.search(r'"requestedQueryCost"\s*:\s*([\d.]+)', txt)
+            need = float(m.group(1)) if m else 100.0
+            return 0.0 if avail >= 2 * need else min(10.0, (2 * need - avail) / rate)
+        except Exception:
+            return _SHOPIFY_MIN_INTERVAL
+    return _SHOPIFY_MIN_INTERVAL                 # header missing/odd — pace defensively
 
 
 def _shopify_call(method, url, hdrs, *, json=None, timeout=20, _max_retries=5):
@@ -4442,25 +4512,23 @@ def _shopify_call(method, url, hdrs, *, json=None, timeout=20, _max_retries=5):
     callers keep their existing status-code handling."""
     fn = getattr(req, method.lower())
     resp = None
+    key = _shopify_pace_key(url)
+    gql = key.endswith(':gql')
     for attempt in range(_max_retries + 1):
-        # Hold the lock only long enough to honour the current spacing + claim the slot.
+        # Reserve this call's slot under the lock, sleep OUTSIDE it: a store that
+        # has to wait must not make the other stores wait too.
         with _SHOPIFY_THROTTLE_LOCK:
-            gap = _shopify_next_gap[0]
-            if gap > 0:
-                wait = gap - (time.monotonic() - _shopify_last_call_at[0])
-                if wait > 0:
-                    time.sleep(wait)
-            _shopify_last_call_at[0] = time.monotonic()
+            now = time.monotonic()
+            slot = max(now, _shopify_last_call_at.get(key, 0.0) + _shopify_next_gap.get(key, 0.0))
+            _shopify_last_call_at[key] = slot
+        if slot > now:
+            time.sleep(slot - now)
         kwargs = {'headers': hdrs, 'timeout': timeout}
         if json is not None:
             kwargs['json'] = json
         resp = fn(url, **kwargs)
-        # Adaptive pacing for the next call, from the leaky-bucket header.
-        try:
-            used, cap = (int(x) for x in resp.headers.get('X-Shopify-Shop-Api-Call-Limit', '').split('/'))
-            _shopify_next_gap[0] = _SHOPIFY_MIN_INTERVAL if cap and used >= cap * 0.7 else 0.0
-        except Exception:
-            _shopify_next_gap[0] = _SHOPIFY_MIN_INTERVAL  # header missing/odd — pace defensively
+        # Adaptive pacing for this shop's next call, from the budget in the answer.
+        _shopify_next_gap[key] = _shopify_gap_after(resp, gql)
         rate_limited = resp.status_code == 429 or (
             resp.status_code >= 400 and 'calls per second' in (resp.text or '').lower()
         )
@@ -11538,7 +11606,8 @@ def _size_chart_fill_loop():
         time.sleep(24 * 3600 if all_ok else 3600)
 
 
-threading.Thread(target=_size_chart_fill_loop, daemon=True, name='size-chart-fill').start()
+if _background_loops_allowed():
+    threading.Thread(target=_size_chart_fill_loop, daemon=True, name='size-chart-fill').start()
 
 
 # ── Siblings-zelfherstel ──────────────────────────────────────────────────
@@ -12022,7 +12091,8 @@ def _siblings_heal_loop():
         time.sleep(24 * 3600)
 
 
-threading.Thread(target=_siblings_heal_loop, daemon=True, name='siblings-heal').start()
+if _background_loops_allowed():
+    threading.Thread(target=_siblings_heal_loop, daemon=True, name='siblings-heal').start()
 
 
 @app.route('/api/size_chart_fill_status')
@@ -20353,16 +20423,28 @@ _COLOR_CONCEPT_GROUPS = [
 ]
 
 
+# The group words, deaccented ONCE: _color_concept re-deaccented all ~170 of
+# them on every call — 2.3M _deaccent calls (95% of 2.3 s) per After
+# Quotation search over 860 colour groups (measured 2026-09-30).
+_COLOR_CONCEPT_TABLE = [
+    (concept, [(' ' + _deaccent(w) + ' ', _deaccent(w), ' ' not in _deaccent(w) and len(_deaccent(w)) >= 6)
+               for w in words])
+    for concept, words in _COLOR_CONCEPT_GROUPS
+]
+
+
+@functools.lru_cache(maxsize=16384)
 def _color_concept(s):
-    """Canonical colour concept for a colour word/handle-segment, or None if unrecognised."""
-    padded = ' ' + _deaccent(s).replace('-', ' ').replace('_', ' ') + ' '
-    compact = _deaccent(s).replace('-', '').replace('_', '').replace(' ', '')
-    for concept, words in _COLOR_CONCEPT_GROUPS:
-        for w in words:
-            wd = _deaccent(w)
-            if ' ' + wd + ' ' in padded:                          # whole word
+    """Canonical colour concept for a colour word/handle-segment, or None if unrecognised.
+    Pure and memoised: the same few hundred colour labels are asked over and over."""
+    d = _deaccent(s)
+    padded = ' ' + d.replace('-', ' ').replace('_', ' ') + ' '
+    compact = d.replace('-', '').replace('_', '').replace(' ', '')
+    for concept, words in _COLOR_CONCEPT_TABLE:
+        for whole, wd, compound in words:
+            if whole in padded:                                  # whole word
                 return concept
-            if ' ' not in wd and len(wd) >= 6 and wd in compact:   # long compound token
+            if compound and wd in compact:                       # long compound token
                 return concept
     return None
 
@@ -24926,7 +25008,8 @@ def _light_channels_heal_loop():
         time.sleep(6 * 3600)
 
 
-threading.Thread(target=_light_channels_heal_loop, daemon=True, name='light-channels-heal').start()
+if _background_loops_allowed():
+    threading.Thread(target=_light_channels_heal_loop, daemon=True, name='light-channels-heal').start()
 
 
 @app.route('/api/lighting/channels_heal', methods=['POST'])
@@ -26140,6 +26223,12 @@ _AQ_INDEX = {}
 _AQ_INDEX_LOCK = threading.Lock()
 _AQ_INDEX_BUILD = {s: threading.Lock() for s in AQ_STORES}
 _AQ_INDEX_REFRESHING = set()          # stores with a background refresh in flight
+_AQ_INDEX_PATCHES = {s: [] for s in AQ_STORES}   # (time, {product id: node or None}) — last 15 min
+# Shopify's product search can lag a write by a minute or more: a full build
+# that starts shortly AFTER a by-id patch may still read the old state, so
+# patches younger than this are replayed into every build (review 30 Sep).
+_AQ_SEARCH_LAG_S = 180
+_AQ_DISK_LOCKS = {s: threading.Lock() for s in AQ_STORES}
 _AQ_FORCE_MIN_S = 60                  # a forced rebuild within a minute of the last is served from memory
 _AQ_JOBS = {}
 _AQ_JOBS_LOCK = threading.Lock()
@@ -26149,6 +26238,25 @@ _AQ_MAX_BODY = 80_000_000             # request cap: an apply carries the new ph
 _AQ_MAX_FILE = 15_000_000             # one uploaded file
 _AQ_MAX_FILES = 12
 _AQ_ATTENTION_DAYS = 60
+# Disk copy of each store's index: the droplet restarts on every deploy (four
+# on 29 Sep) and a cold build took 12 s; the copy is served at once and
+# refreshed in the background. Bump the version when _aq_index_node changes.
+AQ_INDEX_DISK = os.path.join(_AQ_HERE, 'aq_index_%s.json')
+_AQ_INDEX_VERSION = 2                 # 2: entries carry 'archived' (for the order signal)
+_AQ_INDEX_DISK_MAX_AGE = 2 * 86400
+# Orders — which products sold, and when first. The app has read_orders but
+# NOT read_all_orders, so Shopify shows only the last 60 days (measured
+# 30 Sep: DK 13, FR 35, FI 51 orders visible, one GraphQL page each, 0.25 s).
+# Kept on disk per order so history keeps growing past those 60 days.
+AQ_ORDERS_PATH = os.path.join(_AQ_HERE, 'aq_orders.json')
+_AQ_ORDERS_TTL = 600
+_AQ_ORDERS_FULL_EVERY = 86400         # re-read the whole visible window once a day
+_AQ_ORDERS_WINDOW_DAYS = 59           # Shopify's 60 days, one day of margin
+_AQ_ORDERS = {'data': None, 'agg': None, 'ver': 0}
+_AQ_ORDERS_LOCK = threading.Lock()
+_AQ_ORDERS_SYNC = {s: threading.Lock() for s in AQ_STORES}
+_AQ_SUMMARY_CACHE = {'sig': None, 'items': None}
+_AQ_SUMMARY_LOCK = threading.Lock()
 _AQ_LETTER_SIZES = ['XXS', 'XS', 'S', 'M', 'L', 'XL', '2XL', '3XL', '4XL', '5XL']
 _AQ_SIZE_ALIASES = {
     'XXL': '2XL', 'XXXL': '3XL', 'XXXXL': '4XL', 'XXXXXL': '5XL',
@@ -26277,6 +26385,10 @@ _AQ_Q_INDEX = ('query($c:String){ products(first:%d, after:$c, query:"status:act
                'sib: metafield(namespace:"theme", key:"siblings"){ value } '
                'sc: metafield(namespace:"custom", key:"size_chart"){ value } } } }')
 
+_AQ_Q_ARCHIVED = ('query($c:String){ products(first:250, after:$c, query:"status:archived"){ '
+                  'pageInfo{ hasNextPage endCursor } nodes{ legacyResourceId title createdAt '
+                  'sib: metafield(namespace:"theme", key:"siblings"){ value } } } }')
+
 _AQ_Q_NODES = ('query($ids:[ID!]!){ nodes(ids:$ids){ ... on Product { legacyResourceId '
                'cut: metafield(namespace:"theme", key:"cutline"){ value } '
                'sib: metafield(namespace:"theme", key:"siblings"){ value } '
@@ -26308,13 +26420,52 @@ def _aq_index_node(n):
     }
 
 
+def _aq_index_disk_load(store):
+    """The store's index as last saved, or None (missing, old, other version)."""
+    try:
+        with open(AQ_INDEX_DISK % store, encoding='utf-8') as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if d.get('v') != _AQ_INDEX_VERSION or not isinstance(d.get('products'), list):
+        return None
+    ts = float(d.get('ts') or 0)
+    if time.time() - ts > _AQ_INDEX_DISK_MAX_AGE:
+        return None
+    return {'ts': ts, 'products': d['products'], 'archived': d.get('archived') or [], 'from_disk': True}
+
+
+def _aq_index_disk_save(store, entry):
+    """Save the entry that is CURRENT in memory, one writer per store, through a
+    unique temp file: a build and a patch saving at the same moment used to be
+    able to leave the older one on disk (served after the next restart)."""
+    try:
+        with _AQ_DISK_LOCKS[store]:
+            with _AQ_INDEX_LOCK:
+                if _AQ_INDEX.get(store) is not entry:
+                    return                       # a newer entry exists; its own save follows
+            path = AQ_INDEX_DISK % store
+            tmp = f'{path}.{os.getpid()}.{threading.get_ident()}.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump({'v': _AQ_INDEX_VERSION, 'ts': entry['ts'], 'products': entry['products'],
+                           'archived': entry.get('archived') or []}, f, ensure_ascii=False, separators=(',', ':'))
+            os.replace(tmp, path)
+    except Exception as e:
+        print(f'[aq] index disk save {store} failed: {e}')
+
+
 def _aq_index(store, force=False):
     """Every active + draft product of a fashion store, summarised. Served from
-    memory; an entry older than 10 min is returned AND rebuilt in the background
-    (the first build of DK took 33 s at 100/page — nobody should wait for it
-    twice). force=True rebuilds now."""
+    memory (after a restart: from the disk copy); an entry older than 10 min is
+    returned AND rebuilt in the background. force=True rebuilds now."""
     with _AQ_INDEX_LOCK:
         hit = _AQ_INDEX.get(store)
+    if not hit and not force:
+        disk = _aq_index_disk_load(store)
+        if disk:
+            with _AQ_INDEX_LOCK:
+                hit = _AQ_INDEX.setdefault(store, disk)
+    with _AQ_INDEX_LOCK:
         start_bg = bool(hit and not force and time.time() - hit['ts'] >= _AQ_INDEX_TTL
                         and store not in _AQ_INDEX_REFRESHING)
         if start_bg:
@@ -26344,8 +26495,11 @@ def _aq_index_build(store, min_age=0):
     with _AQ_INDEX_BUILD[store]:
         with _AQ_INDEX_LOCK:
             hit = _AQ_INDEX.get(store)
+            # 'ts' is when a build STARTED: one that began before our caller's
+            # writes (and ended after) must not count as fresh (review 30 Sep)
             if hit and (hit['ts'] >= t0 or time.time() - hit['ts'] < min_age):
                 return hit['products']
+        started = time.time()
         out, cur = [], None
         for _ in range(400):
             d = _aq_gql(store, _AQ_Q_INDEX % _AQ_INDEX_PAGE, {'c': cur})
@@ -26355,9 +26509,82 @@ def _aq_index_build(store, min_age=0):
             if not pg.get('hasNextPage'):
                 break
             cur = pg.get('endCursor')
+        # archived colours never show in the tool, but their ORDERS belong to the
+        # family: without them a sold-then-archived colour made a later sale
+        # look like the certain "1st order" (review 30 Sep)
+        archived, cur = [], None
+        for _ in range(100):
+            d = _aq_gql(store, _AQ_Q_ARCHIVED, {'c': cur})
+            conn = d.get('products') or {}
+            archived += [{'id': int(n.get('legacyResourceId') or 0), 'title': (n.get('title') or '').strip(),
+                          'sib': (((n.get('sib') or {}).get('value')) or '').strip(),
+                          'created': n.get('createdAt') or ''} for n in conn.get('nodes') or []]
+            pg = conn.get('pageInfo') or {}
+            if not pg.get('hasNextPage'):
+                break
+            cur = pg.get('endCursor')
+        prev = (hit or {}).get('products') or []
+        if len(prev) >= 100 and len(out) < 0.5 * len(prev):
+            # 2,299 products one build and 40 the next is a broken answer, not a
+            # shop that lost half its catalogue: keep serving the good copy
+            # (storing ≠ oordeel) and say so
+            raise RuntimeError(f'{store.upper()} index shrank from {len(prev)} to {len(out)} products — '
+                               f'kept the previous list')
         with _AQ_INDEX_LOCK:
-            _AQ_INDEX[store] = {'ts': time.time(), 'products': out}
+            # a by-id patch made while this build ran is newer than what the
+            # build read (the product search lags writes): replay it
+            for t, fresh in _AQ_INDEX_PATCHES.get(store) or []:
+                if t >= started - _AQ_SEARCH_LAG_S:
+                    out = _aq_apply_patch(out, fresh)
+            entry = {'ts': started, 'products': out, 'archived': archived}
+            _AQ_INDEX[store] = entry
+        _aq_index_disk_save(store, entry)
         return out
+
+
+_AQ_Q_INDEX_NODES = ('query($ids:[ID!]!){ nodes(ids:$ids){ ... on Product { id legacyResourceId title handle '
+                     'status productType createdAt tags featuredImage{ url } options{ name values } '
+                     'cut: metafield(namespace:"theme", key:"cutline"){ value } '
+                     'sib: metafield(namespace:"theme", key:"siblings"){ value } '
+                     'sc: metafield(namespace:"custom", key:"size_chart"){ value } } } }')
+
+
+def _aq_apply_patch(products, fresh):
+    """products with the patched entries swapped in (None = drop it: archived
+    or deleted), new ones appended. Returns a NEW list — published lists are
+    never mutated (other threads may be reading them)."""
+    out = [fresh[p['id']] if p['id'] in fresh else p for p in products
+           if not (p['id'] in fresh and fresh[p['id']] is None)]
+    have = {p['id'] for p in products}
+    out += [n for pid, n in fresh.items() if n is not None and pid not in have]
+    return out
+
+
+def _aq_index_patch(store, pids):
+    """Re-read these products BY ID and swap them into the store's index. nodes()
+    reads the product itself; products(query:…) reads Shopify's search index,
+    which lags a write — a colour created a second ago can be missing there."""
+    pids = sorted({int(p) for p in pids if p})
+    if not pids or store not in tokens:
+        return
+    t = time.time()
+    fresh = {}
+    for i in range(0, len(pids), 100):
+        chunk = pids[i:i + 100]
+        d = _aq_gql(store, _AQ_Q_INDEX_NODES, {'ids': [f'gid://shopify/Product/{p}' for p in chunk]})
+        got = {int(n['legacyResourceId']): _aq_index_node(n) for n in d.get('nodes') or []
+               if n and n.get('legacyResourceId')}
+        for p in chunk:
+            node = got.get(p)
+            fresh[p] = node if node and node['status'] in ('active', 'draft') else None
+    with _AQ_INDEX_LOCK:
+        _AQ_INDEX_PATCHES[store] = [x for x in _AQ_INDEX_PATCHES.get(store) or [] if t - x[0] < 900] + [(t, fresh)]
+        e = _AQ_INDEX.get(store)
+        if e:
+            e = {**e, 'products': _aq_apply_patch(e['products'], fresh), 'patched': t}
+            _AQ_INDEX[store] = e
+    if e:
+        _aq_index_disk_save(store, e)
 
 
 def _aq_invalidate(stores=AQ_STORES):
@@ -26368,12 +26595,39 @@ def _aq_invalidate(stores=AQ_STORES):
             threading.Thread(target=_aq_index_rebuild_quietly, args=(s, 0), daemon=True).start()
 
 
+def _aq_refresh_after_write(pids_by_store):
+    """Before a job reports done: the products it wrote (and created) re-read by
+    id into the index — the list the page reloads right after already shows the
+    change (it used to show the old sizes for ~11 s). A full rebuild follows in
+    90 s, once Shopify's search index has caught up, to catch anything else."""
+    for s, pids in pids_by_store.items():
+        try:
+            _aq_index_patch(s, pids)
+        except Exception as e:
+            print(f'[aq] patch after write {s} failed: {e}')
+    if 'pytest' in sys.modules:
+        return
+    for s in pids_by_store:
+        if s in tokens:
+            threading.Timer(90, _aq_index_rebuild_quietly, args=(s, 0)).start()
+
+
 def _aq_warm_loop():
-    """Build the three indexes shortly after start, so the first search is instant."""
-    time.sleep(45)
+    """Right after start: disk copies into memory (or a build when there are
+    none), the orders synced, the summaries built — the first search after a
+    deploy is instant. Stale copies refresh themselves in the background."""
+    time.sleep(3)
     for s in AQ_STORES:
         if s in tokens:
-            _aq_index_rebuild_quietly(s)
+            try:
+                _aq_index(s)
+            except Exception as e:
+                print(f'[aq] warm index {s} failed: {e}')
+    try:
+        _aq_orders_ensure(wait=True)
+        _aq_summaries()
+    except Exception as e:
+        print(f'[aq] warm summaries failed: {e}')
 
 
 if not (os.getenv('DEV_LOCAL') == '1' or 'pytest' in sys.modules):
@@ -26391,7 +26645,14 @@ def _aq_indexes(force=False):
             try:
                 indexes[s] = f.result()
             except Exception as e:
-                errors[s] = str(e)[:200]
+                with _AQ_INDEX_LOCK:
+                    hit = _AQ_INDEX.get(s)
+                if hit:
+                    # a refresh failed but a good copy exists: serve it, say so
+                    indexes[s] = hit['products']
+                    errors[s] = f'{str(e)[:160]} — showing the last copy'
+                else:
+                    errors[s] = str(e)[:200]
     return indexes, errors
 
 
@@ -26501,7 +26762,7 @@ def _aq_flags(stores_map):
 
 # ── history ───────────────────────────────────────────────────────────────────
 
-_AQ_HISTORY_CACHE = {'mtime': None, 'rows': []}
+_AQ_HISTORY_CACHE = {'v': None}         # (key, rows) swapped as ONE value
 
 
 def _aq_history_raw():
@@ -26511,9 +26772,10 @@ def _aq_history_raw():
     except OSError:
         return []
     # size too: two appends inside one clock tick keep the same mtime (Windows)
-    mt = (st.st_mtime_ns, st.st_size)
-    if _AQ_HISTORY_CACHE['mtime'] == (AQ_HISTORY_PATH, mt):
-        return _AQ_HISTORY_CACHE['rows']
+    mt = (AQ_HISTORY_PATH, st.st_mtime_ns, st.st_size)
+    hit = _AQ_HISTORY_CACHE['v']
+    if hit and hit[0] == mt:
+        return hit[1]
     rows = []
     with open(AQ_HISTORY_PATH, encoding='utf-8') as f:
         for line in f:
@@ -26521,7 +26783,7 @@ def _aq_history_raw():
                 rows.append(json.loads(line))
             except Exception:
                 continue
-    _AQ_HISTORY_CACHE.update(mtime=(AQ_HISTORY_PATH, mt), rows=rows)
+    _AQ_HISTORY_CACHE['v'] = (mt, rows)
     return rows
 
 
@@ -26599,7 +26861,7 @@ def _aq_source_ids(q):
     return ids
 
 
-def _aq_family_summary(key, stores_map, processed):
+def _aq_family_summary(key, stores_map, processed, orders=None):
     prods = [p for ps in stores_map.values() for p in ps]
     active = [p for p in prods if p['status'] == 'active']
     names = collections.Counter(p['title'] for p in prods if p['title'])
@@ -26619,13 +26881,316 @@ def _aq_family_summary(key, stores_map, processed):
                      'status': {s: p.get('status') for s, p in r['cells'].items()}} for r in rows],
         'flags': _aq_flags(stores_map),
         'processed': processed.get(key),
+        'orders': orders,
     }
 
 
-def _aq_search(q='', view='attention', force=False, limit=60):
-    indexes, errors = _aq_indexes(force)
-    fams = _aq_families(indexes)
-    processed = _aq_processed()
+# ── orders: which products sold, and when first ──────────────────────────────
+
+_AQ_Q_ORDERS = ('query($c:String, $q:String){ orders(first:250, after:$c, sortKey:UPDATED_AT, query:$q){ '
+                'pageInfo{ hasNextPage endCursor } nodes{ legacyResourceId createdAt updatedAt cancelledAt '
+                'test lineItems(first:100){ nodes{ quantity currentQuantity product{ legacyResourceId } } } } } }')
+
+
+def _aq_iso(dt):
+    return dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _aq_parse_iso(v):
+    try:
+        return datetime.datetime.strptime(str(v)[:19], '%Y-%m-%dT%H:%M:%S')
+    except (TypeError, ValueError):
+        return None
+
+
+def _aq_orders_data():
+    """The order file, loaded once. Caller must NOT hold _AQ_ORDERS_LOCK."""
+    with _AQ_ORDERS_LOCK:
+        if _AQ_ORDERS['data'] is None:
+            try:
+                with open(AQ_ORDERS_PATH, encoding='utf-8') as f:
+                    d = json.load(f)
+                if d.get('version') != 1 or not isinstance(d.get('stores'), dict):
+                    raise ValueError('other version')
+            except (OSError, ValueError):
+                d = {'version': 1, 'stores': {}}
+            _AQ_ORDERS['data'] = d
+        return _AQ_ORDERS['data']
+
+
+def _aq_orders_save_locked():
+    """Atomic write of the order file. Caller holds _AQ_ORDERS_LOCK."""
+    try:
+        tmp = AQ_ORDERS_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(_AQ_ORDERS['data'], f, ensure_ascii=False, separators=(',', ':'))
+        os.replace(tmp, AQ_ORDERS_PATH)
+    except Exception as e:
+        print(f'[aq] orders save failed: {e}')
+
+
+def _aq_orders_sync(store, full=False):
+    """Pull new/changed orders of one store (orders updated since the last
+    sync, a 10 min overlap), or the whole visible 60-day window (first time,
+    once a day, or full=True — then orders in the window that no longer come
+    back are dropped). Stores per ORDER: created, cancelled, test, product
+    ids — no customer data, no amounts. A failure keeps the old data and is
+    reported (storing ≠ oordeel): 'order data unavailable', never 'no orders'."""
+    lock = _AQ_ORDERS_SYNC[store]
+    if not lock.acquire(blocking=False):
+        return                               # one sync at a time; it serves everybody
+    try:
+        data = _aq_orders_data()
+        with _AQ_ORDERS_LOCK:
+            st = dict(data['stores'].get(store) or {})
+        now = datetime.datetime.utcnow()
+        last_full = _aq_parse_iso(st.get('full_at'))
+        cursor = _aq_parse_iso(st.get('cursor'))
+        full = bool(full or not st.get('synced_at') or not cursor or not last_full
+                    or (now - last_full).total_seconds() > _AQ_ORDERS_FULL_EVERY)
+        q = None if full else f"updated_at:>='{_aq_iso(cursor - datetime.timedelta(minutes=10))}'"
+        got, cur, max_upd = {}, None, st.get('cursor') or ''
+        for _ in range(200):
+            d = _aq_gql(store, _AQ_Q_ORDERS, {'c': cur, 'q': q})
+            conn = d.get('orders') or {}
+            for n in conn.get('nodes') or []:
+                pids = set()
+                for li in ((n.get('lineItems') or {}).get('nodes') or []):
+                    prod = li.get('product') or {}
+                    # currentQuantity: a line swapped out by an order edit keeps its
+                    # `quantity` but was never bought (review 30 Sep)
+                    qty = li.get('currentQuantity')
+                    qty = li.get('quantity') if qty is None else qty
+                    if prod.get('legacyResourceId') and (qty or 0) > 0:
+                        pids.add(int(prod['legacyResourceId']))
+                got[str(n.get('legacyResourceId'))] = {'c': n.get('createdAt') or '', 'x': bool(n.get('cancelledAt')),
+                                                       't': bool(n.get('test')), 'p': sorted(pids)}
+                if (n.get('updatedAt') or '') > max_upd:
+                    max_upd = n['updatedAt']
+            pg = conn.get('pageInfo') or {}
+            if not pg.get('hasNextPage'):
+                break
+            cur = pg.get('endCursor')
+        with _AQ_ORDERS_LOCK:
+            cst = data['stores'].setdefault(store, {})
+            orders = cst.setdefault('orders', {})
+            orders.update(got)
+            if full:
+                # inside the window (two days of margin) and gone from Shopify: deleted
+                edge = _aq_iso(now - datetime.timedelta(days=_AQ_ORDERS_WINDOW_DAYS - 2))
+                for oid in [o for o, v in orders.items() if (v.get('c') or '') >= edge and o not in got]:
+                    orders.pop(oid, None)
+                cst['full_at'] = _aq_iso(now)
+            # everything since here is on file. It only moves forward after a gap
+            # longer than Shopify's window: orders in that gap are gone for good
+            window_start = _aq_iso(now - datetime.timedelta(days=_AQ_ORDERS_WINDOW_DAYS))
+            prev_sync = _aq_parse_iso(cst.get('synced_at'))
+            if prev_sync and (now - prev_sync).days >= _AQ_ORDERS_WINDOW_DAYS:
+                cst['tracking_since'] = max(cst.get('tracking_since') or '', window_start)
+            cst.setdefault('tracking_since', window_start)
+            cst['synced_at'] = _aq_iso(now)
+            cst['cursor'] = max_upd or _aq_iso(now)
+            cst['error'] = None
+            cst.pop('failed_at', None)
+            _AQ_ORDERS['agg'] = None
+            _AQ_ORDERS['ver'] += 1
+            _aq_orders_save_locked()
+    except Exception as e:
+        print(f'[aq] orders sync {store} failed: {e}')
+        with _AQ_ORDERS_LOCK:
+            d = _AQ_ORDERS['data'] or {'version': 1, 'stores': {}}
+            _AQ_ORDERS['data'] = d
+            cst = d['stores'].setdefault(store, {})
+            cst['failed_at'] = _aq_iso(datetime.datetime.utcnow())
+            msg = str(e)[:200]
+            if cst.get('error') != msg:          # only a CHANGE invalidates the caches
+                cst['error'] = msg
+                _AQ_ORDERS['agg'] = None
+                _AQ_ORDERS['ver'] += 1
+    finally:
+        lock.release()
+
+
+def _aq_orders_ensure(wait=False, full=False):
+    """Stale (>10 min) stores sync in the background; a store never synced
+    syncs now (one page, ~0.25 s) — so the first list already has the signal."""
+    data = _aq_orders_data()
+    now = datetime.datetime.utcnow()
+    todo_now, todo_bg = [], []
+    for s in AQ_STORES:
+        if s not in tokens:
+            continue
+        with _AQ_ORDERS_LOCK:
+            st = data['stores'].get(s) or {}
+        last = _aq_parse_iso(st.get('synced_at'))
+        failed = _aq_parse_iso(st.get('failed_at'))
+        if failed and (now - failed).total_seconds() < _AQ_ORDERS_TTL and not full:
+            continue                             # failed a moment ago: back off
+        if full or wait or not last:
+            todo_now.append(s)
+        elif (now - last).total_seconds() > _AQ_ORDERS_TTL:
+            todo_bg.append(s)
+    for s in todo_bg:
+        threading.Thread(target=_aq_orders_sync, args=(s,), daemon=True).start()
+    if todo_now:
+        with _aq_cf.ThreadPoolExecutor(len(todo_now)) as ex:
+            list(ex.map(lambda st_: _aq_orders_sync(st_, full=full), todo_now))
+
+
+def _aq_orders_agg():
+    """-> ({(store, product_id): {'first','last','orders': set}}, meta per store)."""
+    agg, meta, _ver = _aq_orders_agg_v()
+    return agg, meta
+
+
+def _aq_orders_agg_v():
+    """-> (agg, meta, version it was built from) — read under ONE lock, so a
+    sync finishing in between can't label old data with the new version.
+    Cancelled and test orders don't count. Rebuilt only when the data changed."""
+    _aq_orders_data()
+    with _AQ_ORDERS_LOCK:
+        if _AQ_ORDERS['agg'] is not None:
+            return _AQ_ORDERS['agg'] + (_AQ_ORDERS['ver'],)
+        agg, meta = {}, {}
+        for s, st in (_AQ_ORDERS['data'] or {}).get('stores', {}).items():
+            meta[s] = {'synced_at': st.get('synced_at'), 'tracking_since': st.get('tracking_since'),
+                       'error': st.get('error')}
+            for oid, o in (st.get('orders') or {}).items():
+                if o.get('x') or o.get('t'):
+                    continue
+                for pid in o.get('p') or []:
+                    a = agg.setdefault((s, pid), {'first': o['c'], 'last': o['c'], 'orders': set()})
+                    a['first'] = min(a['first'], o['c'])
+                    a['last'] = max(a['last'], o['c'])
+                    a['orders'].add(oid)
+        _AQ_ORDERS['agg'] = (agg, meta)
+        return _AQ_ORDERS['agg'] + (_AQ_ORDERS['ver'],)
+
+
+def _aq_family_orders(stores_map, agg, meta, archived=None):
+    """A family's order signal: first/last order of any of its colours in any
+    store — archived colours included (their sales count) — distinct orders,
+    and whether the FIRST order is certain: only when every colour, archived
+    ones too, was created after we started seeing that store's orders (a
+    product can't sell before it exists). None = no orders on file."""
+    first = last = None
+    oids = set()
+    members = {s: list(ps) + list((archived or {}).get(s) or []) for s, ps in stores_map.items()}
+    for s, extra in (archived or {}).items():
+        members.setdefault(s, list(extra))
+    for s, ps in members.items():
+        for p in ps:
+            a = agg.get((s, p['id']))
+            if not a:
+                continue
+            first = a['first'] if first is None else min(first, a['first'])
+            last = a['last'] if last is None else max(last, a['last'])
+            oids |= {(s, o) for o in a['orders']}
+    if not oids:
+        return None
+    known = all((p.get('created') or '') >= ((meta.get(s) or {}).get('tracking_since') or '9999')
+                for s, ps in members.items() for p in ps)
+    return {'first': first, 'last': last, 'count': len(oids), 'first_known': known}
+
+
+# ── search: summaries built once per data version, search only filters ──────
+
+def _aq_summaries(force=False):
+    """Every family's summary + prebuilt search keys. Rebuilt only when an
+    index, the change log or the orders changed — a search then filters
+    ~860 prepared entries (measured 30 Sep: the per-search rebuild cost
+    0.16-2.3 s). -> (items, store_errors)."""
+    _indexes, errors = _aq_indexes(force)
+    with _AQ_INDEX_LOCK:
+        snap = {s: _AQ_INDEX[s] for s in AQ_STORES if s in _AQ_INDEX and s in tokens}
+    _aq_history_raw()
+    agg, meta, over = _aq_orders_agg_v()
+    hist_v = _AQ_HISTORY_CACHE.get('v')
+    sig = (tuple(sorted((s, e['ts'], e.get('patched')) for s, e in snap.items())),
+           hist_v[0] if hist_v else None, over)
+    with _AQ_SUMMARY_LOCK:
+        if _AQ_SUMMARY_CACHE['sig'] == sig and _AQ_SUMMARY_CACHE['items'] is not None:
+            return _AQ_SUMMARY_CACHE['items'], errors
+        fams = _aq_families({s: e['products'] for s, e in snap.items()})
+        arch = {}
+        for s, e in snap.items():
+            for a in e.get('archived') or []:
+                arch.setdefault(_aq_family_key(a), {}).setdefault(s, []).append(a)
+        processed = _aq_processed()
+        items = []
+        for key, sm in fams.items():
+            prods = [p for ps in sm.values() for p in ps]
+            items.append({
+                's': _aq_family_summary(key, sm, processed,
+                                        orders=_aq_family_orders(sm, agg, meta, arch.get(key))),
+                'names': frozenset(_deaccent(p['title']) for p in prods),
+                'blob': ' '.join(f"{_deaccent(p.get('colour'))} {p['handle']}" for p in prods),
+                'ids': frozenset(p['id'] for p in prods),
+                'handles': frozenset(p['handle'] for p in prods),
+            })
+        _AQ_SUMMARY_CACHE.update(sig=sig, items=items)
+        return items, errors
+
+
+_AQ_LIST_CACHE = {'sig': None, 'payload': None}
+
+
+def _aq_list(force=False):
+    """Every family, slim, ready for the page to filter while the operator types
+    (a keystroke then costs no request). Includes what the views need: 'rec'
+    (recommended rank: [tier, date] — 3 first order known, 2 ordered but first
+    order unknown, 1 needs attention), 'att' (needs attention), 'hay' (the
+    accent-free text a query is matched against). Cached per data version."""
+    if force:
+        _aq_orders_ensure(full=True)
+    else:
+        _aq_orders_ensure()
+    items, errors = _aq_summaries(force)
+    sig = (_AQ_SUMMARY_CACHE['sig'], datetime.datetime.utcnow().date().isoformat())
+    if _AQ_LIST_CACHE['sig'] == sig and _AQ_LIST_CACHE['payload'] is not None and not errors:
+        return _AQ_LIST_CACHE['payload']
+    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=_AQ_ATTENTION_DAYS)).isoformat()
+    fams = []
+    for it in items:
+        sm = it['s']
+        live = sm['active'] > 0 and not sm['processed']
+        hard = any(f['hard'] for f in sm['flags'])
+        fresh = (sm['created'] or '') >= cutoff
+        o = sm.get('orders')
+        rec = None
+        if live:
+            if o and o['first_known']:
+                rec = [3, o['first']]
+            elif o:
+                rec = [2, o['last']]
+            elif hard or fresh:
+                rec = [1, sm['created'] or '']
+        fams.append({
+            'key': sm['key'], 'name': sm['name'], 'cat': sm['cat'], 'type': sm['type'], 'image': sm['image'],
+            'created': sm['created'], 'stores': sm['stores'], 'active': sm['active'], 'total': sm['total'],
+            'sizes': sm['sizes'], 'colours': [c['labels'] for c in sm['colours']], 'flags': sm['flags'],
+            'processed': sm['processed'], 'orders': o, 'rec': rec, 'att': bool(live and (hard or fresh)),
+            'names': sorted(it['names']), 'hay': it['blob'],
+        })
+    _agg, meta = _aq_orders_agg()
+    with _AQ_INDEX_LOCK:
+        indexed = {s: len(e['products']) for s, e in _AQ_INDEX.items()}
+    payload = {'families': fams, 'store_errors': errors, 'orders_meta': meta, 'indexed': indexed,
+               'generated_at': datetime.datetime.utcnow().isoformat() + 'Z'}
+    if not errors:
+        _AQ_LIST_CACHE.update(sig=sig, payload=payload)
+    return payload
+
+
+def _aq_search(q='', view='recommended', force=False, limit=60):
+    """views without a query: recommended (default: families that just sold —
+    first order known first, newest first — then the rest of the attention
+    list), attention, recent, done. A query searches every listing."""
+    if force:
+        _aq_orders_ensure(full=True)
+    else:
+        _aq_orders_ensure()
+    items, errors = _aq_summaries(force)
     q = (q or '').strip()
     ids, handles = set(), set()
     if q:
@@ -26643,41 +27208,55 @@ def _aq_search(q='', view='attention', force=False, limit=60):
             ids |= _aq_source_ids(q)
     needle = _deaccent(q)
     cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=_AQ_ATTENTION_DAYS)).isoformat()
-    scored = []
-    for key, sm in fams.items():
-        prods = [p for ps in sm.values() for p in ps]
+    picked = []
+    for it in items:
+        sm = it['s']
         score = 0
         if q:
-            if ids and any(p['id'] in ids for p in prods):
-                score = 100
-            elif handles and any(p['handle'] in handles for p in prods):
-                score = 100
-            elif not ids and not handles:
-                names = {_deaccent(p['title']) for p in prods}
-                if needle in names:
-                    score = 90
-                elif any(n.startswith(needle) for n in names):
-                    score = 70
-                elif any(needle in n for n in names):
-                    score = 50
-                elif any(needle and (needle in _deaccent(p.get('colour')) or needle in p['handle'])
-                         for p in prods):
-                    score = 30
+            if ids:
+                score = 100 if it['ids'] & ids else 0
+            elif handles:
+                score = 100 if it['handles'] & handles else 0
+            elif needle in it['names']:
+                score = 90
+            elif any(n.startswith(needle) for n in it['names']):
+                score = 70
+            elif any(needle in n for n in it['names']):
+                score = 50
+            elif needle and needle in it['blob']:
+                score = 30
             if not score:
                 continue
-        summary = _aq_family_summary(key, sm, processed)
-        if not q and view == 'attention':
-            hard = any(f['hard'] for f in summary['flags'])
-            fresh = (summary['created'] or '') >= cutoff
-            if summary['processed'] or not (hard or fresh) or summary['active'] == 0:
-                continue
-        if not q and view == 'done' and not summary['processed']:
+            picked.append(((score, sm['created'] or ''), sm))
             continue
-        scored.append((score, summary))
-    # best match first, newest first within a score (no query: all score 0)
-    scored.sort(key=lambda x: (x[0], x[1]['created'] or ''), reverse=True)
-    return {'families': [s for _, s in scored[:limit]], 'total': len(scored),
-            'store_errors': errors, 'indexed': {s: len(v) for s, v in indexes.items()}}
+        live = sm['active'] > 0 and not sm['processed']
+        hard = any(f['hard'] for f in sm['flags'])
+        fresh = (sm['created'] or '') >= cutoff
+        o = sm.get('orders')
+        if view == 'done':
+            if sm['processed']:
+                picked.append(((0, sm['processed'] or ''), sm))
+        elif view == 'recent':
+            picked.append(((0, sm['created'] or ''), sm))
+        elif view == 'attention':
+            if live and (hard or fresh):
+                picked.append(((0, sm['created'] or ''), sm))
+        else:                                   # recommended
+            if not live:
+                continue
+            if o and o['first_known']:
+                picked.append(((3, o['first']), sm))
+            elif o:
+                picked.append(((2, o['last']), sm))
+            elif hard or fresh:
+                picked.append(((1, sm['created'] or ''), sm))
+    picked.sort(key=lambda x: x[0], reverse=True)
+    _agg, meta = _aq_orders_agg()
+    with _AQ_INDEX_LOCK:
+        indexed = {s: len(e['products']) for s, e in _AQ_INDEX.items()}
+    return {'families': [sm for _, sm in picked[:limit]], 'total': len(picked),
+            'store_errors': errors, 'indexed': indexed,
+            'orders_meta': meta, 'view': view if not q else 'search'}
 
 
 # ── one family, fresh ─────────────────────────────────────────────────────────
@@ -26734,12 +27313,12 @@ def _aq_family_state(key, force_index=False):
                 if n and n.get('legacyResourceId'):
                     mf[int(n['legacyResourceId'])] = {k: ((n.get(k) or {}).get('value'))
                                                       for k in ('cut', 'sib', 'sc', 'tt', 'dt', 'spec')}
-        views = []
-        for p in ps:
-            prod = _aq_fetch_product(s, p['id'])
-            if prod:
-                views.append(_aq_product_view(s, prod, mf.get(p['id'], {}), p.get('created') or ''))
-        return views
+        # 4 at a time: a store's REST bucket takes the burst; the family view
+        # of an 8-colour product went from ~8 sequential calls to 2 rounds
+        with _aq_cf.ThreadPoolExecutor(4) as ex:
+            prods = list(ex.map(lambda p: _aq_fetch_product(s, p['id']), ps))
+        return [_aq_product_view(s, prod, mf.get(p['id'], {}), p.get('created') or '')
+                for p, prod in zip(ps, prods) if prod]
 
     state = {'key': key, 'stores': {}, 'store_errors': dict(errors)}
     # one thread per store: each store has its own Shopify rate budget
@@ -27853,7 +28432,13 @@ def _aq_apply_run(jid, key, target, expected_sig, user):
                 if mfs:
                     for e in _aq_metafields_set(s, mfs):
                         _aq_job_log(jid, s, f'metafield not saved: {e}', ok=False)
-            _aq_invalidate([s for s in AQ_STORES if any(o['store'] == s for o in plan['ops'])])
+            _aq_job(jid, step='updating the list')
+            written = {}
+            for (st_, pid) in touched:
+                written.setdefault(st_, set()).add(pid)
+            for c in backup['created']:
+                written.setdefault(c['store'], set()).add(c['product_id'])
+            _aq_refresh_after_write(written)
             errors = _aq_job_errors(jid)
             summary = {s: [o['text'] for o in plan['ops'] if o['store'] == s] for s in AQ_STORES}
             _aq_history_append({
@@ -28069,7 +28654,11 @@ def _aq_undo_run(jid, backup_id, user):
                                                  f'(delete it in Shopify if you don\'t want it)')
                 except Exception as e:
                     _aq_job_log(jid, c['store'], f'new colour "{c["label"]}": FAILED — {e}', ok=False)
-            _aq_invalidate()
+            _aq_job(jid, step='updating the list')
+            written = {st_: {int(p) for p in prods} for st_, prods in writes.items()}
+            for c in bk.get('created') or []:
+                written.setdefault(c['store'], set()).add(c['product_id'])
+            _aq_refresh_after_write(written)
             _aq_history_append({'type': 'undo', 'key': key, 'name': bk.get('name') or '', 'user': user,
                                 'backup_id': backup_id})
             errors = _aq_job_errors(jid)
@@ -28102,10 +28691,22 @@ def _aq_body_error(kind):
 @require_droplet_token
 def api_aq_search():
     try:
-        return jsonify(_aq_search(request.args.get('q', ''), request.args.get('view', 'attention'),
+        view = request.args.get('view', 'recommended')
+        if view not in ('recommended', 'attention', 'recent', 'done'):
+            view = 'recommended'
+        return jsonify(_aq_search(request.args.get('q', ''), view,
                                   force=request.args.get('refresh') == '1'))
     except Exception as e:
         return jsonify({'error': f'Search failed: {str(e)[:200]}'}), 500
+
+
+@app.route('/api/aq/list')
+@require_droplet_token
+def api_aq_list():
+    try:
+        return jsonify(_aq_list(force=request.args.get('refresh') == '1'))
+    except Exception as e:
+        return jsonify({'error': f'Could not load the listings: {str(e)[:200]}'}), 500
 
 
 @app.route('/api/aq/family')
@@ -28115,6 +28716,9 @@ def api_aq_family():
     if not key:
         return jsonify({'error': 'key required'}), 400
     try:
+        # products are read fresh on every load; the index says WHICH ones —
+        # Reload also re-reads membership (a colour published elsewhere a minute
+        # ago must not be skipped by an apply; builds within 60 s are reused)
         state = _aq_family_state(key, force_index=request.args.get('refresh') == '1')
     except Exception as e:
         return jsonify({'error': f'Could not read the listing: {str(e)[:200]}'}), 500

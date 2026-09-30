@@ -96,3 +96,8 @@ aq_history.jsonl
 backend/aq_history.jsonl
 aq_backups/
 backend/aq_backups/
+# After Quotation: disk copy of the search index + the order signal (live data)
+aq_index_*.json
+backend/aq_index_*.json
+aq_orders.json
+backend/aq_orders.json

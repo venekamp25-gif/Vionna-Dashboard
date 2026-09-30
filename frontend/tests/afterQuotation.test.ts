@@ -121,3 +121,63 @@ test("review 2026-09-29: answers land only on the listing that asked, photos cle
   // the list is locked while Shopify is written
   assert.match(wb, /disabled=\{jobRunning && !on\}/);
 });
+
+import { deaccent, filterFamilies, isServerQuery, orderBadge, type AqListEntry } from "../lib/afterQuotation";
+
+const entry = (over: Partial<AqListEntry>): AqListEntry => ({
+  key: over.name ?? "k", name: "X", cat: "dress", type: "Dress", image: "", created: "2026-09-01T00:00:00Z",
+  stores: { dk: 1 }, active: 1, total: 1, sizes: ["S"], colours: [], flags: [], processed: null, orders: null,
+  rec: null, att: false, names: [deaccent(over.name ?? "x")], hay: "", ...over,
+});
+
+test("deaccent matches the server's (Nordic letters before NFKD)", () => {
+  assert.equal(deaccent("Mørkegrøn"), "morkegron");
+  assert.equal(deaccent("Zoé"), "zoe");
+  assert.equal(deaccent("Blåbær Æble"), "blabaer aeble");
+});
+
+test("recommended: newest certain first order on top, then uncertain, then attention", () => {
+  const list = [
+    entry({ name: "Frisk", rec: [1, "2026-09-25T00:00:00Z"] }),
+    entry({ name: "Gamle", rec: [2, "2026-09-29T00:00:00Z"] }),
+    entry({ name: "Runa", rec: [3, "2026-09-26T00:00:00Z"] }),
+    entry({ name: "Ottilie", rec: [3, "2026-09-29T00:00:00Z"] }),
+    entry({ name: "Nope", rec: null }),
+  ];
+  assert.deepEqual(filterFamilies(list, "", "recommended").map((e) => e.name), ["Ottilie", "Runa", "Gamle", "Frisk"]);
+});
+
+test("typing filters every listing with the server's scoring", () => {
+  const list = [
+    entry({ name: "Runa", created: "2026-09-02T00:00:00Z" }),
+    entry({ name: "Brunella", created: "2026-09-03T00:00:00Z" }),
+    entry({ name: "Ottilie", hay: "sort ottilie-sort" }),
+  ];
+  assert.deepEqual(filterFamilies(list, "run", "recommended").map((e) => e.name), ["Runa", "Brunella"]);
+  // accents/case don't matter, and a query searches every listing whatever the pill
+  assert.deepEqual(filterFamilies(list, "SØRT", "done").map((e) => e.name), ["Ottilie"]);
+  assert.deepEqual(filterFamilies(list, "xyz", "recommended").map((e) => e.name), []);
+});
+
+test("links, ids and competitor URLs go to the server", () => {
+  assert.equal(isServerQuery("https://admin.shopify.com/store/x/products/123"), true);
+  assert.equal(isServerQuery("16554287137117"), true);
+  assert.equal(isServerQuery("chic-parisien.fr/products/dejana"), true);
+  assert.equal(isServerQuery("carina"), false);
+  assert.equal(isServerQuery("mørk khaki"), false);
+});
+
+test("order badge says when the first order is not certain", () => {
+  const now = new Date("2026-09-30T12:00:00Z");
+  assert.equal(orderBadge({ first: "2026-09-29T08:00:00Z", last: "2026-09-29T08:00:00Z", count: 1, first_known: true }, now), "1st order yesterday · 1 order");
+  assert.match(orderBadge({ first: "2026-09-01T08:00:00Z", last: "2026-09-27T08:00:00Z", count: 3, first_known: false }, now) ?? "", /ordered 3 days ago · 3 orders \(earlier orders unknown\)/);
+  assert.equal(orderBadge(null, now), null);
+});
+
+test("order badge counts calendar days, not 24-hour blocks (review 30 Sep)", () => {
+  const now = new Date(2026, 8, 30, 8, 0); // 30 Sep 08:00 local
+  const at = (d: number, h: number) => new Date(2026, 8, d, h, 0).toISOString();
+  assert.equal(orderBadge({ first: at(29, 22), last: at(29, 22), count: 1, first_known: true }, now), "1st order yesterday · 1 order");
+  assert.equal(orderBadge({ first: at(30, 1), last: at(30, 1), count: 1, first_known: true }, now), "1st order today · 1 order");
+  assert.equal(orderBadge({ first: at(28, 21), last: at(28, 21), count: 1, first_known: true }, now), "1st order 2 days ago · 1 order");
+});

@@ -31,9 +31,23 @@ let _dropletToken: { value: string; expiresAt: number } | null = null;
 const SESSION_EXPIRED_MESSAGE =
   "Your session has expired or this page is out of date. Please refresh the page (Ctrl+Shift+R), log in again if needed, and try publishing once more.";
 
+// One mint at a time: a page that fires two authed calls at once (list +
+// listing on open) used to mint twice, serially, before either call left.
+// A failed mint is never cached — the next caller tries again.
+let _mintInFlight: Promise<string | null> | null = null;
+
 async function getDropletToken(force = false): Promise<string | null> {
   const now = Date.now();
   if (!force && _dropletToken && _dropletToken.expiresAt > now + 30_000) return _dropletToken.value;
+  if (_mintInFlight) return _mintInFlight;
+  _mintInFlight = mintDropletToken().finally(() => {
+    _mintInFlight = null;
+  });
+  return _mintInFlight;
+}
+
+async function mintDropletToken(): Promise<string | null> {
+  const now = Date.now();
   try {
     const res = await fetch("/api/droplet-token", { credentials: "include" });
     if (!res.ok) {
@@ -98,6 +112,8 @@ async function call<T>(
     let lastErr: unknown;
     for (let attempt = 0; attempt <= maxExtra; attempt++) {
       if (attempt > 0) await new Promise((r) => setTimeout(r, 400 * attempt));
+      // a cancelled request (the user kept typing) must not be retried
+      if (init?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
       try {
         const r = await fetchOnce(token);
         if (isRead && isTransientStatus(r.status)) {
@@ -1960,6 +1976,7 @@ export interface AqFlag {
 }
 
 export interface AqFamilySummary {
+  orders?: import("./afterQuotation").AqOrders | null;
   key: string;
   name: string;
   cat: string;
@@ -2110,11 +2127,29 @@ export interface AqCopy {
   warnings: string[];
 }
 
+export interface AqOrdersMeta {
+  synced_at: string | null;
+  /** orders are on file from here on (Shopify shows only the last 60 days) */
+  tracking_since: string | null;
+  error: string | null;
+}
+
+export interface AqListResponse {
+  families: import("./afterQuotation").AqListEntry[];
+  store_errors: Partial<Record<AqStoreKey, string>>;
+  orders_meta: Partial<Record<AqStoreKey, AqOrdersMeta>>;
+  indexed: Partial<Record<AqStoreKey, number>>;
+  generated_at: string;
+}
+
 export const aqApi = {
-  search: (q: string, view: "attention" | "recent" | "done", refresh = false) =>
+  /** Every colour group, slim — the page filters it while you type. */
+  list: (refresh = false) => call<AqListResponse>(`/api/aq/list${refresh ? "?refresh=1" : ""}`, { authed: true }),
+  /** Server search: links, product ids, competitor URLs. */
+  search: (q: string, view: "recommended" | "attention" | "recent" | "done", refresh = false, signal?: AbortSignal) =>
     call<AqSearchResponse>(
       `/api/aq/search?q=${encodeURIComponent(q)}&view=${view}${refresh ? "&refresh=1" : ""}`,
-      { authed: true }
+      { authed: true, signal }
     ),
   family: (key: string, refresh = false) =>
     call<AqFamily>(`/api/aq/family?key=${encodeURIComponent(key)}${refresh ? "&refresh=1" : ""}`, { authed: true }),
