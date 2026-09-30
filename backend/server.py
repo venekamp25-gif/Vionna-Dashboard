@@ -335,6 +335,14 @@ def _self_update_loop():
         time.sleep(_SELF_UPDATE_INTERVAL)
 
 
+def _background_loops_allowed():
+    """Loops that WRITE to the live stores (size charts, siblings, sales channels)
+    run on the droplet only. They used to start on every import: a local script
+    or test process alive for 5+ minutes ran the siblings self-heal from a
+    laptop (found 30 Sep 2026 — harmless that time: fake test credentials)."""
+    return os.getenv('DEV_LOCAL') != '1' and 'pytest' not in sys.modules
+
+
 if os.getenv('DEV_LOCAL') == '1' or os.getenv('SELF_UPDATE') == '0' or 'pytest' in sys.modules:
     print('[self-update] disabled (DEV_LOCAL/pytest/SELF_UPDATE=0)')
 else:
@@ -2089,8 +2097,9 @@ def _higgsfield_ready_loop():
         time.sleep(3600)
 
 
-threading.Thread(target=_higgsfield_ready_loop, daemon=True,
-                 name='higgsfield-ready').start()
+if _background_loops_allowed():
+    threading.Thread(target=_higgsfield_ready_loop, daemon=True,
+                     name='higgsfield-ready').start()
 
 
 def _sane_image_url(u):
@@ -11597,7 +11606,8 @@ def _size_chart_fill_loop():
         time.sleep(24 * 3600 if all_ok else 3600)
 
 
-threading.Thread(target=_size_chart_fill_loop, daemon=True, name='size-chart-fill').start()
+if _background_loops_allowed():
+    threading.Thread(target=_size_chart_fill_loop, daemon=True, name='size-chart-fill').start()
 
 
 # ── Siblings-zelfherstel ──────────────────────────────────────────────────
@@ -12081,7 +12091,8 @@ def _siblings_heal_loop():
         time.sleep(24 * 3600)
 
 
-threading.Thread(target=_siblings_heal_loop, daemon=True, name='siblings-heal').start()
+if _background_loops_allowed():
+    threading.Thread(target=_siblings_heal_loop, daemon=True, name='siblings-heal').start()
 
 
 @app.route('/api/size_chart_fill_status')
@@ -24997,7 +25008,8 @@ def _light_channels_heal_loop():
         time.sleep(6 * 3600)
 
 
-threading.Thread(target=_light_channels_heal_loop, daemon=True, name='light-channels-heal').start()
+if _background_loops_allowed():
+    threading.Thread(target=_light_channels_heal_loop, daemon=True, name='light-channels-heal').start()
 
 
 @app.route('/api/lighting/channels_heal', methods=['POST'])

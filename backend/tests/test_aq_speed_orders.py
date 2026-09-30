@@ -328,3 +328,16 @@ def test_an_older_index_entry_is_never_saved_over_a_newer_one(aq_tmp):
     assert not (aq_tmp / 'aq_index_dk.json').exists()
     server._aq_index_disk_save('dk', new)
     assert len(json.load(open(aq_tmp / 'aq_index_dk.json'))['products']) == 2
+
+
+def test_write_loops_never_start_on_a_laptop_or_in_tests():
+    """The size-chart fill, siblings heal and lighting channel heal WRITE to the
+    live stores; they used to start on every import (30 Sep: a long local
+    process ran the siblings heal)."""
+    import re
+    src = open(server.__file__, encoding='utf-8').read()
+    assert server._background_loops_allowed() is False                     # pytest is loaded
+    for loop in ('_size_chart_fill_loop', '_siblings_heal_loop', '_light_channels_heal_loop',
+                 '_higgsfield_ready_loop', '_aq_warm_loop'):
+        start = re.search(r'\n([ \t]*)threading\.Thread\(target=' + loop, src)
+        assert start and start.group(1), f'{loop} starts at module level without a guard'
