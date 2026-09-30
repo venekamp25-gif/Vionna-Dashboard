@@ -322,9 +322,13 @@ def test_digest_line_is_silent_without_data_and_counts_with(client, _sandbox, mo
     _write_rows(_sandbox, [_row('dk', 'monitor', _iso(1)), _row('dk', 'monitor', _iso(2), browser_key='q'),
                            _row('fr', 'block', _iso(3), ss_pt=1)])
     line = server._spy_shield_digest_line(14)
-    # Same vocabulary as the tab tiles: would-be blocks (block-tier), 502s shown, buyers in flagged sessions.
-    assert line.startswith('🛡️ Spy Shield (14d): 3 would-be blocks, 1 502s getoond, 0 buyers in flagged sessions, 3 browser-dagen')
-    assert 'DK 2 / FR 1' in line
+    # Same vocabulary as the tab tiles: would-be blocks (block-tier), 502s shown, buyers in flagged sessions —
+    # but as records next to browser-days, per store on would-be blocks, with the orders actually checked.
+    assert line.startswith('🛡️ Spy Shield (data sinds ')
+    assert ('would-be blocks 3 records / 3 browser-dagen (DK 2/2, FR 1/1), 1 502s getoond, '
+            '0 buyers in flagged sessions (DK 0, FR 0 orders gecontroleerd; '
+            'FI niet gecontroleerd: geen block-tier records), 3 browser-dagen in het log') in line
+    assert 'KLAAR VOOR DK: nee' in line
     # 1 of 3 records from a preview theme, 3 hours old → above 5 % and recent → the warning fires.
     assert 'ss_pt=1' in line and '33%' in line
 

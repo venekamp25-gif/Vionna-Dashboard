@@ -52,6 +52,22 @@ def _isolate_hf_media(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_blog_state(tmp_path, monkeypatch):
+    """The blog engine appends to blog_history.jsonl and (since 30 Sep 2026)
+    blog_failures.jsonl next to server.py. A test that drives a run or the
+    scheduler tick must never add rows to the real files: a stray failure row
+    would trip the create circuit breaker, a stray history row reads as
+    'already posted today'."""
+    import server
+
+    monkeypatch.setattr(server, 'BLOG_HISTORY_PATH', str(tmp_path / 'blog_history.jsonl'))
+    monkeypatch.setattr(server, 'BLOG_FAILURES_PATH', str(tmp_path / 'blog_failures.jsonl'))
+    monkeypatch.setattr(server, '_BLOG_TRIED', {})
+    monkeypatch.setattr(server, '_BLOG_SLOT_ALERTED', {})
+    monkeypatch.setattr(server, '_BLOG_LAST', dict(server._BLOG_LAST))
+
+
+@pytest.fixture(autouse=True)
 def _isolate_after_quotation(tmp_path, monkeypatch):
     """After Quotation keeps live data next to server.py: the index disk copies,
     the order file, the change log and the undo backups. A test that rebuilt the
@@ -69,3 +85,17 @@ def _isolate_after_quotation(tmp_path, monkeypatch):
     monkeypatch.setattr(server, '_AQ_SUMMARY_CACHE', {'sig': None, 'items': None})
     monkeypatch.setattr(server, '_AQ_LIST_CACHE', {'sig': None, 'payload': None})
     monkeypatch.setattr(server, '_AQ_HISTORY_CACHE', {'v': None})
+
+
+@pytest.fixture(autouse=True)
+def _isolate_name_pool(tmp_path, monkeypatch):
+    """The name-pool watch keeps its 'already warned' state in
+    backend/name_pool_watch.json (30 Sep 2026: kept in memory, it was lost on
+    every deploy restart and each deploy sent a false Slack ping). Without this
+    the watch tests would write that file into the public repo and the next run
+    would start from its leftovers instead of a clean slate."""
+    import server
+
+    monkeypatch.setattr(server, 'NAME_POOL_STATE_PATH', str(tmp_path / 'name_pool_watch.json'))
+    monkeypatch.setattr(server, '_NAME_POOL_LAST', {'at': 0.0, 'status': None, 'warned_free': None})
+    monkeypatch.setattr(server, '_NAME_POOL_SYNC', {'at': 0.0, 'result': None})

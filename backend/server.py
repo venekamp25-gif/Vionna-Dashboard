@@ -245,7 +245,7 @@ def _run_backup():
         dest = os.path.join(BACKUP_DIR, day)
         os.makedirs(dest, exist_ok=True)
         for fname in ('publish_history.jsonl', 'lighting_history.jsonl', 'bug_reports.jsonl',
-                      'blog_history.jsonl',
+                      'blog_history.jsonl', 'blog_failures.jsonl',
                       'blog_performance.jsonl', 'blog_views.json', 'blog_playbook.json',
                       'bs_snapshots.jsonl', 'known_sources.json', 'blocked_sources.json',
                       'wtl_verdicts.json', 'wtl_traffic.json', 'size_chart_fill.json',
@@ -253,7 +253,7 @@ def _run_backup():
                       'wtl_store_marks.json', 'wtl_extra_stores.json',
                       'wtl_discover_seen.json', 'wtl_discover_state.json',
                       'spy_shield.jsonl', 'lighting_channels.json', 'aq_history.jsonl',
-                      'aq_orders.json', 'aq_size_backfill.json'):
+                      'aq_orders.json', 'aq_size_backfill.json', 'name_pool_watch.json'):
             src = os.path.join(_BASE_DIR, fname)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dest, fname))
@@ -9705,15 +9705,55 @@ def api_spy_shield_beacon(token):
     return ('', 204)
 
 
-def _ss_read_rows(days):
+# Block-tier redenen die de snippet zelf uit een spy-tool-signaal afleidt
+# (tool-verwijzer, extensie-probe, DOM-marker, <script>/<link>-tag, postMessage,
+# of de 24-u-cookie die zo'n signaal onthoudt). Al het andere in de block-tier is
+# geen tool-signaal (een vervalst record — het token is publiek — of een nieuw
+# soort signaal dat eerst bekeken moet worden) en houdt "KLAAR VOOR DK" op nee.
+_SS_TOOL_REASON_PREFIXES = ('ref:', 'ext:', 'dom:', 'tag:', 'msg:', 'cookie:persist')
+# Minimaal aantal kalenderdagen sinds het eerste live record vóór Blokkeren
+# (README/SPEC R5; frontend SS_MONITOR_DAYS).
+_SS_READY_DAYS = 14
+
+
+def _ss_is_operator_test(r):
+    """True voor records uit venek's eigen tests: ?ss_sim=… (reden of signaal
+    'sim:*' — sim kan alleen mét geldige _ss_op-cookie, dus altijd de eigenaar)
+    en de op_cookie/bypass-records van ?ss_debug=1. Digest 30-09-2026: zulke
+    records telden mee als would-be block en in de koper-join, terwijl die
+    browser in het echt nooit geblokkeerd wordt (op_cookie → allow)."""
+    reason = str(r.get('ss_reason') or '')
+    if reason.startswith('sim:') or reason in ('op_cookie', 'bypass'):
+        return True
+    return any(p.startswith('sim:') for p in str(r.get('ss_signals') or '').split('|'))
+
+
+def _ss_is_tool_reason(reason):
+    return str(reason or '').startswith(_SS_TOOL_REASON_PREFIXES)
+
+
+def _ss_read_rows(days, first_seen=None):
     """Records van vandaag + de `days`-1 UTC-dagen ervoor (days=7 = 7 kalender-
-    dagen incl. vandaag), kapotte regels overgeslagen."""
+    dagen incl. vandaag), kapotte regels overgeslagen.
+
+    first_seen (dict, optioneel) wordt in dezelfde leesronde gevuld met per
+    winkel de ts van het oudste LIVE record in het hele log (90 dagen bewaard),
+    los van het venster. Digest 30-09-2026 zei "(14d)" terwijl het log pas op
+    28-09 begon (dag 2 van 14) — de 14-dagen-klok moet dus bij de go-live
+    starten, niet bij de venstergrens. Operator-tests en preview-thema-records
+    (ss_pt=1: de README-checklist test het DK-duplicaat vóór go-live) starten
+    die klok niet."""
     cutoff = (_ss_utcnow() - datetime.timedelta(days=max(1, int(days)) - 1)).strftime('%Y-%m-%d')
     rows = []
     for r in _blog_read_jsonl(SPY_SHIELD_LOG_PATH):
         if not isinstance(r, dict):
             continue
         day = str(r.get('day') or r.get('ts') or '')[:10]
+        if first_seen is not None and r.get('ss_pt') != 1 and not _ss_is_operator_test(r):
+            ts = str(r.get('ts') or '')
+            code = r.get('store') or 'unknown'
+            if ts and (code not in first_seen or ts < first_seen[code]):
+                first_seen[code] = ts
         if day >= cutoff:
             rows.append(r)
     return rows
@@ -9787,14 +9827,22 @@ def _spy_shield_orders(store, since_days):
     return rows
 
 
-def _spy_shield_buyers(rows, stores, days):
+def _spy_shield_buyers(rows, stores, days, first_seen=None):
     """Rode teller: orders waarvan de sessie landde op een pad waar een
     block-tier record (ss_tier == 'block') van dezelfde winkel binnen ±60 min
     zat. Alleen Vionna (tokens hier). count None = minstens één gevraagde
-    Vionna-winkel kon niet gecontroleerd worden — dan is '0' geen bewijs."""
+    Vionna-winkel kon niet gecontroleerd worden — dan is '0' geen bewijs.
+
+    Operator-tests (sim:*) doen niet mee. orders_checked telt alleen orders
+    vanaf het eerste live record van die winkel (first_seen): digest 30-09-2026
+    — het venster haalt 14 dagen orders op, maar het log begon pas op 28-09,
+    dus orders van vóór de go-live zouden als 'gecontroleerd' tellen terwijl ze
+    nooit konden matchen. Een winkel zonder block-tier records wordt niet
+    gecontroleerd (geen fetch) en staat in not_checked — geen kale 0."""
     wanted = [s for s in _SS_BUYER_STORES if s in stores]
+    first_seen = first_seen or {}
     out = {'supported_stores': list(_SS_BUYER_STORES), 'count': 0, 'orders': [],
-           'orders_checked': {}, 'note': '',
+           'orders_checked': {}, 'not_checked': [], 'note': '',
            # Hoeveel verschillende browsers (dag-hashes) achter de gematchte
            # records zitten: het beacon-token is publiek, dus één bron kan een
            # rode teller vervalsen — "alle N treffers uit 1 browser" is het
@@ -9805,10 +9853,12 @@ def _spy_shield_buyers(rows, stores, days):
     matched_keys = set()
     block_keys = set()
     for st in wanted:
-        blocks = [r for r in rows if r.get('store') == st and r.get('ss_tier') == 'block']
+        blocks = [r for r in rows if r.get('store') == st and r.get('ss_tier') == 'block'
+                  and not _ss_is_operator_test(r)]
         block_keys |= {r.get('browser_key') for r in blocks if r.get('browser_key')}
         if not blocks:
             out['orders_checked'][st] = 0
+            out['not_checked'].append(st)
             continue
         try:
             orders = _spy_shield_orders(st, days)
@@ -9819,7 +9869,16 @@ def _spy_shield_buyers(rows, stores, days):
             unreadable.append(st)
             out['orders_checked'][st] = None
             continue
-        out['orders_checked'][st] = len(orders)
+        since = _ss_parse_ts(first_seen.get(st))
+        if since is None:
+            stamps = [t for t in (_ss_parse_ts(r.get('ts')) for r in blocks) if t]
+            since = min(stamps) if stamps else None
+        checked = 0
+        for o in orders:
+            ot = _ss_parse_ts(o.get('created_at'))
+            if ot and (since is None or ot >= since):
+                checked += 1
+        out['orders_checked'][st] = checked
         by_path = {}
         for r in blocks:
             t = _ss_parse_ts(r.get('ts'))
@@ -9847,7 +9906,11 @@ def _spy_shield_buyers(rows, stores, days):
     notes = ['Buyer check covers Vionna DK/FR/FI only (Light Supplier not wired up yet). '
              'Match = same store, same landing path, order within ±60 min of a block-tier '
              'signal — by page and time, not by cookie, so a coincidence is possible: '
-             'open the order before you conclude anything.']
+             'open the order before you conclude anything. Orders checked = orders placed '
+             'since the store\'s first live record; operator tests (?ss_sim) never join.']
+    if out['not_checked']:
+        notes.append('Not checked (no block-tier records, nothing to match): '
+                     + ', '.join(s.upper() for s in out['not_checked']) + '.')
     if unreadable:
         out['count'] = None
         notes.append('Orders not readable for ' + ', '.join(s.upper() for s in unreadable)
@@ -9876,12 +9939,21 @@ def _ss_pt_alarm_active(pt_alarm, total, pt_last_at, now=None):
 def _spy_shield_summary(days=14, store='all', with_buyers=True, with_url=True):
     """Aggregatie voor de tab + de Slack-regel. Nooit browser_key in last_hits.
     with_url=False laat beacon_url weg (X-Notify-Token-lezers hebben het
-    schrijf-token niet nodig)."""
+    schrijf-token niet nodig).
+
+    block_tier_hits zijn RECORDS (de snippet stuurt 1-4 records per
+    paginaweergave: head/late/final), dus naast elkaar block_tier_browsers
+    (dag-hashes = browser-dagen). Operator-tests (sim:*/op_cookie) tellen apart
+    als operator_tests en nooit als would-be block. first_seen/first_seen_at =
+    het oudste live record in het HELE log (de 14-dagen-klok), first_hit_at
+    blijft het oudste record binnen het venster."""
     days = max(1, min(int(days or 14), 90))
-    rows = _ss_read_rows(days)
+    first_seen = {}
+    rows = _ss_read_rows(days, first_seen=first_seen)
     store = (store or 'all').lower()
     if store != 'all':
         rows = [r for r in rows if r.get('store') == store]
+        first_seen = {k: v for k, v in first_seen.items() if k == store}
     stores = {}
     for r in rows:
         code = r.get('store') or 'unknown'
@@ -9891,8 +9963,11 @@ def _spy_shield_summary(days=14, store='all', with_buyers=True, with_url=True):
                                 'by_action': {'allow': 0, 'monitor': 0, 'block': 0},
                                 '_reasons': {}, '_browsers': set(), 'repeat_hits': 0,
                                 'pt_alarm': 0, 'pt_last_at': None, 'block_tier_hits': 0,
+                                '_block_browsers': set(), 'block_tier_non_tool': 0,
+                                'operator_tests': 0,
                                 'utm_hits': 0, '_daily': {}, 'last_hits': [],
-                                'last_hit_at': None, 'first_hit_at': None, 'active_days': 0}
+                                'last_hit_at': None, 'first_hit_at': None, 'active_days': 0,
+                                'first_seen_at': first_seen.get(code)}
         s['total'] += 1
         act = r.get('ss_action') if r.get('ss_action') in _SS_ACTIONS else 'allow'
         s['by_action'][act] += 1
@@ -9909,8 +9984,14 @@ def _spy_shield_summary(days=14, store='all', with_buyers=True, with_url=True):
             s['pt_alarm'] += 1
             if not s['pt_last_at'] or ts > s['pt_last_at']:
                 s['pt_last_at'] = ts
-        if r.get('ss_tier') == 'block':
+        if _ss_is_operator_test(r):
+            s['operator_tests'] += 1
+        elif r.get('ss_tier') == 'block':
             s['block_tier_hits'] += 1
+            if r.get('browser_key'):
+                s['_block_browsers'].add(r['browser_key'])
+            if not _ss_is_tool_reason(r.get('ss_reason')):
+                s['block_tier_non_tool'] += 1
         day = str(r.get('day') or r.get('ts') or '')[:10]
         d = s['_daily'].setdefault(day, {'day': day, 'monitor': 0, 'block': 0, 'allow': 0})
         d[act] += 1
@@ -9920,15 +10001,21 @@ def _spy_shield_summary(days=14, store='all', with_buyers=True, with_url=True):
             s['first_hit_at'] = ts
     totals = {'total': 0, 'by_action': {'allow': 0, 'monitor': 0, 'block': 0},
               'unique_browsers': 0, 'repeat_hits': 0, 'pt_alarm': 0, 'pt_last_at': None,
-              'pt_alarm_active': False, 'block_tier_hits': 0, 'utm_hits': 0,
-              'last_hit_at': None}
+              'pt_alarm_active': False, 'block_tier_hits': 0, 'block_tier_browsers': 0,
+              'block_tier_non_tool': 0, 'operator_tests': 0, 'utm_hits': 0,
+              'last_hit_at': None,
+              'first_seen_at': min(first_seen.values()) if first_seen else None}
     all_browsers = set()
+    all_block_browsers = set()
     for code, s in stores.items():
         s['by_reason'] = sorted(s.pop('_reasons').items(), key=lambda kv: (-kv[1], kv[0]))[:25]
         s['by_reason'] = [[k, v] for k, v in s['by_reason']]
         browsers = s.pop('_browsers')
         all_browsers |= browsers
         s['unique_browsers'] = len(browsers)
+        block_browsers = s.pop('_block_browsers')
+        all_block_browsers |= block_browsers
+        s['block_tier_browsers'] = len(block_browsers)
         daily = s.pop('_daily')
         s['daily'] = [daily[k] for k in sorted(daily)]
         s['active_days'] = len(daily)          # dagen mét records = "dagen data" voor de 14-dagen-eis
@@ -9944,22 +10031,26 @@ def _spy_shield_summary(days=14, store='all', with_buyers=True, with_url=True):
         if s['pt_last_at'] and (not totals['pt_last_at'] or s['pt_last_at'] > totals['pt_last_at']):
             totals['pt_last_at'] = s['pt_last_at']
         totals['block_tier_hits'] += s['block_tier_hits']
+        totals['block_tier_non_tool'] += s['block_tier_non_tool']
+        totals['operator_tests'] += s['operator_tests']
         if s['last_hit_at'] and (not totals['last_hit_at'] or s['last_hit_at'] > totals['last_hit_at']):
             totals['last_hit_at'] = s['last_hit_at']
     totals['unique_browsers'] = len(all_browsers)
+    totals['block_tier_browsers'] = len(all_block_browsers)
     totals['pt_alarm_active'] = _ss_pt_alarm_active(totals['pt_alarm'], totals['total'], totals['pt_last_at'])
     wanted = list(_SS_BUYER_STORES) if store == 'all' else [store]
     if with_buyers:
         try:
-            buyers = _spy_shield_buyers(rows, wanted, days)
+            buyers = _spy_shield_buyers(rows, wanted, days, first_seen=first_seen)
         except Exception as e:
             print(f'[spy_shield] buyers join failed: {type(e).__name__}')
             buyers = {'supported_stores': list(_SS_BUYER_STORES), 'count': None, 'orders': [],
-                      'orders_checked': {}, 'note': 'Buyer check failed — see server log.'}
+                      'orders_checked': {}, 'not_checked': [],
+                      'note': 'Buyer check failed — see server log.'}
     else:
         buyers = {'supported_stores': list(_SS_BUYER_STORES), 'count': None, 'orders': [],
-                  'orders_checked': {}, 'note': 'Buyer check skipped.'}
-    return {
+                  'orders_checked': {}, 'not_checked': [], 'note': 'Buyer check skipped.'}
+    out = {
         'configured': bool(_ss_token()),
         'beacon_url': _ss_beacon_url() if with_url else None,
         'days': days,
@@ -9973,7 +10064,48 @@ def _spy_shield_summary(days=14, store='all', with_buyers=True, with_url=True):
         'accepted_since_start': _SS_ACCEPTED[0],
         'log_full': _ss_log_full(),
         'limits': {k: _SS_LIMITS[k] for k in ('per_ip_min', 'per_ip_day', 'per_day', 'retention_days')},
+        'first_seen': dict(first_seen),
     }
+    out['ready'] = {c: _ss_ready_verdict(out, c) for c in _SS_BUYER_STORES if c in wanted}
+    return out
+
+
+def _ss_ready_verdict(summary, code='dk', now=None):
+    """Klaar voor Blokkeren? Dezelfde criteria als de omzet-checklist, zodat de
+    Slack-regel het oordeel zelf geeft in plaats van dat "(14d)" als "twee weken
+    schoon" gelezen wordt (digest 30-09-2026: dag 2 van 14, koper-check op 1
+    DK-order). Alle vier moeten kloppen:
+      1. ≥ 14 kalenderdagen sinds het eerste live record (hele log, stille
+         dagen tellen mee — niet active_days);
+      2. ≥ 1 gecontroleerde order van die winkel en 0 matches;
+      3. operator-tests (sim:*) tellen niet mee — gegarandeerd doordat
+         _spy_shield_summary/_spy_shield_buyers ze vóór het tellen uitsluiten;
+      4. alle block-tier redenen zijn tool-signalen (_SS_TOOL_REASON_PREFIXES).
+    why_not bevat alleen eigen tekst + getallen (nooit poster-tekst: gaat naar Slack)."""
+    now = now or _ss_utcnow()
+    up = code.upper()
+    why = []
+    first = _ss_parse_ts((summary.get('first_seen') or {}).get(code))
+    days_live = (now.date() - first.date()).days if first else 0
+    if not first:
+        why.append(f'geen live {up}-data')
+    elif days_live < _SS_READY_DAYS:
+        why.append(f'dag {days_live} van {_SS_READY_DAYS}')
+    b = summary.get('buyers_flagged') or {}
+    checked = (b.get('orders_checked') or {}).get(code)
+    matches = sum(1 for o in (b.get('orders') or []) if o.get('store') == code)
+    if code in (b.get('not_checked') or []):
+        why.append(f'{up}-orders niet gecontroleerd (geen block-tier records)')
+    elif checked is None:
+        why.append(f'{up}-orders niet gecontroleerd (niet leesbaar)')
+    elif matches:
+        why.append(f"{matches} {up}-koper{'s' if matches != 1 else ''} in flagged sessions")
+    elif checked < 1:
+        why.append(f'0 {up}-orders gecontroleerd')
+    non_tool = ((summary.get('stores') or {}).get(code) or {}).get('block_tier_non_tool') or 0
+    if non_tool:
+        why.append(f'{non_tool} block-tier records zonder tool-signaal')
+    return {'ready': not why, 'days_live': days_live, 'why_not': why}
 
 
 def require_droplet_or_notify_token(f):
@@ -10033,27 +10165,81 @@ def api_spy_shield_setup():
                     'beacon_url': _ss_beacon_url()})
 
 
+def _ss_orders_checked_txt(b):
+    """'DK 1, FR 4, FI 1 orders gecontroleerd' (+ welke winkels niet
+    gecontroleerd/niet leesbaar zijn) — digest 30-09-2026: de kale '0 buyers'
+    rustte op 6 orders (DK 1) en zei dat nergens."""
+    checked = b.get('orders_checked') or {}
+    skipped = set(b.get('not_checked') or [])
+    ok, unread = [], []
+    for code in _SS_BUYER_STORES:
+        if code not in checked or code in skipped:
+            continue
+        if checked[code] is None:
+            unread.append(code.upper())
+        else:
+            ok.append(f'{code.upper()} {checked[code]}')
+    bits = []
+    if ok:
+        bits.append(', '.join(ok) + ' orders gecontroleerd')
+    if unread:
+        bits.append('/'.join(unread) + ' niet leesbaar')
+    if skipped:
+        bits.append('/'.join(c.upper() for c in _SS_BUYER_STORES if c in skipped)
+                    + ' niet gecontroleerd: geen block-tier records')
+    return '; '.join(bits)
+
+
 def _spy_shield_digest_line(days=14):
     """Eén Slack-regel, of None als er (nog) geen records zijn — een lege
     pijplijn mag nooit als 'schoon' klinken, dus dan zeggen we niets. Zelfde
-    woorden als de tab-tegels (Would-be blocks / Buyers in flagged sessions)."""
+    woorden als de tab-tegels (Would-be blocks / Buyers in flagged sessions).
+
+    Digest 30-09-2026 werd verkeerd gelezen: "(14d)" was alleen de venster-
+    grootte (het log begon op 28-09, dag 2 van 14), "96 would-be blocks" waren
+    records (1-4 per paginaweergave, eigen ?ss_sim-tests incl.), de winkellijst
+    was álle records per winkel en "0 buyers" rustte op 6 orders. Nu: echte
+    dekking, records naast browser-dagen, winkellijst op would-be blocks,
+    gecontroleerde orders per winkel, operator-tests apart en één oordeel
+    "KLAAR VOOR DK: ja/nee" (_ss_ready_verdict)."""
     s = _spy_shield_summary(days=days, store='all', with_buyers=True, with_url=False)
     t = s['totals']
     if not t['total']:
         return None
+    now = _ss_utcnow()
+    first = _ss_parse_ts(t.get('first_seen_at'))
+    if first:
+        n = (now.date() - first.date()).days
+        cov = f"data sinds {first.strftime('%d-%m')}, {n} dag{'en' if n != 1 else ''}"
+        if n >= days:
+            cov += f'; cijfers over laatste {days}d'
+    else:
+        cov = 'nog geen live data, alleen tests/preview'
     b = s['buyers_flagged']
     buyers = b['count']
+    checked_txt = _ss_orders_checked_txt(b)
     if buyers is None:
-        buyers_txt = 'buyers in flagged sessions: n/a (orders niet leesbaar)'
+        buyers_txt = 'buyers in flagged sessions: n/a (' + (checked_txt or 'orders niet leesbaar') + ')'
     else:
         buyers_txt = f'{buyers} buyers in flagged sessions'
         if buyers and b.get('matched_browsers'):
             buyers_txt += f" (uit {b['matched_browsers']} browser{'s' if b['matched_browsers'] != 1 else ''} — eerst de order bekijken)"
-    per_store = ' / '.join(f"{code.upper()} {st['total']}" for code, st in
-                           sorted(s['stores'].items(), key=lambda kv: -kv[1]['total']))
-    line = (f"🛡️ Spy Shield ({days}d): {t['block_tier_hits']} would-be blocks, "
-            f"{t['by_action']['block']} 502s getoond, {buyers_txt}, "
-            f"{t['unique_browsers']} browser-dagen · {per_store}")
+        if checked_txt:
+            buyers_txt += f' ({checked_txt})'
+    flagged = sorted(((code, st) for code, st in s['stores'].items() if st['block_tier_hits']),
+                     key=lambda kv: (-kv[1]['block_tier_hits'], kv[0]))
+    per_store = ', '.join(f"{code.upper()} {st['block_tier_hits']}/{st['block_tier_browsers']}"
+                          for code, st in flagged)
+    line = (f"🛡️ Spy Shield ({cov}): would-be blocks {t['block_tier_hits']} records / "
+            f"{t['block_tier_browsers']} browser-dagen" + (f' ({per_store})' if per_store else '')
+            + f", {t['by_action']['block']} 502s getoond, {buyers_txt}, "
+            f"{t['unique_browsers']} browser-dagen in het log")
+    if t.get('operator_tests'):
+        line += f", {t['operator_tests']} operator tests (sim/op, niet meegeteld)"
+    v = (s.get('ready') or {}).get('dk') or _ss_ready_verdict(s, 'dk', now)
+    # 'ja' still leaves one check that needs the sessions (Shopify Analytics)
+    line += ' · KLAAR VOOR DK: ' + ('ja (check nog in het tabblad: would-be blocks < 0,5% van de DK-sessies)'
+                                    if v['ready'] else 'nee (' + '; '.join(v['why_not']) + ')')
     if t.get('pt_alarm_active'):
         pct = round(100.0 * t['pt_alarm'] / max(1, t['total']))
         line += (f" ⚠️ {pct}% van de records komt uit een preview-thema (ss_pt=1) — test je nu geen "
@@ -10895,7 +11081,18 @@ def get_names():
 NAMES_TS_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                              'frontend', 'lib', 'names.ts')
 NAME_POOL_WARN_BELOW = 150       # vrije namen; bij ~30/week is dat ~5 weken
+# De echte lijst had 1.428 namen op 2026-09-17 (test_the_real_pool_is_large_and_clean
+# bewaakt de repo-kopie). Minder op de droplet = een OUDE kopie, geen lege poel:
+# van 17 t/m 30 sep telde de droplet op een names.ts van 10 juni (279 namen) en
+# meldde na elke deploy 'pool bijna leeg' terwijl er 1.003 van de 1.425 vrij waren.
+NAME_POOL_MIN_EXPECTED = 1400
+# 'Al gewaarschuwd' op DISK: het proces herstart bij elke deploy (os._exit in
+# api_update), dus een dict in het geheugen gaf ~15 min na iedere deploy dezelfde
+# ping opnieuw (22 valse pings sinds 17 sep, 3 op 30 sep).
+NAME_POOL_STATE_PATH = os.path.join(_BASE_DIR, 'name_pool_watch.json')
+_NAME_POOL_SYNC_TTL = 6 * 3600
 _NAME_POOL_LAST = {'at': 0.0, 'status': None, 'warned_free': None}
+_NAME_POOL_SYNC = {'at': 0.0, 'result': None}
 _NAME_SLUG_MAP = {'ø': 'o', 'æ': 'ae', 'å': 'a', 'ä': 'a', 'ö': 'o', 'ü': 'u', 'ß': 'ss', 'œ': 'oe',
                   'ð': 'd', 'þ': 'th', 'ł': 'l'}
 
@@ -10908,20 +11105,87 @@ def _name_slug(text):
     return re.sub(r'[^a-z0-9]+', '-', ''.join(c for c in t if not unicodedata.combining(c))).strip('-')
 
 
+def _name_pool_parse(text):
+    """The WOMEN_NAMES list out of names.ts source text. [] when not found."""
+    m = re.search(r'WOMEN_NAMES\s*=\s*\[(.*?)\];', text or '', re.S)
+    if not m:
+        return []
+    # Commentaar eerst weg: daar staan ook woorden tussen aanhalingstekens
+    # ('de terugval deelde "Berit 2" uit') en die zijn geen poolnamen.
+    return re.findall(r'"([^"]+)"', re.sub(r'//[^\n]*', '', m.group(1)))
+
+
 def _name_pool_names(path=None):
     """The WOMEN_NAMES list parsed out of names.ts. [] when unreadable."""
     try:
         with open(path or NAMES_TS_PATH, encoding='utf-8') as f:
-            ts = f.read()
-        m = re.search(r'WOMEN_NAMES\s*=\s*\[(.*?)\];', ts, re.S)
-        if not m:
-            return []
-        # Commentaar eerst weg: daar staan ook woorden tussen aanhalingstekens
-        # ('de terugval deelde "Berit 2" uit') en die zijn geen poolnamen.
-        return re.findall(r'"([^"]+)"', re.sub(r'//[^\n]*', '', m.group(1)))
+            return _name_pool_parse(f.read())
     except Exception as e:
         print(f'[names] pool unreadable: {e}')
         return []
+
+
+def _write_file_atomic(path, content):
+    """bytes → path via .tmp + os.replace, so a reader never sees half a file."""
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'wb') as f:
+        f.write(content)
+    os.replace(tmp, path)
+
+
+def _name_pool_sync():
+    """Bring the droplet's names.ts in line with GitHub main (what Netlify builds,
+    so what the live frontend hands out). Returns {'source', 'remote_pool'}:
+    source 'github' = the local file now equals main, 'local' = not confirmed;
+    remote_pool = main's slug count, None when GitHub gave nothing usable.
+
+    Why: the self-updater never shipped names.ts, so the droplet counted on the
+    10 June list (279 names) from 17 to 30 Sep while main had 1.425. The first
+    boot after this fix repairs the file itself — the deploy that brings this
+    code is done by the OLD updater, which does not ship names.ts yet.
+
+    Guards: never from a dev machine or pytest (it would overwrite a branch that
+    is extending the list — the self-updater has the same rule); SHA-pinned
+    fetch, because the raw CDN serves a stale file off `main` now and then; and
+    never a SMALLER list over a bigger one, so a stale or broken answer cannot
+    shrink the pool. Never raises. Cached 6 h."""
+    now = time.time()
+    if _NAME_POOL_SYNC['result'] is not None and now - _NAME_POOL_SYNC['at'] < _NAME_POOL_SYNC_TTL:
+        return _NAME_POOL_SYNC['result']
+    result = {'source': 'local', 'remote_pool': None}
+    try:
+        if not _background_loops_allowed() or not GITHUB_RAW:
+            return result
+        sha, info = _resolve_commit_sha(), _github_api_repo()
+        base = f'https://raw.githubusercontent.com/{info[0]}/{info[1]}/{sha}' if sha and info else GITHUB_RAW
+        r = req.get(f'{base}/frontend/lib/names.ts', timeout=15,
+                    headers={'Cache-Control': 'no-cache', 'User-Agent': 'vionna-dashboard-updater'})
+        r.raise_for_status()
+        remote = _name_pool_parse(r.content.decode('utf-8'))
+        remote_slugs = {_name_slug(n) for n in remote}
+        if not remote_slugs:
+            print('[names] sync: no WOMEN_NAMES in GitHub names.ts — kept the local list')
+        else:
+            result['remote_pool'] = len(remote_slugs)
+            local = _name_pool_names()
+            local_slugs = {_name_slug(n) for n in local}
+            if remote == local:
+                result['source'] = 'github'
+            elif len(remote_slugs) >= len(local_slugs):
+                _write_file_atomic(NAMES_TS_PATH, r.content)
+                result['source'] = 'github'
+                print(f'[names] sync: names.ts {len(local_slugs)} -> {len(remote_slugs)} names from GitHub')
+            else:
+                print(f'[names] sync: GitHub has {len(remote_slugs)} names, local {len(local_slugs)} '
+                      f'— refused to shrink the list')
+    except Exception as e:
+        print(f'[names] sync failed: {e}')
+    # a failed or unreached fetch is retried after 10 min, not 6 h: one GitHub
+    # blip at boot must not leave the old list in place for the rest of the day
+    ttl_now = _NAME_POOL_SYNC_TTL if result['remote_pool'] is not None or not _background_loops_allowed() else 600
+    _NAME_POOL_SYNC.update({'at': now - (_NAME_POOL_SYNC_TTL - ttl_now), 'result': result})
+    return result
 
 
 def _store_titles(store):
@@ -10945,9 +11209,13 @@ def _store_titles(store):
 
 
 def _name_pool_status(titles_by_store=None, pool=None):
-    """{pool, free, in_use, numbered, stores_failed, low}. `titles_by_store` and
-    `pool` are injectable for tests."""
-    pool = pool if pool is not None else _name_pool_names()
+    """{pool, free, in_use, numbered, stores_failed, low, pool_source, remote_pool,
+    pool_stale}. `titles_by_store` and `pool` are injectable for tests."""
+    injected = pool is not None
+    sync = {'source': 'injected', 'remote_pool': None}
+    if not injected:
+        sync = _name_pool_sync()
+        pool = _name_pool_names()
     failed, titles = [], []
     if titles_by_store is None:
         titles_by_store = {}
@@ -10965,10 +11233,19 @@ def _name_pool_status(titles_by_store=None, pool=None):
     pool_slugs = {_name_slug(n) for n in pool}
     free = len(pool_slugs - used)
     numbered = sorted({t for t in titles if re.search(r'\s\d{1,2}$', t.strip())})
+    # Gemeten op de lijst die we ECHT gebruiken (na de sync), niet op de grootte
+    # ervoor — anders heet een net gerepareerde 1.425-lijst 'verouderd'. Zonder
+    # GitHub-antwoord geldt de ondergrens; een geïnjecteerde testpoel niet.
+    remote_pool = sync.get('remote_pool')
+    pool_stale = ((bool(remote_pool) and len(pool_slugs) < remote_pool)
+                  or (remote_pool is None and not injected and len(pool_slugs) < NAME_POOL_MIN_EXPECTED))
     return {'pool': len(pool_slugs), 'free': free, 'in_use': len(used), 'numbered_names': numbered[:40],
             'stores_failed': failed, 'warn_below': NAME_POOL_WARN_BELOW,
             # Onbekend is geen 'genoeg': met een mislukte winkel is `free` te hoog.
-            'low': bool(pool_slugs) and not failed and free < NAME_POOL_WARN_BELOW,
+            # En een twijfelachtige lijst is geen oordeel: 'low' alleen op een
+            # actuele lijst (storing ≠ oordeel).
+            'low': bool(pool_slugs) and not failed and not pool_stale and free < NAME_POOL_WARN_BELOW,
+            'pool_source': sync.get('source'), 'remote_pool': remote_pool, 'pool_stale': bool(pool_stale),
             'checked_at': datetime.datetime.utcnow().isoformat() + 'Z'}
 
 
@@ -10985,30 +11262,96 @@ def api_name_pool_status():
     return jsonify(st)
 
 
+def _name_pool_state_load():
+    """The watch's 'already warned' state. The file wins; the in-memory copy is
+    only the fallback when the file cannot be read (then we dedupe per process,
+    the old behaviour, instead of pinging on every check)."""
+    try:
+        with open(NAME_POOL_STATE_PATH, encoding='utf-8') as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            return d
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f'[names] watch state unreadable: {e}')
+    return dict(_NAME_POOL_LAST.get('state') or {})
+
+
+def _name_pool_state_save(state):
+    _NAME_POOL_LAST['state'] = dict(state)
+    _NAME_POOL_LAST['warned_free'] = state.get('warned_free')
+    try:
+        _write_file_atomic(NAME_POOL_STATE_PATH, json.dumps(state, ensure_ascii=False).encode('utf-8'))
+    except Exception as e:
+        print(f'[names] could not save watch state: {e}')
+
+
 def _name_pool_watch_once():
     """One daily check: Slack ping when the pool is low or a numbered name shows
-    up. Pings again only when it got WORSE, not every day."""
+    up. Pings again only when it got WORSE, not every day — and not after every
+    restart: the state lives in NAME_POOL_STATE_PATH."""
     st = _name_pool_status()
     _NAME_POOL_LAST.update({'at': time.time(), 'status': st})
-    if st['stores_failed'] or not st['pool']:
-        return st
-    worse = _NAME_POOL_LAST['warned_free'] is None or st['free'] <= _NAME_POOL_LAST['warned_free'] - 25
-    if (st['low'] and worse) or (st['numbered_names'] and _NAME_POOL_LAST['warned_free'] is None):
-        bits = [f":label: *Product-name pool*: {st['free']} of {st['pool']} names still free "
-                f"({st['in_use']} in use across DK/FR/FI)."]
-        if st['free'] == 0:
-            bits.append("The pool is EMPTY — the dashboard is now making names up. Extend `frontend/lib/names.ts`.")
-        elif st['low']:
-            bits.append(f"Below the {NAME_POOL_WARN_BELOW} mark — extend `frontend/lib/names.ts` before it runs out.")
-        if st['numbered_names']:
-            bits.append("Numbered names in the stores: " + ', '.join(st['numbered_names'][:12]))
-        _blog_slack('\n'.join(bits))
-        _NAME_POOL_LAST['warned_free'] = st['free']
+    state = _name_pool_state_load()
+    before = dict(state)
+    # A list that is older or smaller than main's gets its OWN message, once per
+    # (local, GitHub) pair, and never the 'extend names.ts' advice: on 30 Sep
+    # that advice pointed at a list that already had 1.003 free names.
+    if st.get('pool_stale'):
+        pair = [st['pool'], st.get('remote_pool')]
+        if state.get('stale_warned_pool') != pair:
+            if st.get('remote_pool'):
+                why = (f"GitHub main has {st['remote_pool']}, so the droplet's copy of the list is outdated "
+                       f"and could not be refreshed")
+            else:
+                why = (f"expected at least {NAME_POOL_MIN_EXPECTED}, and GitHub could not be reached to compare "
+                       f"— the droplet's copy of the list is probably outdated")
+            _blog_slack(f":warning: *Product-name pool*: the droplet's `frontend/lib/names.ts` has only "
+                        f"{st['pool']} names ({why}). The free-name count is NOT a verdict until the droplet "
+                        f"has the current list — don't add names on the strength of it; check the self-updater.")
+            state['stale_warned_pool'] = pair
+    if st['pool'] and not st['stores_failed']:
+        wf = state.get('warned_free')
+        worse = st['low'] and (wf is None or state.get('warned_pool') != st['pool']
+                               or st['free'] <= wf - 25 or (st['free'] == 0 and wf != 0))
+        seen = set(state.get('warned_numbered') or [])
+        new_numbered = [n for n in st['numbered_names'] if n not in seen]
+        if worse or new_numbered:
+            if st.get('pool_stale'):
+                bits = [":label: *Product-name pool*: numbered names showed up in the stores."]
+            else:
+                bits = [f":label: *Product-name pool*: {st['free']} of {st['pool']} names still free "
+                        f"({st['in_use']} in use across DK/FR/FI)."]
+            if st['low'] and st['free'] == 0:
+                bits.append("The pool is EMPTY — the dashboard is now making names up. Extend `frontend/lib/names.ts`.")
+            elif st['low']:
+                bits.append(f"Below the {NAME_POOL_WARN_BELOW} mark — extend `frontend/lib/names.ts` before it runs out.")
+            if st['numbered_names']:
+                bits.append("Numbered names in the stores: " + ', '.join(st['numbered_names'][:12]))
+            _blog_slack('\n'.join(bits))
+            if worse:
+                state['warned_free'], state['warned_pool'] = st['free'], st['pool']
+            state['warned_numbered'] = sorted(seen | set(st['numbered_names']))
+        if not st['low']:
+            # Only the low marker re-arms: a later drop must warn again, but the
+            # stale marker stays so the 'outdated list' message is not repeated.
+            state['warned_free'] = None
+    if state != before:
+        _name_pool_state_save(state)
     return st
 
 
 def _name_pool_watch_loop():
-    time.sleep(900)
+    # Repair the list at boot, before the first check. After 60 s: this thread
+    # starts halfway through importing server.py, before GITHUB_RAW and the
+    # updater helpers further down exist.
+    time.sleep(60)
+    try:
+        _name_pool_sync()
+    except Exception as e:
+        print(f'[names] boot sync error: {e}')
+    time.sleep(840)
     while True:
         try:
             _name_pool_watch_once()
@@ -20126,7 +20469,6 @@ def api_update():
         return jsonify({'error': 'Unauthorized — /api/update is local-only or requires a valid token'}), 401
     if not GITHUB_RAW:
         return jsonify({'error': 'GITHUB_RAW not configured'}), 400
-    base_dir = os.path.dirname(os.path.abspath(__file__))
 
     # Resolve an IMMUTABLE source before fetching. A ?t=<ts> cache-bust is useless
     # here — raw.githubusercontent.com ignores query strings for its cache key — so
@@ -20142,30 +20484,70 @@ def api_update():
         fetch_base = GITHUB_RAW
         pinned = False
 
-    # Pull from backend/ on GitHub, save locally next to the running server.py.
-    # NOTE: every .py module the server imports MUST be in this list — otherwise
-    # deploys silently ship a stale module (bit us with shipping_check v1.177).
-    files_to_update = ['index.html', 'server.py', 'shipping_check.py', 'version.txt']
-    updated = []
-    errors  = []
-    for fname in files_to_update:
+    # Fetch EVERYTHING first, write only when every fetch succeeded, version.txt
+    # last. Writing each file as it arrived let version.txt move on while another
+    # file had failed, and the updater then never retried the missing one.
+    fetched, errors, warnings = [], [], []
+    for repo_path, dest in _updater_files():
         try:
-            r = req.get(f'{fetch_base}/backend/{fname}', timeout=15,
+            r = req.get(f'{fetch_base}/{repo_path}', timeout=15,
                         headers={'Cache-Control': 'no-cache',
                                  'User-Agent': 'vionna-dashboard-updater'})
             r.raise_for_status()
-            dest = os.path.join(base_dir, fname)
-            with open(dest, 'wb') as f:
-                f.write(r.content)
-            updated.append(fname)
+            fetched.append((repo_path, dest, r.content))
         except Exception as e:
-            errors.append(f'{fname}: {e}')
-
+            if repo_path in _UPDATER_OPTIONAL:
+                # A data file that is gone or moved on main (404) must never
+                # stop code deploys for good — including the one that fixes it.
+                warnings.append(f'{repo_path}: {e}')
+                continue
+            errors.append(f'{repo_path}: {e}')
     if errors:
-        return jsonify({'success': False, 'updated': updated, 'errors': errors,
+        return jsonify({'success': False, 'updated': [], 'errors': errors, 'warnings': warnings,
                         'sha': sha, 'pinned': pinned}), 500
 
-    # Schedule restart after response is sent
+    updated = []
+    for repo_path, dest, content in fetched:
+        try:
+            _write_file_atomic(dest, content)
+            updated.append(repo_path)
+        except Exception as e:
+            if repo_path in _UPDATER_OPTIONAL:
+                # A data file must never hold a code deploy hostage: if names.ts
+                # can't be written the new code still ships; the boot sync
+                # retries it and the name-pool status reports the list as stale.
+                warnings.append(f'{repo_path}: {e}')
+                print(f'[self-update] could not write {repo_path}: {e} — continuing')
+                continue
+            # Stop before version.txt: the next tick sees the old version and retries.
+            return jsonify({'success': False, 'updated': updated, 'errors': [f'{repo_path}: {e}'],
+                            'sha': sha, 'pinned': pinned}), 500
+
+    _schedule_restart()
+    return jsonify({'success': True, 'updated': updated, 'restarting': True, 'warnings': warnings,
+                    'sha': sha, 'pinned': pinned})
+
+
+# Files whose write may fail without failing the deploy (data, not code).
+_UPDATER_OPTIONAL = {'frontend/lib/names.ts'}
+
+
+def _updater_files():
+    """(repo path, local destination) of every file the self-updater ships,
+    version.txt LAST (it is what tells the updater it is done).
+    NOTE: every .py module server.py imports and every repo file it reads at
+    runtime MUST be in this list, or deploys silently keep a stale copy — bit us
+    with shipping_check (v1.177) and with names.ts (the droplet counted the name
+    pool on the 10 June list until 30 Sep 2026). test_name_pool checks both."""
+    return [('backend/index.html', os.path.join(_BASE_DIR, 'index.html')),
+            ('backend/server.py', os.path.join(_BASE_DIR, 'server.py')),
+            ('backend/shipping_check.py', os.path.join(_BASE_DIR, 'shipping_check.py')),
+            ('frontend/lib/names.ts', NAMES_TS_PATH),
+            ('backend/version.txt', VERSION_FILE)]
+
+
+def _schedule_restart():
+    """Restart the process shortly after the update response has been sent."""
     def _restart():
         import time, subprocess
         time.sleep(1.5)
@@ -20181,8 +20563,6 @@ def api_update():
 
     import threading
     threading.Thread(target=_restart, daemon=True).start()
-    return jsonify({'success': True, 'updated': updated, 'restarting': True,
-                    'sha': sha, 'pinned': pinned})
 
 
 # ── Meta Ads ──────────────────────────────────────────────────────────────────
@@ -21475,6 +21855,52 @@ def _blog_ensure_author_page(store, hdrs):
 
 BLOG_BESTSELLER_TITLEKW = {'dk': 'mest elskede styles lige nu', 'fr': 'styles préférés du moment',
                            'fi': 'rakastetuimmat tyylit juuri nyt'}
+# Fixed marker on every bestsellers article. Until 30 Sep 2026 only a history row
+# with source='bestsellers' said "this month's piece exists"; an article that got
+# into the store without one (laptop run, or a create whose bookkeeping never ran)
+# came back as source='shopify-sync' and the topic stayed due.
+BLOG_BESTSELLER_TAG = 'vionna-bestsellers'
+
+# Handle transliteration: Danish/Finnish/French letters must not fall out of a
+# slug. The writer sanitiser dropped them ('de-sko-der-l-fter-ethvert-outfit').
+_BLOG_SLUG_MAP = {'æ': 'ae', 'ø': 'oe', 'å': 'aa', 'ä': 'a', 'ö': 'o', 'ü': 'u', 'ß': 'ss',
+                  'œ': 'oe', 'ð': 'd', 'þ': 'th', 'ł': 'l'}
+
+
+def _blog_slug(text):
+    """URL slug for an article handle: lowercase ascii with hyphens. Nordic letters
+    are transliterated (æ→ae, ø→oe, å→aa, ä→a, ö→o), accents fold (é→e, ç→c)."""
+    t = ''.join(_BLOG_SLUG_MAP.get(c, c) for c in (text or '').lower())
+    t = ''.join(c for c in unicodedata.normalize('NFKD', t) if not unicodedata.combining(c))
+    return re.sub(r'[^a-z0-9]+', '-', t).strip('-')[:80].strip('-')
+
+
+def _blog_is_article_row(row):
+    """A history row that stands for a created article (not a maintenance or
+    refresh note about an existing one)."""
+    return bool(row.get('article_id')) and not row.get('maint') and not row.get('refresh')
+
+
+def _blog_is_bestsellers(store, row, strict=False):
+    """Is this history row or Shopify article the store's monthly bestsellers
+    piece? Our own log, the fixed tag, or the keyword slug in the handle all
+    count, so a row that only came back via the Shopify sync counts too."""
+    if row.get('source') == 'bestsellers' or (row.get('levers') or {}).get('format') == 'bestsellers':
+        return True
+    tags = row.get('tags') or []
+    if isinstance(tags, str):
+        tags = tags.split(',')
+    if BLOG_BESTSELLER_TAG in {str(t).strip().lower() for t in tags}:
+        return True
+    kw = _blog_slug(BLOG_BESTSELLER_TITLEKW.get(store) or '')
+    handle = (row.get('article_handle') or row.get('handle') or '').lower()
+    if not (kw and handle):
+        return False
+    if strict:
+        # retiring UNPUBLISHES: only a handle that starts with the keyword slug
+        # (the real ones do: '-2', '-vionna'), never one that merely contains it
+        return handle == kw or handle.startswith(kw + '-')
+    return f'-{kw}-' in f'-{handle}-'
 
 
 def _blog_bestsellers_topic(store, hdrs, n=5):
@@ -21484,8 +21910,7 @@ def _blog_bestsellers_topic(store, hdrs, n=5):
     month = datetime.datetime.utcnow().strftime('%Y-%m')
     for r in _blog_read_jsonl(BLOG_HISTORY_PATH):
         if (r.get('store') == store and (r.get('ts') or '').startswith(month)
-                and (r.get('source') == 'bestsellers'
-                     or (r.get('levers') or {}).get('format') == 'bestsellers')):
+                and _blog_is_article_row(r) and _blog_is_bestsellers(store, r)):
             return None
     since = (datetime.datetime.utcnow() - datetime.timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
     counts = {}
@@ -21661,6 +22086,10 @@ def _blog_article_jsonld(store, art):
     except Exception:
         return ''
 BLOG_HISTORY_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blog_history.jsonl')
+# Failed runs get their own file: DK missed 6 slots in a row (11-29 Sep 2026) and
+# nothing on disk said why — only successes were logged. NOT blog_history.jsonl:
+# _blog_store_posted_on counts every row there as "posted today".
+BLOG_FAILURES_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blog_failures.jsonl')
 BLOG_VIEWS_PATH     = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blog_views.json')
 _BLOG_VIEWS_LOCK    = threading.Lock()
 BLOG_PERF_PATH      = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blog_performance.jsonl')
@@ -22065,6 +22494,21 @@ def _blog_log(store, topic, article):
             }, ensure_ascii=False) + '\n')
     except Exception as e:
         print(f"[blog] history write failed: {e}")
+
+
+def _blog_record_failure(store, topic_keyword, step, error):
+    """Append one failed attempt to blog_failures.jsonl (why + which topic).
+    2026-09: DK failed 6 slots on the same 422 and only 2 one-off Slack lines
+    ever said so; a restart wiped the in-memory _BLOG_LAST. Never raises."""
+    try:
+        with open(BLOG_FAILURES_PATH, 'a', encoding='utf-8') as f:
+            f.write(json.dumps({
+                'ts': datetime.datetime.utcnow().isoformat() + 'Z',
+                'store': store, 'topic': topic_keyword, 'step': step,
+                'error': str(error)[:400],
+            }, ensure_ascii=False) + '\n')
+    except Exception as e:
+        print(f"[blog] failure log write failed: {e}")
 
 
 # ============================================================================
@@ -22795,15 +23239,100 @@ def _blog_repetition_violations(body, prev_texts, min_words=BLOG_REPEAT_SHINGLE,
             f"rewrite it completely in different words: \"{h[:180]}\"" for h in hits[:max_hits]]
 
 
+# Output format + budget (incident 29 Sep 2026: the FI Tuesday article never
+# appeared, Slack only said 'writer failed'). The writer returned its ~10k-char
+# HTML article as ONE string inside hand-written JSON, which broke two ways with
+# no retry: cut off at the fixed 4,500-token cap (Finnish ~4.8 tokens/word, the
+# pillar/SERP targets grew to 1,400 words on 22 Jul, the cap never followed),
+# and an unescaped quote inside the HTML ('"half tuck"', 'href=\"/blogs/..">')
+# even on a clean end_turn — 5 of 12 reproduced FI pillar calls were unusable.
+# A forced tool call makes the API hand back a parsed dict (it owns the escaping),
+# and stop_reason tells truncation apart from everything else.
+BLOG_TOKENS_PER_WORD = {'fi': 4.8, 'dk': 3.2, 'fr': 2.8}   # measured 30-09-2026 on writer output
+BLOG_WRITER_MAX_TOKENS = 16000     # same ceiling as the editor (non-streaming stays under the SDK timeout)
+
+
+def _blog_writer_budget(store, wc_target):
+    """Output-token cap for one article: target words × tokens/word for this
+    language + 20% slack + room for the metadata. Billing is per generated
+    token, so a generous cap costs nothing extra; a tight one loses the day."""
+    return max(6000, min(BLOG_WRITER_MAX_TOKENS,
+                         int(wc_target * 1.2 * BLOG_TOKENS_PER_WORD.get(store, 3.5)) + 1500))
+
+
+def _blog_tool(name, description, props, required=None):
+    """Tool definition for one forced structured answer (all string fields
+    unless props says otherwise)."""
+    return {'name': name, 'description': description,
+            'input_schema': {'type': 'object', 'properties': props,
+                             'required': list(required or props)}}
+
+
+_BLOG_TAGS_PROP = {'type': 'array', 'items': {'type': 'string'}}
+# No 'faq' array: the FAQ already lives in body_html (<h2>/<h3>/<p>) and
+# _blog_faq_from_body reads it from there — the duplicate cost ~1k tokens per
+# FI article and only raised the truncation risk.
+BLOG_ARTICLE_TOOL = _blog_tool(
+    'article', 'Deliver the finished blog article.',
+    {'title': {'type': 'string'},
+     'handle': {'type': 'string', 'description': 'url slug: lowercase ascii, hyphens, no year'},
+     'meta_description': {'type': 'string'},
+     'excerpt': {'type': 'string'},
+     'tags': _BLOG_TAGS_PROP,
+     'body_html': {'type': 'string', 'description': 'the complete article as HTML, FAQ section included'}})
+BLOG_EDITED_TOOL = _blog_tool(
+    'edited_article', 'Deliver the corrected article.',
+    {'title': {'type': 'string'}, 'meta_description': {'type': 'string'},
+     'excerpt': {'type': 'string'}, 'tags': _BLOG_TAGS_PROP,
+     'body_html': {'type': 'string', 'description': 'the complete corrected article as HTML'}})
+BLOG_REFRESH_TOOL = _blog_tool(
+    'updated_body', 'Deliver the strengthened article body.',
+    {'body_html': {'type': 'string', 'description': 'the complete updated article as HTML'}})
+BLOG_MAINT_TOOL = _blog_tool(
+    'maintained_article', 'Deliver the improved article.',
+    {'title': {'type': 'string'}, 'meta_description': {'type': 'string'},
+     'body_html': {'type': 'string', 'description': 'the complete improved article as HTML'},
+     'changes': {'type': 'array', 'items': {'type': 'string'},
+                 'description': 'short note per change'}})
+
+
+def _blog_llm_tool(client, prompt, tool, max_tokens, need=('body_html',), model='claude-sonnet-4-6'):
+    """ONE forced tool call. Returns (input_dict, None, msg) on success, else
+    (None, why, msg): why names the real failure — truncation, no tool block or
+    an empty required field (each with stop_reason + output tokens), or the API
+    exception — never just 'no JSON'. Never raises."""
+    try:
+        msg = client.messages.create(model=model, max_tokens=max_tokens, tools=[tool],
+                                     tool_choice={'type': 'tool', 'name': tool['name']},
+                                     messages=[{'role': 'user', 'content': prompt}])
+    except Exception as e:
+        return None, f"API error {type(e).__name__}: {str(e)[:160]}", None
+    stop = getattr(msg, 'stop_reason', None)
+    used = getattr(getattr(msg, 'usage', None), 'output_tokens', None)
+    ctx = f"stop_reason={stop}, {used} output tokens, max_tokens={max_tokens}"
+    if stop == 'max_tokens':
+        return None, f"output cut off at max_tokens ({ctx})", msg
+    block = next((b for b in (getattr(msg, 'content', None) or [])
+                  if getattr(b, 'type', None) == 'tool_use'), None)
+    data = getattr(block, 'input', None)
+    if not isinstance(data, dict):
+        return None, f"no '{tool['name']}' tool call in the answer ({ctx})", msg
+    empty = [k for k in need if not str(data.get(k) or '').strip()]
+    if empty:
+        return None, f"tool answer has empty {', '.join(empty)} ({ctx})", msg
+    return data, None, msg
+
+
 def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns=None,
                 serp_brief=None, fmt=None, avoid_phrases=None):
     """Claude writes the SEO article in the store's language. Returns a dict:
-    {title, handle, meta_description, excerpt, tags[], body_html, faq[]}. None on
-    failure. avoid: QA findings from a rejected earlier attempt (rewrite mode).
+    {title, handle, meta_description, excerpt, tags[], body_html, faq[]}, or
+    {'error': why} on failure (why = the real reason, for Slack and the logs).
+    avoid: QA findings from a rejected earlier attempt (rewrite mode).
     faq_questions: real question-style searches to build the FAQ section from.
     concerns: real consumer doubts from fashion forums (English) to address."""
     if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
-        return None
+        return {'error': 'no Anthropic API key configured'}
     lang = DFS_LANG_NAME.get(store, 'Danish')
     kw = topic.get('keyword') or ''
     cluster = [c for c in (topic.get('cluster') or []) if c]
@@ -22941,36 +23470,38 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns
         f"8. tags: 2-3 short {lang} topical tags, never more (they are data for archive pages, "
         "not shown on the storefront cards).\n"
         "9. handle: url slug from the title, lowercase, ascii, hyphens, NO year.\n\n"
-        "Return ONLY compact JSON with EXACTLY these keys: "
-        '{"title": "...", "handle": "...", "meta_description": "...", "excerpt": "...", '
-        '"tags": ["..."], "body_html": "...", '
-        '"faq": [{"q": "plain-text question", "a": "plain-text answer"}]}'
+        "Deliver the article by calling the `article` tool with: title, handle, meta_description, "
+        "excerpt, tags and body_html (the complete HTML article, the FAQ section from requirement 4 "
+        "included)."
     )
+    # Budget per language, and ONE retry at the full ceiling on ANY failure: a
+    # fresh sample succeeds in ~75% of the cases, so one bad answer no longer
+    # burns one of the scheduler's only 2 attempts per store per day.
+    caps = (_blog_writer_budget(store, wc_target), BLOG_WRITER_MAX_TOKENS)
+    data, whys, used_cap, msg = None, [], None, None
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=4500,
-                                      messages=[{'role': 'user', 'content': prompt}])
-        txt = (msg.content[0].text if msg.content else '') or ''
-        data = _blog_first_json(txt)
-        if data is None:
-            print(f"[blog] writer returned no JSON: {txt[:150]}")
-            return None
     except Exception as e:
-        print(f"[blog] writer failed: {e}")
-        return None
+        return {'error': f"API client error {type(e).__name__}: {str(e)[:160]}"}
+    for cap in caps:
+        data, why, msg = _blog_llm_tool(client, prompt, BLOG_ARTICLE_TOOL, cap, need=('title', 'body_html'))
+        if data is not None:
+            used_cap = cap
+            break
+        whys.append(why)
+        print(f"[blog] {store}: writer attempt {len(whys)}/{len(caps)} failed "
+              f"({lang}, target {wc_target} words): {why}")
+    if data is None:
+        return {'error': ' | retry: '.join(whys) + f" [{lang}, target {wc_target} words]"}
     # sanitise
     tags = data.get('tags') or []
     if isinstance(tags, str):
         tags = [t.strip() for t in tags.split(',') if t.strip()]
-    faq = []
-    for f in (data.get('faq') or [])[:5]:
-        if isinstance(f, dict) and (f.get('q') or '').strip() and (f.get('a') or '').strip():
-            faq.append({'q': re.sub(r'<[^>]+>', '', f['q']).strip()[:200],
-                        'a': re.sub(r'<[^>]+>', '', f['a']).strip()[:600]})
-    handle = re.sub(r'[^a-z0-9]+', '-', (data.get('handle') or data.get('title') or 'post').lower()).strip('-')[:80]
+    handle = _blog_slug(data.get('handle') or data.get('title') or 'post')
     title = (data.get('title') or '').strip()[:120]
     body = data.get('body_html') or ''
+    faq = _blog_faq_from_body(store, body)
     # Levers — the writing knobs the feedback loop later correlates with performance.
     words = len(re.findall(r"[\wÀ-ÿ]+", re.sub(r'<[^>]+>', ' ', body)))
     levers = {
@@ -22994,6 +23525,10 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns
         'product_cards': True,
         'format': ('bestsellers' if topic.get('source') == 'bestsellers'
                    else 'pillar' if topic.get('pillar') else fmt),
+        # headroom per article: FI sat at 90-96% of the old cap for weeks unnoticed
+        'writer_output_tokens': getattr(getattr(msg, 'usage', None), 'output_tokens', None),
+        'writer_max_tokens': used_cap,
+        'writer_retried': bool(whys),
     }
     return {
         'title': title,
@@ -23242,20 +23777,18 @@ def _blog_edit(store, art, products=None, violations=None):
         f"EXCERPT: {art.get('excerpt')}\n"
         f"TAGS: {json.dumps(art.get('tags'), ensure_ascii=False)}\n"
         f"BODY_HTML:\n{art.get('body_html')}\n\n"
-        "Return ONLY compact JSON: {\"title\": \"...\", \"meta_description\": \"...\", "
-        "\"excerpt\": \"...\", \"tags\": [\"...\"], \"body_html\": \"...\"}"
+        "Deliver the corrected article by calling the `edited_article` tool with: title, "
+        "meta_description, excerpt, tags and body_html (the complete corrected HTML)."
     )
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=16000,
-                                      messages=[{'role': 'user', 'content': prompt}])
-        txt = (msg.content[0].text if msg.content else '') or ''
-        data = _blog_first_json(txt)
+        # forced tool call: the full HTML body no longer travels as a hand-escaped
+        # JSON string (see BLOG_TOKENS_PER_WORD for the 29 Sep incident)
+        data, why, _msg = _blog_llm_tool(client, prompt, BLOG_EDITED_TOOL, 16000)
         if data is None:
-            # usually output-cap truncation (the editor must echo the FULL body);
             # keeping the writer version is safe but skips the fixes
-            print('[blog] editor returned no JSON; keeping writer version')
+            print(f'[blog] editor unusable ({why}); keeping writer version')
             return art
         body = data.get('body_html') or ''
         # Safety: the edit must not lose product links; if it did, keep the original.
@@ -23280,8 +23813,90 @@ def _blog_edit(store, art, products=None, violations=None):
         return art
 
 
+class _BlogCreateRejected(RuntimeError):
+    """Shopify refused THIS article (a content-level 4xx such as a 422 on a
+    field). Unlike auth/scope errors, 429 or 5xx, another topic can still work."""
+
+    def __init__(self, msg, status=None):
+        super().__init__(msg)
+        self.status = status
+
+
+# 4xx codes that are about the store or the moment, not about this article: a
+# different topic hits them just the same, so they never trigger a fall-through.
+_BLOG_STORE_LEVEL_4XX = (401, 402, 403, 404, 408, 423, 429)
+
+
+def _blog_existing_handles(store, blog_id, hdrs):
+    """Every article in the journal blog (any status) as {handle: article}, with
+    Link pagination. None when the listing fails — an unreadable list is NOT an
+    empty one, so callers must not treat it as 'every handle is free'."""
+    url = shopify_url(store, f'blogs/{blog_id}/articles.json?published_status=any'
+                             '&fields=id,handle,title,tags,created_at&limit=250')
+    out = {}
+    try:
+        while url:
+            r = _shopify_call('get', url, hdrs, timeout=30)
+            if r.status_code != 200:
+                print(f"[blog] {store}: article handle list HTTP {r.status_code}")
+                return None
+            for a in (r.json().get('articles') or []):
+                h = (a.get('handle') or '').lower()
+                if h:
+                    out[h] = a
+            m = re.search(r'<([^>]+)>;\s*rel="next"', r.headers.get('Link') or '')
+            url = m.group(1) if m else None
+    except Exception as e:
+        print(f"[blog] {store}: article handle list failed: {e}")
+        return None
+    return out
+
+
+def _blog_unique_handle(handle, title, taken):
+    """A handle that is free in this blog. The writer derives the handle from the
+    title, so a fixed keyword gives the same slug every time: DK's monthly
+    bestsellers piece came back as 'mest-elskede-styles-lige-nu', taken since
+    24 Jul 2026, and Shopify refused 6 slots in a row with 422 'handle has
+    already been taken'. Order: the writer's handle if free → the full title
+    re-slugged (transliterated) → handle-2, -3, … (unbounded: a monthly piece
+    converges on the same slug, a cap would only move the 422 a year out)."""
+    base = _blog_slug(handle) or _blog_slug(title) or 'post'
+    if base not in taken:
+        return base
+    alt = _blog_slug(title)
+    if alt and alt not in taken:
+        return alt
+    n = 2
+    while f'{base}-{n}' in taken:
+        n += 1
+    return f'{base}-{n}'
+
+
+def _blog_handle_taken(resp):
+    """Shopify's 422 for a duplicate handle: {"errors": {"handle": [...]}}."""
+    if resp.status_code != 422:
+        return False
+    try:
+        errs = (resp.json() or {}).get('errors')
+    except Exception:
+        errs = None
+    if isinstance(errs, dict):
+        return 'handle' in errs
+    return 'handle' in str(errs or resp.text or '').lower()
+
+
+def _blog_jsonld_retarget(body, handle):
+    """Point the Article JSON-LD's mainEntityOfPage at `handle` — the body is
+    assembled before the create call, so a handle change there must follow."""
+    return re.sub(r'("mainEntityOfPage":\s*"[^"]*/blogs/%s/)[^"]*"' % re.escape(BLOG_HANDLE),
+                  lambda m: m.group(1) + handle + '"', body or '')
+
+
 def _blog_create_article(store, blog_id, art, hdrs, published=False, featured_img=None):
-    """Create the Shopify article (DRAFT by default) with SEO metafields + image."""
+    """Create the Shopify article (DRAFT by default) with SEO metafields + image.
+    A 422 on the handle (another run took it between our check and this POST)
+    is re-resolved and retried ONCE; any other content-level 4xx raises
+    _BlogCreateRejected, everything else a plain RuntimeError."""
     article = {
         'title': art['title'],
         'author': BLOG_AUTHOR_STORE.get(store, BLOG_AUTHOR),
@@ -23304,8 +23919,19 @@ def _blog_create_article(store, blog_id, art, hdrs, published=False, featured_im
         article['image'] = {'src': featured_img, 'alt': art['title']}
     r = _shopify_call('post', shopify_url(store, f'blogs/{blog_id}/articles.json'), hdrs,
                       json={'article': article}, timeout=30)
+    if art.get('handle') and _blog_handle_taken(r):
+        taken = set(_blog_existing_handles(store, blog_id, hdrs) or ()) | {art['handle']}
+        new = _blog_unique_handle(art['handle'], art['title'], taken)
+        print(f"[blog] {store}: handle '{art['handle']}' taken at create — retrying as '{new}'")
+        art['handle'] = article['handle'] = new
+        art['body_html'] = article['body_html'] = _blog_jsonld_retarget(article['body_html'], new)
+        r = _shopify_call('post', shopify_url(store, f'blogs/{blog_id}/articles.json'), hdrs,
+                          json={'article': article}, timeout=30)
     if r.status_code not in (200, 201):
-        raise RuntimeError(f'article create failed HTTP {r.status_code}: {r.text[:300]}')
+        msg = f'article create failed HTTP {r.status_code}: {r.text[:300]}'
+        if 400 <= r.status_code < 500 and r.status_code not in _BLOG_STORE_LEVEL_4XX:
+            raise _BlogCreateRejected(msg, status=r.status_code)
+        raise RuntimeError(msg)
     a = r.json().get('article') or {}
     shop = tokens.get(store, {}).get('shop') or STORES.get(store)
     return {
@@ -23426,15 +24052,20 @@ def _blog_faq_jsonld(faq):
 BLOG_READALSO = {'dk': 'Læs også', 'fr': 'À lire aussi', 'fi': 'Lue myös'}
 
 
-def _blog_related_links(store, category, hdrs, exclude_handle=None, max_links=3):
+def _blog_related_links(store, category, hdrs, exclude_handle=None, max_links=3,
+                        exclude_bestsellers=False):
     """'Read also' block linking this store's other PUBLISHED articles (same
     category first, then newest), each verified live (HTTP 200) so a parked
-    draft never gets linked. '' until at least 2 verified candidates exist."""
+    draft never gets linked. '' until at least 2 verified candidates exist.
+    exclude_bestsellers: a new bestsellers piece retires (301s) the earlier ones
+    to itself, so linking them would be a link back to the same page."""
     latest = {}
     for r in _blog_read_jsonl(BLOG_HISTORY_PATH):
         h = r.get('article_handle')
         if r.get('store') == store and h and h != exclude_handle:
             latest[h] = r     # file order = chronological; last row per handle wins
+    if exclude_bestsellers:
+        latest = {h: r for h, r in latest.items() if not _blog_is_bestsellers(store, r)}
     rows = [r for r in latest.values() if r.get('published')]
     rows.sort(key=lambda r: r.get('ts') or '', reverse=True)
     # pillar of this category first, then same-category spokes, then newest rest
@@ -23961,8 +24592,93 @@ def _blog_generate_one(store, topic=None, published=None):
             candidates.insert(0, bt)
         if not candidates:
             return {'store': store, 'error': 'no topics available (no DataForSEO + no fallback)'}
+        # Circuit breaker: a topic Shopify refused on two different days this
+        # month is not tried first a third time (each try is a full paid run).
+        blocked = _blog_topics_failing_create(store)
+        kept = [c for c in candidates if (c.get('keyword') or '').lower() not in blocked]
+        if kept and len(kept) < len(candidates):
+            print(f"[blog] {store}: skipping topic(s) refused at create this month: {sorted(blocked)}")
+            candidates = kept
     exclude = _blog_recent_product_handles(store)
-    topic, products = None, []
+    # One topic must not block a store: bestsellers sits at index 0 and takes
+    # every slot while it is due, so its 422 kept DK silent for 6 slots (Sep
+    # 2026). A content-level refusal is recorded and the next candidate gets
+    # the slot, bounded to BLOG_CREATE_FALLTHROUGH extra full runs.
+    remaining, rejection, pillar_fail = list(candidates), None, None
+    for attempt in range(1 + BLOG_CREATE_FALLTHROUGH):
+        topic, products = _blog_pick_topic(store, remaining, hdrs, exclude)
+        if topic is None:
+            break
+        try:
+            res = _blog_write_and_publish(store, topic, products, hdrs, published)
+        except _BlogCreateRejected as e:
+            e.topic_keyword, e.recorded = topic.get('keyword'), True
+            _blog_record_failure(store, topic.get('keyword'), 'create', e)
+            print(f"[blog] {store}: create refused for topic '{topic.get('keyword')}': {e}")
+            rejection = e
+            remaining = [c for c in remaining if c is not topic]
+            continue
+        # 29 Sep 2026: FI lost its Tuesday article on a PILLAR whose writer failed.
+        # A pillar is due by rule, not the day's only option, so it hands the slot
+        # to the next candidate (same bound as a refused create). Recorded right
+        # here: when the next topic succeeds, nothing downstream sees this failure.
+        rest = [c for c in remaining if c is not topic]
+        if (res.get('writer_failed') and topic.get('pillar') and rest
+                and attempt < BLOG_CREATE_FALLTHROUGH):
+            kw = topic.get('keyword')
+            _blog_record_failure(store, kw, 'writer', res['error'])
+            print(f"[blog] {store}: pillar '{kw}' writer failed ({res.get('writer_error')}) "
+                  f"— trying the next topic")
+            pillar_fail = {'keyword': kw, 'error': res.get('writer_error')}
+            remaining = rest
+            continue
+        return _blog_after_pillar_failure(store, res, pillar_fail)
+    if rejection is not None:
+        raise rejection
+    return _blog_after_pillar_failure(store, {
+        'store': store, 'topic': candidates[0],
+        'error': 'no candidate topic has enough genuinely fitting products'}, pillar_fail)
+
+
+# Extra topics tried in the same run after Shopify refuses an article or a due
+# pillar's writer fails (one shared budget). Each one is a full writer → editor
+# → QA → hero run, hence the bound.
+BLOG_CREATE_FALLTHROUGH = 1
+
+
+def _blog_after_pillar_failure(store, res, pillar_fail):
+    """Carry a pillar writer failure that handed its slot on into the run's result.
+    On an error it joins the reason. On a success it would otherwise vanish, and
+    _blog_pillar_candidate hands back the same due pillar every run, so a pillar
+    that always fails would silently stop cluster-building: say so in Slack."""
+    if not pillar_fail:
+        return res
+    res['pillar_writer_failed'] = pillar_fail
+    kw, why = pillar_fail['keyword'], pillar_fail['error']
+    if res.get('error'):
+        res['error'] += f" (after pillar '{kw}' writer failed: {why})"
+    else:
+        _blog_slack(f"⚠️ Blog [{store.upper()}]: pillar '{kw}' kon niet geschreven worden, "
+                    f"vandaag '{_blog_topic_kw(res.get('topic'))}' in de plaats. Reden: {str(why)[:300]}")
+    return res
+
+
+def _blog_topics_failing_create(store, now=None):
+    """Keywords (lowercase) whose article create was refused on >= 2 different
+    days this month, from blog_failures.jsonl."""
+    month = (now or datetime.datetime.utcnow()).strftime('%Y-%m')
+    days = {}
+    for f in _blog_read_jsonl(BLOG_FAILURES_PATH):
+        ts = f.get('ts') or ''
+        if (f.get('store') == store and f.get('step') == 'create' and f.get('topic')
+                and ts.startswith(month)):
+            days.setdefault(str(f['topic']).lower(), set()).add(ts[:10])
+    return {k for k, d in days.items() if len(d) >= 2}
+
+
+def _blog_pick_topic(store, candidates, hdrs, exclude):
+    """First candidate with enough genuinely fitting products → (topic, products),
+    or (None, [])."""
     # Relax ladder when nothing passes: (1) strict, (2) drop the variety-exclusions,
     # (3) accept 2 fitting products. Publishing beats the variety rule; product-topic
     # FIT itself never relaxes (that is a correctness rule, not a preference).
@@ -23971,8 +24687,7 @@ def _blog_generate_one(store, topic=None, published=None):
                           (None, 2)):
         for cand in candidates:
             if cand.get('products_override'):
-                topic, products = cand, cand['products_override']
-                break
+                return cand, cand['products_override']
             prods = _blog_match_products(store, cand.get('category'), hdrs, n=6,
                                          keyword=cand.get('keyword'), exclude=excl)
             prods = _blog_products_fit_topic(store, cand, prods)
@@ -23980,13 +24695,14 @@ def _blog_generate_one(store, topic=None, published=None):
                 print(f"[blog] {store}: topic '{cand.get('keyword')}' rejected — "
                       f"only {len(prods)} genuinely fitting (need {min_fit})")
                 continue
-            topic, products = cand, prods
-            break
-        if topic is not None:
-            break
-    if topic is None:
-        return {'store': store, 'topic': candidates[0],
-                'error': 'no candidate topic has enough genuinely fitting products'}
+            return cand, prods
+    return None, []
+
+
+def _blog_write_and_publish(store, topic, products, hdrs, published):
+    """Write → edit → QA → assemble → create one article for a chosen topic.
+    A writer that gives nothing usable returns an error marked 'writer_failed';
+    raises _BlogCreateRejected when Shopify refuses the article itself."""
     faqs = _blog_faq_questions(store, topic.get('keyword'))
     concerns = _blog_reddit_concerns(store, topic)
     brief = _blog_serp_brief(store, topic)
@@ -23996,7 +24712,13 @@ def _blog_generate_one(store, topic=None, published=None):
     art = _blog_write(store, topic, products, faq_questions=faqs, concerns=concerns,
                       serp_brief=brief, fmt=fmt, avoid_phrases=avoid_phrases)
     if not art or not art.get('title') or not art.get('body_html'):
-        return {'store': store, 'topic': topic, 'error': 'writer failed'}
+        # 29 Sep 2026: FI lost its Tuesday article on a pillar whose writer failed
+        # twice, and Slack only said 'writer failed'. The reason and the subject
+        # now travel with the error; 'writer_failed' lets _blog_generate_one hand
+        # a failed PILLAR's slot to the next candidate in its own loop.
+        why = (art or {}).get('error') or 'empty title/body'
+        return {'store': store, 'topic': topic, 'writer_failed': True, 'writer_error': why,
+                'error': f"writer failed: {why} (topic '{topic.get('keyword')}')"}
     art['primary_keyword'] = topic.get('keyword')
     art = _blog_edit(store, art, products)
     # Deterministic style gate: models under-obey the dash/length budget when merely
@@ -24044,9 +24766,26 @@ def _blog_generate_one(store, topic=None, published=None):
                                        'qa': qa and {'score': qa['score'], 'critical': qa['critical'][:3]}}
     else:
         publish = bool(published)
+    # Final handle BEFORE the body is assembled: the related-links exclusion and
+    # the Article JSON-LD (mainEntityOfPage) both bake it in. A handle already in
+    # the blog was sent as-is until 30 Sep 2026 → 422 on 6 DK slots in a row.
+    blog_id = _blog_ensure(store, hdrs)
+    existing = _blog_existing_handles(store, blog_id, hdrs)
+    if existing is None:
+        print(f"[blog] {store}: handle list unavailable — keeping '{art.get('handle')}' "
+              f"(create re-resolves on a 422)")
+    else:
+        final = _blog_unique_handle(art.get('handle'), art.get('title'), existing)
+        if final != art.get('handle'):
+            print(f"[blog] {store}: handle '{art.get('handle')}' is taken — using '{final}'")
+        art['handle'] = final
+    is_bestsellers = topic.get('source') == 'bestsellers'
+    if is_bestsellers:
+        art['tags'] = list(dict.fromkeys(list(art.get('tags') or []) + [BLOG_BESTSELLER_TAG]))
     art['body_html'] = _blog_fix_anchors(art['body_html'], products)
     art['body_html'] = _blog_inline_product_images(art['body_html'], products, store=store)
-    related = _blog_related_links(store, topic.get('category'), hdrs, exclude_handle=art.get('handle'))
+    related = _blog_related_links(store, topic.get('category'), hdrs, exclude_handle=art.get('handle'),
+                                  exclude_bestsellers=is_bestsellers)
     art['body_html'] += related
     art['body_html'] += _blog_newsletter_block(store)
     art['body_html'] += _blog_cta_buttons(store, topic, products, hdrs)
@@ -24063,7 +24802,6 @@ def _blog_generate_one(store, topic=None, published=None):
         art['levers']['n_internal_links'] = related.count('<li>')
         if qa:
             art['levers']['qa_score'] = qa['score']
-    blog_id = _blog_ensure(store, hdrs)
     hero = _blog_hero_image(store, topic, products) if publish else None
     featured = hero or next((p.get('image') for p in products if p.get('image')), None)
     if isinstance(art.get('levers'), dict):
@@ -24159,7 +24897,13 @@ def api_blog_status():
         return jsonify({'error': str(e)[:120]}), 500
     perf = _blog_perf_latest()
     perf_sorted = sorted(perf, key=lambda p: -(p.get('score') or 0))
+    # Cadence per store + failures from disk: DK's month of empty slots (Sep
+    # 2026) never showed here — only successes were ever written down.
+    failures = _blog_read_jsonl(BLOG_FAILURES_PATH)
+    now = datetime.datetime.now()
     return jsonify({
+        'recent_failures': failures[-10:],
+        'per_store': {st: _blog_store_health(st, now, recent, failures) for st in BLOG_SCHED_STORES},
         'dataforseo_configured': _dfs_configured(),
         'reddit_enrichment': ('reddit-api' if os.getenv('REDDIT_CLIENT_ID', '').strip() else
                               'apify' if os.getenv('APIFY_TOKEN', '').strip() else 'off'),
@@ -24284,6 +25028,98 @@ def _blog_store_posted_on(store, date_str):
     return False
 
 
+# The slot alert looks back this many hours after BLOG_SCHED_HOUR: long enough to
+# survive a slow run spilling past the hour, short enough that a restart in the
+# afternoon (self-update) does not send the same alert again.
+BLOG_ALERT_WINDOW_H = 3
+_BLOG_SLOT_ALERTED = {}   # {'day': YYYY-MM-DD} — slot alert already sent today
+
+
+def _blog_parse_ts(ts):
+    """History timestamp ('…Z' from us, '…+02:00' from Shopify) → naive UTC
+    datetime, or None."""
+    try:
+        d = datetime.datetime.fromisoformat(str(ts or '').replace('Z', '+00:00'))
+    except Exception:
+        return None
+    if d.tzinfo is not None:
+        d = d.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return d
+
+
+def _blog_last_article(store, rows):
+    """(datetime, row) of the store's newest created article, or (None, None)."""
+    best, best_row = None, None
+    for r in rows:
+        if r.get('store') != store or not _blog_is_article_row(r):
+            continue
+        d = _blog_parse_ts(r.get('ts'))
+        if d and (best is None or d > best):
+            best, best_row = d, r
+    return best, best_row
+
+
+def _blog_missed_slots(store, now, rows):
+    """Scheduled slots (BLOG_SCHED_DAYS) since the store's last article that
+    produced nothing; today's slot counts once its hour is over. Pure: history
+    rows in, a number out. DK (last article 8 Sep 2026) was at 6 on 30 Sep while
+    every individual alert had looked like a one-off."""
+    last, _ = _blog_last_article(store, rows)
+    if last is None:
+        return 0
+    n, d, today = 0, last.date() + datetime.timedelta(days=1), now.date()
+    while d <= today:
+        if d.weekday() in BLOG_SCHED_DAYS and (d < today or now.hour > BLOG_SCHED_HOUR):
+            n += 1
+        d += datetime.timedelta(days=1)
+    return n
+
+
+def _blog_store_health(store, now, rows, failures):
+    """Per-store cadence: last article, empty slots since, and the newest failure
+    AFTER that article (an older one is already solved)."""
+    last, last_row = _blog_last_article(store, rows)
+    last_err = None
+    for f in failures:
+        if f.get('store') != store:
+            continue
+        d = _blog_parse_ts(f.get('ts'))
+        if last is None or (d is not None and d > last):
+            last_err = f
+    return {'last_article_at': (last_row or {}).get('ts'),
+            'last_article_title': (last_row or {}).get('title'),
+            'missed_slots': _blog_missed_slots(store, now, rows),
+            'last_error': last_err}
+
+
+def _blog_slot_alerts(now, stores=None):
+    """Slack texts after today's slot: one per scheduled store without an article
+    today, with the recorded reason + topic; escalated once >= 2 slots in a row
+    are empty. Until 30 Sep 2026 Slack only spoke after 2 failures inside the
+    same hour, which stayed silent on 4 of DK's 6 empty slots."""
+    today = now.strftime('%Y-%m-%d')
+    rows = _blog_read_jsonl(BLOG_HISTORY_PATH)
+    fails = _blog_read_jsonl(BLOG_FAILURES_PATH)
+    out = []
+    for st in (BLOG_SCHED_STORES if stores is None else stores):
+        if st not in STORES or _blog_store_posted_on(st, today):
+            continue
+        if not shopify_headers(st).get('X-Shopify-Access-Token'):
+            continue    # the scheduler skips a store without a token too
+        h = _blog_store_health(st, now, rows, fails)
+        err = h['last_error']
+        reason = (f"{err.get('error')} (onderwerp: {err.get('topic') or 'onbekend'}, "
+                  f"stap: {err.get('step')})" if err else
+                  'geen fout vastgelegd (herstart tijdens de run of overgeslagen?)')
+        if h['missed_slots'] >= 2:
+            out.append(f"🚨 Blog [{st.upper()}]: {h['missed_slots']} geplande dagen zonder artikel "
+                       f"(laatste: {(h['last_article_at'] or '?')[:10]}, "
+                       f"'{h['last_article_title'] or '?'}'). Laatste fout: {reason}")
+        else:
+            out.append(f"🚨 Blog [{st.upper()}]: vandaag geen artikel. Reden: {reason}")
+    return out
+
+
 def _blog_refresh_one(store):
     """Content refresh (highest-ROI SEO move): take one article stuck at position
     5-20, add one section targeting the queries it ALMOST ranks for (from our own
@@ -24331,17 +25167,19 @@ def _blog_refresh_one(store):
         kws = ', '.join(f"\"{k.get('keyword')}\" (pos {k.get('position')})" for k in near)
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=16000,
-            messages=[{'role': 'user', 'content':
+        data, why, _msg = _blog_llm_tool(client,
             f"You are updating an existing {lang} fashion-blog article that ranks positions 5-20 "
             f"for these searches: {kws}. Strengthen it so it can reach the top: add ONE new <h2> "
             "section (120-220 words) that directly and naturally serves those searches, and where "
             "an existing sentence can weave one of those phrasings in naturally, do so. Do NOT "
             "change the title, links, structure or tone otherwise; keep every <a href> exactly. "
             f"Same writing rules as always:\n{BLOG_ANTI_AI_RULES}\n\nBODY_HTML:\n{body}\n\n"
-            'Return ONLY compact JSON: {"body_html": "..."}'}])
-        data = _blog_first_json((msg.content[0].text if msg.content else '') or '')
-        new_body = (data or {}).get('body_html') or ''
+            "Deliver the complete updated article by calling the `updated_body` tool.",
+            BLOG_REFRESH_TOOL, 16000)
+        if data is None:
+            print(f"[blog] refresh {store}: update unusable ({why}), skipped")
+            return
+        new_body = data.get('body_html') or ''
         if not new_body or new_body.count('/products/') < body.count('/products/'):
             print(f"[blog] refresh {store}: update unusable, skipped")
             return
@@ -24377,18 +25215,22 @@ def _blog_retire_previous_bestsellers(store, hdrs, created):
     unpublish the earlier ones and 301 them to it. Never raises."""
     try:
         new_id = created.get('id')
-        olds = []
+        olds = {}   # article_id -> handle
         for r in _blog_read_jsonl(BLOG_HISTORY_PATH):
-            if (r.get('store') == store and r.get('article_id') and r['article_id'] != new_id
-                    and (r.get('source') == 'bestsellers'
-                         or (r.get('levers') or {}).get('format') == 'bestsellers')):
-                olds.append(r)
+            if (r.get('store') == store and _blog_is_article_row(r) and r['article_id'] != new_id
+                    and _blog_is_bestsellers(store, r, strict=True)):
+                olds[r['article_id']] = r.get('article_handle')
+        blog_id = _blog_ensure(store, hdrs)
+        # Shopify itself too: a bestsellers article without our history row (it
+        # came back as source='shopify-sync') was never retired before 30 Sep 2026.
+        for h, a in (_blog_existing_handles(store, blog_id, hdrs) or {}).items():
+            if (a.get('id') and a['id'] != new_id and h != (created.get('handle') or '').lower()
+                    and _blog_is_bestsellers(store, a, strict=True)):
+                olds[a['id']] = h   # the live handle beats a stale history row
         if not olds:
             return
-        blog_id = _blog_ensure(store, hdrs)
         target = '/blogs/%s/%s' % (BLOG_HANDLE, created.get('handle'))
-        for r in {x['article_id']: x for x in olds}.values():
-            aid, handle = r['article_id'], r.get('article_handle')
+        for aid, handle in olds.items():
             u = _shopify_call('put', shopify_url(store, f'blogs/{blog_id}/articles/{aid}.json'),
                               hdrs, json={'article': {'id': aid, 'published': False}}, timeout=30)
             if u.status_code == 200 and handle:
@@ -24525,8 +25367,7 @@ def _blog_maintain_one(store, hdrs=None):
             return 'no anthropic key'
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=16000,
-            messages=[{'role': 'user', 'content':
+        data, why, _msg = _blog_llm_tool(client,
                 f"You are maintaining a PUBLISHED article on a {lang}-language womenswear shop blog "
                 f"(Vionna). Improve it on three axes without changing its subject or structure:\n"
                 f"1. LANGUAGE — fix every grammar, agreement, spelling and idiom error; make it read "
@@ -24545,10 +25386,14 @@ def _blog_maintain_one(store, hdrs=None):
                 "keep the FAQ section; do not change the URL handle; keep the same headings unless "
                 "one is genuinely wrong.\n\n"
                 f"CURRENT TITLE: {title}\n\nCURRENT HTML:\n{head}\n\n"
-                'Return ONLY compact JSON: {"title": "...", "meta_description": "...", '
-                '"body_html": "...", "changes": ["short note per change"]}'}])
-        data = _blog_first_json((msg.content[0].text if msg.content else '') or '')
-        new_head = (data or {}).get('body_html') or ''
+                "Deliver the result by calling the `maintained_article` tool with: title, "
+                "meta_description, body_html (the complete improved HTML) and changes (a short "
+                "note per change).",
+                BLOG_MAINT_TOOL, 16000)
+        if data is None:
+            print(f"[blog] maint {store}/{handle}: unusable result ({why}), skipped")
+            return f'unusable ({why[:120]})'
+        new_head = data.get('body_html') or ''
         if not new_head or new_head.count('/products/') < n_links:
             print(f"[blog] maint {store}/{handle}: unusable result, skipped")
             return 'unusable'
@@ -24681,15 +25526,23 @@ def _blog_sync_history_from_shopify(store, hdrs=None):
         if not hdrs.get('X-Shopify-Access-Token'):
             return 0
         blog_id = _blog_ensure(store, hdrs)
-        r = _shopify_call('get', shopify_url(store, f'blogs/{blog_id}/articles.json?limit=50'),
-                          hdrs, timeout=30)
-        if r.status_code != 200:
-            return 0
+        # all pages: a single limit=50 page silently stops seeing new articles
+        # once a store passes 50 (FR/FI were at 27/26 on 30 Sep 2026)
+        url, articles = shopify_url(store, f'blogs/{blog_id}/articles.json?limit=250'), []
+        while url:
+            r = _shopify_call('get', url, hdrs, timeout=30)
+            if r.status_code != 200:
+                if not articles:
+                    return 0
+                break
+            articles += r.json().get('articles', [])
+            m = re.search(r'<([^>]+)>;\s*rel="next"', r.headers.get('Link') or '')
+            url = m.group(1) if m else None
         known = {row.get('article_id') for row in _blog_read_jsonl(BLOG_HISTORY_PATH)
                  if row.get('store') == store}
         shop = tokens.get(store, {}).get('shop') or STORES.get(store)
         added = 0
-        for a in r.json().get('articles', []):
+        for a in articles:
             if a.get('id') in known:
                 continue
             body = a.get('body_html') or ''
@@ -24714,6 +25567,9 @@ def _blog_sync_history_from_shopify(store, hdrs=None):
                     'url': f"https://{shop}/blogs/{BLOG_HANDLE}/{a.get('handle')}",
                     'published': a.get('published_at') is not None,
                     'products': handles[:8] or None,
+                    # carries the bestsellers marker, so the monthly due-check
+                    # still sees an article that never got our own history row
+                    'tags': a.get('tags') or None,
                 }, ensure_ascii=False) + '\n')
             added += 1
         if added:
@@ -24748,10 +25604,13 @@ def _blog_scheduler_loop():
                 boots[st] = {'error': res.get('error'), 'url': art.get('storefront_url')}
                 print(f"[blog] bootstrap {st}: {res.get('error') or art.get('storefront_url')}")
                 if res.get('error'):
+                    _blog_record_failure(st, _blog_topic_kw(res.get('topic')), 'bootstrap', res['error'])
                     _blog_slack(f"🚨 Blog bootstrap [{st.upper()}] faalde: {res['error']}")
             except Exception as e:
                 boots[st] = {'error': str(e)[:200]}
                 print(f"[blog] bootstrap {st} failed: {e}")
+                if not getattr(e, 'recorded', False):
+                    _blog_record_failure(st, getattr(e, 'topic_keyword', None), 'bootstrap', e)
                 _blog_slack(f"🚨 Blog bootstrap [{st.upper()}] crashte: {str(e)[:180]}")
         if boots:
             _BLOG_LAST['bootstrap'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z', **boots}
@@ -24768,45 +25627,63 @@ def _blog_scheduler_loop():
                 last_learn_day = now.strftime('%Y-%m-%d')
                 print('[blog] weekly learn cycle…')
                 _blog_run_learn_cycle()
-            if now.weekday() in BLOG_SCHED_DAYS and now.hour == BLOG_SCHED_HOUR:
-                today = now.strftime('%Y-%m-%d')
-                for st in BLOG_SCHED_STORES:
-                    if st not in STORES or _blog_store_posted_on(st, today):
-                        continue
-                    if not shopify_headers(st).get('X-Shopify-Access-Token'):
-                        continue
-                    # max 2 attempts per store per day: the 10-min tick otherwise
-                    # retries a structural failure all hour and spams Slack each time
-                    fails = _BLOG_TRIED.get((st, today), 0)
-                    if fails >= 2:
-                        continue
-                    try:
-                        _blog_sync_history_from_shopify(st)
-                        if _blog_store_posted_on(st, today):
-                            continue    # someone already posted today (laptop/manual)
-                        print(f'[blog] scheduled article for {st}…')
-                        res = _blog_generate_one(st)
-                        art = (res.get('article') or {})
-                        _BLOG_LAST['scheduled'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
-                                                   'store': st, 'error': res.get('error'),
-                                                   'url': art.get('storefront_url')}
-                        print(f"[blog] {st}: {res.get('error') or art.get('storefront_url')}")
-                        if res.get('error'):
-                            _BLOG_TRIED[(st, today)] = fails + 1
-                            if fails + 1 >= 2:
-                                _blog_slack(f"🚨 Blog-run [{st.upper()}] faalde 2x, opgegeven voor vandaag: "
-                                            f"{res['error']}")
-                    except Exception as e:
-                        _BLOG_LAST['scheduled'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
-                                                   'store': st, 'error': str(e)[:200]}
-                        print(f'[blog] scheduled {st} failed: {e}')
-                        _BLOG_TRIED[(st, today)] = fails + 1
-                        if fails + 1 >= 2:
-                            _blog_slack(f"🚨 Blog-run [{st.upper()}] crashte 2x, opgegeven voor vandaag: "
-                                        f"{str(e)[:150]}")
+            _blog_scheduled_tick(now)
         except Exception as e:
             print(f'[blog] scheduler error: {e}')
         time.sleep(600)
+
+
+def _blog_topic_kw(topic):
+    """Keyword of a result's topic (a dict from the candidate list, or a bare string)."""
+    return topic.get('keyword') if isinstance(topic, dict) else topic
+
+
+def _blog_scheduled_tick(now):
+    """One 10-minute tick of the Tue/Fri schedule. During BLOG_SCHED_HOUR: write
+    for every store without an article today (max 2 attempts, each failure on
+    disk). In the hours after it, once per day: one Slack alert per store that
+    still has none, with the recorded reason — this replaces the old ping that
+    only fired after 2 failures inside the same hour."""
+    if now.weekday() not in BLOG_SCHED_DAYS:
+        return
+    today = now.strftime('%Y-%m-%d')
+    if now.hour == BLOG_SCHED_HOUR:
+        for st in BLOG_SCHED_STORES:
+            if st not in STORES or _blog_store_posted_on(st, today):
+                continue
+            if not shopify_headers(st).get('X-Shopify-Access-Token'):
+                continue
+            # max 2 attempts per store per day: the 10-min tick otherwise
+            # retries a structural failure all hour
+            fails = _BLOG_TRIED.get((st, today), 0)
+            if fails >= 2:
+                continue
+            try:
+                _blog_sync_history_from_shopify(st)
+                if _blog_store_posted_on(st, today):
+                    continue    # someone already posted today (laptop/manual)
+                print(f'[blog] scheduled article for {st}…')
+                res = _blog_generate_one(st)
+                art = (res.get('article') or {})
+                _BLOG_LAST['scheduled'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
+                                           'store': st, 'error': res.get('error'),
+                                           'url': art.get('storefront_url')}
+                print(f"[blog] {st}: {res.get('error') or art.get('storefront_url')}")
+                if res.get('error'):
+                    _BLOG_TRIED[(st, today)] = fails + 1
+                    _blog_record_failure(st, _blog_topic_kw(res.get('topic')), 'scheduled', res['error'])
+            except Exception as e:
+                _BLOG_LAST['scheduled'] = {'ts': datetime.datetime.utcnow().isoformat() + 'Z',
+                                           'store': st, 'error': str(e)[:200]}
+                print(f'[blog] scheduled {st} failed: {e}')
+                _BLOG_TRIED[(st, today)] = fails + 1
+                if not getattr(e, 'recorded', False):   # a refused create logs itself
+                    _blog_record_failure(st, getattr(e, 'topic_keyword', None), 'scheduled', e)
+    elif (BLOG_SCHED_HOUR < now.hour <= BLOG_SCHED_HOUR + BLOG_ALERT_WINDOW_H
+            and _BLOG_SLOT_ALERTED.get('day') != today):
+        _BLOG_SLOT_ALERTED['day'] = today
+        for text in _blog_slot_alerts(now):
+            _blog_slack(text)
 
 
 try:

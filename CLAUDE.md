@@ -38,6 +38,21 @@ Nothing else. The droplet installs it itself within ~10 minutes:
 - Verify from anywhere: `curl https://188-166-11-177.nip.io/api/version` →
   `"self_update":"active"` means the updater thread is running; after a push,
   `local` should equal `remote` within ~10 min.
+- **What it ships** (`_updater_files()`): `backend/index.html`, `server.py`,
+  `shipping_check.py`, `frontend/lib/names.ts` and `version.txt` LAST — all
+  fetched first, written only when every fetch succeeded. Any repo file
+  `server.py` reads at runtime MUST be in that list (test_name_pool checks it):
+  until v1.325 names.ts was not, and the droplet counted the name pool on the
+  10 June list (279 names) — "1 of 279 free" Slack pings after every deploy
+  while 1,003 of 1,425 were free. A names.ts write failure never blocks a code
+  deploy (`_UPDATER_OPTIONAL`); `_name_pool_sync()` also repairs it at boot.
+  Watch loops keep their "already warned" state ON DISK (the process restarts
+  on every deploy): e.g. `backend/name_pool_watch.json`.
+- **The RUNNING version's list ships the next release.** A release that adds
+  a new local `.py` module or runtime file must go in two steps (first a
+  release that adds it to `_updater_files()`, then the one that imports it),
+  or the droplet boots without it. Data files (`_UPDATER_OPTIONAL`) may fail
+  to fetch or write without blocking the code deploy.
 - Kill switch: set `SELF_UPDATE=0` in the droplet's `.env` (or environment).
   Local dev (`start.bat`) and pytest skip the updater automatically
   (`DEV_LOCAL=1` / pytest import guard) — otherwise it would overwrite your
@@ -194,9 +209,15 @@ this backend is the prerequisite for ever switching a store to Block.
   ~09:05 **droplet-local time (UTC → 11:05 NL in summer)** via the bug-report
   webhook (`_slack_webhook_url`), only when there are records; the posted day
   is persisted in `backend/spy_shield_digest.json` so a self-update restart
-  cannot post twice. Same vocabulary as the tiles (`N would-be blocks, N 502s
-  getoond, N buyers in flagged sessions, N browser-dagen · DK n / FR n`), plus
-  warnings for an active `ss_pt` alarm, dropped records and `token` drops.
+  cannot post twice. Since v1.325 it says what the numbers are: real coverage
+  ("data sinds 28-09, N dagen" instead of a bare "14d"), would-be blocks as
+  RECORDS / BROWSERS (~2 records per page view: head/late + final), per store
+  on would-be blocks, how many orders the buyer check covered, operator tests
+  (`sim:*`) counted apart, and a "KLAAR VOOR DK: ja/nee" verdict (≥14 days,
+  ≥1 checked DK order with 0 matches, only tool reasons). Plus warnings for an
+  active `ss_pt` alarm, dropped records and `token` drops. NOTE:
+  `tools_set_settings.py block` flips ALL 6 stores and rotates the owner key —
+  switch DK alone in the theme editor instead.
   The real dagbericht is composed in master-dashboard; once it pulls the
   summary with `X-Notify-Token`, disable this loop with `SPY_SHIELD_DIGEST=0`.
   Guarded like the other loops (skipped under pytest / DEV_LOCAL).
@@ -251,6 +272,33 @@ The type is now decided ONCE at import (`POST /api/resolve_type`, gated;
 - Also fixed here: the blog scheduler, the WTL traffic/classify loops and the
   deletion watchdog started on EVERY import of server.py (local scripts, tests)
   — now behind `_background_loops_allowed()` like the other write loops.
+
+---
+
+## 📰 Blog engine — reliability rules (v1.325.0)
+
+The scheduler posts Tue/Fri per store (`_blog_scheduler_loop`). Two silent
+failures found 30 Sep 2026:
+- **DK posted nothing from 8 Sep:** the monthly "bestsellers" topic always
+  comes first and the writer always slugs it to the same handle, which a July
+  article already had → Shopify 422 "handle has already been taken", every
+  slot. Now the handle is made unique against the live blog BEFORE the body is
+  assembled (`_blog_unique_handle`: keep / transliterated re-slug / -2, -3 …),
+  a 422 on the handle retries once, a refused create falls through to the next
+  candidate topic, and bestsellers articles carry the tag `vionna-bestsellers`
+  so the monthly due-check also sees ones created outside the history file.
+- **FI "writer failed":** the article came back as HTML inside JSON — cut off
+  by `max_tokens=4500` (Finnish ≈ 4.8 tokens/word) or broken by an unescaped
+  quote. The writer (and editor) now return through a FORCED TOOL call (the API
+  parses it), with a per-language budget, one retry on any failure, and the
+  real reason in the error ("writer failed: <reason> (topic …)"). NOTE: forced
+  `tool_choice` works on claude-sonnet-4-6 but returns 400 on some newer
+  models — changing the blog model string needs a check of every tool call.
+- Every failure is appended to `backend/blog_failures.jsonl` (NOT the history
+  file: `_blog_store_posted_on` would count it as posted); `/api/blog/status`
+  shows `recent_failures` and per store `last_article_at` / `missed_slots` /
+  `last_error`; Slack alerts on the first failure with the reason and escalates
+  at ≥ 2 missed slots.
 
 ---
 
