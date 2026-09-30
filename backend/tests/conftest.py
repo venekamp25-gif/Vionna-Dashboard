@@ -52,6 +52,22 @@ def _isolate_hf_media(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_blog_state(tmp_path, monkeypatch):
+    """The blog engine appends to blog_history.jsonl and (since 30 Sep 2026)
+    blog_failures.jsonl next to server.py. A test that drives a run or the
+    scheduler tick must never add rows to the real files: a stray failure row
+    would trip the create circuit breaker, a stray history row reads as
+    'already posted today'."""
+    import server
+
+    monkeypatch.setattr(server, 'BLOG_HISTORY_PATH', str(tmp_path / 'blog_history.jsonl'))
+    monkeypatch.setattr(server, 'BLOG_FAILURES_PATH', str(tmp_path / 'blog_failures.jsonl'))
+    monkeypatch.setattr(server, '_BLOG_TRIED', {})
+    monkeypatch.setattr(server, '_BLOG_SLOT_ALERTED', {})
+    monkeypatch.setattr(server, '_BLOG_LAST', dict(server._BLOG_LAST))
+
+
+@pytest.fixture(autouse=True)
 def _isolate_after_quotation(tmp_path, monkeypatch):
     """After Quotation keeps live data next to server.py: the index disk copies,
     the order file, the change log and the undo backups. A test that rebuilt the
