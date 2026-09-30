@@ -49,3 +49,22 @@ def _isolate_hf_media(tmp_path, monkeypatch):
     d = tmp_path / 'hf_media'
     d.mkdir()
     monkeypatch.setattr(server, 'HF_MEDIA_DIR', str(d))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_after_quotation(tmp_path, monkeypatch):
+    """After Quotation keeps live data next to server.py: the index disk copies,
+    the order file, the change log and the undo backups. A test that rebuilt the
+    index with a fake empty Shopify once wrote an EMPTY backend/aq_index_dk.json
+    (30 Sep) — the next real start would have served DK with no products."""
+    import server
+
+    monkeypatch.setattr(server, 'AQ_INDEX_DISK', str(tmp_path / 'aq_index_%s.json'))
+    monkeypatch.setattr(server, 'AQ_ORDERS_PATH', str(tmp_path / 'aq_orders.json'))
+    monkeypatch.setattr(server, 'AQ_HISTORY_PATH', str(tmp_path / 'aq_history.jsonl'))
+    monkeypatch.setattr(server, 'AQ_BACKUP_DIR', str(tmp_path / 'aq_backups'))
+    monkeypatch.setattr(server, '_AQ_INDEX', {})
+    monkeypatch.setattr(server, '_AQ_ORDERS', {'data': None, 'agg': None, 'ver': 0})
+    monkeypatch.setattr(server, '_AQ_SUMMARY_CACHE', {'sig': None, 'items': None})
+    monkeypatch.setattr(server, '_AQ_LIST_CACHE', {'sig': None, 'payload': None})
+    monkeypatch.setattr(server, '_AQ_HISTORY_CACHE', {'v': None})

@@ -17,12 +17,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import {
+  BACKEND,
   aqApi,
   type AqCopy,
   type AqExtracted,
   type AqFamily,
   type AqFamilySummary,
   type AqJob,
+  type AqListResponse,
+  type AqOrdersMeta,
   type AqPlan,
   type AqStoreKey,
   type AqTarget,
@@ -34,6 +37,9 @@ import {
   SIZE_PRESETS,
   chartForSizes,
   chartSizes,
+  filterFamilies,
+  isServerQuery,
+  orderBadge,
   parseChartText,
   parseSizeList,
   sizeKind,
@@ -41,9 +47,57 @@ import {
   sortSizes,
   targetFingerprint,
   type AqChart,
+  type AqListEntry,
+  type AqView,
 } from "@/lib/afterQuotation";
 
-type View = "attention" | "recent" | "done";
+type View = AqView;
+const PAGE = 60;
+
+/** "14:03" today, "29 Sept 14:03" otherwise — a days-old cache must look old. */
+function listStamp(iso: string): string {
+  const d = new Date(iso);
+  const time = d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+  return d.toDateString() === new Date().toDateString()
+    ? time
+    : `${d.toLocaleDateString("en-GB", { day: "numeric", month: "short" })} ${time}`;
+}
+const LIST_CACHE_KEY = `aq:list:v1:${BACKEND}`;
+
+/** The last list, for an instant page open (a new tab each time, so not
+ *  sessionStorage). Never trusted blindly: always revalidated right away. */
+function readListCache(): AqListResponse | null {
+  try {
+    const raw = window.localStorage.getItem(LIST_CACHE_KEY);
+    const d = raw ? (JSON.parse(raw) as AqListResponse) : null;
+    return d && Array.isArray(d.families) ? d : null;
+  } catch {
+    return null;
+  }
+}
+function writeListCache(d: AqListResponse) {
+  try {
+    window.localStorage.setItem(LIST_CACHE_KEY, JSON.stringify(d));
+  } catch {
+    /* quota / private mode: the page works without it */
+  }
+}
+
+/** A server search answer (links, ids) in the list's shape. */
+function summaryToEntry(f: AqFamilySummary): AqListEntry {
+  return {
+    key: f.key, name: f.name, cat: f.cat, type: f.type, image: f.image, created: f.created, stores: f.stores,
+    active: f.active, total: f.total, sizes: f.sizes, colours: f.colours.map((c) => c.labels), flags: f.flags,
+    processed: f.processed, orders: f.orders ?? null, rec: null, att: false, names: [], hay: "",
+  };
+}
+
+/** A dropped connection or a gateway error while the droplet restarts —
+ *  matched precisely: "→ 500" with a product id like 1502… is a real error. */
+function isRestarting(msg: string): boolean {
+  return /failed to fetch|networkerror|load failed|^HTTP 50[234]$|→ 50[234]:/i.test(msg);
+}
+const RESTART_MSG = "The dashboard server is restarting after an update — trying again in a few seconds…";
 type Upload = AqUpload & { thumb?: string };
 type ColourAction = { action: "keep" | "rename" | "drop"; labels: Partial<Record<AqStoreKey, string>>; notInQuote?: boolean };
 type NewColour = { id: string; labels: Record<AqStoreKey, string>; images: Upload[]; activate: boolean; supplier?: string };
@@ -265,19 +319,27 @@ const inputCls =
 // ── the page ─────────────────────────────────────────────────────────────────
 
 export function AfterQuotationWorkbench() {
-  // search
-  const [view, setView] = useState<View>("attention");
+  // the list: downloaded once, filtered in the browser while you type
+  const [view, setView] = useState<View>("recommended");
   const [q, setQ] = useState("");
-  const [results, setResults] = useState<AqFamilySummary[]>([]);
-  const [total, setTotal] = useState(0);
-  const [searching, setSearching] = useState(false);
-  const [searchErr, setSearchErr] = useState<string | null>(null);
+  const [list, setList] = useState<AqListEntry[] | null>(null);
+  const [listAt, setListAt] = useState<string | null>(null);
+  const [listFromCache, setListFromCache] = useState(false);
+  const [listLoading, setListLoading] = useState(false);
+  const [listErr, setListErr] = useState<string | null>(null);
   const [storeErrors, setStoreErrors] = useState<Partial<Record<AqStoreKey, string>>>({});
-  const searchSeq = useRef(0);
-  const qRef = useRef(q);
-  const viewRef = useRef(view);
-  qRef.current = q;
-  viewRef.current = view;
+  const [ordersMeta, setOrdersMeta] = useState<Partial<Record<AqStoreKey, AqOrdersMeta>>>({});
+  const [shown, setShown] = useState(PAGE);
+  const listSeq = useRef(0);
+  const listRetry = useRef(0);
+  const listLoadingRef = useRef(false);   // a load is in flight: focus/retry must not overtake it
+  const lastFetchedRef = useRef(0);       // CLIENT time of the last good answer (focus throttle)
+  const retryTimer = useRef<number | null>(null);
+  // links / ids / competitor URLs: asked from the server, cancellable
+  const [serverHits, setServerHits] = useState<AqListEntry[] | null>(null);
+  const [serverSearching, setServerSearching] = useState(false);
+  const [serverErr, setServerErr] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   // the listing
   const [family, setFamily] = useState<AqFamily | null>(null);
@@ -328,28 +390,106 @@ export function AfterQuotationWorkbench() {
 
   const jobRunning = applying || job?.status === "running";
 
-  // ── search ──
-  const runSearch = useCallback(async (query: string, v: View, refresh = false) => {
-    const seq = ++searchSeq.current;
-    setSearching(true);
-    setSearchErr(null);
+  // ── the list ──
+  const loadList = useCallback(async (refresh = false) => {
+    if (retryTimer.current) {
+      window.clearTimeout(retryTimer.current);
+      retryTimer.current = null;
+    }
+    if (refresh) listRetry.current = 0; // a manual Refresh gets a fresh set of retries
+    const seq = ++listSeq.current;
+    listLoadingRef.current = true;
+    setListLoading(true);
     try {
-      const r = await aqApi.search(query, v, refresh);
-      if (seq !== searchSeq.current) return;
-      setResults(r.families);
-      setTotal(r.total);
+      const r = await aqApi.list(refresh);
+      if (seq !== listSeq.current) return;
+      listRetry.current = 0;
+      lastFetchedRef.current = Date.now();
+      setListErr(null);
+      // the server serves a store whose refresh failed from its last good copy
+      // and says so in store_errors — the answer is complete, take it
       setStoreErrors(r.store_errors || {});
+      setOrdersMeta(r.orders_meta || {});
+      setList(r.families);
+      setListAt(r.generated_at);
+      setListFromCache(false);
+      writeListCache(r);
     } catch (e) {
-      if (seq === searchSeq.current) setSearchErr(errText(e));
+      if (seq !== listSeq.current) return;
+      const raw = errText(e);
+      if (isRestarting(raw) && listRetry.current < 20) {
+        listRetry.current += 1; // server restarting: keep the old list, try again
+        setListErr(RESTART_MSG);
+        retryTimer.current = window.setTimeout(() => void loadList(refresh), 4000);
+      } else {
+        setListErr(isRestarting(raw) ? "The dashboard server isn't answering — press ↻ Refresh to try again." : raw);
+      }
     } finally {
-      if (seq === searchSeq.current) setSearching(false);
+      if (seq === listSeq.current) {
+        listLoadingRef.current = false;
+        setListLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
-    const t = window.setTimeout(() => void runSearch(q, view), q ? 350 : 0);
-    return () => window.clearTimeout(t);
-  }, [q, view, runSearch]);
+    const cached = readListCache();
+    if (cached) {
+      setList(cached.families);
+      setListAt(cached.generated_at);
+      setListFromCache(true);
+      setOrdersMeta(cached.orders_meta || {});
+    }
+    void loadList();
+    // back on the tab after a while: quietly fetch the newest list — never
+    // while a load (e.g. a slow forced Refresh) is still running
+    const onFocus = () => {
+      if (listLoadingRef.current) return;
+      if (Date.now() - lastFetchedRef.current > 120_000) void loadList();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      if (retryTimer.current) window.clearTimeout(retryTimer.current);
+    };
+  }, [loadList]);
+  const serverQuery = isServerQuery(q);
+  useEffect(() => {
+    abortRef.current?.abort();
+    // never show the previous link's hit under a new link, not even for 250 ms
+    setServerHits(null);
+    setServerErr(null);
+    if (!serverQuery) {
+      setServerSearching(false);
+      return;
+    }
+    setServerSearching(true);
+    const ctl = new AbortController();
+    abortRef.current = ctl;
+    const t = window.setTimeout(async () => {
+      try {
+        const r = await aqApi.search(q.trim(), view, false, ctl.signal);
+        if (!ctl.signal.aborted) setServerHits(r.families.map(summaryToEntry));
+      } catch (e) {
+        if (!ctl.signal.aborted && !(e instanceof DOMException && e.name === "AbortError")) {
+          setServerHits(null);
+          setServerErr(isRestarting(errText(e)) ? RESTART_MSG : errText(e));
+        }
+      } finally {
+        if (!ctl.signal.aborted) setServerSearching(false);
+      }
+    }, 250);
+    return () => {
+      window.clearTimeout(t);
+      ctl.abort();
+    };
+  }, [q, serverQuery, view]);
+
+  const results = useMemo(
+    () => (serverQuery ? serverHits ?? [] : filterFamilies(list ?? [], q, view)),
+    [serverQuery, serverHits, list, q, view]
+  );
+  useEffect(() => setShown(PAGE), [q, view]);
 
   // ── one listing ──
   const resetForm = useCallback((f: AqFamily) => {
@@ -449,6 +589,7 @@ export function AfterQuotationWorkbench() {
   const openFamily = (key: string) => {
     if (jobRunning) return; // the list is locked while Shopify is being written
     if (family && key !== family.key && dirty && !window.confirm("Leave this listing? What you filled in has not been applied.")) return;
+    if (family && key !== family.key) setFamily(null); // the old listing must not stay editable while the new one loads
     void loadFamily(key);
   };
 
@@ -682,7 +823,7 @@ export function AfterQuotationWorkbench() {
         setPlanFingerprint("");
         await loadFamily(key, { keepForm: true });
       }
-      void runSearch(qRef.current, viewRef.current);
+      void loadList();
     } catch (e) {
       if (stillOn(key)) setJobErr(errText(e));
     } finally {
@@ -701,7 +842,7 @@ export function AfterQuotationWorkbench() {
       const { job_id } = await aqApi.undo(backupId);
       const done = await pollJob(job_id, key);
       if (done && stillOn(key)) await loadFamily(key, { keepForm: false });
-      void runSearch(qRef.current, viewRef.current);
+      void loadList();
     } catch (e) {
       if (stillOn(key)) setJobErr(errText(e));
     } finally {
@@ -779,7 +920,14 @@ export function AfterQuotationWorkbench() {
             className={inputCls}
             aria-label="Search listings"
           />
-          <div className="flex items-center gap-1.5 flex-wrap">
+          <div className={`flex items-center gap-1.5 flex-wrap ${q.trim() ? "opacity-50" : ""}`}>
+            <Pill
+              on={view === "recommended"}
+              onClick={() => setView("recommended")}
+              title="Just sold: listings whose first order came in recently (newest first) — that's when you ask the supplier for a quote. Then the other listings that need attention."
+            >
+              Recommended
+            </Pill>
             <Pill on={view === "attention"} onClick={() => setView("attention")} title="Listed in the last 60 days and not done yet, or a clear contradiction (shoes in XS–XL, sizes ≠ chart, no chart)">
               Needs attention
             </Pill>
@@ -792,26 +940,65 @@ export function AfterQuotationWorkbench() {
             <span className="flex-1" />
             <button
               type="button"
-              onClick={() => void runSearch(q, view, true)}
-              className="text-[11.5px] text-text-dim hover:text-accent"
-              title="Re-read every listing from Shopify (takes ~15 s)"
+              onClick={() => void loadList(true)}
+              disabled={listLoading}
+              className="text-[11.5px] text-text-dim hover:text-accent disabled:opacity-50"
+              title="Re-read every listing and the latest orders from Shopify (takes ~10 s)"
             >
               ↻ Refresh
             </button>
           </div>
-          <p className="text-[11.5px] text-text-faint">
-            {searching ? "Searching…" : `${total} listing${total === 1 ? "" : "s"}${q ? " found" : view === "attention" ? " need attention" : ""}`}
+          <p className="text-[11.5px] text-text-faint flex items-center gap-2 flex-wrap">
+            <span>
+              {q.trim()
+                ? serverQuery
+                  ? serverSearching
+                    ? "Looking it up…"
+                    : `${results.length} found for this link`
+                  : `${results.length} listing${results.length === 1 ? "" : "s"} found · searching all listings`
+                : list === null
+                  ? "Loading listings…"
+                  : `${results.length} listing${results.length === 1 ? "" : "s"}${
+                      view === "recommended" ? " recommended" : view === "attention" ? " need attention" : ""
+                    }`}
+            </span>
+            {(listLoading || listFromCache) && list !== null && (
+              <span className="text-text-faint" title={listAt ? `List from ${new Date(listAt).toLocaleString("en-GB")}` : undefined}>
+                · {listLoading ? "updating…" : ""} {listFromCache && listAt ? `list from ${listStamp(listAt)}` : ""}
+              </span>
+            )}
           </p>
           {jobRunning && <Banner tone="info">Writing to Shopify — the list is locked until it&apos;s done.</Banner>}
-          {searchErr && <Banner tone="danger">{searchErr}</Banner>}
+          {listErr && <Banner tone={list ? "warning" : "danger"}>{listErr}{list ? " Showing the last list meanwhile." : ""}</Banner>}
+          {serverErr && <Banner tone="danger">{serverErr}</Banner>}
           {Object.entries(storeErrors).map(([s, m]) => (
             <Banner key={s} tone="warning">
-              {AQ_STORE_LABEL[s as AqStoreKey]} could not be read: {m}
+              {AQ_STORE_LABEL[s as AqStoreKey]}: {m}
             </Banner>
           ))}
-          <ul className="space-y-2">
-            {results.map((f) => {
+          {Object.entries(ordersMeta)
+            .filter(([, m]) => m?.error)
+            .map(([s]) => (
+              <Banner key={`o${s}`} tone="warning">
+                Order data for {AQ_STORE_LABEL[s as AqStoreKey]} couldn&apos;t be read just now — its listings are shown without the &quot;just sold&quot; order.
+              </Banner>
+            ))}
+          {list === null && !listErr && (
+            <ul className="space-y-2" aria-busy="true">
+              {[0, 1, 2, 3].map((i) => (
+                <li key={i} className="h-[84px] rounded-xl border border-border bg-bg-elev animate-pulse" />
+              ))}
+            </ul>
+          )}
+          {q.trim() && !serverSearching && !serverErr && list !== null && results.length === 0 && (
+            <p className="text-[12px] text-text-dim">
+              No listing matches &quot;{q.trim()}&quot;. Try the product name, a colour, or paste the Shopify or competitor link.
+            </p>
+          )}
+          <ul className={`space-y-2 ${serverSearching ? "opacity-60" : ""}`}>
+            {results.slice(0, shown).map((f) => {
               const on = family?.key === f.key;
+              const badge = orderBadge(f.orders);
               return (
                 <li key={f.key}>
                   <button
@@ -824,7 +1011,7 @@ export function AfterQuotationWorkbench() {
                   >
                     {f.image ? (
                       // eslint-disable-next-line @next/next/no-img-element
-                      <img src={thumb(f.image, 120)} alt="" className="w-14 h-14 rounded-lg object-cover shrink-0 bg-bg-elev-2" />
+                      <img src={thumb(f.image, 120)} alt="" loading="lazy" decoding="async" className="w-14 h-14 rounded-lg object-cover shrink-0 bg-bg-elev-2" />
                     ) : (
                       <div className="w-14 h-14 rounded-lg bg-bg-elev-2 shrink-0" />
                     )}
@@ -840,6 +1027,16 @@ export function AfterQuotationWorkbench() {
                         {AQ_STORES.filter((s) => f.stores[s]).map((s) => AQ_STORE_LABEL[s]).join(" ")} · {f.sizes.join(" ")}
                       </div>
                       <div className="flex flex-wrap gap-1 mt-1">
+                        {badge && (
+                          <span
+                            className={`text-[10.5px] px-1.5 rounded ${
+                              f.orders?.first_known ? "bg-accent/15 text-accent" : "bg-bg-elev-2 text-text-dim"
+                            }`}
+                            title={f.orders?.first_known ? "First order of this product — time to ask the supplier" : "Sold recently; orders before tracking started are not known"}
+                          >
+                            🛒 {badge}
+                          </span>
+                        )}
                         {f.processed && <span className="text-[10.5px] px-1.5 rounded bg-green-500/15 text-green-600 dark:text-green-400">✓ done {fmtDate(f.processed)}</span>}
                         {f.flags.map((fl) => (
                           <span
@@ -857,6 +1054,11 @@ export function AfterQuotationWorkbench() {
               );
             })}
           </ul>
+          {results.length > shown && (
+            <Button variant="secondary" size="sm" onClick={() => setShown((n) => n + PAGE)}>
+              Show {Math.min(PAGE, results.length - shown)} more ({results.length - shown} left)
+            </Button>
+          )}
         </aside>
 
         {/* ── the listing ── */}
@@ -870,7 +1072,11 @@ export function AfterQuotationWorkbench() {
               </ol>
             </Card>
           )}
-          {familyLoading && <p className="text-[12.5px] text-text-faint">Reading the listing from Shopify…</p>}
+          {familyLoading && (
+            <p className="text-[12.5px] text-text-faint">
+              Reading {list?.find((f) => f.key === activeKey.current)?.name ?? "the listing"} live from Shopify…
+            </p>
+          )}
           {familyErr && <Banner tone="danger">{familyErr}</Banner>}
 
           {family && (

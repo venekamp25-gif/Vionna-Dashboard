@@ -220,3 +220,108 @@ export function targetFingerprint(target: unknown): string {
     typeof v === "string" && v.startsWith("data:") ? `img:${v.length}:${v.slice(-24)}` : v
   );
 }
+
+// ── the listing list: filtered in the browser (no request per keystroke) ─────
+
+export interface AqOrders {
+  first: string;
+  last: string;
+  count: number;
+  /** false = the colour group existed before order tracking started, so an
+   *  earlier first order can't be ruled out */
+  first_known: boolean;
+}
+
+/** One colour group as /api/aq/list sends it (slim). */
+export interface AqListEntry {
+  key: string;
+  name: string;
+  cat: string;
+  type: string;
+  image: string;
+  created: string;
+  stores: Partial<Record<AqStore, number>>;
+  active: number;
+  total: number;
+  sizes: string[];
+  colours: Partial<Record<AqStore, string>>[];
+  flags: { code: string; hard: boolean; text: string }[];
+  processed: string | null;
+  orders: AqOrders | null;
+  /** recommended rank [tier, date]: 3 first order known, 2 ordered (first order
+   *  unknown), 1 needs attention; null = not recommended */
+  rec: [number, string] | null;
+  /** in "Needs attention" (the server owns the 60-day rule) */
+  att: boolean;
+  /** accent-free names + colour/handle text, prepared by the server */
+  names: string[];
+  hay: string;
+}
+
+export type AqView = "recommended" | "attention" | "recent" | "done";
+
+const NORDIC: Record<string, string> = { ø: "o", æ: "ae", å: "a", ß: "ss", ð: "d", þ: "th" };
+
+/** Port of server `_deaccent`: lowercase, Nordic letters first (NFKD doesn't
+ *  split ø/æ), then accents off — "Mørkegrøn" → "morkegron", "Zoé" → "zoe". */
+export function deaccent(s: string): string {
+  return String(s ?? "")
+    .toLowerCase()
+    .replace(/[øæåßðþ]/g, (c) => NORDIC[c] ?? c)
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "");
+}
+
+/** Links, product ids and competitor URLs are looked up by the server (it
+ *  knows handles and the publish history); plain words are filtered here. */
+export function isServerQuery(q: string): boolean {
+  const t = q.trim();
+  return /\/products\/\S+/.test(t) || /^\d{8,}$/.test(t) || /^https?:\/\//i.test(t) || /^[\w-]+(\.[\w-]+)+(\/|$)/.test(t);
+}
+
+/** Same scoring as server `_aq_search`: exact name 90, name prefix 70, name
+ *  part 50, colour/handle 30; no query → the view's own filter and order. */
+export function filterFamilies(list: AqListEntry[], q: string, view: AqView): AqListEntry[] {
+  const needle = deaccent(q.trim());
+  const scored: { e: AqListEntry; k: [number, string] }[] = [];
+  for (const e of list) {
+    if (needle) {
+      let score = 0;
+      if (e.names.includes(needle)) score = 90;
+      else if (e.names.some((n) => n.startsWith(needle))) score = 70;
+      else if (e.names.some((n) => n.includes(needle))) score = 50;
+      else if (e.hay.includes(needle)) score = 30;
+      if (score) scored.push({ e, k: [score, e.created || ""] });
+      continue;
+    }
+    if (view === "recommended") {
+      if (e.rec) scored.push({ e, k: [e.rec[0], e.rec[1] || ""] });
+    } else if (view === "attention") {
+      if (e.att) scored.push({ e, k: [0, e.created || ""] });
+    } else if (view === "done") {
+      if (e.processed) scored.push({ e, k: [0, e.processed] });
+    } else {
+      scored.push({ e, k: [0, e.created || ""] });
+    }
+  }
+  scored.sort((a, b) => b.k[0] - a.k[0] || (a.k[1] < b.k[1] ? 1 : a.k[1] > b.k[1] ? -1 : 0));
+  return scored.map((x) => x.e);
+}
+
+/** "1st order 28 Sep · 3 orders" — honest when the first order isn't certain. */
+export function orderBadge(o: AqOrders | null | undefined, now: Date = new Date()): string | null {
+  if (!o) return null;
+  // calendar days in the viewer's timezone: an order at 22:00 yesterday is
+  // "yesterday" at 08:00 today, not "today" (review 30 Sep)
+  const sod = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const day = (iso: string) => {
+    const d = new Date(iso);
+    const days = Math.round((sod(now) - sod(d)) / 86_400_000);
+    if (days <= 0) return "today";
+    if (days === 1) return "yesterday";
+    if (days < 7) return `${days} days ago`;
+    return d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+  };
+  const n = `${o.count} order${o.count === 1 ? "" : "s"}`;
+  return o.first_known ? `1st order ${day(o.first)} · ${n}` : `ordered ${day(o.last)} · ${n} (earlier orders unknown)`;
+}
