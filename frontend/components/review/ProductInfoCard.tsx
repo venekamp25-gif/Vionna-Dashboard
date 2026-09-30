@@ -12,6 +12,19 @@ import { slugify } from "@/lib/slug";
 import { useUsedNames } from "@/lib/useUsedNames";
 import { translateColor } from "@/lib/colors";
 import { api } from "@/lib/api";
+import { SIZE_PRESETS, chartSizes, parseSizeList, sizeKind, sizesMatchChart } from "@/lib/afterQuotation";
+import { sortListingSizes, type SizeSource } from "@/lib/competitorSizes";
+import { nbCategory } from "@/lib/nbCategory";
+
+const SIZE_SOURCE_HINT: Record<SizeSource | "legacy", string> = {
+  competitor: "from the competitor",
+  "converted-uk": "converted from UK/AU sizes",
+  "one-size": "One Size — accessory",
+  default: "default — the competitor lists no usable sizes",
+  "shoe-default": "default shoe sizes — check them",
+  manual: "edited",
+  legacy: "imported before competitor sizes — check them",
+};
 
 const COLOR_DOTS: Record<string, string> = {
   // English canonical keys
@@ -36,6 +49,16 @@ type NameStatus = "idle" | "checking" | "available" | "taken";
 
 export function ProductInfoCard() {
   const { data, patch, setData } = useProduct();
+  const [newSize, setNewSize] = useState("");
+  // functional updates: two quick clicks must not work on a stale list
+  const removeSize = (s: string) =>
+    setData((p) => ({ ...p, sizes: p.sizes.filter((x) => x !== s), sizesSource: "manual" }));
+  const addSizes = (raw: string) => {
+    const add = parseSizeList(raw);
+    if (!add.length) return;
+    setData((p) => ({ ...p, sizes: sortListingSizes([...new Set([...p.sizes, ...add])]), sizesSource: "manual" }));
+    setNewSize("");
+  };
   // Note: `useStore.store` follows the active tab. We intentionally do NOT use it
   // for name validation — that has to span every selected store.
 
@@ -390,10 +413,77 @@ export function ProductInfoCard() {
       </Field>
 
       <Field>
-        <Label>Sizes</Label>
+        <div className="flex items-center justify-between gap-2">
+          <Label hint={SIZE_SOURCE_HINT[data.sizesSource ?? "legacy"]}>Sizes</Label>
+          {data.competitorSizes.length > 0 && data.competitorSizes.join("|") !== data.sizes.join("|") && (
+            <button
+              type="button"
+              onClick={() => patch({ sizes: data.competitorSizes, sizesSource: "competitor" })}
+              className="text-[11px] text-text-dim hover:text-accent transition whitespace-nowrap"
+              title={`Back to the competitor's sizes: ${data.competitorSizes.join(" ")}`}
+            >
+              ↺ Competitor sizes
+            </button>
+          )}
+        </div>
         <div className="flex flex-wrap gap-2">
           {data.sizes.map((s) => (
-            <Chip key={s}>{s}</Chip>
+            <Chip key={s} onRemove={() => removeSize(s)}>
+              {s}
+            </Chip>
+          ))}
+          {data.sizes.length === 0 && <span className="text-[12px] text-danger">No sizes — add at least one before publishing</span>}
+        </div>
+        {data.sizesNote && <div className="text-[11.5px] text-warning mt-1.5">{data.sizesNote}</div>}
+        {nbCategory(data.productType) === "shoes" && sizeKind(data.sizes) === "letter" && (
+          <div className="text-[11.5px] text-warning mt-1.5">Shoes in clothing sizes — shoes are sold in EU sizes (35, 36, …).</div>
+        )}
+        {data.sizeChart && sizesMatchChart(data.sizes, data.sizeChart) === false && (
+          <div className="text-[11.5px] text-warning mt-1.5">
+            The size chart has rows {chartSizes(data.sizeChart).join(" ")} — the sizes are {data.sizes.join(" ")}.{" "}
+            <button
+              type="button"
+              className="underline hover:text-accent"
+              onClick={() => patch({ sizes: chartSizes(data.sizeChart), sizesSource: "manual" })}
+            >
+              Use the chart&apos;s sizes
+            </button>
+          </div>
+        )}
+        <div className="flex gap-2 mt-2">
+          <Input
+            type="text"
+            value={newSize}
+            onChange={(e) => setNewSize(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                addSizes(newSize);
+              }
+            }}
+            placeholder="Add sizes: S-2XL, 35-41, S M L, 36,5 …"
+            className="flex-1"
+          />
+          <button
+            type="button"
+            title="Add sizes"
+            onClick={() => addSizes(newSize)}
+            className="px-3 h-10 flex items-center justify-center rounded-[10px] bg-bg-elev-2 border border-border text-text-dim hover:border-accent hover:text-accent transition active:scale-95 text-[13px] whitespace-nowrap"
+          >
+            + Add
+          </button>
+        </div>
+        <div className="flex flex-wrap gap-1.5 mt-2">
+          <span className="text-[11px] text-text-faint self-center">Replace with:</span>
+          {SIZE_PRESETS.map((p) => (
+            <button
+              key={p.label}
+              type="button"
+              onClick={() => patch({ sizes: parseSizeList(p.text), sizesSource: "manual" })}
+              className="px-2 h-6 rounded-[8px] border border-border text-[11px] text-text-dim hover:border-accent hover:text-accent transition"
+            >
+              {p.label}
+            </button>
           ))}
         </div>
       </Field>

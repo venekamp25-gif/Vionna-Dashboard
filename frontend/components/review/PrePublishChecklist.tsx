@@ -1,5 +1,7 @@
 "use client";
 
+import { sizeKind } from "@/lib/afterQuotation";
+import { nbCategory } from "@/lib/nbCategory";
 import { useEffect, useState } from "react";
 import { useProduct, colorLabelFor } from "@/lib/product";
 import { StoreKey, STORE_CONFIG } from "@/lib/store";
@@ -44,6 +46,32 @@ export function buildPrePublishChecks(
       id: "colors",
       label: `${data.canonicalColors.length} ${data.canonicalColors.length === 1 ? "colour" : "colours"} ready`,
       level: "ok",
+    });
+  }
+
+  // 2b. Sizes (v1.323): taken from the competitor; say so when they weren't
+  if (data.sizes.length === 0) {
+    out.push({ id: "sizes", label: "No sizes — add at least one", level: "fail" });
+  } else if (nbCategory(data.productType) === "shoes" && sizeKind(data.sizes) === "letter") {
+    out.push({
+      id: "sizes",
+      label: `Shoes in clothing sizes (${data.sizes.join(" ")})`,
+      level: "warn",
+      detail: "Shoes are sold in EU sizes (35, 36, …) — change them on the Sizes line above.",
+    });
+  } else if (data.sizesSource === "default" || data.sizesSource === "shoe-default" || data.sizesSource === null) {
+    out.push({
+      id: "sizes",
+      label: `Sizes ${data.sizes.join(" ")} — not taken from the competitor`,
+      level: "warn",
+      detail: data.sizesNote ?? "Imported before competitor sizes existed — check the sizes.",
+    });
+  } else {
+    out.push({
+      id: "sizes",
+      label: `Sizes ${data.sizes.join(" ")}${data.sizesSource === "manual" ? " (edited)" : ""}`,
+      level: "ok",
+      detail: data.sizesNote ?? undefined,
     });
   }
 

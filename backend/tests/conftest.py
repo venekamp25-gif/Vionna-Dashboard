@@ -63,6 +63,7 @@ def _isolate_after_quotation(tmp_path, monkeypatch):
     monkeypatch.setattr(server, 'AQ_ORDERS_PATH', str(tmp_path / 'aq_orders.json'))
     monkeypatch.setattr(server, 'AQ_HISTORY_PATH', str(tmp_path / 'aq_history.jsonl'))
     monkeypatch.setattr(server, 'AQ_BACKUP_DIR', str(tmp_path / 'aq_backups'))
+    monkeypatch.setattr(server, 'AQ_SIZE_REPORT_PATH', str(tmp_path / 'aq_size_backfill.json'))
     monkeypatch.setattr(server, '_AQ_INDEX', {})
     monkeypatch.setattr(server, '_AQ_ORDERS', {'data': None, 'agg': None, 'ver': 0})
     monkeypatch.setattr(server, '_AQ_SUMMARY_CACHE', {'sig': None, 'items': None})

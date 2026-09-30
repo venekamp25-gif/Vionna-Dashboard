@@ -16,6 +16,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";
+import { SizeBackfillPanel } from "@/components/after-quotation/SizeBackfillPanel";
 import {
   BACKEND,
   aqApi,
@@ -319,6 +320,8 @@ const inputCls =
 // ── the page ─────────────────────────────────────────────────────────────────
 
 export function AfterQuotationWorkbench() {
+  // the page's two tabs: one listing at a time, or the size backfill for many
+  const [mode, setMode] = useState<"listings" | "sizes">("listings");
   // the list: downloaded once, filtered in the browser while you type
   const [view, setView] = useState<View>("recommended");
   const [q, setQ] = useState("");
@@ -904,13 +907,24 @@ export function AfterQuotationWorkbench() {
             Supplier confirmed the real product? Put it on the listing.
           </span>
           <span className="flex-1" />
+          <div className="flex items-center gap-1.5">
+            <Pill on={mode === "listings"} onClick={() => setMode("listings")}>Listings</Pill>
+            <Pill on={mode === "sizes"} onClick={() => setMode("sizes")} disabled={jobRunning} title="Give every listing still on XS–XL the competitor's sizes">
+              Sizes from competitors
+            </Pill>
+          </div>
           <a href="/" className="text-[12px] text-accent hover:underline whitespace-nowrap">
             ← Dashboard
           </a>
         </div>
       </div>
 
-      <div className="max-w-[1400px] mx-auto px-5 lg:px-8 py-6 grid grid-cols-1 lg:grid-cols-[360px_minmax(0,1fr)] gap-6">
+      {mode === "sizes" && (
+        <div className="max-w-[1400px] mx-auto px-5 lg:px-8 py-6">
+          <SizeBackfillPanel onDone={() => void loadList()} />
+        </div>
+      )}
+      <div className={`max-w-[1400px] mx-auto px-5 lg:px-8 py-6 grid grid-cols-1 lg:grid-cols-[360px_minmax(0,1fr)] gap-6 ${mode === "sizes" ? "hidden" : ""}`}>
         {/* ── search ── */}
         <aside className="space-y-3 lg:sticky lg:top-20 lg:self-start lg:max-h-[calc(100vh-6rem)] lg:overflow-y-auto pr-1">
           <input

@@ -1,5 +1,7 @@
 "use client";
 
+import { competitorSizes, type CompetitorSizes } from "@/lib/competitorSizes";
+import { nbCategory } from "@/lib/nbCategory";
 import { useEffect, useRef, useState } from "react";
 import { Spinner } from "@/components/ui/Spinner";
 import { Button } from "@/components/ui/Button";
@@ -48,6 +50,7 @@ type PendingCtx = {
   images: { url: string; selected: boolean; variantIds: number[] }[];
   variantsByColor: ReturnType<typeof extractVariantsByColor>;
   imagesByColor: ReturnType<typeof groupImagesByColor>;
+  sizes: CompetitorSizes;
 };
 
 /** Plain-text competitor info (title + description). Source of truth for fabric
@@ -112,6 +115,9 @@ export function GenerateStep() {
       };
       const productType = guessProductType(product);
       const canonicalColors = extractColors(product).map(canonicalize);
+      // The competitor's own sizes (v1.323) — the listing used to get XS–XL
+      // whatever the competitor sold (shoes in XS–XL, 3XL never offered).
+      const sizes = competitorSizes(product?.options, nbCategory(productType));
 
       // ImagesCard "From competitor" shows just 8 thumbnails — enough for the
       // user to pick a reference for steps 1-4. Nothing is pre-selected.
@@ -172,6 +178,7 @@ export function GenerateStep() {
         images,
         variantsByColor,
         imagesByColor,
+        sizes,
       };
 
       // ── 3. Keyword research (DataForSEO) ── build the review candidates.
@@ -270,6 +277,7 @@ export function GenerateStep() {
       images,
       variantsByColor,
       imagesByColor,
+      sizes,
     } = ctx;
     try {
       setReviewOpen(false);
@@ -363,6 +371,13 @@ export function GenerateStep() {
         colors: primaryColors,
         siblingsHandle: autoSiblingsHandle(chosenName),
         productType,
+        // ALWAYS written (fallback included): product B must never inherit A's sizes
+        sizes: sizes.sizes,
+        sizesSource: sizes.source,
+        competitorSizes: sizes.sizes,
+        sizesNote: sizes.note
+          ? `${sizes.note}${sizes.raw.length ? ` (competitor: ${sizes.raw.slice(0, 12).join(" · ")})` : ""}`
+          : null,
         competitorImages: images,
         competitorVariantsByColor: variantsByColor,
         competitorImagesByColor: imagesByColor,

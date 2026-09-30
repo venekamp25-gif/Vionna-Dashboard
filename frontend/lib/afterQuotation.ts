@@ -16,7 +16,7 @@ export interface AqChart {
   rows: string[][];
 }
 
-export const LETTER_SIZES = ["XXS", "XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL"];
+export const LETTER_SIZES = ["XXS", "XS", "S", "M", "L", "XL", "2XL", "3XL", "4XL", "5XL", "6XL", "7XL"];
 
 const ALIASES: Record<string, string> = {
   XXL: "2XL",
@@ -32,8 +32,14 @@ const ALIASES: Record<string, string> = {
   "X-LARGE": "XL",
   "XX-LARGE": "2XL",
   XXLARGE: "2XL",
+  "2XS": "XXS",
+  XXXS: "XXS",
+  "1XL": "XL",
+  "XX-SMALL": "XXS",
 };
-const ONE_SIZE = new Set(["ONESIZE", "OS", "FREESIZE", "FREE", "TAILLEUNIQUE", "YKSIKOKO", "ONESIZEFITSALL"]);
+const ONE_SIZE = new Set([
+  "ONESIZE", "OS", "FREESIZE", "FREE", "TAILLEUNIQUE", "YKSIKOKO", "ONESIZEFITSALL", "OSFA", "TU", "ONE-SIZE", "O/S",
+]);
 
 /** One spelling per size: "xxl" → "2XL", "EU 38" → "38", "one size" → "One Size". */
 export function normSize(raw: string): string {
@@ -43,8 +49,8 @@ export function normSize(raw: string): string {
   if (ALIASES[u]) return ALIASES[u];
   if (LETTER_SIZES.includes(u)) return u;
   if (ONE_SIZE.has(u.normalize("NFKD").replace(/[̀-ͯ]/g, ""))) return "One Size";
-  const m = u.match(/^(?:EU|EUR|FR|DK)?(\d{2,3}(?:[.,]5)?)$/);
-  if (m) return m[1].replace(",", ".");
+  const m = u.replace("½", ".5").match(/^(?:EU|EUR|FR|DK)?(\d{2,3}(?:[.,][05])?)$/);
+  if (m) return String(parseFloat(m[1].replace(",", "."))); // "36.0" → "36", "37½" → "37.5"
   return t.slice(0, 20);
 }
 
@@ -54,7 +60,8 @@ export function sizeKind(sizes: string[]): SizeKind {
   const ns = sizes.map(normSize).filter(Boolean);
   if (!ns.length) return "other";
   if (ns.every((x) => x === "One Size")) return "one";
-  if (ns.every((x) => LETTER_SIZES.includes(x))) return "letter";
+  // combined sizes ("S/M") count as letter sizes when both halves are letters
+  if (ns.every((x) => x.split("/").every((y) => LETTER_SIZES.includes(y)))) return "letter";
   if (ns.every((x) => /^\d{2,3}(\.5)?$/.test(x))) return "number";
   return "other";
 }
@@ -63,7 +70,10 @@ export function sizeKind(sizes: string[]): SizeKind {
 export function sortSizes(sizes: string[]): string[] {
   const ns = [...new Set(sizes.map(normSize).filter(Boolean))];
   const kind = sizeKind(ns);
-  if (kind === "letter") return ns.sort((a, b) => LETTER_SIZES.indexOf(a) - LETTER_SIZES.indexOf(b));
+  if (kind === "letter") {
+    const idx = (x: string) => LETTER_SIZES.indexOf(x.split("/")[0]);
+    return ns.sort((a, b) => idx(a) - idx(b) || a.length - b.length);
+  }
   if (kind === "number") return ns.sort((a, b) => parseFloat(a) - parseFloat(b));
   return ns;
 }

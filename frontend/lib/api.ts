@@ -1293,6 +1293,9 @@ export const api = {
     product_name: string;
     color: string;
     sizes?: string[];
+    /** where the sizes came from (competitor / converted-uk / one-size /
+     *  default / shoe-default / manual) — logged with the publish */
+    sizes_source?: string | null;
     description: string;
     meta_description: string;
     m_title_specs: string;
@@ -2109,7 +2112,7 @@ export interface AqPlan {
 
 export interface AqJob {
   id: string;
-  kind: "apply" | "undo";
+  kind: "apply" | "undo" | "size_check" | "size_apply";
   status: "running" | "done" | "partial" | "error";
   step: string;
   done: number;
@@ -2191,4 +2194,38 @@ export const aqApi = {
     call<{ history: AqHistoryRow[] }>(`/api/aq/history${key ? `?key=${encodeURIComponent(key)}` : ""}`, {
       authed: true,
     }),
+};
+
+// ── After Quotation: sizes from competitors (backfill, v1.323) ────────────────
+
+export interface AqSizeRow {
+  key: string;
+  name: string;
+  cat: string;
+  image: string;
+  current: string[];
+  proposed: string[] | null;
+  /** competitor | converted-uk | one-size | default | shoe-default */
+  source: string | null;
+  note: string | null;
+  competitor_url: string | null;
+  /** orders on file for this colour group — sold groups start unticked */
+  orders: number;
+  stores: AqStoreKey[];
+  raw?: string[];
+  /** change | same | no_source | gone | failed */
+  status: string;
+}
+
+export interface AqSizeReport {
+  generated_at: string | null;
+  rows: AqSizeRow[];
+  counts: Record<string, number>;
+}
+
+export const aqSizesApi = {
+  check: () => call<{ job_id: string }>("/api/aq/size_backfill/check", { method: "POST", body: {}, authed: true }),
+  report: () => call<AqSizeReport>("/api/aq/size_backfill/report", { authed: true }),
+  apply: (keys: string[]) =>
+    call<{ job_id: string }>("/api/aq/size_backfill/apply", { method: "POST", body: { keys }, authed: true }),
 };
