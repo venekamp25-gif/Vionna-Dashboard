@@ -22795,15 +22795,100 @@ def _blog_repetition_violations(body, prev_texts, min_words=BLOG_REPEAT_SHINGLE,
             f"rewrite it completely in different words: \"{h[:180]}\"" for h in hits[:max_hits]]
 
 
+# Output format + budget (incident 29 Sep 2026: the FI Tuesday article never
+# appeared, Slack only said 'writer failed'). The writer returned its ~10k-char
+# HTML article as ONE string inside hand-written JSON, which broke two ways with
+# no retry: cut off at the fixed 4,500-token cap (Finnish ~4.8 tokens/word, the
+# pillar/SERP targets grew to 1,400 words on 22 Jul, the cap never followed),
+# and an unescaped quote inside the HTML ('"half tuck"', 'href=\"/blogs/..">')
+# even on a clean end_turn — 5 of 12 reproduced FI pillar calls were unusable.
+# A forced tool call makes the API hand back a parsed dict (it owns the escaping),
+# and stop_reason tells truncation apart from everything else.
+BLOG_TOKENS_PER_WORD = {'fi': 4.8, 'dk': 3.2, 'fr': 2.8}   # measured 30-09-2026 on writer output
+BLOG_WRITER_MAX_TOKENS = 16000     # same ceiling as the editor (non-streaming stays under the SDK timeout)
+
+
+def _blog_writer_budget(store, wc_target):
+    """Output-token cap for one article: target words × tokens/word for this
+    language + 20% slack + room for the metadata. Billing is per generated
+    token, so a generous cap costs nothing extra; a tight one loses the day."""
+    return max(6000, min(BLOG_WRITER_MAX_TOKENS,
+                         int(wc_target * 1.2 * BLOG_TOKENS_PER_WORD.get(store, 3.5)) + 1500))
+
+
+def _blog_tool(name, description, props, required=None):
+    """Tool definition for one forced structured answer (all string fields
+    unless props says otherwise)."""
+    return {'name': name, 'description': description,
+            'input_schema': {'type': 'object', 'properties': props,
+                             'required': list(required or props)}}
+
+
+_BLOG_TAGS_PROP = {'type': 'array', 'items': {'type': 'string'}}
+# No 'faq' array: the FAQ already lives in body_html (<h2>/<h3>/<p>) and
+# _blog_faq_from_body reads it from there — the duplicate cost ~1k tokens per
+# FI article and only raised the truncation risk.
+BLOG_ARTICLE_TOOL = _blog_tool(
+    'article', 'Deliver the finished blog article.',
+    {'title': {'type': 'string'},
+     'handle': {'type': 'string', 'description': 'url slug: lowercase ascii, hyphens, no year'},
+     'meta_description': {'type': 'string'},
+     'excerpt': {'type': 'string'},
+     'tags': _BLOG_TAGS_PROP,
+     'body_html': {'type': 'string', 'description': 'the complete article as HTML, FAQ section included'}})
+BLOG_EDITED_TOOL = _blog_tool(
+    'edited_article', 'Deliver the corrected article.',
+    {'title': {'type': 'string'}, 'meta_description': {'type': 'string'},
+     'excerpt': {'type': 'string'}, 'tags': _BLOG_TAGS_PROP,
+     'body_html': {'type': 'string', 'description': 'the complete corrected article as HTML'}})
+BLOG_REFRESH_TOOL = _blog_tool(
+    'updated_body', 'Deliver the strengthened article body.',
+    {'body_html': {'type': 'string', 'description': 'the complete updated article as HTML'}})
+BLOG_MAINT_TOOL = _blog_tool(
+    'maintained_article', 'Deliver the improved article.',
+    {'title': {'type': 'string'}, 'meta_description': {'type': 'string'},
+     'body_html': {'type': 'string', 'description': 'the complete improved article as HTML'},
+     'changes': {'type': 'array', 'items': {'type': 'string'},
+                 'description': 'short note per change'}})
+
+
+def _blog_llm_tool(client, prompt, tool, max_tokens, need=('body_html',), model='claude-sonnet-4-6'):
+    """ONE forced tool call. Returns (input_dict, None, msg) on success, else
+    (None, why, msg): why names the real failure — truncation, no tool block or
+    an empty required field (each with stop_reason + output tokens), or the API
+    exception — never just 'no JSON'. Never raises."""
+    try:
+        msg = client.messages.create(model=model, max_tokens=max_tokens, tools=[tool],
+                                     tool_choice={'type': 'tool', 'name': tool['name']},
+                                     messages=[{'role': 'user', 'content': prompt}])
+    except Exception as e:
+        return None, f"API error {type(e).__name__}: {str(e)[:160]}", None
+    stop = getattr(msg, 'stop_reason', None)
+    used = getattr(getattr(msg, 'usage', None), 'output_tokens', None)
+    ctx = f"stop_reason={stop}, {used} output tokens, max_tokens={max_tokens}"
+    if stop == 'max_tokens':
+        return None, f"output cut off at max_tokens ({ctx})", msg
+    block = next((b for b in (getattr(msg, 'content', None) or [])
+                  if getattr(b, 'type', None) == 'tool_use'), None)
+    data = getattr(block, 'input', None)
+    if not isinstance(data, dict):
+        return None, f"no '{tool['name']}' tool call in the answer ({ctx})", msg
+    empty = [k for k in need if not str(data.get(k) or '').strip()]
+    if empty:
+        return None, f"tool answer has empty {', '.join(empty)} ({ctx})", msg
+    return data, None, msg
+
+
 def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns=None,
                 serp_brief=None, fmt=None, avoid_phrases=None):
     """Claude writes the SEO article in the store's language. Returns a dict:
-    {title, handle, meta_description, excerpt, tags[], body_html, faq[]}. None on
-    failure. avoid: QA findings from a rejected earlier attempt (rewrite mode).
+    {title, handle, meta_description, excerpt, tags[], body_html, faq[]}, or
+    {'error': why} on failure (why = the real reason, for Slack and the logs).
+    avoid: QA findings from a rejected earlier attempt (rewrite mode).
     faq_questions: real question-style searches to build the FAQ section from.
     concerns: real consumer doubts from fashion forums (English) to address."""
     if not ANTHROPIC_KEY or ANTHROPIC_KEY == 'VOELINJEYHIER':
-        return None
+        return {'error': 'no Anthropic API key configured'}
     lang = DFS_LANG_NAME.get(store, 'Danish')
     kw = topic.get('keyword') or ''
     cluster = [c for c in (topic.get('cluster') or []) if c]
@@ -22941,36 +23026,38 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns
         f"8. tags: 2-3 short {lang} topical tags, never more (they are data for archive pages, "
         "not shown on the storefront cards).\n"
         "9. handle: url slug from the title, lowercase, ascii, hyphens, NO year.\n\n"
-        "Return ONLY compact JSON with EXACTLY these keys: "
-        '{"title": "...", "handle": "...", "meta_description": "...", "excerpt": "...", '
-        '"tags": ["..."], "body_html": "...", '
-        '"faq": [{"q": "plain-text question", "a": "plain-text answer"}]}'
+        "Deliver the article by calling the `article` tool with: title, handle, meta_description, "
+        "excerpt, tags and body_html (the complete HTML article, the FAQ section from requirement 4 "
+        "included)."
     )
+    # Budget per language, and ONE retry at the full ceiling on ANY failure: a
+    # fresh sample succeeds in ~75% of the cases, so one bad answer no longer
+    # burns one of the scheduler's only 2 attempts per store per day.
+    caps = (_blog_writer_budget(store, wc_target), BLOG_WRITER_MAX_TOKENS)
+    data, whys, used_cap, msg = None, [], None, None
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=4500,
-                                      messages=[{'role': 'user', 'content': prompt}])
-        txt = (msg.content[0].text if msg.content else '') or ''
-        data = _blog_first_json(txt)
-        if data is None:
-            print(f"[blog] writer returned no JSON: {txt[:150]}")
-            return None
     except Exception as e:
-        print(f"[blog] writer failed: {e}")
-        return None
+        return {'error': f"API client error {type(e).__name__}: {str(e)[:160]}"}
+    for cap in caps:
+        data, why, msg = _blog_llm_tool(client, prompt, BLOG_ARTICLE_TOOL, cap, need=('title', 'body_html'))
+        if data is not None:
+            used_cap = cap
+            break
+        whys.append(why)
+        print(f"[blog] {store}: writer attempt {len(whys)}/{len(caps)} failed "
+              f"({lang}, target {wc_target} words): {why}")
+    if data is None:
+        return {'error': ' | retry: '.join(whys) + f" [{lang}, target {wc_target} words]"}
     # sanitise
     tags = data.get('tags') or []
     if isinstance(tags, str):
         tags = [t.strip() for t in tags.split(',') if t.strip()]
-    faq = []
-    for f in (data.get('faq') or [])[:5]:
-        if isinstance(f, dict) and (f.get('q') or '').strip() and (f.get('a') or '').strip():
-            faq.append({'q': re.sub(r'<[^>]+>', '', f['q']).strip()[:200],
-                        'a': re.sub(r'<[^>]+>', '', f['a']).strip()[:600]})
     handle = re.sub(r'[^a-z0-9]+', '-', (data.get('handle') or data.get('title') or 'post').lower()).strip('-')[:80]
     title = (data.get('title') or '').strip()[:120]
     body = data.get('body_html') or ''
+    faq = _blog_faq_from_body(store, body)
     # Levers — the writing knobs the feedback loop later correlates with performance.
     words = len(re.findall(r"[\wÀ-ÿ]+", re.sub(r'<[^>]+>', ' ', body)))
     levers = {
@@ -22994,6 +23081,10 @@ def _blog_write(store, topic, products, avoid=None, faq_questions=None, concerns
         'product_cards': True,
         'format': ('bestsellers' if topic.get('source') == 'bestsellers'
                    else 'pillar' if topic.get('pillar') else fmt),
+        # headroom per article: FI sat at 90-96% of the old cap for weeks unnoticed
+        'writer_output_tokens': getattr(getattr(msg, 'usage', None), 'output_tokens', None),
+        'writer_max_tokens': used_cap,
+        'writer_retried': bool(whys),
     }
     return {
         'title': title,
@@ -23242,20 +23333,18 @@ def _blog_edit(store, art, products=None, violations=None):
         f"EXCERPT: {art.get('excerpt')}\n"
         f"TAGS: {json.dumps(art.get('tags'), ensure_ascii=False)}\n"
         f"BODY_HTML:\n{art.get('body_html')}\n\n"
-        "Return ONLY compact JSON: {\"title\": \"...\", \"meta_description\": \"...\", "
-        "\"excerpt\": \"...\", \"tags\": [\"...\"], \"body_html\": \"...\"}"
+        "Deliver the corrected article by calling the `edited_article` tool with: title, "
+        "meta_description, excerpt, tags and body_html (the complete corrected HTML)."
     )
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=16000,
-                                      messages=[{'role': 'user', 'content': prompt}])
-        txt = (msg.content[0].text if msg.content else '') or ''
-        data = _blog_first_json(txt)
+        # forced tool call: the full HTML body no longer travels as a hand-escaped
+        # JSON string (see BLOG_TOKENS_PER_WORD for the 29 Sep incident)
+        data, why, _msg = _blog_llm_tool(client, prompt, BLOG_EDITED_TOOL, 16000)
         if data is None:
-            # usually output-cap truncation (the editor must echo the FULL body);
             # keeping the writer version is safe but skips the fixes
-            print('[blog] editor returned no JSON; keeping writer version')
+            print(f'[blog] editor unusable ({why}); keeping writer version')
             return art
         body = data.get('body_html') or ''
         # Safety: the edit must not lose product links; if it did, keep the original.
@@ -23933,10 +24022,12 @@ def _blog_slack_article(store, created, publish, qa_slim, topic):
         print(f"[blog] slack article notify failed: {e}")
 
 
-def _blog_generate_one(store, topic=None, published=None):
+def _blog_generate_one(store, topic=None, published=None, _candidates=None):
     """Full pipeline for one store → one article. published: True/False force the
     state; None = auto mode — publish only when the QA gate passes (and
-    BLOG_AUTO_PUBLISH isn't 0), else save as draft. Returns a result dict."""
+    BLOG_AUTO_PUBLISH isn't 0), else save as draft. Returns a result dict.
+    _candidates: internal — the rest of this run's topic list after a pillar's
+    writer failed."""
     hdrs = shopify_headers(store)
     if not hdrs.get('X-Shopify-Access-Token'):
         return {'store': store, 'error': 'no Shopify token for this store'}
@@ -23946,6 +24037,8 @@ def _blog_generate_one(store, topic=None, published=None):
     # dress is not wedding wear — reject and try the next subject instead).
     if topic is not None:
         candidates = [topic]
+    elif _candidates:
+        candidates = list(_candidates)
     else:
         candidates = [{**t, 'source': 'dataforseo'} for t in _blog_hot_topics(store, k=3, hdrs=hdrs)]
         fb = _blog_fallback_topic(store, hdrs=hdrs)
@@ -23996,7 +24089,21 @@ def _blog_generate_one(store, topic=None, published=None):
     art = _blog_write(store, topic, products, faq_questions=faqs, concerns=concerns,
                       serp_brief=brief, fmt=fmt, avoid_phrases=avoid_phrases)
     if not art or not art.get('title') or not art.get('body_html'):
-        return {'store': store, 'topic': topic, 'error': 'writer failed'}
+        # 29 Sep 2026: FI lost its Tuesday article on a pillar whose writer failed
+        # twice, and Slack only said 'writer failed'. The reason and the subject
+        # now travel with the error, and a failed PILLAR (a due-by-rule piece, not
+        # the day's only option) hands the slot to the next candidate.
+        why = (art or {}).get('error') or 'empty title/body'
+        kw = topic.get('keyword')
+        rest = [c for c in candidates if c is not topic]
+        if topic.get('pillar') and rest:
+            print(f"[blog] {store}: pillar '{kw}' writer failed ({why}) — trying the next topic")
+            res = _blog_generate_one(store, published=published, _candidates=rest)
+            res['pillar_writer_failed'] = {'keyword': kw, 'error': why}
+            if res.get('error'):
+                res['error'] += f" (after pillar '{kw}' writer failed: {why})"
+            return res
+        return {'store': store, 'topic': topic, 'error': f"writer failed: {why} (topic '{kw}')"}
     art['primary_keyword'] = topic.get('keyword')
     art = _blog_edit(store, art, products)
     # Deterministic style gate: models under-obey the dash/length budget when merely
@@ -24331,17 +24438,19 @@ def _blog_refresh_one(store):
         kws = ', '.join(f"\"{k.get('keyword')}\" (pos {k.get('position')})" for k in near)
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=16000,
-            messages=[{'role': 'user', 'content':
+        data, why, _msg = _blog_llm_tool(client,
             f"You are updating an existing {lang} fashion-blog article that ranks positions 5-20 "
             f"for these searches: {kws}. Strengthen it so it can reach the top: add ONE new <h2> "
             "section (120-220 words) that directly and naturally serves those searches, and where "
             "an existing sentence can weave one of those phrasings in naturally, do so. Do NOT "
             "change the title, links, structure or tone otherwise; keep every <a href> exactly. "
             f"Same writing rules as always:\n{BLOG_ANTI_AI_RULES}\n\nBODY_HTML:\n{body}\n\n"
-            'Return ONLY compact JSON: {"body_html": "..."}'}])
-        data = _blog_first_json((msg.content[0].text if msg.content else '') or '')
-        new_body = (data or {}).get('body_html') or ''
+            "Deliver the complete updated article by calling the `updated_body` tool.",
+            BLOG_REFRESH_TOOL, 16000)
+        if data is None:
+            print(f"[blog] refresh {store}: update unusable ({why}), skipped")
+            return
+        new_body = data.get('body_html') or ''
         if not new_body or new_body.count('/products/') < body.count('/products/'):
             print(f"[blog] refresh {store}: update unusable, skipped")
             return
@@ -24525,8 +24634,7 @@ def _blog_maintain_one(store, hdrs=None):
             return 'no anthropic key'
         import anthropic
         client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=16000,
-            messages=[{'role': 'user', 'content':
+        data, why, _msg = _blog_llm_tool(client,
                 f"You are maintaining a PUBLISHED article on a {lang}-language womenswear shop blog "
                 f"(Vionna). Improve it on three axes without changing its subject or structure:\n"
                 f"1. LANGUAGE — fix every grammar, agreement, spelling and idiom error; make it read "
@@ -24545,10 +24653,14 @@ def _blog_maintain_one(store, hdrs=None):
                 "keep the FAQ section; do not change the URL handle; keep the same headings unless "
                 "one is genuinely wrong.\n\n"
                 f"CURRENT TITLE: {title}\n\nCURRENT HTML:\n{head}\n\n"
-                'Return ONLY compact JSON: {"title": "...", "meta_description": "...", '
-                '"body_html": "...", "changes": ["short note per change"]}'}])
-        data = _blog_first_json((msg.content[0].text if msg.content else '') or '')
-        new_head = (data or {}).get('body_html') or ''
+                "Deliver the result by calling the `maintained_article` tool with: title, "
+                "meta_description, body_html (the complete improved HTML) and changes (a short "
+                "note per change).",
+                BLOG_MAINT_TOOL, 16000)
+        if data is None:
+            print(f"[blog] maint {store}/{handle}: unusable result ({why}), skipped")
+            return f'unusable ({why[:120]})'
+        new_head = data.get('body_html') or ''
         if not new_head or new_head.count('/products/') < n_links:
             print(f"[blog] maint {store}/{handle}: unusable result, skipped")
             return 'unusable'
