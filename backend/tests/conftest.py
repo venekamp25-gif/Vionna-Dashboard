@@ -69,3 +69,17 @@ def _isolate_after_quotation(tmp_path, monkeypatch):
     monkeypatch.setattr(server, '_AQ_SUMMARY_CACHE', {'sig': None, 'items': None})
     monkeypatch.setattr(server, '_AQ_LIST_CACHE', {'sig': None, 'payload': None})
     monkeypatch.setattr(server, '_AQ_HISTORY_CACHE', {'v': None})
+
+
+@pytest.fixture(autouse=True)
+def _isolate_name_pool(tmp_path, monkeypatch):
+    """The name-pool watch keeps its 'already warned' state in
+    backend/name_pool_watch.json (30 Sep 2026: kept in memory, it was lost on
+    every deploy restart and each deploy sent a false Slack ping). Without this
+    the watch tests would write that file into the public repo and the next run
+    would start from its leftovers instead of a clean slate."""
+    import server
+
+    monkeypatch.setattr(server, 'NAME_POOL_STATE_PATH', str(tmp_path / 'name_pool_watch.json'))
+    monkeypatch.setattr(server, '_NAME_POOL_LAST', {'at': 0.0, 'status': None, 'warned_free': None})
+    monkeypatch.setattr(server, '_NAME_POOL_SYNC', {'at': 0.0, 'result': None})

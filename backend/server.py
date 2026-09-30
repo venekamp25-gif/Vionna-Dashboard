@@ -253,7 +253,7 @@ def _run_backup():
                       'wtl_store_marks.json', 'wtl_extra_stores.json',
                       'wtl_discover_seen.json', 'wtl_discover_state.json',
                       'spy_shield.jsonl', 'lighting_channels.json', 'aq_history.jsonl',
-                      'aq_orders.json', 'aq_size_backfill.json'):
+                      'aq_orders.json', 'aq_size_backfill.json', 'name_pool_watch.json'):
             src = os.path.join(_BASE_DIR, fname)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dest, fname))
@@ -10895,7 +10895,18 @@ def get_names():
 NAMES_TS_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                              'frontend', 'lib', 'names.ts')
 NAME_POOL_WARN_BELOW = 150       # vrije namen; bij ~30/week is dat ~5 weken
+# De echte lijst had 1.428 namen op 2026-09-17 (test_the_real_pool_is_large_and_clean
+# bewaakt de repo-kopie). Minder op de droplet = een OUDE kopie, geen lege poel:
+# van 17 t/m 30 sep telde de droplet op een names.ts van 10 juni (279 namen) en
+# meldde na elke deploy 'pool bijna leeg' terwijl er 1.003 van de 1.425 vrij waren.
+NAME_POOL_MIN_EXPECTED = 1400
+# 'Al gewaarschuwd' op DISK: het proces herstart bij elke deploy (os._exit in
+# api_update), dus een dict in het geheugen gaf ~15 min na iedere deploy dezelfde
+# ping opnieuw (22 valse pings sinds 17 sep, 3 op 30 sep).
+NAME_POOL_STATE_PATH = os.path.join(_BASE_DIR, 'name_pool_watch.json')
+_NAME_POOL_SYNC_TTL = 6 * 3600
 _NAME_POOL_LAST = {'at': 0.0, 'status': None, 'warned_free': None}
+_NAME_POOL_SYNC = {'at': 0.0, 'result': None}
 _NAME_SLUG_MAP = {'ø': 'o', 'æ': 'ae', 'å': 'a', 'ä': 'a', 'ö': 'o', 'ü': 'u', 'ß': 'ss', 'œ': 'oe',
                   'ð': 'd', 'þ': 'th', 'ł': 'l'}
 
@@ -10908,20 +10919,84 @@ def _name_slug(text):
     return re.sub(r'[^a-z0-9]+', '-', ''.join(c for c in t if not unicodedata.combining(c))).strip('-')
 
 
+def _name_pool_parse(text):
+    """The WOMEN_NAMES list out of names.ts source text. [] when not found."""
+    m = re.search(r'WOMEN_NAMES\s*=\s*\[(.*?)\];', text or '', re.S)
+    if not m:
+        return []
+    # Commentaar eerst weg: daar staan ook woorden tussen aanhalingstekens
+    # ('de terugval deelde "Berit 2" uit') en die zijn geen poolnamen.
+    return re.findall(r'"([^"]+)"', re.sub(r'//[^\n]*', '', m.group(1)))
+
+
 def _name_pool_names(path=None):
     """The WOMEN_NAMES list parsed out of names.ts. [] when unreadable."""
     try:
         with open(path or NAMES_TS_PATH, encoding='utf-8') as f:
-            ts = f.read()
-        m = re.search(r'WOMEN_NAMES\s*=\s*\[(.*?)\];', ts, re.S)
-        if not m:
-            return []
-        # Commentaar eerst weg: daar staan ook woorden tussen aanhalingstekens
-        # ('de terugval deelde "Berit 2" uit') en die zijn geen poolnamen.
-        return re.findall(r'"([^"]+)"', re.sub(r'//[^\n]*', '', m.group(1)))
+            return _name_pool_parse(f.read())
     except Exception as e:
         print(f'[names] pool unreadable: {e}')
         return []
+
+
+def _write_file_atomic(path, content):
+    """bytes → path via .tmp + os.replace, so a reader never sees half a file."""
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'wb') as f:
+        f.write(content)
+    os.replace(tmp, path)
+
+
+def _name_pool_sync():
+    """Bring the droplet's names.ts in line with GitHub main (what Netlify builds,
+    so what the live frontend hands out). Returns {'source', 'remote_pool'}:
+    source 'github' = the local file now equals main, 'local' = not confirmed;
+    remote_pool = main's slug count, None when GitHub gave nothing usable.
+
+    Why: the self-updater never shipped names.ts, so the droplet counted on the
+    10 June list (279 names) from 17 to 30 Sep while main had 1.425. The first
+    boot after this fix repairs the file itself — the deploy that brings this
+    code is done by the OLD updater, which does not ship names.ts yet.
+
+    Guards: never from a dev machine or pytest (it would overwrite a branch that
+    is extending the list — the self-updater has the same rule); SHA-pinned
+    fetch, because the raw CDN serves a stale file off `main` now and then; and
+    never a SMALLER list over a bigger one, so a stale or broken answer cannot
+    shrink the pool. Never raises. Cached 6 h."""
+    now = time.time()
+    if _NAME_POOL_SYNC['result'] is not None and now - _NAME_POOL_SYNC['at'] < _NAME_POOL_SYNC_TTL:
+        return _NAME_POOL_SYNC['result']
+    result = {'source': 'local', 'remote_pool': None}
+    try:
+        if not _background_loops_allowed() or not GITHUB_RAW:
+            return result
+        sha, info = _resolve_commit_sha(), _github_api_repo()
+        base = f'https://raw.githubusercontent.com/{info[0]}/{info[1]}/{sha}' if sha and info else GITHUB_RAW
+        r = req.get(f'{base}/frontend/lib/names.ts', timeout=15,
+                    headers={'Cache-Control': 'no-cache', 'User-Agent': 'vionna-dashboard-updater'})
+        r.raise_for_status()
+        remote = _name_pool_parse(r.content.decode('utf-8'))
+        remote_slugs = {_name_slug(n) for n in remote}
+        if not remote_slugs:
+            print('[names] sync: no WOMEN_NAMES in GitHub names.ts — kept the local list')
+        else:
+            result['remote_pool'] = len(remote_slugs)
+            local = _name_pool_names()
+            local_slugs = {_name_slug(n) for n in local}
+            if remote == local:
+                result['source'] = 'github'
+            elif len(remote_slugs) >= len(local_slugs):
+                _write_file_atomic(NAMES_TS_PATH, r.content)
+                result['source'] = 'github'
+                print(f'[names] sync: names.ts {len(local_slugs)} -> {len(remote_slugs)} names from GitHub')
+            else:
+                print(f'[names] sync: GitHub has {len(remote_slugs)} names, local {len(local_slugs)} '
+                      f'— refused to shrink the list')
+    except Exception as e:
+        print(f'[names] sync failed: {e}')
+    _NAME_POOL_SYNC.update({'at': now, 'result': result})
+    return result
 
 
 def _store_titles(store):
@@ -10945,9 +11020,13 @@ def _store_titles(store):
 
 
 def _name_pool_status(titles_by_store=None, pool=None):
-    """{pool, free, in_use, numbered, stores_failed, low}. `titles_by_store` and
-    `pool` are injectable for tests."""
-    pool = pool if pool is not None else _name_pool_names()
+    """{pool, free, in_use, numbered, stores_failed, low, pool_source, remote_pool,
+    pool_stale}. `titles_by_store` and `pool` are injectable for tests."""
+    injected = pool is not None
+    sync = {'source': 'injected', 'remote_pool': None}
+    if not injected:
+        sync = _name_pool_sync()
+        pool = _name_pool_names()
     failed, titles = [], []
     if titles_by_store is None:
         titles_by_store = {}
@@ -10965,10 +11044,19 @@ def _name_pool_status(titles_by_store=None, pool=None):
     pool_slugs = {_name_slug(n) for n in pool}
     free = len(pool_slugs - used)
     numbered = sorted({t for t in titles if re.search(r'\s\d{1,2}$', t.strip())})
+    # Gemeten op de lijst die we ECHT gebruiken (na de sync), niet op de grootte
+    # ervoor — anders heet een net gerepareerde 1.425-lijst 'verouderd'. Zonder
+    # GitHub-antwoord geldt de ondergrens; een geïnjecteerde testpoel niet.
+    remote_pool = sync.get('remote_pool')
+    pool_stale = ((bool(remote_pool) and len(pool_slugs) < remote_pool)
+                  or (remote_pool is None and not injected and len(pool_slugs) < NAME_POOL_MIN_EXPECTED))
     return {'pool': len(pool_slugs), 'free': free, 'in_use': len(used), 'numbered_names': numbered[:40],
             'stores_failed': failed, 'warn_below': NAME_POOL_WARN_BELOW,
             # Onbekend is geen 'genoeg': met een mislukte winkel is `free` te hoog.
-            'low': bool(pool_slugs) and not failed and free < NAME_POOL_WARN_BELOW,
+            # En een twijfelachtige lijst is geen oordeel: 'low' alleen op een
+            # actuele lijst (storing ≠ oordeel).
+            'low': bool(pool_slugs) and not failed and not pool_stale and free < NAME_POOL_WARN_BELOW,
+            'pool_source': sync.get('source'), 'remote_pool': remote_pool, 'pool_stale': bool(pool_stale),
             'checked_at': datetime.datetime.utcnow().isoformat() + 'Z'}
 
 
@@ -10985,30 +11073,96 @@ def api_name_pool_status():
     return jsonify(st)
 
 
+def _name_pool_state_load():
+    """The watch's 'already warned' state. The file wins; the in-memory copy is
+    only the fallback when the file cannot be read (then we dedupe per process,
+    the old behaviour, instead of pinging on every check)."""
+    try:
+        with open(NAME_POOL_STATE_PATH, encoding='utf-8') as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            return d
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f'[names] watch state unreadable: {e}')
+    return dict(_NAME_POOL_LAST.get('state') or {})
+
+
+def _name_pool_state_save(state):
+    _NAME_POOL_LAST['state'] = dict(state)
+    _NAME_POOL_LAST['warned_free'] = state.get('warned_free')
+    try:
+        _write_file_atomic(NAME_POOL_STATE_PATH, json.dumps(state, ensure_ascii=False).encode('utf-8'))
+    except Exception as e:
+        print(f'[names] could not save watch state: {e}')
+
+
 def _name_pool_watch_once():
     """One daily check: Slack ping when the pool is low or a numbered name shows
-    up. Pings again only when it got WORSE, not every day."""
+    up. Pings again only when it got WORSE, not every day — and not after every
+    restart: the state lives in NAME_POOL_STATE_PATH."""
     st = _name_pool_status()
     _NAME_POOL_LAST.update({'at': time.time(), 'status': st})
-    if st['stores_failed'] or not st['pool']:
-        return st
-    worse = _NAME_POOL_LAST['warned_free'] is None or st['free'] <= _NAME_POOL_LAST['warned_free'] - 25
-    if (st['low'] and worse) or (st['numbered_names'] and _NAME_POOL_LAST['warned_free'] is None):
-        bits = [f":label: *Product-name pool*: {st['free']} of {st['pool']} names still free "
-                f"({st['in_use']} in use across DK/FR/FI)."]
-        if st['free'] == 0:
-            bits.append("The pool is EMPTY — the dashboard is now making names up. Extend `frontend/lib/names.ts`.")
-        elif st['low']:
-            bits.append(f"Below the {NAME_POOL_WARN_BELOW} mark — extend `frontend/lib/names.ts` before it runs out.")
-        if st['numbered_names']:
-            bits.append("Numbered names in the stores: " + ', '.join(st['numbered_names'][:12]))
-        _blog_slack('\n'.join(bits))
-        _NAME_POOL_LAST['warned_free'] = st['free']
+    state = _name_pool_state_load()
+    before = dict(state)
+    # A list that is older or smaller than main's gets its OWN message, once per
+    # (local, GitHub) pair, and never the 'extend names.ts' advice: on 30 Sep
+    # that advice pointed at a list that already had 1.003 free names.
+    if st.get('pool_stale'):
+        pair = [st['pool'], st.get('remote_pool')]
+        if state.get('stale_warned_pool') != pair:
+            if st.get('remote_pool'):
+                why = (f"GitHub main has {st['remote_pool']}, so the droplet's copy of the list is outdated "
+                       f"and could not be refreshed")
+            else:
+                why = (f"expected at least {NAME_POOL_MIN_EXPECTED}, and GitHub could not be reached to compare "
+                       f"— the droplet's copy of the list is probably outdated")
+            _blog_slack(f":warning: *Product-name pool*: the droplet's `frontend/lib/names.ts` has only "
+                        f"{st['pool']} names ({why}). The free-name count is NOT a verdict until the droplet "
+                        f"has the current list — don't add names on the strength of it; check the self-updater.")
+            state['stale_warned_pool'] = pair
+    if st['pool'] and not st['stores_failed']:
+        wf = state.get('warned_free')
+        worse = st['low'] and (wf is None or state.get('warned_pool') != st['pool']
+                               or st['free'] <= wf - 25 or (st['free'] == 0 and wf != 0))
+        seen = set(state.get('warned_numbered') or [])
+        new_numbered = [n for n in st['numbered_names'] if n not in seen]
+        if worse or new_numbered:
+            if st.get('pool_stale'):
+                bits = [":label: *Product-name pool*: numbered names showed up in the stores."]
+            else:
+                bits = [f":label: *Product-name pool*: {st['free']} of {st['pool']} names still free "
+                        f"({st['in_use']} in use across DK/FR/FI)."]
+            if st['low'] and st['free'] == 0:
+                bits.append("The pool is EMPTY — the dashboard is now making names up. Extend `frontend/lib/names.ts`.")
+            elif st['low']:
+                bits.append(f"Below the {NAME_POOL_WARN_BELOW} mark — extend `frontend/lib/names.ts` before it runs out.")
+            if st['numbered_names']:
+                bits.append("Numbered names in the stores: " + ', '.join(st['numbered_names'][:12]))
+            _blog_slack('\n'.join(bits))
+            if worse:
+                state['warned_free'], state['warned_pool'] = st['free'], st['pool']
+            state['warned_numbered'] = sorted(seen | set(st['numbered_names']))
+        if not st['low']:
+            # Only the low marker re-arms: a later drop must warn again, but the
+            # stale marker stays so the 'outdated list' message is not repeated.
+            state['warned_free'] = None
+    if state != before:
+        _name_pool_state_save(state)
     return st
 
 
 def _name_pool_watch_loop():
-    time.sleep(900)
+    # Repair the list at boot, before the first check. After 60 s: this thread
+    # starts halfway through importing server.py, before GITHUB_RAW and the
+    # updater helpers further down exist.
+    time.sleep(60)
+    try:
+        _name_pool_sync()
+    except Exception as e:
+        print(f'[names] boot sync error: {e}')
+    time.sleep(840)
     while True:
         try:
             _name_pool_watch_once()
@@ -20126,7 +20280,6 @@ def api_update():
         return jsonify({'error': 'Unauthorized — /api/update is local-only or requires a valid token'}), 401
     if not GITHUB_RAW:
         return jsonify({'error': 'GITHUB_RAW not configured'}), 400
-    base_dir = os.path.dirname(os.path.abspath(__file__))
 
     # Resolve an IMMUTABLE source before fetching. A ?t=<ts> cache-bust is useless
     # here — raw.githubusercontent.com ignores query strings for its cache key — so
@@ -20142,30 +20295,54 @@ def api_update():
         fetch_base = GITHUB_RAW
         pinned = False
 
-    # Pull from backend/ on GitHub, save locally next to the running server.py.
-    # NOTE: every .py module the server imports MUST be in this list — otherwise
-    # deploys silently ship a stale module (bit us with shipping_check v1.177).
-    files_to_update = ['index.html', 'server.py', 'shipping_check.py', 'version.txt']
-    updated = []
-    errors  = []
-    for fname in files_to_update:
+    # Fetch EVERYTHING first, write only when every fetch succeeded, version.txt
+    # last. Writing each file as it arrived let version.txt move on while another
+    # file had failed, and the updater then never retried the missing one.
+    fetched, errors = [], []
+    for repo_path, dest in _updater_files():
         try:
-            r = req.get(f'{fetch_base}/backend/{fname}', timeout=15,
+            r = req.get(f'{fetch_base}/{repo_path}', timeout=15,
                         headers={'Cache-Control': 'no-cache',
                                  'User-Agent': 'vionna-dashboard-updater'})
             r.raise_for_status()
-            dest = os.path.join(base_dir, fname)
-            with open(dest, 'wb') as f:
-                f.write(r.content)
-            updated.append(fname)
+            fetched.append((repo_path, dest, r.content))
         except Exception as e:
-            errors.append(f'{fname}: {e}')
-
+            errors.append(f'{repo_path}: {e}')
     if errors:
-        return jsonify({'success': False, 'updated': updated, 'errors': errors,
+        return jsonify({'success': False, 'updated': [], 'errors': errors,
                         'sha': sha, 'pinned': pinned}), 500
 
-    # Schedule restart after response is sent
+    updated = []
+    for repo_path, dest, content in fetched:
+        try:
+            _write_file_atomic(dest, content)
+            updated.append(repo_path)
+        except Exception as e:
+            # Stop before version.txt: the next tick sees the old version and retries.
+            return jsonify({'success': False, 'updated': updated, 'errors': [f'{repo_path}: {e}'],
+                            'sha': sha, 'pinned': pinned}), 500
+
+    _schedule_restart()
+    return jsonify({'success': True, 'updated': updated, 'restarting': True,
+                    'sha': sha, 'pinned': pinned})
+
+
+def _updater_files():
+    """(repo path, local destination) of every file the self-updater ships,
+    version.txt LAST (it is what tells the updater it is done).
+    NOTE: every .py module server.py imports and every repo file it reads at
+    runtime MUST be in this list, or deploys silently keep a stale copy — bit us
+    with shipping_check (v1.177) and with names.ts (the droplet counted the name
+    pool on the 10 June list until 30 Sep 2026). test_name_pool checks both."""
+    return [('backend/index.html', os.path.join(_BASE_DIR, 'index.html')),
+            ('backend/server.py', os.path.join(_BASE_DIR, 'server.py')),
+            ('backend/shipping_check.py', os.path.join(_BASE_DIR, 'shipping_check.py')),
+            ('frontend/lib/names.ts', NAMES_TS_PATH),
+            ('backend/version.txt', VERSION_FILE)]
+
+
+def _schedule_restart():
+    """Restart the process shortly after the update response has been sent."""
     def _restart():
         import time, subprocess
         time.sleep(1.5)
@@ -20181,8 +20358,6 @@ def api_update():
 
     import threading
     threading.Thread(target=_restart, daemon=True).start()
-    return jsonify({'success': True, 'updated': updated, 'restarting': True,
-                    'sha': sha, 'pinned': pinned})
 
 
 # ── Meta Ads ──────────────────────────────────────────────────────────────────

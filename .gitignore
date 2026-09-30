@@ -103,3 +103,6 @@ aq_orders.json
 backend/aq_orders.json
 aq_size_backfill.json
 backend/aq_size_backfill.json
+# Name-pool watch: 'already warned' state (droplet only; survives deploy restarts)
+name_pool_watch.json
+backend/name_pool_watch.json
