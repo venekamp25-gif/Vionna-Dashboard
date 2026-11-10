@@ -253,7 +253,8 @@ def _run_backup():
                       'wtl_store_marks.json', 'wtl_extra_stores.json',
                       'wtl_discover_seen.json', 'wtl_discover_state.json',
                       'spy_shield.jsonl', 'lighting_channels.json', 'aq_history.jsonl',
-                      'aq_orders.json', 'aq_size_backfill.json', 'name_pool_watch.json'):
+                      'aq_orders.json', 'aq_size_backfill.json', 'name_pool_watch.json',
+                      'ptest.jsonl'):
             src = os.path.join(_BASE_DIR, fname)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dest, fname))
@@ -10314,6 +10315,337 @@ if os.getenv('SPY_SHIELD_DIGEST') != '0' and os.getenv('DEV_LOCAL') != '1' and '
         threading.Thread(target=_spy_shield_digest_loop, daemon=True, name='spy-shield-digest').start()
     except Exception as _e:
         print(f'[spy_shield] could not start digest thread: {_e}')
+
+
+# ============================================================================
+# 🧪 Ptest-teller: A/B-test verzekerde verzending in de TLS-cartlade (since v1.326.0)
+# ============================================================================
+# De eigen cartlade van The Light Supplier (NL + DE, ~/Documents/upcart-vervanger/
+# ptest) deelt elke NIEUWE winkelwagen in: groep A (verzekerde verzending €2,95) of
+# B (€4,95); 'off' = eigen toestellen (?ptest=off) en 'ch' = Zwitserland doen niet
+# mee maar worden wel geteld. Shopify kan winkelwagens niet per groep splitsen, dus
+# de lade stuurt per winkelwagen hooguit twee beacons (navigator.sendBeacon,
+# text/plain, JSON-body) naar POST /api/ptest/<token>:
+#   - step 'cart'     bij de groepstoewijzing (één keer per winkelwagen)
+#   - step 'checkout' bij de eerste klik op afrekenen in de lade (één keer)
+# Afgebroken winkelwagens per groep = cart − checkout ("welke groep laat meer
+# winkelwagens liggen"); orders en verlaten checkouts komen uit Shopify zelf
+# (note_attribute _ptest), niet hieruit.
+# Zelfde veiligheidsopzet als de Spy Shield-beacon hierboven — de route is BEWUST
+# ongegate (browsers posten ernaartoe), dus:
+#   - zelfde publieke token als Spy Shield (_ss_token(): spam-gating, geen
+#     authenticatie), constant-time vergeleken (verkeerd token → tóch 204)
+#   - body ≤ 1 KB, geldige JSON, event 'ptest', group/step uit een vaste lijst
+#     (onbekende waarde → drop), alleen whitelisted velden, v afgekapt op 16
+#   - rate-limit per IP (per minuut én per dag) en globaal per dag met EIGEN
+#     tellers en lock: een ptest-flood mag het Spy Shield-budget niet opeten en
+#     andersom
+#   - append-only naar backend/ptest.jsonl, GEEN ander bijeffect
+#   - geen IP, geen UA, geen browser_key: alleen ts/day/store/group/step/v
+#   - begrensd: 120 dagen bewaren (_pt_prune, hooguit 1× per dag vanuit de
+#     gegate summary — nooit vanuit de beacon-route) + harde grens van 20 MB
+# Iedereen met de URL kan tellingen vervalsen (het token staat in de winkelbron):
+# leg de orders uit Shopify ernaast voordat je een groep afschrijft.
+# Uitlezen: GET /api/ptest/summary (gegate). Kill switch: PTEST_BEACON=0 in .env.
+PTEST_LOG_PATH = os.path.join(_BASE_DIR, 'ptest.jsonl')
+_PT_GROUPS = ('A', 'B', 'off', 'ch')
+_PT_STEPS = ('cart', 'checkout')
+# Normaal ±95 winkelwagens/dag over NL+DE → ±150-200 records van ±120 bytes.
+# Eén winkelwagen = hooguit 2 records, dus 20/min en 200/dag per IP laten een heel
+# kantoor of mobiel CGNAT door, maar geen flood uit één bron; 10 000/dag ≈ 50× een
+# gewone dag (Black Friday past ruim) en dan duurt het nog ±2 weken voordat een
+# flood de 20 MB vol heeft. retention_days = ook de max van ?days in de summary.
+_PT_LIMITS = {'body': 1024, 'per_ip_min': 20, 'per_ip_day': 200, 'per_day': 10000,
+              'max_bytes': 20 * 1024 * 1024, 'retention_days': 120}
+_PT_LOCK = threading.Lock()
+_PT_RATE = {'ip': {}, 'ip_day': {}, 'day': '', 'day_count': 0}
+# Zelfde drop-redenen als _SS_DROPPED (in het geheugen, dus sinds de laatste
+# herstart — counters_since in de summary): nooit een oorzaak naar de poster terug.
+_PT_DROPPED = {'off': 0, 'token': 0, 'size': 0, 'json': 0, 'shape': 0,
+               'rate_ip': 0, 'rate_day': 0, 'full': 0, 'error': 0}
+_PT_ACCEPTED = [0]
+_PT_STARTED_AT = _ss_utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+_PT_PRUNED = {'day': ''}       # laatste UTC-dag waarop _pt_prune_daily snoeide
+
+
+def _pt_beacon_url():
+    """De URL voor de lade: de Spy Shield-beacon-URL met /api/ptest/ als pad."""
+    tok = _ss_token()
+    return f'{_ss_public_base()}/api/ptest/{tok}' if tok else None
+
+
+def _pt_rate_allow(ip, now_mono, day):
+    """Zelfde patroon als _ss_rate_allow (per IP per 60 s én per UTC-dag, globaal
+    per UTC-dag), maar op _PT_RATE onder _PT_LOCK. IP's alleen gehasht en alleen
+    in het geheugen."""
+    key = hashlib.sha256(ip.encode()).hexdigest()[:16]
+    with _PT_LOCK:
+        if _PT_RATE['day'] != day:
+            _PT_RATE['day'] = day
+            _PT_RATE['day_count'] = 0
+            _PT_RATE['ip'] = {}
+            _PT_RATE['ip_day'] = {}
+        if _PT_RATE['day_count'] >= _PT_LIMITS['per_day']:
+            _PT_DROPPED['rate_day'] += 1
+            return False
+        if _PT_RATE['ip_day'].get(key, 0) >= _PT_LIMITS['per_ip_day']:
+            _PT_DROPPED['rate_ip'] += 1
+            return False
+        hits = [t for t in _PT_RATE['ip'].get(key, []) if now_mono - t < 60]
+        if len(hits) >= _PT_LIMITS['per_ip_min']:
+            _PT_RATE['ip'][key] = hits
+            _PT_DROPPED['rate_ip'] += 1
+            return False
+        hits.append(now_mono)
+        _PT_RATE['ip'][key] = hits
+        _PT_RATE['ip_day'][key] = _PT_RATE['ip_day'].get(key, 0) + 1
+        # Vergeten IP's opruimen zodat de dict niet groeit bij een scan.
+        if len(_PT_RATE['ip']) > 5000:
+            _PT_RATE['ip'] = {k: v for k, v in _PT_RATE['ip'].items()
+                              if v and now_mono - v[-1] < 60}
+        _PT_RATE['day_count'] += 1
+        return True
+
+
+def _pt_clean_fields(data):
+    """Whitelist: event 'ptest' en group/step uit de vaste lijst, anders None (=
+    drop: een onbekende groep zou de A/B-vergelijking stil vervuilen). ss_store (64)
+    en v (16) afgekapt. Ook None bij een string die niet als UTF-8 kan worden
+    weggeschreven (losse surrogate), zodat zo'n post géén rate-budget kost."""
+    if not isinstance(data, dict) or data.get('event') != 'ptest':
+        return None
+    group, step = data.get('group'), data.get('step')
+    if group not in _PT_GROUPS or step not in _PT_STEPS:
+        return None
+    out = {'group': group, 'step': step}
+    for name, limit in (('ss_store', 64), ('v', 16)):
+        v = data.get(name)
+        s = '' if v is None else str(v)[:limit]
+        try:
+            s.encode('utf-8')
+        except UnicodeEncodeError:
+            return None
+        out[name] = s
+    return out
+
+
+def _pt_store_code(raw):
+    """ss_store = eerste label van shop.permanent_domain (zoals Spy Shield,
+    'ced027-2' → nl). Een volledig domein telt ook; onbekend → 'unknown'."""
+    return _SS_STORES.get(raw.split('.', 1)[0].strip().lower(), 'unknown')
+
+
+def _pt_log_full():
+    """True als het logbestand boven de harde grens zit (dan droppen, nooit groeien)."""
+    try:
+        return os.path.getsize(PTEST_LOG_PATH) >= _PT_LIMITS['max_bytes']
+    except OSError:
+        return False
+
+
+def _pt_prune(now=None):
+    """Bewaar alleen de laatste `retention_days` UTC-dagen — zelfde aanpak als
+    _ss_prune: tijdelijk bestand + os.replace onder _PT_LOCK (de append ziet nooit
+    een half bestand). Geeft het aantal verwijderde regels terug."""
+    now = now or _ss_utcnow()
+    cutoff = (now - datetime.timedelta(days=_PT_LIMITS['retention_days'] - 1)).strftime('%Y-%m-%d')
+    removed = 0
+    with _PT_LOCK:
+        if not os.path.exists(PTEST_LOG_PATH):
+            return 0
+        tmp = PTEST_LOG_PATH + '.tmp'
+        with open(PTEST_LOG_PATH, 'r', encoding='utf-8') as src, \
+                open(tmp, 'w', encoding='utf-8') as dst:
+            for line in src:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    day = str(json.loads(s).get('day') or '')[:10]
+                except Exception:
+                    removed += 1          # kapotte regel: gaat mee weg
+                    continue
+                if day >= cutoff:
+                    dst.write(s + '\n')
+                else:
+                    removed += 1
+        os.replace(tmp, PTEST_LOG_PATH)
+    return removed
+
+
+def _pt_prune_daily(now=None):
+    """Hooguit één keer per UTC-dag snoeien, vanuit de (gegate) summary — nooit
+    vanuit de beacon-route, die heeft geen bijeffecten. Niet aan de Spy Shield-
+    digest-loop gehangen: die gaat uit (SPY_SHIELD_DIGEST=0) zodra master-dashboard
+    de cijfers ophaalt, en dan zou dit snoeien stil mee stoppen. Na een herstart
+    snoeit de eerstvolgende summary opnieuw (idempotent, ≤ 20 MB); leest niemand
+    de summary, dan houdt de harde grens het bestand klein."""
+    now = now or _ss_utcnow()
+    day = now.strftime('%Y-%m-%d')
+    if _PT_PRUNED['day'] == day:
+        return None
+    _PT_PRUNED['day'] = day
+    try:
+        return _pt_prune(now)
+    except Exception as e:
+        print(f'[ptest] prune error: {type(e).__name__}')
+        return None
+
+
+def _pt_ingest(token):
+    """Verwerk één ptest-beacon. Geeft de uitkomst terug ('ok' of de drop-reden)
+    voor tests/tellers — de route zelf antwoordt altijd 204."""
+    if os.getenv('PTEST_BEACON', '1') == '0':
+        _PT_DROPPED['off'] += 1
+        return 'off'
+    expected = _ss_token()
+    if not expected or not hmac.compare_digest((token or '').encode(), expected.encode()):
+        _PT_DROPPED['token'] += 1
+        return 'token'
+    cl = request.content_length
+    if cl is None or cl > _PT_LIMITS['body']:
+        _PT_DROPPED['size'] += 1
+        return 'size'
+    raw = request.get_data(cache=False)
+    if len(raw) > _PT_LIMITS['body']:
+        _PT_DROPPED['size'] += 1
+        return 'size'
+    try:
+        data = json.loads(raw.decode('utf-8', 'replace') or '')
+    except Exception:
+        _PT_DROPPED['json'] += 1
+        return 'json'
+    fields = _pt_clean_fields(data)
+    if fields is None:
+        _PT_DROPPED['shape'] += 1
+        return 'shape'
+    if _pt_log_full():
+        _PT_DROPPED['full'] += 1
+        return 'full'
+    now = _ss_utcnow()
+    day = now.strftime('%Y-%m-%d')
+    if not _pt_rate_allow(_ss_client_ip(), time.monotonic(), day):
+        return 'rate'
+    # Bewust GEEN ip, ua of browser_key: de A/B-telling heeft alleen winkel ×
+    # groep × stap nodig. ensure_ascii=True: één fysieke regel per record.
+    entry = {'ts': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'day': day,
+             'store': _pt_store_code(fields['ss_store']),
+             'group': fields['group'], 'step': fields['step'], 'v': fields['v']}
+    line = json.dumps(entry, ensure_ascii=True) + '\n'
+    with _PT_LOCK:
+        with open(PTEST_LOG_PATH, 'a', encoding='utf-8') as f:
+            f.write(line)
+    _PT_ACCEPTED[0] += 1
+    return 'ok'
+
+
+@app.route('/api/ptest/<token>', methods=['POST'])
+def api_ptest_beacon(token):
+    """Ongegate ptest-ontvanger (zie blok-commentaar). ELKE uitkomst → 204 zonder
+    body, net als de Spy Shield-beacon: verkeerd token, te grote body, kapotte
+    JSON, onbekende groep of rate-limit mogen niet te onderscheiden zijn van een
+    geslaagde append. Alles in try/except, want handle_error zou een crash anders
+    als JSON-500 verraden."""
+    try:
+        _pt_ingest(token)
+    except Exception as e:
+        _PT_DROPPED['error'] += 1
+        print(f'[ptest] ingest error: {type(e).__name__}')
+    return ('', 204)
+
+
+def _pt_with_rates(c):
+    """{cart, checkout} + abandoned (cart − checkout, nooit < 0: een 'checkout'
+    zonder 'cart' = een cart-beacon die niet aankwam of van vóór de start) en
+    checkout_rate (None zonder winkelwagens, nooit een deling door 0)."""
+    out = {'cart': c['cart'], 'checkout': c['checkout']}
+    out['abandoned'] = max(0, c['cart'] - c['checkout'])
+    out['checkout_rate'] = round(c['checkout'] / float(c['cart']), 4) if c['cart'] else None
+    return out
+
+
+def _ptest_summary(days=60, with_url=True):
+    """Tellingen per dag × winkel × groep × stap (daily) + totalen per winkel ×
+    groep (totals) en over alle winkels (totals_all), met afgebroken winkelwagens
+    erbij. Periode van N dagen = vandaag + N-1 UTC-dagen (zoals Spy Shield), max
+    retention_days. Snoeit eerst hooguit 1× per dag. with_url=False laat beacon_url
+    weg (X-Notify-Token-lezers hebben het schrijf-token niet nodig). versions =
+    welke lade-versies (v) er rapporteren — een versiewissel midden in de test
+    hoort naast de cijfers te liggen; top 20 per winkel (v is poster-tekst)."""
+    days = max(1, min(int(days or 60), _PT_LIMITS['retention_days']))
+    _pt_prune_daily()
+    cutoff = (_ss_utcnow() - datetime.timedelta(days=days - 1)).strftime('%Y-%m-%d')
+    daily, totals, versions = {}, {}, {}
+    first_at = last_at = None
+    for r in _blog_read_jsonl(PTEST_LOG_PATH):
+        if not isinstance(r, dict):
+            continue
+        day = str(r.get('day') or r.get('ts') or '')[:10]
+        group, step = r.get('group'), r.get('step')
+        if day < cutoff or group not in _PT_GROUPS or step not in _PT_STEPS:
+            continue
+        store = str(r.get('store') or '')
+        if store not in _SS_STORE_NAMES:
+            store = 'unknown'
+        daily.setdefault((day, store, group), {'cart': 0, 'checkout': 0})[step] += 1
+        per_store = totals.setdefault(store, {gr: {'cart': 0, 'checkout': 0} for gr in _PT_GROUPS})
+        per_store[group][step] += 1
+        v = str(r.get('v') or '')
+        versions.setdefault(store, {})
+        versions[store][v] = versions[store].get(v, 0) + 1
+        ts = str(r.get('ts') or '')
+        if ts and (first_at is None or ts < first_at):
+            first_at = ts
+        if ts and (last_at is None or ts > last_at):
+            last_at = ts
+    all_stores = {gr: {'cart': 0, 'checkout': 0} for gr in _PT_GROUPS}
+    for per_store in totals.values():
+        for gr, c in per_store.items():
+            all_stores[gr]['cart'] += c['cart']
+            all_stores[gr]['checkout'] += c['checkout']
+    return {
+        'configured': bool(_ss_token()),
+        'beacon_url': _pt_beacon_url() if with_url else None,
+        'days': days,
+        'generated_at': _ss_utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'groups': list(_PT_GROUPS),
+        'steps': list(_PT_STEPS),
+        'store_names': dict(_SS_STORE_NAMES),
+        'daily': [{'day': d, 'store': s, 'group': gr, **c} for (d, s, gr), c in
+                  sorted(daily.items(), key=lambda kv: (kv[0][0], kv[0][1], _PT_GROUPS.index(kv[0][2])))],
+        'totals': {s: {gr: _pt_with_rates(c) for gr, c in per_store.items()}
+                   for s, per_store in sorted(totals.items())},
+        'totals_all': {gr: _pt_with_rates(c) for gr, c in all_stores.items()},
+        'versions': {s: dict(sorted(vs.items(), key=lambda kv: (-kv[1], kv[0]))[:20])
+                     for s, vs in sorted(versions.items())},
+        'first_at': first_at,
+        'last_at': last_at,
+        'dropped': dict(_PT_DROPPED),
+        'accepted_since_start': _PT_ACCEPTED[0],
+        'counters_since': _PT_STARTED_AT,
+        'log_full': _pt_log_full(),
+        'limits': {k: _PT_LIMITS[k] for k in ('per_ip_min', 'per_ip_day', 'per_day',
+                                              'max_bytes', 'retention_days')},
+        'note': ('cart = carts assigned to a group (one per cart); checkout = first checkout '
+                 'click in the drawer (one per cart); abandoned = cart - checkout. These are '
+                 'not orders: orders and abandoned checkouts per group come from Shopify '
+                 '(_ptest attribute). The beacon token is public, so counts can be forged - '
+                 'compare with the orders before you conclude anything. dropped and '
+                 'accepted_since_start count since the last restart (counters_since).'),
+    }
+
+
+@app.route('/api/ptest/summary', methods=['GET'])
+@require_droplet_or_notify_token
+def api_ptest_summary():
+    """Gegate zoals /api/spy_shield/summary: sessietoken of X-Notify-Token
+    (master-dashboard krijgt de cijfers, nooit beacon_url). ?days=60 (max 120)."""
+    try:
+        days = int(request.args.get('days', 60))
+    except Exception:
+        days = 60
+    with_url = not getattr(g, 'ss_notify', False)
+    return jsonify(_ptest_summary(days=days, with_url=with_url))
 
 
 # --- Bug-report intake (queued for CEO's Claude Code session) ---
@@ -30827,13 +31159,19 @@ def api_aq_size_apply():
     return jsonify({'job_id': jid})
 
 
+# Beacon-paden die nooit in werkzeug's request-log horen (het pad bevat het token).
+_BEACON_LOG_PATHS = ('/api/spy_shield/', '/api/ptest/')
+
+
 class _SpyShieldAccessLogFilter(logging.Filter):
     """Werkzeug's request-log zou anders per beacon 'POST /api/spy_shield/<token>'
-    in journald zetten. Het token is publiek (staat in de winkelbron), maar zes
-    winkels × elke beslissing = ruis die de echte fouten verstopt."""
+    (en sinds v1.326 'POST /api/ptest/<token>' uit de TLS-cartlade) in journald
+    zetten. Het token is publiek (staat in de winkelbron), maar zes winkels × elke
+    beslissing = ruis die de echte fouten verstopt."""
     def filter(self, record):
         try:
-            return '/api/spy_shield/' not in record.getMessage()
+            msg = record.getMessage()
+            return not any(p in msg for p in _BEACON_LOG_PATHS)
         except Exception:
             return True
 

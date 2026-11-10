@@ -93,6 +93,11 @@ backend/hf_media/
 spy_shield.jsonl
 backend/spy_shield.jsonl
 backend/spy_shield_digest.json
+# Ptest beacon log (v1.326.0): A/B cart counts from the TLS cart drawer (no IP,
+# no UA) — droplet-only, never in a public repo. .tmp = the daily prune's rewrite.
+ptest.jsonl
+backend/ptest.jsonl
+backend/ptest.jsonl.tmp
 
 # After Quotation tool: change log + per-apply product backups (live data, droplet only)
 aq_history.jsonl

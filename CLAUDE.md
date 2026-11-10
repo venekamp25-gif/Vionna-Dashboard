@@ -11,8 +11,8 @@ and sales channels.
   - Self-updates from `main` automatically (see "Deploy & self-update" below);
     bump `backend/version.txt` for any backend change so the droplet picks it up.
 - Repo is PUBLIC — never commit secrets. `.env`, `tokens.json`, `slack_config.json`
-  are gitignored and live only on the droplet — as does `spy_shield.jsonl` (visitor
-  records of the Spy Shield beacon, see below).
+  are gitignored and live only on the droplet — as do `spy_shield.jsonl` (visitor
+  records of the Spy Shield beacon, see below) and `ptest.jsonl` (A/B cart counts).
 
 ---
 
@@ -224,6 +224,47 @@ this backend is the prerequisite for ever switching a store to Block.
 - **Verify:** `curl -X POST -d '{}' https://188-166-11-177.nip.io/api/spy_shield/wrong`
   → `204` and nothing appended. Tests: `backend/tests/test_spy_shield.py` +
   `test_spy_shield_review.py` (the v1.314 review findings as regression tests).
+
+---
+
+## 🧪 Ptest beacon — A/B cart counter for the TLS cart drawer (since v1.326.0)
+
+The protection-price A/B test (TLS NL + DE, own cart drawer, code in
+`~/Documents/upcart-vervanger/ptest/`) needs carts per group, which Shopify
+can't split. The drawer sends at most TWO beacons per cart
+(`navigator.sendBeacon`, text/plain JSON) to `POST /api/ptest/<token>`:
+`{"event":"ptest","ss_store":"ced027-2","group":"A","step":"cart","v":"1.0.0"}`
+— `step` `cart` at group assignment, `checkout` at the first checkout click in
+the drawer; `group` A (€2,95) / B (€4,95) / `off` (own devices, `?ptest=off`) /
+`ch` (Switzerland, not in the test); `ss_store` = first label of
+`shop.permanent_domain`, like Spy Shield.
+
+- **Same safety set-up as the Spy Shield beacon** (section above): ungated by
+  design, the SAME public token (`_ss_token()` — so the drawer URL is the Spy
+  Shield beacon URL with `/api/spy_shield/` → `/api/ptest/`), constant-time
+  compare, every outcome `204` with an empty body (wrapped against crashes),
+  body ≤ 1 KB, field whitelist, an unknown `group`/`step` is dropped as `shape`.
+  OWN rate limits, counters and lock (`_PT_RATE`/`_PT_LOCK`: 20/min + 200/day
+  per IP, 10 000/day globally — normal is ~150-200 records/day), so a flood on
+  one beacon never eats the other's budget. Kill switch `PTEST_BEACON=0`.
+- **Log:** `backend/ptest.jsonl` (gitignored, droplet-only, in `_run_backup`).
+  One line per beacon: `ts`, `day`, `store` (nl/de/… via `_SS_STORES`, else
+  `unknown`), `group`, `step`, `v` — **no IP, no UA, no browser_key**. Hard cap
+  20 MB (drop as `full`); `_pt_prune` keeps 120 days and runs at most once per
+  UTC day from the summary — never from the beacon route, and deliberately not
+  from the Spy Shield digest loop (that one goes off with `SPY_SHIELD_DIGEST=0`).
+- **Reading it:** `GET /api/ptest/summary?days=60` (max 120; gated like the Spy
+  Shield summary: session token or `X-Notify-Token`, which gets
+  `beacon_url: null`). `daily` = rows day × store × group with cart/checkout;
+  `totals` per store × group and `totals_all` add `abandoned` (cart − checkout,
+  floored at 0) and `checkout_rate` (`null` without carts; > 1 means cart
+  beacons went missing); `versions` = which drawer versions reported; `dropped`
+  / `accepted_since_start` count since the last restart (`counters_since`).
+  Orders and abandoned checkouts per group come from Shopify (`_ptest`
+  attribute), not from here. The token is public: counts can be forged —
+  compare with the orders before concluding anything.
+- **Verify:** `curl -X POST -d '{}' https://188-166-11-177.nip.io/api/ptest/wrong`
+  → `204` and nothing appended. Tests: `backend/tests/test_ptest_beacon.py`.
 
 ---
 
