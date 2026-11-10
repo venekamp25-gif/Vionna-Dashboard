@@ -254,7 +254,7 @@ def _run_backup():
                       'wtl_discover_seen.json', 'wtl_discover_state.json',
                       'spy_shield.jsonl', 'lighting_channels.json', 'aq_history.jsonl',
                       'aq_orders.json', 'aq_size_backfill.json', 'name_pool_watch.json',
-                      'ptest.jsonl'):
+                      'ptest.jsonl', 'ptest_drops.json'):
             src = os.path.join(_BASE_DIR, fname)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dest, fname))
@@ -10330,127 +10330,250 @@ if os.getenv('SPY_SHIELD_DIGEST') != '0' and os.getenv('DEV_LOCAL') != '1' and '
 #   - step 'checkout' bij de eerste klik op afrekenen in de lade (één keer)
 # Afgebroken winkelwagens per groep = cart − checkout ("welke groep laat meer
 # winkelwagens liggen"); orders en verlaten checkouts komen uit Shopify zelf
-# (note_attribute _ptest), niet hieruit.
+# (note_attribute _ptest, ptest/analyse.py), niet hieruit.
 # Zelfde veiligheidsopzet als de Spy Shield-beacon hierboven — de route is BEWUST
 # ongegate (browsers posten ernaartoe), dus:
 #   - zelfde publieke token als Spy Shield (_ss_token(): spam-gating, geen
 #     authenticatie), constant-time vergeleken (verkeerd token → tóch 204)
 #   - body ≤ 1 KB, geldige JSON, event 'ptest', group/step uit een vaste lijst
-#     (onbekende waarde → drop), alleen whitelisted velden, v afgekapt op 16
+#     (onbekende waarde → drop), alleen whitelisted velden; v alleen als
+#     versie-tekst ([0-9A-Za-z._+-], ≤ 16), anders leeg: er komt nooit vrije
+#     poster-tekst in het log, en dus ook niet in een Slack-regel
 #   - rate-limit per IP (per minuut én per dag) en globaal per dag met EIGEN
 #     tellers en lock: een ptest-flood mag het Spy Shield-budget niet opeten en
 #     andersom
-#   - append-only naar backend/ptest.jsonl, GEEN ander bijeffect
+#   - append-only naar backend/ptest.jsonl; verder alleen de eigen drop-teller
+#     (backend/ptest_drops.json, klein en gethrottled) — geen Slack, geen
+#     shop-call, nooit snoeien vanuit de route
 #   - geen IP, geen UA, geen browser_key: alleen ts/day/store/group/step/v
-#   - begrensd: 120 dagen bewaren (_pt_prune, hooguit 1× per dag vanuit de
-#     gegate summary — nooit vanuit de beacon-route) + harde grens van 20 MB
+#   - begrensd: 120 dagen bewaren (_ptest_prune, hooguit 1× per dag vanuit de
+#     gegate summary — nooit vanuit de beacon-route) + harde grens van 20 MB;
+#     zit het log op die grens (een flood), dan snoeit dezelfde summary ook de
+#     oudste regels weg (zelfherstel, en dat staat als 'trimmed' in de historie)
 # Iedereen met de URL kan tellingen vervalsen (het token staat in de winkelbron):
-# leg de orders uit Shopify ernaast voordat je een groep afschrijft.
-# Uitlezen: GET /api/ptest/summary (gegate). Kill switch: PTEST_BEACON=0 in .env.
+# de summary waarschuwt bij een scheve A/B-verdeling, maar leg de orders uit
+# Shopify ernaast voordat je een groep afschrijft.
+# Uitlezen: GET /api/ptest/summary (gegate). Venster in Amsterdamse tijd
+# (since/aa_until/until, dezelfde data als ptest/analyse.py), complete + warnings
+# zeggen of de telling heel is ("storing ≠ oordeel"). Kill switch: PTEST_BEACON=0.
 PTEST_LOG_PATH = os.path.join(_BASE_DIR, 'ptest.jsonl')
-_PT_GROUPS = ('A', 'B', 'off', 'ch')
-_PT_STEPS = ('cart', 'checkout')
+# Drop-tellers per UTC-dag op schijf (zie _ptest_count_drop_locked).
+PTEST_DROPS_PATH = os.path.join(_BASE_DIR, 'ptest_drops.json')
+_PTEST_GROUPS = ('A', 'B', 'off', 'ch')
+_PTEST_STEPS = ('cart', 'checkout')
+# Alleen hier draait de A/B-test: andere winkels en 'unknown' staan wel in totals,
+# nooit in totals_test of de vergelijking.
+_PTEST_TEST_STORES = ('nl', 'de')
+_PTEST_V_RX = re.compile(r'[0-9A-Za-z._+-]{1,16}')
 # Normaal ±95 winkelwagens/dag over NL+DE → ±150-200 records van ±120 bytes.
-# Eén winkelwagen = hooguit 2 records, dus 20/min en 200/dag per IP laten een heel
-# kantoor of mobiel CGNAT door, maar geen flood uit één bron; 10 000/dag ≈ 50× een
-# gewone dag (Black Friday past ruim) en dan duurt het nog ±2 weken voordat een
-# flood de 20 MB vol heeft. retention_days = ook de max van ?days in de summary.
-_PT_LIMITS = {'body': 1024, 'per_ip_min': 20, 'per_ip_day': 200, 'per_day': 10000,
-              'max_bytes': 20 * 1024 * 1024, 'retention_days': 120}
-_PT_LOCK = threading.Lock()
-_PT_RATE = {'ip': {}, 'ip_day': {}, 'day': '', 'day_count': 0}
-# Zelfde drop-redenen als _SS_DROPPED (in het geheugen, dus sinds de laatste
-# herstart — counters_since in de summary): nooit een oorzaak naar de poster terug.
-_PT_DROPPED = {'off': 0, 'token': 0, 'size': 0, 'json': 0, 'shape': 0,
-               'rate_ip': 0, 'rate_day': 0, 'full': 0, 'error': 0}
-_PT_ACCEPTED = [0]
-_PT_STARTED_AT = _ss_utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
-_PT_PRUNED = {'day': ''}       # laatste UTC-dag waarop _pt_prune_daily snoeide
+# Eén winkelwagen = hooguit 2 records en een klant maakt zelden meer dan 2-3
+# winkelwagens per dag, dus 6/min en 30/dag per IP (= 15 winkelwagens) laten een
+# huishouden, kantoor of mobiel CGNAT ruim door. Strakker mag: een rate-drop is
+# groepsneutraal (de lade loot A/B los van het IP), dus een te strakke grens kost
+# alleen volume, nooit A-tegen-B; een te ruime grens laat één bron een groep
+# vervalsen (200/dag was ±100 nep-winkelwagens per IP = een hele echte dag).
+# 10 000/dag globaal ≈ 50× een gewone dag (Black Friday past ruim) en dan duurt
+# het nog ±2 weken voordat een flood de 20 MB vol heeft. retention_days = ook de
+# max van ?days in de summary.
+_PTEST_LIMITS = {'body': 1024, 'per_ip_min': 6, 'per_ip_day': 30, 'per_day': 10000,
+                 'max_bytes': 20 * 1024 * 1024, 'retention_days': 120}
+_PTEST_LOCK = threading.Lock()
+_PTEST_RATE = {'ip': {}, 'ip_day': {}, 'day': '', 'day_count': 0}
+# Zelfde drop-redenen als _SS_DROPPED, in het geheugen sinds de laatste herstart
+# (counters_since) — nooit een oorzaak naar de poster terug. Elke merge = een
+# self-update = een herstart, dus de summary rekent met de dag-historie op schijf.
+_PTEST_DROPPED = {'off': 0, 'token': 0, 'size': 0, 'json': 0, 'shape': 0,
+                  'rate_ip': 0, 'rate_day': 0, 'full': 0, 'error': 0}
+_PTEST_ACCEPTED = [0]
+_PTEST_STARTED_AT = _ss_utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+_PTEST_PRUNED = {'day': ''}    # laatste UTC-dag waarop _ptest_prune_daily snoeide
+# Dag-historie van de drops (lui geladen): data = {'since': ts, 'days': {dag:
+# {reden: n}}, 'trimmed_through': dag}; dirty = nog niet op schijf.
+_PTEST_DROPS = {'data': None, 'dirty': False, 'flushed': None}
+_PTEST_DROPS_FLUSH_S = 60
+# NormalDist().inv_cdf(0.95): tweezijdig 90%, zoals het plan en ptest/analyse.py
+# beslissen. inv_cdf(0.9995): p < 0,001 — pas dan heet een scheve A/B-verdeling
+# verdacht; op 90% zou bij elke 10e blik een vals alarm afgaan.
+_PTEST_Z90 = 1.6448536269514715
+_PTEST_Z_SPLIT = 3.2905267314919255
 
 
-def _pt_beacon_url():
+def _ptest_beacon_url():
     """De URL voor de lade: de Spy Shield-beacon-URL met /api/ptest/ als pad."""
     tok = _ss_token()
     return f'{_ss_public_base()}/api/ptest/{tok}' if tok else None
 
 
-def _pt_rate_allow(ip, now_mono, day):
+def _ptest_drops_locked():
+    """De drop-historie, lui geladen. Alleen met _PTEST_LOCK vast. Ontbreekt het
+    bestand of is het kapot, dan begint een nieuwe historie vanaf de start van
+    DIT proces (_PTEST_STARTED_AT): dit is de eerste keer dat hij nodig is, dus
+    sinds die start viel er niets weg. Van daarvóór valt niets te garanderen en
+    dat zegt de summary dan ook (nooit stil 'compleet')."""
+    d = _PTEST_DROPS['data']
+    if d is not None:
+        return d
+    try:
+        with open(PTEST_DROPS_PATH, 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+        d = {'since': str(raw['since'])[:20],
+             'days': {str(k)[:10]: {str(r)[:16]: int(n) for r, n in v.items()}
+                      for k, v in raw['days'].items()},
+             'trimmed_through': str(raw.get('trimmed_through') or '')[:10]}
+    except Exception:
+        d = {'since': _PTEST_STARTED_AT, 'days': {}, 'trimmed_through': ''}
+        _PTEST_DROPS['dirty'] = True
+    _PTEST_DROPS['data'] = d
+    return d
+
+
+def _ptest_drops_flush_locked(force=False):
+    """Drop-historie naar schijf (tijdelijk bestand + os.replace), hooguit 1× per
+    _PTEST_DROPS_FLUSH_S tenzij force; dagen buiten retention_days gaan eruit.
+    Alleen met _PTEST_LOCK vast. Een schrijffout wordt gelogd, nooit gegooid (de
+    route moet altijd 204 kunnen antwoorden) en hooguit 1× per minuut herhaald."""
+    if not _PTEST_DROPS['dirty']:
+        return
+    now_mono = time.monotonic()
+    last = _PTEST_DROPS['flushed']
+    if not force and last is not None and now_mono - last < _PTEST_DROPS_FLUSH_S:
+        return
+    _PTEST_DROPS['flushed'] = now_mono
+    try:
+        d = _ptest_drops_locked()
+        cutoff = (_ss_utcnow() - datetime.timedelta(days=_PTEST_LIMITS['retention_days'])).strftime('%Y-%m-%d')
+        d['days'] = {k: v for k, v in d['days'].items() if k >= cutoff}
+        tmp = PTEST_DROPS_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(d, f, sort_keys=True)
+        os.replace(tmp, PTEST_DROPS_PATH)
+        _PTEST_DROPS['dirty'] = False
+    except Exception as e:
+        print(f'[ptest] drops flush error: {type(e).__name__}')
+
+
+def _ptest_count_drop_locked(reason):
+    """Tel één drop in het geheugen (sinds de herstart) én in de dag-historie. Een
+    nieuwe (dag, reden) gaat METEEN naar schijf, zodat "er vielen beacons weg" een
+    herstart altijd overleeft; verdere tellingen hooguit 1× per minuut (een flood
+    met een verkeerd token kost dan geen schijf-I/O per post). Alleen met
+    _PTEST_LOCK vast; gooit nooit."""
+    _PTEST_DROPPED[reason] += 1
+    try:
+        per = _ptest_drops_locked()['days'].setdefault(_ss_utcnow().strftime('%Y-%m-%d'), {})
+        first = reason not in per
+        per[reason] = per.get(reason, 0) + 1
+        _PTEST_DROPS['dirty'] = True
+        _ptest_drops_flush_locked(force=first)
+    except Exception as e:
+        print(f'[ptest] drop count error: {type(e).__name__}')
+
+
+def _ptest_drop(reason):
+    """Drop tellen (zie _ptest_count_drop_locked) en de reden teruggeven."""
+    with _PTEST_LOCK:
+        _ptest_count_drop_locked(reason)
+    return reason
+
+
+def _ptest_rate_allow(ip, now_mono, day):
     """Zelfde patroon als _ss_rate_allow (per IP per 60 s én per UTC-dag, globaal
-    per UTC-dag), maar op _PT_RATE onder _PT_LOCK. IP's alleen gehasht en alleen
-    in het geheugen."""
+    per UTC-dag), maar op _PTEST_RATE onder _PTEST_LOCK. IP's alleen gehasht en
+    alleen in het geheugen."""
     key = hashlib.sha256(ip.encode()).hexdigest()[:16]
-    with _PT_LOCK:
-        if _PT_RATE['day'] != day:
-            _PT_RATE['day'] = day
-            _PT_RATE['day_count'] = 0
-            _PT_RATE['ip'] = {}
-            _PT_RATE['ip_day'] = {}
-        if _PT_RATE['day_count'] >= _PT_LIMITS['per_day']:
-            _PT_DROPPED['rate_day'] += 1
+    with _PTEST_LOCK:
+        if _PTEST_RATE['day'] != day:
+            _PTEST_RATE['day'] = day
+            _PTEST_RATE['day_count'] = 0
+            _PTEST_RATE['ip'] = {}
+            _PTEST_RATE['ip_day'] = {}
+        if _PTEST_RATE['day_count'] >= _PTEST_LIMITS['per_day']:
+            _ptest_count_drop_locked('rate_day')
             return False
-        if _PT_RATE['ip_day'].get(key, 0) >= _PT_LIMITS['per_ip_day']:
-            _PT_DROPPED['rate_ip'] += 1
+        if _PTEST_RATE['ip_day'].get(key, 0) >= _PTEST_LIMITS['per_ip_day']:
+            _ptest_count_drop_locked('rate_ip')
             return False
-        hits = [t for t in _PT_RATE['ip'].get(key, []) if now_mono - t < 60]
-        if len(hits) >= _PT_LIMITS['per_ip_min']:
-            _PT_RATE['ip'][key] = hits
-            _PT_DROPPED['rate_ip'] += 1
+        hits = [t for t in _PTEST_RATE['ip'].get(key, []) if now_mono - t < 60]
+        if len(hits) >= _PTEST_LIMITS['per_ip_min']:
+            _PTEST_RATE['ip'][key] = hits
+            _ptest_count_drop_locked('rate_ip')
             return False
         hits.append(now_mono)
-        _PT_RATE['ip'][key] = hits
-        _PT_RATE['ip_day'][key] = _PT_RATE['ip_day'].get(key, 0) + 1
+        _PTEST_RATE['ip'][key] = hits
+        _PTEST_RATE['ip_day'][key] = _PTEST_RATE['ip_day'].get(key, 0) + 1
         # Vergeten IP's opruimen zodat de dict niet groeit bij een scan.
-        if len(_PT_RATE['ip']) > 5000:
-            _PT_RATE['ip'] = {k: v for k, v in _PT_RATE['ip'].items()
-                              if v and now_mono - v[-1] < 60}
-        _PT_RATE['day_count'] += 1
+        if len(_PTEST_RATE['ip']) > 5000:
+            _PTEST_RATE['ip'] = {k: v for k, v in _PTEST_RATE['ip'].items()
+                                 if v and now_mono - v[-1] < 60}
+        _PTEST_RATE['day_count'] += 1
         return True
 
 
-def _pt_clean_fields(data):
+def _ptest_clean_fields(data):
     """Whitelist: event 'ptest' en group/step uit de vaste lijst, anders None (=
-    drop: een onbekende groep zou de A/B-vergelijking stil vervuilen). ss_store (64)
-    en v (16) afgekapt. Ook None bij een string die niet als UTF-8 kan worden
-    weggeschreven (losse surrogate), zodat zo'n post géén rate-budget kost."""
+    drop: een onbekende groep zou de A/B-vergelijking stil vervuilen). ss_store
+    (64) wordt alleen opgezocht, nooit opgeslagen. v telt alleen als versie-tekst
+    (_PTEST_V_RX, na afkappen op 16), anders '': de telling blijft, de vrije tekst
+    niet ('<!channel>' of 16 emoji's van 4 bytes komen nooit in log of Slack)."""
     if not isinstance(data, dict) or data.get('event') != 'ptest':
         return None
     group, step = data.get('group'), data.get('step')
-    if group not in _PT_GROUPS or step not in _PT_STEPS:
+    if group not in _PTEST_GROUPS or step not in _PTEST_STEPS:
         return None
-    out = {'group': group, 'step': step}
-    for name, limit in (('ss_store', 64), ('v', 16)):
-        v = data.get(name)
-        s = '' if v is None else str(v)[:limit]
-        try:
-            s.encode('utf-8')
-        except UnicodeEncodeError:
-            return None
-        out[name] = s
-    return out
+    store, v = data.get('ss_store'), data.get('v')
+    v = '' if v is None else str(v)[:16]
+    return {'group': group, 'step': step, 'ss_store': '' if store is None else str(store)[:64],
+            'v': v if _PTEST_V_RX.fullmatch(v) else ''}
 
 
-def _pt_store_code(raw):
+def _ptest_store_code(raw):
     """ss_store = eerste label van shop.permanent_domain (zoals Spy Shield,
     'ced027-2' → nl). Een volledig domein telt ook; onbekend → 'unknown'."""
     return _SS_STORES.get(raw.split('.', 1)[0].strip().lower(), 'unknown')
 
 
-def _pt_log_full():
+def _ptest_log_full():
     """True als het logbestand boven de harde grens zit (dan droppen, nooit groeien)."""
     try:
-        return os.path.getsize(PTEST_LOG_PATH) >= _PT_LIMITS['max_bytes']
+        return os.path.getsize(PTEST_LOG_PATH) >= _PTEST_LIMITS['max_bytes']
     except OSError:
         return False
 
 
-def _pt_prune(now=None):
-    """Bewaar alleen de laatste `retention_days` UTC-dagen — zelfde aanpak als
-    _ss_prune: tijdelijk bestand + os.replace onder _PT_LOCK (de append ziet nooit
-    een half bestand). Geeft het aantal verwijderde regels terug."""
+def _ptest_iter_log():
+    """De logregels één voor één: een vol log is ±166 000 regels, die horen nooit
+    allemaal tegelijk als dicts in het geheugen. Kapotte regels worden overgeslagen
+    (ook een half geschreven laatste regel: de summary leest zonder lock)."""
+    try:
+        with open(PTEST_LOG_PATH, 'r', encoding='utf-8') as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    r = json.loads(s)
+                except Exception:
+                    continue
+                if isinstance(r, dict):
+                    yield r
+    except FileNotFoundError:
+        return
+
+
+def _ptest_prune(now=None):
+    """Bewaar alleen de laatste `retention_days` dagen — zelfde aanpak als
+    _ss_prune (tijdelijk bestand + os.replace onder _PTEST_LOCK: de append ziet
+    nooit een half bestand), met één UTC-dag extra zodat ook de eerste uren van de
+    oudste Amsterdamse dag van een venster van 120 dagen er nog zijn. Zit het log
+    daarna nog op de harde grens (een flood), dan gaan ook de oudste regels eruit
+    tot 80% van de grens: anders vallen echte beacons maandenlang als 'full' weg
+    tot de flood veroudert. Dat komt als 'trimmed' (+ t/m welke dag) in de
+    drop-historie, zodat de summary elk geraakt venster incompleet noemt. Geeft
+    het aantal verwijderde regels terug."""
     now = now or _ss_utcnow()
-    cutoff = (now - datetime.timedelta(days=_PT_LIMITS['retention_days'] - 1)).strftime('%Y-%m-%d')
+    cutoff = (now - datetime.timedelta(days=_PTEST_LIMITS['retention_days'])).strftime('%Y-%m-%d')
     removed = 0
-    with _PT_LOCK:
+    with _PTEST_LOCK:
         if not os.path.exists(PTEST_LOG_PATH):
             return 0
         tmp = PTEST_LOG_PATH + '.tmp'
@@ -10470,72 +10593,90 @@ def _pt_prune(now=None):
                 else:
                     removed += 1
         os.replace(tmp, PTEST_LOG_PATH)
+        size = os.path.getsize(PTEST_LOG_PATH)
+        if size >= _PTEST_LIMITS['max_bytes']:
+            skip, trimmed, last = size - int(_PTEST_LIMITS['max_bytes'] * 0.8), 0, ''
+            with open(PTEST_LOG_PATH, 'r', encoding='utf-8') as src, \
+                    open(tmp, 'w', encoding='utf-8') as dst:
+                for line in src:          # na de eerste ronde alleen nog geldige regels
+                    if skip > 0:
+                        skip -= len(line)
+                        trimmed, last = trimmed + 1, line
+                    else:
+                        dst.write(line)
+            os.replace(tmp, PTEST_LOG_PATH)
+            removed += trimmed
+            hist = _ptest_drops_locked()
+            per = hist['days'].setdefault(now.strftime('%Y-%m-%d'), {})
+            per['trimmed'] = per.get('trimmed', 0) + trimmed
+            through = str(json.loads(last).get('day') or '')[:10] if last else ''
+            hist['trimmed_through'] = max(hist.get('trimmed_through') or '', through)
+            _PTEST_DROPS['dirty'] = True
+            _ptest_drops_flush_locked(force=True)
     return removed
 
 
-def _pt_prune_daily(now=None):
-    """Hooguit één keer per UTC-dag snoeien, vanuit de (gegate) summary — nooit
-    vanuit de beacon-route, die heeft geen bijeffecten. Niet aan de Spy Shield-
-    digest-loop gehangen: die gaat uit (SPY_SHIELD_DIGEST=0) zodra master-dashboard
-    de cijfers ophaalt, en dan zou dit snoeien stil mee stoppen. Na een herstart
-    snoeit de eerstvolgende summary opnieuw (idempotent, ≤ 20 MB); leest niemand
-    de summary, dan houdt de harde grens het bestand klein."""
+def _ptest_prune_daily(now=None):
+    """Hooguit één keer per UTC-dag snoeien — of meteen als het log op de harde
+    grens zit (zelfherstel na een flood) — vanuit de (gegate) summary, nooit vanuit
+    de beacon-route. Niet aan de Spy Shield-digest-loop gehangen: die gaat uit
+    (SPY_SHIELD_DIGEST=0) zodra master-dashboard de cijfers ophaalt, en dan zou dit
+    snoeien stil mee stoppen. Na een herstart snoeit de eerstvolgende summary
+    opnieuw (idempotent); leest niemand de summary, dan houdt de harde grens het
+    bestand klein (en tellen de weggevallen beacons als 'full')."""
     now = now or _ss_utcnow()
     day = now.strftime('%Y-%m-%d')
-    if _PT_PRUNED['day'] == day:
+    if _PTEST_PRUNED['day'] == day and not _ptest_log_full():
         return None
-    _PT_PRUNED['day'] = day
+    _PTEST_PRUNED['day'] = day
     try:
-        return _pt_prune(now)
+        return _ptest_prune(now)
     except Exception as e:
         print(f'[ptest] prune error: {type(e).__name__}')
         return None
 
 
-def _pt_ingest(token):
+def _ptest_ingest(token):
     """Verwerk één ptest-beacon. Geeft de uitkomst terug ('ok' of de drop-reden)
     voor tests/tellers — de route zelf antwoordt altijd 204."""
     if os.getenv('PTEST_BEACON', '1') == '0':
-        _PT_DROPPED['off'] += 1
-        return 'off'
+        return _ptest_drop('off')
     expected = _ss_token()
     if not expected or not hmac.compare_digest((token or '').encode(), expected.encode()):
-        _PT_DROPPED['token'] += 1
-        return 'token'
+        return _ptest_drop('token')
     cl = request.content_length
-    if cl is None or cl > _PT_LIMITS['body']:
-        _PT_DROPPED['size'] += 1
-        return 'size'
+    if cl is None or cl > _PTEST_LIMITS['body']:
+        return _ptest_drop('size')
     raw = request.get_data(cache=False)
-    if len(raw) > _PT_LIMITS['body']:
-        _PT_DROPPED['size'] += 1
-        return 'size'
+    if len(raw) > _PTEST_LIMITS['body']:
+        return _ptest_drop('size')
     try:
         data = json.loads(raw.decode('utf-8', 'replace') or '')
     except Exception:
-        _PT_DROPPED['json'] += 1
-        return 'json'
-    fields = _pt_clean_fields(data)
+        return _ptest_drop('json')
+    fields = _ptest_clean_fields(data)
     if fields is None:
-        _PT_DROPPED['shape'] += 1
-        return 'shape'
-    if _pt_log_full():
-        _PT_DROPPED['full'] += 1
-        return 'full'
+        return _ptest_drop('shape')
+    if _ptest_log_full():
+        return _ptest_drop('full')
     now = _ss_utcnow()
     day = now.strftime('%Y-%m-%d')
-    if not _pt_rate_allow(_ss_client_ip(), time.monotonic(), day):
+    if not _ptest_rate_allow(_ss_client_ip(), time.monotonic(), day):
         return 'rate'
     # Bewust GEEN ip, ua of browser_key: de A/B-telling heeft alleen winkel ×
     # groep × stap nodig. ensure_ascii=True: één fysieke regel per record.
     entry = {'ts': now.strftime('%Y-%m-%dT%H:%M:%SZ'), 'day': day,
-             'store': _pt_store_code(fields['ss_store']),
+             'store': _ptest_store_code(fields['ss_store']),
              'group': fields['group'], 'step': fields['step'], 'v': fields['v']}
     line = json.dumps(entry, ensure_ascii=True) + '\n'
-    with _PT_LOCK:
+    with _PTEST_LOCK:
         with open(PTEST_LOG_PATH, 'a', encoding='utf-8') as f:
             f.write(line)
-    _PT_ACCEPTED[0] += 1
+        _PTEST_ACCEPTED[0] += 1
+        # Een nieuwe historie (eerste beacon na de deploy) of drops die alleen nog
+        # in het geheugen staan gaan nu mee naar schijf — hooguit 1× per minuut.
+        _ptest_drops_locked()
+        _ptest_drops_flush_locked()
     return 'ok'
 
 
@@ -10547,105 +10688,403 @@ def api_ptest_beacon(token):
     geslaagde append. Alles in try/except, want handle_error zou een crash anders
     als JSON-500 verraden."""
     try:
-        _pt_ingest(token)
+        _ptest_ingest(token)
     except Exception as e:
-        _PT_DROPPED['error'] += 1
+        try:
+            _ptest_drop('error')
+        except Exception:
+            pass
         print(f'[ptest] ingest error: {type(e).__name__}')
     return ('', 204)
 
 
-def _pt_with_rates(c):
+# --- Summary: venster in Amsterdamse tijd, vergelijking B tegen A ------------
+
+def _ptest_last_sunday(year, month):
+    d = datetime.date(year, month + 1, 1) - datetime.timedelta(days=1)
+    return d - datetime.timedelta(days=(d.weekday() + 1) % 7)
+
+
+def _ptest_ams_offset(utc):
+    """UTC-afstand van Amsterdam (en Berlijn: de DE-winkel) zonder tijdzone-
+    database — Windows-Python heeft er geen zonder tzdata: UTC+2 van de laatste
+    zondag van maart 01:00 UTC tot de laatste zondag van oktober 01:00 UTC (EU-
+    regel), anders UTC+1. Zelfde regel als ptest/analyse.py: beide knippen op
+    precies hetzelfde moment."""
+    tz = datetime.timezone.utc
+    start = datetime.datetime.combine(_ptest_last_sunday(utc.year, 3), datetime.time(1, tzinfo=tz))
+    end = datetime.datetime.combine(_ptest_last_sunday(utc.year, 10), datetime.time(1, tzinfo=tz))
+    return datetime.timedelta(hours=2 if start <= utc < end else 1)
+
+
+def _ptest_ams_to_utc(naive):
+    """Amsterdamse kloktijd (naive) → aware UTC. Het dubbele uur in oktober telt
+    als zomertijd, het ontbrekende uur in maart als wintertijd (zoals analyse.py)."""
+    for h in (2, 1):
+        utc = (naive - datetime.timedelta(hours=h)).replace(tzinfo=datetime.timezone.utc)
+        if _ptest_ams_offset(utc) == datetime.timedelta(hours=h):
+            return utc
+    return (naive - datetime.timedelta(hours=1)).replace(tzinfo=datetime.timezone.utc)
+
+
+def _ptest_moment(text):
+    """'2026-11-15', '15-11-2026', '2026-11-15T09:00' of '15-11-2026 09:00' in
+    Amsterdamse tijd (of ISO mét zone, bv. '…Z') → aware UTC; leeg → None; onzin
+    → ValueError. Zelfde invoer als --since/--aa-until/--until van analyse.py."""
+    s = str(text or '').strip()
+    if not s:
+        return None
+    if len(s) > 40:
+        raise ValueError('too long')
+    try:
+        for fmt in ('%d-%m-%Y', '%d-%m-%Y %H:%M'):
+            try:
+                return _ptest_ams_to_utc(datetime.datetime.strptime(s, fmt))
+            except ValueError:
+                pass
+        dt = datetime.datetime.fromisoformat(s[:-1] + '+00:00' if s[-1:] in ('Z', 'z') else s)
+        return _ptest_ams_to_utc(dt) if dt.tzinfo is None else dt.astimezone(datetime.timezone.utc)
+    except (ValueError, OverflowError) as e:
+        raise ValueError(str(e)) from None
+
+
+def _ptest_show(utc):
+    """Aware UTC → 'dd-mm-jjjj uu:mm' in Amsterdamse tijd (voor de warnings)."""
+    return (utc + _ptest_ams_offset(utc)).strftime('%d-%m-%Y %H:%M')
+
+
+def _ptest_ams_day(ts, cache):
+    """'2026-11-14T23:30:00Z' → '2026-11-15' (de Amsterdamse datum). De zomertijd
+    wisselt op een heel UTC-uur, dus één berekening per UTC-uur (cache)."""
+    key = ts[:13]
+    day = cache.get(key)
+    if day is None:
+        utc = datetime.datetime.strptime(key, '%Y-%m-%dT%H').replace(tzinfo=datetime.timezone.utc)
+        day = cache[key] = (utc + _ptest_ams_offset(utc)).strftime('%Y-%m-%d')
+    return day
+
+
+def _ptest_counts():
+    return {gr: {'cart': 0, 'checkout': 0} for gr in _PTEST_GROUPS}
+
+
+def _ptest_with_rates(c):
     """{cart, checkout} + abandoned (cart − checkout, nooit < 0: een 'checkout'
-    zonder 'cart' = een cart-beacon die niet aankwam of van vóór de start) en
-    checkout_rate (None zonder winkelwagens, nooit een deling door 0)."""
-    out = {'cart': c['cart'], 'checkout': c['checkout']}
-    out['abandoned'] = max(0, c['cart'] - c['checkout'])
-    out['checkout_rate'] = round(c['checkout'] / float(c['cart']), 4) if c['cart'] else None
-    return out
+    zonder 'cart' = een cart-beacon die niet aankwam of van vóór de start),
+    abandon_rate (abandoned / cart: los van de groepsgrootte, dus tussen groepen
+    te vergelijken) en checkout_rate (> 1 = cart-beacons weggevallen) — None
+    zonder winkelwagens, nooit een deling door 0."""
+    cart, checkout = c['cart'], c['checkout']
+    abandoned = max(0, cart - checkout)
+    return {'cart': cart, 'checkout': checkout, 'abandoned': abandoned,
+            'abandon_rate': round(abandoned / float(cart), 4) if cart else None,
+            'checkout_rate': round(checkout / float(cart), 4) if cart else None}
 
 
-def _ptest_summary(days=60, with_url=True):
-    """Tellingen per dag × winkel × groep × stap (daily) + totalen per winkel ×
-    groep (totals) en over alle winkels (totals_all), met afgebroken winkelwagens
-    erbij. Periode van N dagen = vandaag + N-1 UTC-dagen (zoals Spy Shield), max
-    retention_days. Snoeit eerst hooguit 1× per dag. with_url=False laat beacon_url
-    weg (X-Notify-Token-lezers hebben het schrijf-token niet nodig). versions =
-    welke lade-versies (v) er rapporteren — een versiewissel midden in de test
-    hoort naast de cijfers te liggen; top 20 per winkel (v is poster-tekst)."""
-    days = max(1, min(int(days or 60), _PT_LIMITS['retention_days']))
-    _pt_prune_daily()
-    cutoff = (_ss_utcnow() - datetime.timedelta(days=days - 1)).strftime('%Y-%m-%d')
-    daily, totals, versions = {}, {}, {}
-    first_at = last_at = None
-    for r in _blog_read_jsonl(PTEST_LOG_PATH):
-        if not isinstance(r, dict):
+def _ptest_wilson(x, n, z=_PTEST_Z90):
+    """Wilson-interval van een aandeel: ook goed bij kleine groepen en bij 0 of n
+    (Wald niet). Zelfde formule als wilson() in ptest/analyse.py."""
+    p, d = x / n, 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * (p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5 / d
+    return max(0.0, c - h), min(1.0, c + h)
+
+
+def _ptest_compare(A, B):
+    """B tegen A op het aandeel afgebroken winkelwagens (abandoned / cart) met een
+    90%-marge: Wilson per groep, Newcombe (1998, methode 10) voor het verschil —
+    dezelfde rekensom als ptest/analyse.py voor de attach. more_abandoned = de groep
+    die aantoonbaar (90%) meer winkelwagens laat liggen, None = geen aantoonbaar
+    verschil. Plus de verdeling: de lade loot 50/50, dus een sterk scheve
+    verhouding (|z| > 3,29) wijst op een fout in de lade of op vervalste posts
+    (split_ok False). None zolang A of B geen winkelwagens heeft."""
+    na, nb = A['cart'], B['cart']
+    if not (na and nb):
+        return None
+    xa, xb = max(0, na - A['checkout']), max(0, nb - B['checkout'])
+    pa, pb = xa / na, xb / nb
+    la, ua = _ptest_wilson(xa, na)
+    lb, ub = _ptest_wilson(xb, nb)
+    d = pb - pa
+    lo = d - ((pb - lb) ** 2 + (ua - pa) ** 2) ** 0.5
+    hi = d + ((ub - pb) ** 2 + (pa - la) ** 2) ** 0.5
+    n = na + nb
+    s_lo, s_hi = _ptest_wilson(nb, n)
+    r4 = lambda x: round(x, 4)   # noqa: E731
+    return {'carts_a': na, 'carts_b': nb, 'abandon_rate_a': r4(pa), 'abandon_rate_b': r4(pb),
+            'diff': r4(d), 'diff_90': [r4(lo), r4(hi)],
+            'more_abandoned': 'B' if lo > 0 else 'A' if hi < 0 else None,
+            'share_b': r4(nb / n), 'share_b_90': [r4(s_lo), r4(s_hi)],
+            'split_ok': abs(nb - n / 2) / (n / 4) ** 0.5 <= _PTEST_Z_SPLIT}
+
+
+def _ptest_period(per_store):
+    """Totalen van één periode: per winkel (alle winkels, ook unknown), over de
+    testwinkels samen (totals_test, alleen nl+de) en B tegen A per testwinkel en
+    samen (comparison['test_stores'])."""
+    test = _ptest_counts()
+    for s in _PTEST_TEST_STORES:
+        for gr, c in (per_store.get(s) or {}).items():
+            test[gr]['cart'] += c['cart']
+            test[gr]['checkout'] += c['checkout']
+    comparison = {s: _ptest_compare(*[(per_store.get(s) or _ptest_counts())[gr] for gr in ('A', 'B')])
+                  for s in _PTEST_TEST_STORES}
+    comparison['test_stores'] = _ptest_compare(test['A'], test['B'])
+    return {'totals': {s: {gr: _ptest_with_rates(c) for gr, c in groups.items()}
+                       for s, groups in sorted(per_store.items())},
+            'totals_test': {gr: _ptest_with_rates(c) for gr, c in test.items()},
+            'comparison': comparison}
+
+
+def _ptest_tally(start_s, aa_s, until_s, want_v):
+    """Eén ronde door het log: tellingen per periode ('aa' = vóór aa_until, anders
+    'test') × winkel × groep × stap, daily per Amsterdamse dag, versions (vóór het
+    v-filter, zodat je ziet wat je wegfiltert) en de records van buiten nl/de.
+    Grenzen als ISO-UTC-tekst: ts heeft altijd die vaste vorm, dus tekst-
+    vergelijken = tijd-vergelijken (geen strptime per regel)."""
+    t = {'per': {'aa': {}, 'test': {}}, 'daily': {}, 'versions': {}, 'test_versions': {},
+         'other': {}, 'first_at': None, 'last_at': None}
+    ams = {}
+    for r in _ptest_iter_log():
+        ts, group, step = str(r.get('ts') or ''), r.get('group'), r.get('step')
+        if group not in _PTEST_GROUPS or step not in _PTEST_STEPS or ts < start_s \
+                or (until_s and ts >= until_s):
             continue
-        day = str(r.get('day') or r.get('ts') or '')[:10]
-        group, step = r.get('group'), r.get('step')
-        if day < cutoff or group not in _PT_GROUPS or step not in _PT_STEPS:
+        try:
+            day = _ptest_ams_day(ts, ams)
+        except Exception:
             continue
         store = str(r.get('store') or '')
         if store not in _SS_STORE_NAMES:
             store = 'unknown'
-        daily.setdefault((day, store, group), {'cart': 0, 'checkout': 0})[step] += 1
-        per_store = totals.setdefault(store, {gr: {'cart': 0, 'checkout': 0} for gr in _PT_GROUPS})
-        per_store[group][step] += 1
+        period = 'aa' if aa_s and ts < aa_s else 'test'
         v = str(r.get('v') or '')
-        versions.setdefault(store, {})
-        versions[store][v] = versions[store].get(v, 0) + 1
-        ts = str(r.get('ts') or '')
-        if ts and (first_at is None or ts < first_at):
-            first_at = ts
-        if ts and (last_at is None or ts > last_at):
-            last_at = ts
-    all_stores = {gr: {'cart': 0, 'checkout': 0} for gr in _PT_GROUPS}
-    for per_store in totals.values():
-        for gr, c in per_store.items():
-            all_stores[gr]['cart'] += c['cart']
-            all_stores[gr]['checkout'] += c['checkout']
+        vs = t['versions'].setdefault(store, {})
+        vs[v] = vs.get(v, 0) + 1
+        if period == 'test' and store in _PTEST_TEST_STORES:
+            t['test_versions'][v] = t['test_versions'].get(v, 0) + 1
+        if want_v and v not in want_v:
+            continue
+        t['per'][period].setdefault(store, _ptest_counts())[group][step] += 1
+        t['daily'].setdefault((day, period, store, group), {'cart': 0, 'checkout': 0})[step] += 1
+        if store not in _PTEST_TEST_STORES:
+            t['other'][store] = t['other'].get(store, 0) + 1
+        if t['first_at'] is None or ts < t['first_at']:
+            t['first_at'] = ts
+        if t['last_at'] is None or ts > t['last_at']:
+            t['last_at'] = ts
+    return t
+
+
+def _ptest_drops_window(start, until, now):
+    """De drop-historie over de UTC-dagen die het venster raken (ruim genomen:
+    liever een waarschuwing te veel dan een stil gat). 'trimmed' telt niet als
+    drop van een binnenkomende beacon: welke dagen dat raakte staat in
+    trimmed_through. Geeft (drops, historie dekt het venster, trim raakt het)."""
+    with _PTEST_LOCK:
+        hist = _ptest_drops_locked()
+        _ptest_drops_flush_locked(force=True)
+        since, through = hist['since'], hist.get('trimmed_through') or ''
+        days = {k: dict(v) for k, v in hist['days'].items()}
+    d0 = start.strftime('%Y-%m-%d')
+    d1 = ((until - datetime.timedelta(seconds=1)) if until else now).strftime('%Y-%m-%d')
+    daily = {k: v for k, v in sorted(days.items()) if d0 <= k <= d1}
+    in_window = {}
+    for per in daily.values():
+        for reason, n in per.items():
+            if reason != 'trimmed':
+                in_window[reason] = in_window.get(reason, 0) + n
+    drops = {'history_since': since, 'in_window': in_window, 'daily': daily,
+             'trimmed_through': through or None}
+    return drops, since <= start.strftime('%Y-%m-%dT%H:%M:%SZ'), bool(through) and through >= d0
+
+
+# Uitleg per drop-reden in de warnings (eigen tekst, nooit poster-tekst).
+_PTEST_DROP_HINTS = (
+    (('token',), 'token = een verkeerd token: na een Rotate in de Spy Shield-tab of een nieuw '
+                 'DK-token staat in de lade nog de oude URL'),
+    (('shape',), 'shape = onbekende groep of stap: klopt de lade?'),
+    (('size', 'json'), 'size/json = kapotte posts'),
+    (('rate_ip', 'rate_day'), 'rate = de rate-limit (een flood, of veel klanten achter één IP)'),
+    (('full',), 'full = het log zat vol'),
+    (('off',), 'off = de teller stond uit (PTEST_BEACON=0)'),
+    (('error',), 'error = een fout in de ontvanger (zie de serverlog)'),
+)
+
+
+def _ptest_warnings(win, drops, history_ok, trimmed_hit, full, tally, periods):
+    """Waarom de cijfers (nog) niet als oordeel mogen gelden. Alleen eigen tekst +
+    getallen + gewhitelistte versies, zoals de Spy Shield-verdicts: dit kan in een
+    Slack-regel belanden."""
+    w = []
+    if not win['since']:
+        w.append('geen startmoment (since of PTEST_SINCE): ook winkelwagens van vóór de start '
+                 'van de test tellen mee')
+    if not history_ok:
+        since = _ss_parse_ts(drops['history_since'])
+        w.append(f"drops worden pas sinds {_ptest_show(since) if since else '?'} bijgehouden: of er "
+                 'daarvóór beacons wegvielen is niet te zeggen')
+    lost = drops['in_window']
+    if lost:
+        parts = ', '.join(f'{k} {n}' for k, n in sorted(lost.items(), key=lambda kv: (-kv[1], kv[0])))
+        hints = [h for keys, h in _PTEST_DROP_HINTS if any(lost.get(k) for k in keys)]
+        w.append(f'{sum(lost.values())} beacon(s) vielen weg in dit venster ({parts}), dus de tellingen '
+                 'zijn onvolledig: ' + '; '.join(hints or ['onbekende reden']))
+    if trimmed_hit:
+        w.append(f"het log zat vol: de oudste regels t/m {drops['trimmed_through']} (UTC) zijn verwijderd "
+                 'om weer te kunnen tellen, en dit venster mist ze')
+    if full:
+        w.append('het log zit op de harde grens: nieuwe beacons vallen weg (full)')
+    if tally['other']:
+        parts = ', '.join(f'{s} {n}' for s, n in sorted(tally['other'].items()))
+        w.append(f'records van buiten nl/de ({parts}): wel in totals, niet in totals_test of de vergelijking')
+    if not win['v'] and len(tally['test_versions']) > 1:
+        parts = ', '.join(f"{v or '(geen)'} {n}" for v, n in
+                          sorted(tally['test_versions'].items(), key=lambda kv: (-kv[1], kv[0]))[:5])
+        w.append(f'meerdere lade-versies in de testperiode ({parts}): filter met ?v= als de wissel ertoe doet')
+    for name, p in periods:
+        for key, c in p['comparison'].items():
+            if c and not c['split_ok']:
+                w.append(f"{name} {'nl+de' if key == 'test_stores' else key}: de A/B-verdeling wijkt sterk af "
+                         f"van 50/50 (B {c['share_b']:.0%} van {c['carts_a'] + c['carts_b']} winkelwagens): "
+                         'klopt de toewijzing in de lade, of zijn er vervalste posts?')
+        for gr in ('A', 'B'):
+            t = p['totals_test'][gr]
+            if t['checkout'] > t['cart']:
+                w.append(f"{name} {gr}: meer checkouts dan winkelwagens ({t['checkout']} > {t['cart']}), dus "
+                         'er vielen cart-beacons weg')
+    return w
+
+
+def _ptest_summary(days=60, with_url=True, window=None):
+    """Tellingen in een venster in Amsterdamse tijd: window = {since, aa_until,
+    until, v} (zie _ptest_window_args; zonder since = vandaag + days-1 Amsterdamse
+    dagen, max retention_days). daily = rij per Amsterdamse dag × periode × winkel
+    × groep. totals (per winkel), totals_test (nl+de) en comparison (B tegen A op
+    abandon_rate, 90%-marge) gaan over de TESTperiode (vanaf aa_until); aa = dezelfde
+    drie voor de A/A-proef. complete + warnings: zijn er in het venster beacons
+    weggevallen, dekt de drop-historie het, zat het log vol — want een gat in de
+    telling mag nooit als "geen verschil" of "B wint" landen. Snoeit eerst (hooguit
+    1× per dag, of meteen bij een vol log). with_url=False laat beacon_url weg
+    (X-Notify-Token-lezers hebben het schrijf-token niet nodig)."""
+    win = window or {'since': None, 'aa_until': None, 'until': None, 'v': None, 'source': {}}
+    days = max(1, min(int(days or 60), _PTEST_LIMITS['retention_days']))
+    _ptest_prune_daily()
+    now = _ss_utcnow()
+    if win['since']:
+        start = win['since']
+    else:
+        today = (now + _ptest_ams_offset(now)).date()
+        start = _ptest_ams_to_utc(datetime.datetime.combine(today - datetime.timedelta(days=days - 1),
+                                                            datetime.time()))
+    iso = lambda d: d.strftime('%Y-%m-%dT%H:%M:%SZ') if d else None   # noqa: E731
+    start_s, aa_s, until_s = iso(start), iso(win['aa_until']), iso(win['until'])
+    tally = _ptest_tally(start_s, aa_s, until_s, set(win['v'] or ()))
+    test = _ptest_period(tally['per']['test'])
+    aa = _ptest_period(tally['per']['aa']) if win['aa_until'] else None
+    drops, history_ok, trimmed_hit = _ptest_drops_window(start, win['until'], now)
+    full = _ptest_log_full()
+    order = {'aa': 0, 'test': 1}
     return {
         'configured': bool(_ss_token()),
-        'beacon_url': _pt_beacon_url() if with_url else None,
-        'days': days,
-        'generated_at': _ss_utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
-        'groups': list(_PT_GROUPS),
-        'steps': list(_PT_STEPS),
+        'beacon_url': _ptest_beacon_url() if with_url else None,
+        'days': None if win['since'] else days,
+        'generated_at': iso(now),
+        'window': {'tz': 'Europe/Amsterdam', 'start': start_s, 'since': iso(win['since']),
+                   'aa_until': aa_s, 'until': until_s, 'v': win['v'], 'source': dict(win['source'])},
+        'groups': list(_PTEST_GROUPS),
+        'steps': list(_PTEST_STEPS),
+        'test_stores': list(_PTEST_TEST_STORES),
         'store_names': dict(_SS_STORE_NAMES),
-        'daily': [{'day': d, 'store': s, 'group': gr, **c} for (d, s, gr), c in
-                  sorted(daily.items(), key=lambda kv: (kv[0][0], kv[0][1], _PT_GROUPS.index(kv[0][2])))],
-        'totals': {s: {gr: _pt_with_rates(c) for gr, c in per_store.items()}
-                   for s, per_store in sorted(totals.items())},
-        'totals_all': {gr: _pt_with_rates(c) for gr, c in all_stores.items()},
+        'daily': [{'day': d, 'period': p, 'store': s, 'group': gr, **c} for (d, p, s, gr), c in
+                  sorted(tally['daily'].items(), key=lambda kv: (kv[0][0], order[kv[0][1]], kv[0][2],
+                                                                  _PTEST_GROUPS.index(kv[0][3])))],
+        'totals': test['totals'],
+        'totals_test': test['totals_test'],
+        'comparison': test['comparison'],
+        'aa': aa,
         'versions': {s: dict(sorted(vs.items(), key=lambda kv: (-kv[1], kv[0]))[:20])
-                     for s, vs in sorted(versions.items())},
-        'first_at': first_at,
-        'last_at': last_at,
-        'dropped': dict(_PT_DROPPED),
-        'accepted_since_start': _PT_ACCEPTED[0],
-        'counters_since': _PT_STARTED_AT,
-        'log_full': _pt_log_full(),
-        'limits': {k: _PT_LIMITS[k] for k in ('per_ip_min', 'per_ip_day', 'per_day',
-                                              'max_bytes', 'retention_days')},
-        'note': ('cart = carts assigned to a group (one per cart); checkout = first checkout '
-                 'click in the drawer (one per cart); abandoned = cart - checkout. These are '
-                 'not orders: orders and abandoned checkouts per group come from Shopify '
-                 '(_ptest attribute). The beacon token is public, so counts can be forged - '
-                 'compare with the orders before you conclude anything. dropped and '
-                 'accepted_since_start count since the last restart (counters_since).'),
+                     for s, vs in sorted(tally['versions'].items())},
+        'first_at': tally['first_at'],
+        'last_at': tally['last_at'],
+        'complete': history_ok and not drops['in_window'] and not trimmed_hit and not full,
+        'warnings': _ptest_warnings(win, drops, history_ok, trimmed_hit, full, tally,
+                                    [('test', test)] + ([('A/A', aa)] if aa else [])),
+        'drops': drops,
+        'dropped': dict(_PTEST_DROPPED),
+        'accepted_since_start': _PTEST_ACCEPTED[0],
+        'counters_since': _PTEST_STARTED_AT,
+        'log_full': full,
+        'limits': {k: _PTEST_LIMITS[k] for k in ('per_ip_min', 'per_ip_day', 'per_day',
+                                                 'max_bytes', 'retention_days')},
+        'note': ('cart = carts assigned to a group (one per cart); checkout = first checkout click in '
+                 'the drawer (one per cart); abandoned = cart - checkout, abandon_rate = abandoned / '
+                 'cart. A checkout that bypasses the drawer (cart page, Buy it now) counts as abandoned '
+                 'here, for A and B alike. comparison = B vs A on abandon_rate with a 90% margin '
+                 '(Wilson/Newcombe, like ptest/analyse.py); more_abandoned stays null until one group '
+                 'demonstrably leaves more carts behind. Window in Amsterdam time; totals, totals_test '
+                 '(nl+de) and comparison cover the test period (from aa_until), aa the A/A trial. These '
+                 'are not orders: orders and abandoned checkouts per group come from Shopify (_ptest '
+                 'attribute). The beacon token is public, so counts can be forged - compare with the '
+                 'orders before you conclude anything. complete is false when beacons were dropped in '
+                 'the window, the drop history does not cover it or the log was full (see warnings). '
+                 'dropped and accepted_since_start count since the last restart (counters_since); '
+                 'drops.daily survives restarts.'),
     }
+
+
+# since/aa_until/until: query-parameter → .env-standaard.
+_PTEST_WINDOW_ENV = (('since', 'PTEST_SINCE'), ('aa_until', 'PTEST_AA_UNTIL'), ('until', 'PTEST_UNTIL'))
+
+
+def _ptest_window_args(args):
+    """Venster uit de query, anders uit .env (PTEST_SINCE / PTEST_AA_UNTIL /
+    PTEST_UNTIL: één keer zetten bij de start van de test, met dezelfde data als
+    --since/--aa-until/--until van analyse.py; dan rekent elke lezer, ook
+    master-dashboard, met hetzelfde venster). Een query-parameter wint altijd, ook
+    leeg ('?since=' = geen grens). v = komma-lijst van lade-versies (alleen die
+    tellen). Geeft (venster, None) of (None, fouttekst): een kapotte datum wordt
+    nooit stil genegeerd — dan klopt het venster niet terwijl de cijfers er gewoon
+    uitzien."""
+    win = {'source': {}}
+    for name, env in _PTEST_WINDOW_ENV:
+        raw, src = (args.get(name, ''), 'query') if name in args else (os.getenv(env, ''), 'env')
+        try:
+            win[name] = _ptest_moment(raw)
+        except ValueError:
+            where = name if src == 'query' else f'{env} in .env'
+            return None, (f'{where}: unknown date {str(raw)[:40]!r} (use YYYY-MM-DD, DD-MM-YYYY or '
+                          'YYYY-MM-DDTHH:MM, Amsterdam time)')
+        win['source'][name] = src if win[name] else None
+    s, a, u = win['since'], win['aa_until'], win['until']
+    if s and a and a <= s:
+        return None, 'aa_until must be after since'
+    if u and (a or s) and u <= (a or s):
+        return None, 'until must be after since and aa_until'
+    vs = [x.strip() for x in str(args.get('v') or '').split(',') if x.strip()]
+    bad = [x for x in vs if not _PTEST_V_RX.fullmatch(x)]
+    if bad:
+        return None, f'v: not a drawer version {bad[0][:40]!r}'
+    win['v'] = vs[:20] or None
+    return win, None
 
 
 @app.route('/api/ptest/summary', methods=['GET'])
 @require_droplet_or_notify_token
 def api_ptest_summary():
     """Gegate zoals /api/spy_shield/summary: sessietoken of X-Notify-Token
-    (master-dashboard krijgt de cijfers, nooit beacon_url). ?days=60 (max 120)."""
+    (master-dashboard krijgt de cijfers, nooit beacon_url). ?since= / ?aa_until= /
+    ?until= (Amsterdamse tijd, anders PTEST_SINCE / PTEST_AA_UNTIL / PTEST_UNTIL),
+    ?v= (komma-lijst), ?days=60 (max 120, alleen zonder since). Kapotte datum → 400."""
     try:
         days = int(request.args.get('days', 60))
     except Exception:
         days = 60
+    window, err = _ptest_window_args(request.args)
+    if err:
+        return jsonify({'error': err}), 400
     with_url = not getattr(g, 'ss_notify', False)
-    return jsonify(_ptest_summary(days=days, with_url=with_url))
+    return jsonify(_ptest_summary(days=days, with_url=with_url, window=window))
 
 
 # --- Bug-report intake (queued for CEO's Claude Code session) ---
@@ -31160,7 +31599,9 @@ def api_aq_size_apply():
 
 
 # Beacon-paden die nooit in werkzeug's request-log horen (het pad bevat het token).
-_BEACON_LOG_PATHS = ('/api/spy_shield/', '/api/ptest/')
+# Voor ptest alleen de POST van de lade: GET /api/ptest/summary is gegate en hoort
+# (ook een 401-poging) gewoon in journald te staan.
+_BEACON_LOG_PATHS = ('/api/spy_shield/', 'POST /api/ptest/')
 
 
 class _SpyShieldAccessLogFilter(logging.Filter):
