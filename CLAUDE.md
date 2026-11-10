@@ -11,8 +11,9 @@ and sales channels.
   - Self-updates from `main` automatically (see "Deploy & self-update" below);
     bump `backend/version.txt` for any backend change so the droplet picks it up.
 - Repo is PUBLIC — never commit secrets. `.env`, `tokens.json`, `slack_config.json`
-  are gitignored and live only on the droplet — as does `spy_shield.jsonl` (visitor
-  records of the Spy Shield beacon, see below).
+  are gitignored and live only on the droplet — as do `spy_shield.jsonl` (visitor
+  records of the Spy Shield beacon, see below), `ptest.jsonl` (A/B cart counts)
+  and `ptest_drops.json` (its dropped beacons per day).
 
 ---
 
@@ -224,6 +225,71 @@ this backend is the prerequisite for ever switching a store to Block.
 - **Verify:** `curl -X POST -d '{}' https://188-166-11-177.nip.io/api/spy_shield/wrong`
   → `204` and nothing appended. Tests: `backend/tests/test_spy_shield.py` +
   `test_spy_shield_review.py` (the v1.314 review findings as regression tests).
+
+---
+
+## 🧪 Ptest beacon — A/B cart counter for the TLS cart drawer (since v1.326.0)
+
+The protection-price A/B test (TLS NL + DE, own cart drawer, code in
+`~/Documents/upcart-vervanger/ptest/`) needs carts per group, which Shopify
+can't split. The drawer sends at most TWO beacons per cart
+(`navigator.sendBeacon`, text/plain JSON) to `POST /api/ptest/<token>`:
+`{"event":"ptest","ss_store":"ced027-2","group":"A","step":"cart","v":"1.0.0"}`
+— `step` `cart` at group assignment, `checkout` at the first checkout click in
+the drawer; `group` A (€2,95) / B (€4,95) / `off` (own devices, `?ptest=off`) /
+`ch` (Switzerland, not in the test); `ss_store` = first label of
+`shop.permanent_domain`, like Spy Shield.
+
+- **Same safety set-up as the Spy Shield beacon** (section above): ungated by
+  design, the SAME public token (`_ss_token()` — so the drawer URL is the Spy
+  Shield beacon URL with `/api/spy_shield/` → `/api/ptest/`), constant-time
+  compare, every outcome `204` with an empty body (wrapped against crashes),
+  body ≤ 1 KB, field whitelist, an unknown `group`/`step` is dropped as `shape`;
+  `v` is kept only as a version string (`[0-9A-Za-z._+-]`, ≤ 16), else `''` —
+  no free poster text ever reaches the log or a Slack line.
+  OWN rate limits, counters and lock (`_PTEST_RATE`/`_PTEST_LOCK`: 6/min +
+  30/day per IP = at most 15 forged carts per IP per day, 10 000/day globally —
+  normal is ~150-200 records/day), so a flood on one beacon never eats the
+  other's budget. A rate drop is group-neutral (the drawer draws A/B
+  independently of the IP). Kill switch `PTEST_BEACON=0`.
+- **Log:** `backend/ptest.jsonl` (gitignored, droplet-only, in `_run_backup`).
+  One line per beacon: `ts`, `day`, `store` (nl/de/… via `_SS_STORES`, else
+  `unknown`), `group`, `step`, `v` — **no IP, no UA, no browser_key**. Hard cap
+  20 MB (drop as `full`); `_ptest_prune` keeps 120 days (+1 UTC day, so the
+  oldest Amsterdam day of `?days=120` is whole) and runs at most once per UTC
+  day from the summary — or at once when the log is full: then it also trims
+  the oldest lines to 80% of the cap (self-heal after a flood, recorded as
+  `trimmed`). Never from the beacon route, and deliberately not from the Spy
+  Shield digest loop (that one goes off with `SPY_SHIELD_DIGEST=0`).
+- **Drop history:** `backend/ptest_drops.json` (gitignored, in `_run_backup`) =
+  dropped beacons per UTC day and reason, since `since`. A new (day, reason) is
+  written at once, more counts at most once a minute — so a restart (every
+  merge self-updates) never hides that beacons were lost. `dropped` in the
+  summary is still since the last restart only.
+- **Reading it:** `GET /api/ptest/summary` (gated like the Spy Shield summary:
+  session token or `X-Notify-Token`, which gets `beacon_url: null`). Window in
+  **Amsterdam time**, same input as `ptest/analyse.py`: `?since=` / `?aa_until=`
+  / `?until=` (`2026-11-15`, `15-11-2026`, `2026-11-15T09:00`; until/aa_until =
+  before that moment), defaults from `.env` `PTEST_SINCE` / `PTEST_AA_UNTIL` /
+  `PTEST_UNTIL` (a query param wins, `?since=` = no bound; a broken date → 400,
+  never ignored); without since `?days=60` (max 120); `?v=1.2.0,1.2.1` counts
+  only those drawer versions. `daily` = rows per Amsterdam day × period (`aa` /
+  `test`) × store × group. `totals` (per store), `totals_test` (nl+de only) and
+  `comparison` (B vs A: `abandon_rate_a/_b`, `diff` with `diff_90` —
+  Wilson/Newcombe like analyse.py — `more_abandoned` A/B/null, and the 50/50
+  split check `share_b` / `split_ok`) cover the TEST period; `aa` = the same for
+  the A/A trial. `complete` is false — and `warnings` (Dutch, own text only)
+  say why — when beacons were dropped in the window, the drop history does not
+  cover it, or the log was full/trimmed; warnings also flag no start date,
+  records outside nl/de, a drawer version change and a lopsided split.
+  Orders and abandoned checkouts per group come from Shopify (`_ptest`
+  attribute, `ptest/analyse.py`), not from here; a checkout that bypasses the
+  drawer counts as abandoned here (for A and B alike). The token is public:
+  counts can be forged — compare with the orders before concluding anything.
+- **Verify:** `curl -X POST -d '{}' https://188-166-11-177.nip.io/api/ptest/wrong`
+  → `204` and nothing appended (a `token` drop in `ptest_drops.json`). Werkzeug's
+  access log hides only `POST /api/ptest/` (the gated summary stays visible).
+  Tests: `backend/tests/test_ptest_beacon.py`.
 
 ---
 
