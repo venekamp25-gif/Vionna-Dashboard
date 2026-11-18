@@ -635,41 +635,113 @@ def auth(store_key):
     })
     return redirect(f"https://{shop}/admin/oauth/authorize?{params}")
 
+# --- OAuth callback hardening (v1.327.0) ---
+# The security audits of 31 Aug, 15 Sep, 10 Nov and 16 Nov 2026 rated this CRITICAL:
+# /callback trusted the `shop` query value. Three anonymous requests (/auth/dk, then
+# /callback?shop=<own host>&state=...) made the droplet POST the DK client_secret to a
+# host of the attacker's choice and write that host plus a fake token into tokens.json
+# (shopify_url() prefers the tokens.json shop, so later API calls would go there too).
+# Now the shop must be EXACTLY the configured domain of the store, the query must carry
+# Shopify's HMAC (signed with that store's client secret, which only Shopify and we
+# know), and the token exchange always goes to the configured domain, never to the
+# query value. Tests: backend/tests/test_oauth_callback.py.
+_SHOP_DOMAIN_RE = re.compile(r'^[a-z0-9][a-z0-9-]*\.myshopify\.com$')
+
+
+def _shopify_hmac_message(args):
+    """Shopify's OAuth HMAC message: every query parameter except `hmac`, as key=value
+    pairs sorted and joined with '&'; '%' and '&' escaped in keys and values, '=' in
+    keys, `ids[]` lists as a JSON array (as the shopify_python_api library does).
+    Returns None when a parameter appears twice (ambiguous, so never signed)."""
+    pairs = []
+    for key in args.keys():
+        if key == 'hmac':
+            continue
+        values = args.getlist(key)
+        if key.endswith('[]'):
+            k, v = key[:-2], json.dumps([str(x) for x in values])
+        elif len(values) != 1:
+            return None
+        else:
+            k, v = key, str(values[0])
+        k = k.replace('%', '%25').replace('=', '%3D')
+        v = v.replace('%', '%25')
+        pairs.append(f'{k}={v}'.replace('&', '%26'))
+    return '&'.join(sorted(pairs))
+
+
+def _shopify_hmac_ok(args, secret):
+    """True only when the query carries one `hmac` that Shopify made with `secret`."""
+    given = args.getlist('hmac')
+    if not secret or len(given) != 1 or not given[0]:
+        return False
+    msg = _shopify_hmac_message(args)
+    if msg is None:
+        return False
+    want = hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(want.encode(), given[0].strip().lower().encode('utf-8', 'replace'))
+
+
 @app.route('/callback')
 def callback():
     code      = request.args.get('code')
-    shop      = request.args.get('shop')
-    state     = request.args.get('state')
+    shop      = (request.args.get('shop') or '').strip().lower()
+    state     = request.args.get('state') or ''
     store_key = session.get('store_key')
 
-    # Fallback: derive store_key from shop domain (needed when OAuth is
-    # initiated directly without going through /auth/<key>, e.g. by a
-    # bot/automation that can't navigate to localhost first).
-    if not store_key:
-        for k, s in STORES.items():
-            if s == shop:
-                store_key = k
-                break
-    if not store_key:
-        return f'Unknown shop: {shop}', 400
-
-    # State check: only enforced when session has a state we set ourselves.
-    # Direct/automation OAuth flows skip this — they don't have CSRF risk
-    # because there's no logged-in user being phished.
-    session_state = session.get('oauth_state')
-    if session_state and state != session_state:
-        return 'Invalid state', 403
+    # The shop decides where the client_secret goes and what lands in tokens.json, so it
+    # must be a myshopify domain AND exactly the configured domain of one store: the
+    # session's store when /auth/<key> started the flow, else the store that owns it
+    # (a flow started on the Shopify side has no session). Never echo the value back.
+    if not _SHOP_DOMAIN_RE.match(shop):
+        return 'Unknown shop', 400
+    owner = next((k for k, s in STORES.items() if s and s.strip().lower() == shop), None)
+    if not owner or (store_key and store_key != owner):
+        return 'Unknown shop', 400
+    store_key = owner
 
     creds = APP_CREDENTIALS.get(store_key, {})
-    res = req.post(f"https://{shop}/admin/oauth/access_token", json={
-        'client_id':     creds.get('client_id'),
-        'client_secret': creds.get('client_secret'),
-        'code':          code,
-    })
-    if res.status_code != 200:
-        return f'OAuth error: {res.text}', 400
+    # Proof that Shopify itself sent this redirect for this shop.
+    if not _shopify_hmac_ok(request.args, creds.get('client_secret')):
+        # parameter names only, never values (they hold the code and the hmac)
+        print(f'[oauth] {store_key}: callback refused, bad or missing hmac '
+              f'(params: {sorted(request.args.keys())})')
+        return 'Invalid signature', 403
 
-    tokens[store_key] = {'shop': shop, 'token': res.json()['access_token']}
+    # State (CSRF): enforced whenever /auth set one. A flow started on the Shopify side
+    # has no session state; the HMAC above already proves that request is genuine.
+    session_state = session.get('oauth_state')
+    if session_state and not hmac.compare_digest(state.encode('utf-8', 'replace'),
+                                                 str(session_state).encode()):
+        return 'Invalid state', 403
+    if not code:
+        return 'Missing code', 400
+
+    shop = STORES[store_key].strip().lower()      # the configured value, never the query's
+    try:
+        res = req.post(f"https://{shop}/admin/oauth/access_token", json={
+            'client_id':     creds.get('client_id'),
+            'client_secret': creds.get('client_secret'),
+            'code':          code,
+        }, timeout=20)
+    except req.RequestException as e:
+        print(f'[oauth] {store_key}: token exchange unreachable ({type(e).__name__})')
+        return 'OAuth error: Shopify did not answer, please try again', 502
+    if res.status_code != 200:
+        print(f'[oauth] {store_key}: token exchange failed, HTTP {res.status_code}: {(res.text or "")[:200]}')
+        return f'OAuth error (HTTP {res.status_code})', 400
+    try:
+        data = res.json()
+    except ValueError:
+        data = None
+    access_token = data.get('access_token') if isinstance(data, dict) else None
+    if not access_token:
+        return 'OAuth error (no access token in the answer)', 400
+
+    # The session is a signed cookie, so this cannot revoke a captured copy; the real
+    # one-time guarantee is Shopify's single-use code. Clearing it keeps the session tidy.
+    session.pop('oauth_state', None)
+    tokens[store_key] = {'shop': shop, 'token': access_token}
     save_tokens()
     return redirect(f'/?auth=success&store={store_key}')
 
