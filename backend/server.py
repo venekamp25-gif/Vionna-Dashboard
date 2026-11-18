@@ -11770,14 +11770,20 @@ def plans_approve(plan_id):
     bug = _bug_entry(bid) if bid else None
     same_bug = bool(bug and entry.get('bug_created_at')
                     and bug.get('created_at') == entry.get('bug_created_at'))
-    callbacks = _bug_callback_lines(bug, with_plan=False) if same_bug else []
+    # Callbacks only while that same bug is still open: the stall watcher never
+    # chases a PR on a closed bug, so a /pr call there would silently do nothing.
+    still_open = same_bug and bug.get('status') == 'open'
+    callbacks = _bug_callback_lines(bug, with_plan=False) if still_open else []
     if callbacks:
         after = ('After the PR is open with auto-merge enabled, register it and mark '
                  'the bug resolved with the callbacks below.')
+    elif same_bug and not still_open:
+        after = (f"Bug #{bid} is already {bug.get('status')}: build the plan, but leave the bug "
+                 'queue alone.')
     elif bid:
         after = (f'No callback token for bug #{bid} (it is not in the queue any more, the id now '
-                 'belongs to another bug, or this droplet has no secret): do not touch the bug '
-                 'queue; the CEO resolves it.')
+                 'belongs to another bug, or this droplet has no secret): leave the bug queue '
+                 'alone; the CEO resolves it.')
     else:
         after = 'This plan has no bug id, so there is no bug to mark resolved.'
     text = '\n'.join([

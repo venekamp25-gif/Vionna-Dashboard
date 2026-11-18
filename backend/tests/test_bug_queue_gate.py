@@ -501,6 +501,16 @@ def test_an_approved_plan_after_id_reuse_hands_out_no_token(queue):
     assert 'X-Bug-Token' not in head and 'belongs to another bug' in head
 
 
+def test_an_approved_plan_for_a_bug_closed_meanwhile_hands_out_no_callbacks(queue):
+    """The stall watcher never chases a PR on a closed bug, so /pr would be a no-op."""
+    _seed([_bug(7, status='resolved')])
+    _pending_plan(7)
+    c = server.app.test_client()
+    assert c.post('/api/plans/1/approve', headers=_session()).status_code == 200
+    head = queue['fired'][-1].split('--- PLAN')[0]
+    assert 'X-Bug-Token' not in head and 'already resolved' in head
+
+
 def test_an_approved_plan_for_a_missing_bug_hands_out_no_token(queue):
     _seed([])
     _pending_plan(8)

@@ -535,7 +535,7 @@ so a new `/api/bug_reports*` or `/api/plans*` route that is left open fails CI):
   or `local`) and `bug_created_at`. `plans_approve` refuses (409) a pending plan
   without `filed_via` — it was filed while the route was open — and hands out
   callbacks only when the queue entry with that id still has the same
-  `created_at`. `plans.jsonl` is in the daily backup next to `bug_reports.jsonl`.
+  `created_at` and is still open. `plans.jsonl` is in the daily backup next to `bug_reports.jsonl`.
 - **Screenshot links** carry `?sig=_bug_cap('screenshot', entry)`: Slack's
   image fetcher and a plain browser can open them; ids are no longer enough.
   Links in Slack messages from before v1.328.0 have no `sig` and now answer
@@ -555,7 +555,8 @@ so a new `/api/bug_reports*` or `/api/plans*` route that is left open fails CI):
   needs the Merge click" when GitHub reports `mergeable_state: clean`.
 - No `DROPLET_TOKEN_SECRET` = no capabilities: internet calls get 503 like
   every gated route; a call on the droplet itself still gets in everywhere
-  except filing a bug.
+  except filing a bug and approving or rejecting a plan (session-token only:
+  503 without the secret, unless `DEV_LOCAL=1`).
 - Rotating `DROPLET_TOKEN_SECRET`: it must be the same in the droplet `.env`
   and on Netlify — set Netlify first, then the droplet. A rotation also
   invalidates every handed-out `X-Bug-Token` and screenshot link; those need
