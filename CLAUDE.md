@@ -492,34 +492,117 @@ Rules now, all enforced in `callback()` and covered by `test_oauth_callback.py`:
 
 ---
 
+## 🔐 Bug queue gate (v1.328.0)
+
+Until v1.327.0 every bug-queue route was open, on a URL that is hardcoded in
+this PUBLIC repo. A stranger could file a bug (Slack ping, and — whenever
+`ROUTINE_FIRE_URL` is set — the hands-off routine fired with the stranger's
+text in its prompt; that routine merges its own PRs), queue a plan that reaches
+the routine as "approved verbatim by the CEO", plant a link that the stall
+watcher posted to Slack as "Open PR", close bugs, and download every screenshot
+by counting ids. `ROUTINE_FIRE_URL` was kept empty from 3 Oct 2026 for exactly
+this reason. Rules now (`test_bug_queue_gate.py` walks the real route table,
+so a new `/api/bug_reports*` or `/api/plans*` route that is left open fails CI):
+
+| Route | Who gets in | Decorator |
+|---|---|---|
+| `POST /api/bug_reports` (file a bug) | session token only (`api.reportBug` sends it) | `require_droplet_token` |
+| `POST /api/bug_reports/<id>/pr`, `/<id>/resolve` | `X-Bug-Token` of the bug in the path, a session token, or a genuinely local call | `require_bug_callback_access` |
+| `POST /api/plans` | `X-Bug-Token` of the `bug_id` in the body (that bug must be open), a session token, or a local call | `require_plan_filing_access` |
+| `GET /api/bug_reports`, `GET /api/plans` | session token or a genuinely local call — never a bug token | `require_team_access` |
+| `GET /api/bug_reports/<id>/screenshot` | its signed `?sig=` link, a session token, or a local call | `require_bug_screenshot_access` |
+| `/api/plans/<id>/approve`, `/reject` | session token only (unchanged) | `require_droplet_token` |
+
+- **`X-Bug-Token`** = `_bug_cap('callback', entry)`: an HMAC of the entry's id
+  AND `created_at` under a subkey of `DROPLET_TOKEN_SECRET`. It opens exactly
+  the three callback routes for that one entry (a second test sweep asserts
+  this route by route), never a route that returns the whole queue, and it can
+  never pass as a session token. Because `created_at` is in it, an id that gets
+  handed out again (queue file lost or restored from an old backup) does not
+  inherit old tokens or old Slack links. `_fire_routine` and `plans_approve`
+  put it in the fire text with ready-made curl lines (`_bug_callback_lines`);
+  a plan goes as `--data-binary @plan.json`, built with a JSON encoder, never
+  hand-quoted in bash. The routine still never holds a session token (see
+  "Self-test endpoints").
+- A wrong `X-Bug-Token` (or screenshot `sig`) gets its own 401 that says so,
+  not the session-token text; a token with a plan body that is not a JSON
+  object with a numeric `bug_id` gets a 400 that says so.
+- A per-bug capability must never open a route that returns more than that one
+  bug, wherever the bug id would come from (body, query string, a header): until
+  the review of v1.328.0 a GET with the JSON body `{"bug_id": 5}` plus bug 5's
+  token read the whole queue.
+- **Plans remember where they came from:** `filed_via` (`bug-token`, `session`
+  or `local`) and `bug_created_at`. `plans_approve` refuses (409) a pending plan
+  without `filed_via` — it was filed while the route was open — and hands out
+  callbacks only when the queue entry with that id still has the same
+  `created_at`. `plans.jsonl` is in the daily backup next to `bug_reports.jsonl`.
+- **Screenshot links** carry `?sig=_bug_cap('screenshot', entry)`: Slack's
+  image fetcher and a plain browser can open them; ids are no longer enough.
+  Links in Slack messages from before v1.328.0 have no `sig` and now answer
+  401. `_SignedLinkLogFilter` blanks the `sig` in werkzeug's request log;
+  `__main__` installs it through `_install_request_log_filters()`.
+- **Genuinely local** = `_is_genuinely_local()`: a direct call on the droplet
+  with no `X-Forwarded-*` headers. Caddy adds those to every internet request,
+  so this means "something running on the droplet" — in practice the laptop's
+  "bug" flow over SSH. The open routes that fetch a caller's URL only issue
+  GETs, and nothing on the queue changes on a GET; a future open route that
+  POSTs to a caller's URL, or echoes back what it fetched, would break this.
+- `/pr` builds the link from the number; a caller's `pr_url` is ignored, and the
+  stall ping also rebuilds it from the number (old entries may carry one). The
+  watcher warns once and stops chasing a registered PR whose branch lives
+  outside the repo the PR was opened on (compared by repo id, so a rename or
+  transfer is no fork; `head.repo = null` = a deleted fork). It only says "just
+  needs the Merge click" when GitHub reports `mergeable_state: clean`.
+- No `DROPLET_TOKEN_SECRET` = no capabilities: internet calls get 503 like
+  every gated route; a call on the droplet itself still gets in everywhere
+  except filing a bug.
+- Rotating `DROPLET_TOKEN_SECRET`: it must be the same in the droplet `.env`
+  and on Netlify — set Netlify first, then the droplet. A rotation also
+  invalidates every handed-out `X-Bug-Token` and screenshot link; those need
+  no extra step.
+- When the routine is switched back on (`ROUTINE_FIRE_URL` in the droplet
+  `.env`), check that its instructions on claude.ai use the callback lines from
+  the fire text, header included (a call without it now gets 401), and reject
+  any pending plan without `filed_via`.
+
+---
+
 ## 🐛 Codeword: "bug"
 
 When the user says **"bug"** (also accept "bugs", "/bug", "fix bugs", "work the
 bug queue"), run this flow without asking for clarification first:
 
-1. **Fetch the open queue:**
+1. **Fetch the open queue.** Since v1.328.0 the queue is not public any more
+   (see "Bug queue gate" above); the laptop reads it over SSH, on the droplet
+   itself. `<droplet-ssh>` = the SSH command for the droplet; it is kept out of
+   this public repo and lives on the laptop only — read it from
+   `~/.claude/vionna-droplet-access.md` first.
    ```bash
-   curl -sS "https://188-166-11-177.nip.io/api/bug_reports?status=open"
+   <droplet-ssh> 'curl -sS "http://127.0.0.1:5000/api/bug_reports?status=open"'
    ```
-2. **If reachable and `open_count > 0`:** summarise each open bug (id, title,
-   reporter, store, page_url, and the screenshot link
-   `https://188-166-11-177.nip.io/api/bug_reports/<id>/screenshot` if it has one),
-   then start fixing them — lowest id first — unless the user named a specific one.
-3. **If the queue API is NOT reachable** (cloud / mobile sessions have restricted
-   network egress and often can't reach the droplet): say so in one line and ask
-   the user to paste the bug text from the `#bugs-report` Slack message, then fix
-   from that.
+2. **If that works and `open_count > 0`:** summarise each open bug (id, title,
+   reporter, store, page_url, and its `screenshot_url` if it has one — a signed
+   link that opens in a browser), then start fixing them — lowest id first —
+   unless the user named a specific one. Never paste a `screenshot_url` into a
+   commit, PR or comment: the repo is public.
+3. **If it does NOT work** (only the laptop has the SSH key and the imported
+   file; cloud / mobile sessions get no further than a 401 from the public
+   URL): say so in one line
+   and ask the user to paste the bug text from the `#bugs-report` Slack message,
+   then fix from that.
 4. **After fixing each bug:**
-   - **Local laptop session:** commit + push to `main` (Netlify + droplet auto-deploy;
-     bump `backend/version.txt` if backend changed), then mark it resolved:
+   - **Local laptop session:** open a PR and merge it once CI is green (`main`
+     refuses direct pushes; Netlify + droplet auto-deploy; bump
+     `backend/version.txt` if backend changed), then mark it resolved:
      ```bash
-     curl -sS -X POST "https://188-166-11-177.nip.io/api/bug_reports/<id>/resolve"
+     <droplet-ssh> 'curl -sS -X POST http://127.0.0.1:5000/api/bug_reports/<id>/resolve'
      ```
    - **Cloud / web session:** open a PR (ready for review, **not** a draft — a
      draft cannot auto-merge), turn on **auto-merge (squash)**, and let CI be the
      gate. Read back whether auto-merge actually got enabled; if it didn't, wait
-     for CI and merge yourself once green. Then mark the bug resolved if the
-     droplet API is reachable.
+     for CI and merge yourself once green. A cloud session cannot mark the bug
+     resolved (no SSH key, no session token): say which id is done so the user
+     can.
 5. **If GitHub Actions gives no verdict** (it stopped assigning runners entirely
    on 2026-08-06 — `runner_id: 0`, jobs cancelled after ~15 min queued), run
    `bash scripts/ci-local.sh`. It runs exactly what `ci.yml` runs and prints a
@@ -536,7 +619,7 @@ bug queue"), run this flow without asking for clarification first:
 
 Notes:
 - The bug queue + Slack ping are handled entirely by the droplet; Claude does NOT
-  need any Slack access — only the GitHub repo + (when reachable) the public API.
+  need any Slack access — only the GitHub repo + (on the laptop) SSH to the droplet.
 - Data-mutation tasks that need live Shopify tokens (`tokens.json`) only work from
   the laptop, not cloud sessions.
 
@@ -624,6 +707,9 @@ untrusted input — scraped competitor HTML and bug reports typed by others — 
 credential it holds is something a prompt injection can try to aim. These
 endpoints have nothing worth stealing. `/api/plans/<id>/approve` must never
 become reachable to the routine either; it would let it approve its own plans.
+What it does get (v1.328.0) is the `X-Bug-Token` of the one bug it was fired
+for: register that bug's PR, file a plan for it, mark it resolved — nothing else
+(see "Bug queue gate").
 
 ---
 
@@ -633,12 +719,13 @@ The hands-off pipeline distinguishes two kinds of reports:
 - **Clear code bug** → the fix routine repairs it directly (PR + auto-merge on
   green CI). No human in the loop.
 - **Feature request / judgement call** → the routine must NOT build. It POSTs a
-  plan to `POST /api/plans` (`{bug_id, title, summary, plan}`); the droplet
+  plan to `POST /api/plans` (`{bug_id, title, summary, plan}`, with the
+  `X-Bug-Token` header from its fire text — without it: 401); the droplet
   Slack-pings the CEO with the summary. The CEO approves/rejects in the
   dashboard (**Tools → Plans**). Approving (token-gated) fires the routine again
   with the plan text in "APPROVED PLAN" mode — it then builds exactly that plan,
   opens a PR with auto-merge, and resolves the bug.
 - Plan storage: `backend/plans.jsonl` (gitignored, droplet-only).
 - The routine's cloud environment needs network access to the droplet
-  (`188-166-11-177.nip.io`) for the plan POST + resolve calls; if unreachable it
-  falls back to a draft PR describing the plan.
+  (`188-166-11-177.nip.io`) for the plan POST + resolve calls; if unreachable (or
+  answered 401) it falls back to a draft PR describing the plan.

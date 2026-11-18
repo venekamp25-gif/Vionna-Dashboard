@@ -1278,9 +1278,12 @@ export const api = {
       product_name: string | null;
     };
   }) =>
+    // authed since v1.328.0: filing a bug pings Slack and can fire the auto-fix
+    // routine, so the droplet no longer takes it from strangers.
     call<{ success: boolean; id?: number; error?: string }>("/api/bug_reports", {
       method: "POST",
       body: params,
+      authed: true,
     }),
 
   backfillSalesChannels: (store: "dk" | "fr" | "fi") =>
@@ -1752,7 +1755,7 @@ export interface PlanEntry {
 export const plansApi = {
   list: (all = false) =>
     call<{ entries: PlanEntry[]; pending_count: number }>(
-      `/api/plans${all ? "?status=all" : ""}`
+      `/api/plans${all ? "?status=all" : ""}`, { authed: true }
     ),
   approve: (id: number) =>
     call<{ success?: boolean; status?: string; error?: string }>(

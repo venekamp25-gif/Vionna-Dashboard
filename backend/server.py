@@ -245,7 +245,7 @@ def _run_backup():
         dest = os.path.join(BACKUP_DIR, day)
         os.makedirs(dest, exist_ok=True)
         for fname in ('publish_history.jsonl', 'lighting_history.jsonl', 'bug_reports.jsonl',
-                      'blog_history.jsonl', 'blog_failures.jsonl',
+                      'plans.jsonl', 'blog_history.jsonl', 'blog_failures.jsonl',
                       'blog_performance.jsonl', 'blog_views.json', 'blog_playbook.json',
                       'bs_snapshots.jsonl', 'known_sources.json', 'blocked_sources.json',
                       'wtl_verdicts.json', 'wtl_traffic.json', 'size_chart_fill.json',
@@ -516,7 +516,8 @@ def shopify_url(store_key, path):
 # keeps working. When DROPLET_TOKEN_SECRET is unset the gate is fail-CLOSED for
 # remote calls (a fresh droplet without the env var does NOT silently expose every
 # gated route); only local dev with DEV_LOCAL=1 passes. Set the SAME secret on the
-# droplet AND on Netlify to activate it (set Netlify first, then the droplet — see CLAUDE.md).
+# droplet AND on Netlify to activate it (set Netlify first, then the droplet). Rotating it
+# also invalidates the bug-queue capabilities (CLAUDE.md, "Bug queue gate").
 DROPLET_TOKEN_SECRET = os.getenv('DROPLET_TOKEN_SECRET')
 
 def _b64url_decode(seg):
@@ -11217,9 +11218,217 @@ def _rewrite_bug_reports(entries):
     os.replace(tmp, BUG_REPORTS_PATH)
 
 
+# ── Who may touch the bug queue (v1.328.0) ────────────────────────────────────
+# Until v1.327 every bug-queue route was open to the whole internet, on a URL
+# that is hardcoded in this PUBLIC repo. Filing a bug fired the hands-off fix
+# routine (an agent that merges its own PRs) with the reporter's text in its
+# prompt; /pr stored a caller-chosen link that the stall-watcher later posted to
+# Slack as "Open PR"; /resolve let anyone close bugs. Now:
+#   - filing a bug needs a session token (the dashboard sends one);
+#   - the routine's callbacks take X-Bug-Token, a capability for the ONE bug it
+#     was fired for, handed over in its fire text: /pr and /resolve of the bug
+#     in the path, POST /api/plans for the bug_id in the body. The routine
+#     still never holds a session token (see CLAUDE.md);
+#   - reading the queue or the plans needs a session token or a genuinely local
+#     call, i.e. someone with SSH on the droplet (the laptop's "bug" flow). No
+#     per-bug capability opens those, wherever a bug id would come from: they
+#     return everything;
+#   - a screenshot opens with its signed ?sig= link (Slack ping, fire text, list).
+
+def _pos_int(v):
+    """A positive int from a path arg or a JSON value (int or digit string)."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v if v > 0 else None
+    if isinstance(v, str) and re.fullmatch(r'[0-9]{1,9}', v.strip()):
+        n = int(v.strip())
+        return n if n > 0 else None
+    return None
+
+
+def _bug_entry(bug_id):
+    """The queue entry with this id, or None."""
+    bug_id = _pos_int(bug_id)
+    if bug_id is None:
+        return None
+    return next((e for e in _load_bug_reports() if e.get('id') == bug_id), None)
+
+
+_BUG_CAP_KINDS = ('callback', 'screenshot')
+
+
+def _bug_cap(kind, entry):
+    """Capability for one queue entry: 'callback' (X-Bug-Token for the routine's
+    pr/plan/resolve calls) or 'screenshot' (?sig= on the screenshot link).
+
+    Takes the ENTRY, not a bare id: the HMAC covers the id and its created_at,
+    so if ids are ever handed out again (queue file lost, or restored from an
+    older backup) an old token or Slack link does not open the new bug. Derived
+    from DROPLET_TOKEN_SECRET through its own subkey, so it can never pass as a
+    session token (other key, no dots) and one kind never stands in for the
+    other. Returns '' when the secret is unset: nothing passes then."""
+    if not DROPLET_TOKEN_SECRET or kind not in _BUG_CAP_KINDS or not isinstance(entry, dict):
+        return ''
+    bug_id = _pos_int(entry.get('id'))
+    if bug_id is None:
+        return ''
+    subkey = hmac.new(DROPLET_TOKEN_SECRET.encode(), b'vionna-bug-queue-v1', hashlib.sha256).digest()
+    msg = f"{kind}\n{bug_id}\n{entry.get('created_at') or ''}".encode()
+    return hmac.new(subkey, msg, hashlib.sha256).hexdigest()
+
+
+def _bug_cap_ok(kind, entry, supplied):
+    if not isinstance(supplied, str) or not supplied:
+        return False
+    expected = _bug_cap(kind, entry)
+    if not expected:
+        return False
+    return hmac.compare_digest(supplied.strip().encode(), expected.encode())
+
+
+def _bug_queue_gate(f, capability=None, bad_capability_msg=None):
+    """Let a call through when it is genuinely local (SSH on the droplet), has
+    a session token, or — where the route allows one — carries the right
+    per-bug capability. Records how it got in as g.bug_queue_auth ('local',
+    'bug-token' or 'session'): POST /api/plans keeps that with the plan.
+
+    `capability(kwargs)` returns None when the call presents no capability,
+    True when it presents a valid one, False when it presents a wrong one. A
+    wrong one gets its own 401 (unless a session token rescues the call), so
+    the routine never reads "session token" in an error about a credential it
+    was never given."""
+    def _as(how):
+        @wraps(f)
+        def _run(*args, **kwargs):
+            g.bug_queue_auth = how
+            return f(*args, **kwargs)
+        return _run
+
+    as_local, as_capability = _as('local'), _as('bug-token')
+    gated = require_droplet_token(_as('session'))
+
+    @wraps(f)
+    def _wrapped(*args, **kwargs):
+        if _is_genuinely_local():
+            return as_local(*args, **kwargs)
+        verdict = capability(kwargs) if capability is not None else None
+        if verdict is True:
+            return as_capability(*args, **kwargs)
+        if (verdict is False and bad_capability_msg and DROPLET_TOKEN_SECRET
+                and not _verify_droplet_token(request.headers.get('X-Droplet-Token', ''))):
+            return jsonify({'error': bad_capability_msg}), 401
+        return gated(*args, **kwargs)
+    return _wrapped
+
+
+_BAD_BUG_TOKEN = ('X-Bug-Token does not match this bug: it only works for the one bug '
+                  'it was handed out for.')
+
+
+def require_team_access(f):
+    """Session token or a genuinely local call — nothing else. For the routes
+    that return the whole queue or every plan."""
+    return _bug_queue_gate(f)
+
+
+def require_bug_callback_access(f):
+    """/api/bug_reports/<bug_id>/pr and /resolve: the X-Bug-Token of the bug in
+    the PATH, a session token, or a local call."""
+    def _capability(kw):
+        supplied = request.headers.get('X-Bug-Token', '')
+        if not supplied:
+            return None
+        return _bug_cap_ok('callback', _bug_entry(kw.get('bug_id')), supplied)
+    return _bug_queue_gate(f, _capability, _BAD_BUG_TOKEN)
+
+
+def require_plan_filing_access(f):
+    """POST /api/plans: the X-Bug-Token of the bug_id in the JSON body, a
+    session token, or a local call. A token with a body that is not a JSON
+    object with a bug id gets a 400 that says so (it depends only on the shape
+    of the request, never on whether the token is valid)."""
+    def _capability(kw):
+        supplied = request.headers.get('X-Bug-Token', '')
+        if not supplied:
+            return None
+        body = request.get_json(silent=True)
+        bug_id = body.get('bug_id') if isinstance(body, dict) else None
+        return _bug_cap_ok('callback', _bug_entry(bug_id), supplied)
+    inner = _bug_queue_gate(f, _capability, _BAD_BUG_TOKEN)
+
+    @wraps(f)
+    def _wrapped(*args, **kwargs):
+        if request.headers.get('X-Bug-Token') and not _is_genuinely_local():
+            body = request.get_json(silent=True)
+            if not isinstance(body, dict) or _pos_int(body.get('bug_id')) is None:
+                return jsonify({'error': 'Send the plan as a JSON object with a numeric bug_id '
+                                         'and Content-Type: application/json. Build the file with '
+                                         'a JSON encoder: titles and plans contain quotes and '
+                                         'newlines.'}), 400
+        return inner(*args, **kwargs)
+    return _wrapped
+
+
+def require_bug_screenshot_access(f):
+    """The signed ?sig= link of this bug's screenshot, a session token, or a
+    local call. A link without a sig counts as a wrong one, so an old Slack
+    link (from before v1.328.0) gets an answer that explains itself."""
+    def _capability(kw):
+        return _bug_cap_ok('screenshot', _bug_entry(kw.get('bug_id')), request.args.get('sig', ''))
+    return _bug_queue_gate(f, _capability,
+                           'This screenshot link is not valid: links from before v1.328.0 have '
+                           'no signature. Take a fresh link from the bug list.')
+
+
+def _bug_public_base():
+    return os.getenv('PUBLIC_BASE_URL', 'https://188-166-11-177.nip.io').rstrip('/')
+
+
+def _bug_screenshot_url(entry):
+    """The screenshot link we hand out (Slack, fire text, gated list): signed,
+    so it opens in a plain browser or Slack's image fetcher without a session."""
+    bug_id = entry.get('id', '?') if isinstance(entry, dict) else '?'
+    sig = _bug_cap('screenshot', entry)
+    url = f"{_bug_public_base()}/api/bug_reports/{bug_id}/screenshot"
+    return f"{url}?sig={sig}" if sig else url
+
+
+def _bug_callback_lines(entry, with_plan=True):
+    """The routine's callback commands for one bug, token included. Empty when
+    no capability can be made (no secret, or no such entry) — the routine then
+    falls back to a draft PR, exactly as when the droplet is unreachable."""
+    tok = _bug_cap('callback', entry)
+    if not tok:
+        return []
+    bug_id = entry['id']
+    base = _bug_public_base()
+    h = f'-H "X-Bug-Token: {tok}"'
+    j = "-H 'Content-Type: application/json'"
+    lines = [
+        '',
+        f'Droplet callbacks for bug #{bug_id}. The X-Bug-Token below works for this '
+        'bug only. Never copy it (or the screenshot link) into code, commits, PRs '
+        'or comments: the repo is public.',
+        f"  register your fix PR:  curl -sS -X POST {h} {j} -d '{{\"pr_number\": <N>}}' "
+        f"{base}/api/bug_reports/{bug_id}/pr",
+    ]
+    if with_plan:
+        lines += [
+            f'  needs a human call:    write {{"bug_id": {bug_id}, "title": ..., "summary": ..., '
+            f'"plan": ...}} to plan.json with a JSON encoder (e.g. Python\'s json.dump; never by '
+            f'hand: the texts hold quotes and newlines), then',
+            f"                         curl -sS -X POST {h} {j} --data-binary @plan.json {base}/api/plans",
+        ]
+    lines.append(f"  mark it resolved:      curl -sS -X POST {h} {base}/api/bug_reports/{bug_id}/resolve")
+    return lines
+
+
 @app.route('/api/bug_reports', methods=['POST'])
+@require_droplet_token
 def bug_reports_create():
-    """Submit a new bug report. Body:
+    """Submit a new bug report (session token required since v1.328.0: filing a
+    bug pings Slack and can fire the auto-fix routine). Body:
         {
           "title":         "short summary",
           "description":   "detailed explanation",
@@ -11315,8 +11524,7 @@ def _post_bug_to_slack(entry):
     if not url:
         return
     bug_id = entry.get('id', '?')
-    shop_base = os.getenv('PUBLIC_BASE_URL', 'https://188-166-11-177.nip.io').rstrip('/')
-    sshot = f"{shop_base}/api/bug_reports/{bug_id}/screenshot" if entry.get('screenshot_filename') else None
+    sshot = _bug_screenshot_url(entry) if entry.get('screenshot_filename') else None
     fields = [
         {'type': 'mrkdwn', 'text': f"*Reporter:*\n{entry.get('reporter_email') or 'unknown'}"},
         {'type': 'mrkdwn', 'text': f"*Store:*\n{(entry.get('store') or '—').upper()}"},
@@ -11370,7 +11578,6 @@ def _fire_routine(entry):
     rather than expecting it to call back for the queue.
     """
     bug_id = entry.get('id', '?')
-    shop_base = os.getenv('PUBLIC_BASE_URL', 'https://188-166-11-177.nip.io').rstrip('/')
     lines = [
         "A new bug was just reported in the Vionna Dashboard. Fix it hands-off, "
         "following your routine instructions.",
@@ -11393,7 +11600,8 @@ def _fire_routine(entry):
         if diag.get('sizes'):
             lines.append(f"Sizes: {', '.join(diag['sizes'])}")
     if entry.get('screenshot_filename'):
-        lines.append(f"\nScreenshot: {shop_base}/api/bug_reports/{bug_id}/screenshot")
+        lines.append(f"\nScreenshot: {_bug_screenshot_url(entry)}")
+    lines.extend(_bug_callback_lines(entry))
 
     _fire_routine_text('\n'.join(lines), f'bug #{bug_id}')
 
@@ -11460,22 +11668,38 @@ def _rewrite_plans(entries):
 
 
 @app.route('/api/plans', methods=['POST'])
+@require_plan_filing_access
 def plans_create():
     """Submit a plan (called by the fix routine when a report needs a human
-    decision). Body: {bug_id, title, summary, plan}. Same open trust level as
-    bug-report submission — worst case is a spam plan the CEO rejects."""
-    data = request.json or {}
-    title = (data.get('title') or '').strip()[:200]
+    decision). Body: {bug_id, title, summary, plan}. Since v1.328.0 it needs
+    the X-Bug-Token of that bug_id (or a session / local call): an approved
+    plan goes to the routine as "approved verbatim by the CEO", so a stranger
+    must not be able to put one in the queue."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    title = str(data.get('title') or '').strip()[:200]
     if not title:
         return jsonify({'error': 'title is required'}), 400
+    bug_id = _pos_int(data.get('bug_id'))
+    bug = _bug_entry(bug_id) if bug_id else None
+    if bug is not None and bug.get('status') != 'open':
+        # A token stays valid after its bug is closed; a plan for a closed bug is
+        # never wanted and would only ping Slack.
+        return jsonify({'error': f"bug #{bug_id} is already {bug.get('status')}"}), 409
     plans = _load_plans()
     plan_id = max([p.get('id', 0) for p in plans] or [0]) + 1
     entry = {
         'id':         plan_id,
-        'bug_id':     data.get('bug_id'),
+        'bug_id':     bug_id,
+        # Which bug exactly (ids can be handed out again) and how the plan got
+        # in: plans_approve hands out callbacks only for this same bug, and
+        # refuses plans without filed_via (filed while this route was open).
+        'bug_created_at': (bug or {}).get('created_at'),
+        'filed_via':  getattr(g, 'bug_queue_auth', None) or 'session',
         'title':      title,
-        'summary':    (data.get('summary') or '').strip()[:2000],
-        'plan':       (data.get('plan') or '').strip()[:20000],
+        'summary':    str(data.get('summary') or '').strip()[:2000],
+        'plan':       str(data.get('plan') or '').strip()[:20000],
         'status':     'pending',
         'created_at': datetime.datetime.utcnow().isoformat() + 'Z',
         'decided_at': None,
@@ -11513,6 +11737,7 @@ def _post_plan_to_slack(entry):
 
 
 @app.route('/api/plans', methods=['GET'])
+@require_team_access
 def plans_list():
     """List plans. Default: pending only. ?status=all for full history."""
     status = request.args.get('status', 'pending')
@@ -11535,13 +11760,32 @@ def plans_approve(plan_id):
         return jsonify({'error': f'plan #{plan_id} not found'}), 404
     if entry.get('status') != 'pending':
         return jsonify({'error': f"plan #{plan_id} is already {entry.get('status')}"}), 409
-    shop_base = os.getenv('PUBLIC_BASE_URL', 'https://188-166-11-177.nip.io').rstrip('/')
+    if not entry.get('filed_via'):
+        # Filed before v1.328.0, when anyone on the internet could file a plan:
+        # its text would reach the routine as "approved verbatim by the CEO".
+        return jsonify({'error': f'plan #{plan_id} was filed before v1.328.0, when anyone could '
+                                 'file a plan. Reject it; if the work is wanted, let the routine '
+                                 'file it again.'}), 409
+    bid = _pos_int(entry.get('bug_id'))
+    bug = _bug_entry(bid) if bid else None
+    same_bug = bool(bug and entry.get('bug_created_at')
+                    and bug.get('created_at') == entry.get('bug_created_at'))
+    callbacks = _bug_callback_lines(bug, with_plan=False) if same_bug else []
+    if callbacks:
+        after = ('After the PR is open with auto-merge enabled, register it and mark '
+                 'the bug resolved with the callbacks below.')
+    elif bid:
+        after = (f'No callback token for bug #{bid} (it is not in the queue any more, the id now '
+                 'belongs to another bug, or this droplet has no secret): do not touch the bug '
+                 'queue; the CEO resolves it.')
+    else:
+        after = 'This plan has no bug id, so there is no bug to mark resolved.'
     text = '\n'.join([
         'APPROVED PLAN — execute now, hands-off, following your routine instructions (mode A).',
         '',
         f"Plan #{entry['id']} for bug #{entry.get('bug_id') or '?'}: {entry['title']}",
-        f"After the PR is open with auto-merge enabled, mark the bug resolved via:",
-        f"  curl -sS -X POST {shop_base}/api/bug_reports/{entry.get('bug_id') or 0}/resolve",
+        after,
+        *callbacks,
         '',
         '--- PLAN (approved verbatim by the CEO) ---',
         entry.get('plan') or entry.get('summary') or '(no plan text)',
@@ -11602,47 +11846,52 @@ def config_slack_webhook():
 
 
 @app.route('/api/bug_reports', methods=['GET'])
+@require_team_access
 def bug_reports_list():
-    """List bug reports. Default: open only. Pass ?status=all to see resolved too."""
+    """List bug reports. Default: open only. Pass ?status=all to see resolved too.
+
+    Gated since v1.328.0 (session token, or a genuinely local call — the laptop's
+    "bug" flow runs this curl over SSH on the droplet). Because only the team can
+    read it now, entries come back whole, plus a signed screenshot_url."""
     status = request.args.get('status', 'open')
     entries = _load_bug_reports(status_filter=None if status == 'all' else 'open')
-    # This endpoint is unauthenticated (the in-app bug list + the ops curl-flow
-    # both hit it tokenless), so it must NOT leak reporter PII or the
-    # possibly-URL-bearing diagnostics blob. Strip those from the public
-    # response; the full record stays in bug_reports.jsonl for the server-side
-    # Slack ping and the resolve/CLI text. The frontend list never renders these
-    # two fields, so hiding them changes no UI.
-    _PUBLIC_DROP = ('reporter_email', 'diagnostics')
-    safe_entries = [{k: v for k, v in e.items() if k not in _PUBLIC_DROP}
-                    for e in entries]
-    # Hide screenshot path from list-level response — the GET-by-ID returns it
+    out = []
+    for e in entries:
+        row = dict(e)
+        if e.get('screenshot_filename'):
+            row['screenshot_url'] = _bug_screenshot_url(e)
+        out.append(row)
     return jsonify({
         'open_count':  sum(1 for e in entries if e.get('status') == 'open'),
         'total_count': len(entries),
-        'entries':     safe_entries,
+        'entries':     out,
     })
 
 
 @app.route('/api/bug_reports/<int:bug_id>/pr', methods=['POST'])
+@require_bug_callback_access
 def bug_reports_attach_pr(bug_id):
-    """Register the PR that carries the fix for a bug. Body: {pr_number, pr_url?}.
+    """Register the PR that carries the fix for a bug. Body: {pr_number}.
 
     Without this the pipeline has no idea a fix exists: the bug sits 'open' while
     a finished, green PR waits for a merge click nobody knows about (bug #31 sat
     that way). Once registered, _fix_pr_watch_loop below chases it until it is
     merged, so a fix can no longer be lost because the routine's session ended
-    before CI went green."""
-    body = request.get_json(silent=True) or {}
-    try:
-        pr_number = int(body.get('pr_number'))
-    except (TypeError, ValueError):
-        return jsonify({'error': 'pr_number (int) is required'}), 400
+    before CI went green.
+
+    The link is always built from the number. Until v1.328.0 a caller-supplied
+    pr_url was stored and later posted to Slack as "Open PR" — a phishing link
+    in the CEO's channel for anyone who could reach this route."""
+    body = request.get_json(silent=True)
+    pr_number = _pos_int(body.get('pr_number')) if isinstance(body, dict) else None
+    if pr_number is None:
+        return jsonify({'error': 'pr_number (positive int) is required'}), 400
     entries = _load_bug_reports()
     entry = next((e for e in entries if e.get('id') == bug_id), None)
     if not entry:
         return jsonify({'error': f'bug #{bug_id} not found'}), 404
     entry['pr_number'] = pr_number
-    entry['pr_url'] = (body.get('pr_url') or f'{GITHUB_REPO_URL}/pull/{pr_number}')[:300]
+    entry['pr_url'] = f'{GITHUB_REPO_URL}/pull/{pr_number}'
     entry['pr_opened_at'] = datetime.datetime.utcnow().isoformat() + 'Z'
     entry['pr_nagged_at'] = None
     try:
@@ -11653,7 +11902,8 @@ def bug_reports_attach_pr(bug_id):
     return jsonify({'success': True, 'id': bug_id, 'pr_number': pr_number})
 
 
-GITHUB_REPO_URL = 'https://github.com/venekamp25-gif/Vionna-Dashboard'
+GITHUB_REPO_SLUG = 'venekamp25-gif/Vionna-Dashboard'
+GITHUB_REPO_URL = f'https://github.com/{GITHUB_REPO_SLUG}'
 _FIX_PR_WATCH_INTERVAL = 600          # seconds between sweeps
 _FIX_PR_GRACE = 15 * 60               # how long a PR may sit before the first ping
 _FIX_PR_RENAG = 6 * 3600              # re-ping this often while it stays unmerged
@@ -11670,8 +11920,7 @@ def _fix_pr_sweep():
         if e.get('status') != 'open' or not e.get('pr_number'):
             continue
         try:
-            r = req.get(f'https://api.github.com/repos/venekamp25-gif/Vionna-Dashboard'
-                        f"/pulls/{e['pr_number']}",
+            r = req.get(f"https://api.github.com/repos/{GITHUB_REPO_SLUG}/pulls/{e['pr_number']}",
                         headers={'Accept': 'application/vnd.github+json'}, timeout=15)
             if r.status_code != 200:
                 continue
@@ -11687,6 +11936,17 @@ def _fix_pr_sweep():
             continue
         if pr.get('state') == 'closed':
             e['pr_number'] = None
+            changed = True
+            continue
+        foreign = _pr_head_outside_repo(pr)
+        if foreign is not None:
+            # The routine only ever opens PRs from branches of this repo. A fork's
+            # PR here means someone registered a stranger's code as "the fix":
+            # warn once, never call it mergeable, and stop chasing it.
+            _post_foreign_pr_to_slack(e, pr, foreign)
+            pings += 1
+            e['pr_number'] = None
+            e['pr_foreign'] = foreign
             changed = True
             continue
         opened = _parse_iso(e.get('pr_opened_at'))
@@ -11732,15 +11992,75 @@ def _parse_iso(s):
         return None
 
 
-def _post_stalled_fix_to_slack(entry, pr, minutes):
-    """Tell the CEO a finished fix is waiting on a merge click."""
+def _pr_head_outside_repo(pr):
+    """None when the PR's branch lives in the repo the PR was opened on (or
+    GitHub sent no head info); otherwise where it lives: 'owner/repo', or 'a
+    deleted fork' (GitHub reports head.repo = null once a fork is gone — the
+    base repo never is). Decided from the response itself — repo id first, so
+    a renamed or transferred repo is not mistaken for a fork."""
+    head = pr.get('head')
+    if not isinstance(head, dict) or 'repo' not in head:
+        return None
+    repo = head.get('repo')
+    if not isinstance(repo, dict):
+        return 'a deleted fork'
+    name = str(repo.get('full_name') or '')
+    base = pr.get('base')
+    base_repo = base.get('repo') if isinstance(base, dict) else None
+    if isinstance(base_repo, dict) and repo.get('id') is not None and base_repo.get('id') is not None:
+        return None if repo.get('id') == base_repo.get('id') else (name or 'an unknown repo')
+    ours = str((base_repo or {}).get('full_name') or GITHUB_REPO_SLUG)
+    return None if name.lower() == ours.lower() else (name or 'an unknown repo')
+
+
+def _pr_link(entry, pr):
+    """Built from the number, never from a stored URL: entries written before
+    v1.328.0 may carry a pr_url that a stranger chose."""
+    num = _pos_int(pr.get('number')) or _pos_int(entry.get('pr_number'))
+    return (f'{GITHUB_REPO_URL}/pull/{num}' if num else GITHUB_REPO_URL), num
+
+
+def _post_foreign_pr_to_slack(entry, pr, where):
+    """Warn the CEO that the PR registered as a bug's fix is not ours."""
     url = _slack_webhook_url()
     if not url:
         return
-    pr_url = entry.get('pr_url') or pr.get('html_url') or GITHUB_REPO_URL
-    draft = pr.get('draft')
-    why = ('it is still a draft — it was opened for a human decision'
-           if draft else 'CI is done and it is mergeable — it just needs the Merge click')
+    pr_url, num = _pr_link(entry, pr)
+    try:
+        req.post(url, json={
+            'text': f"⚠️ PR #{num} registered as the fix for bug #{entry.get('id')} "
+                    f"comes from {where}, not from our repo. Do not merge it.",
+            'blocks': [
+                {'type': 'header', 'text': {'type': 'plain_text',
+                                            'text': f"⚠️ Foreign PR on bug #{entry.get('id')}",
+                                            'emoji': True}},
+                {'type': 'section', 'text': {'type': 'mrkdwn',
+                                             'text': f"*{entry.get('title') or '(no title)'}*\n"
+                                                     f"PR #{num} comes from {where}, not from our "
+                                                     f"repo — the fix routine never opens one like "
+                                                     f"that. Do not merge it; the watcher stopped "
+                                                     f"chasing it."}},
+                {'type': 'section', 'text': {'type': 'mrkdwn',
+                                             'text': f"<{pr_url}|Look at PR #{num}>"}},
+            ]}, timeout=10)
+    except Exception as ex:
+        print(f"[fix-watch] slack ping failed: {ex}")
+
+
+def _post_stalled_fix_to_slack(entry, pr, minutes):
+    """Tell the CEO a fix is waiting. Only says "just needs the Merge click"
+    when GitHub itself reports the PR as clean (checks green, no conflicts)."""
+    url = _slack_webhook_url()
+    if not url:
+        return
+    pr_url, _num = _pr_link(entry, pr)
+    if pr.get('draft'):
+        why = 'it is still a draft — it was opened for a human decision'
+    elif pr.get('mergeable_state') == 'clean':
+        why = 'CI is green and it is mergeable — it just needs the Merge click'
+    else:
+        why = (f"it is not merged yet (GitHub: {pr.get('mergeable_state') or 'unknown'}) — "
+               'check its CI and merge it once green')
     try:
         req.post(url, json={
             'text': f"⏳ Fix for bug #{entry.get('id')} has been waiting {minutes} min: {pr_url}",
@@ -11768,8 +12088,9 @@ else:
 
 
 @app.route('/api/bug_reports/<int:bug_id>/resolve', methods=['POST'])
+@require_bug_callback_access
 def bug_reports_resolve(bug_id):
-    """Mark a single bug as resolved."""
+    """Mark a single bug as resolved (X-Bug-Token of this bug, session, or local)."""
     entries = _load_bug_reports()
     found = False
     for e in entries:
@@ -11788,8 +12109,12 @@ def bug_reports_resolve(bug_id):
 
 
 @app.route('/api/bug_reports/<int:bug_id>/screenshot', methods=['GET'])
+@require_bug_screenshot_access
 def bug_reports_screenshot(bug_id):
-    """Serve a bug's screenshot image, if any was attached."""
+    """Serve a bug's screenshot image, if any was attached. Needs the signed
+    ?sig= link (what Slack, the routine and the gated list get), a session token
+    or a local call: ids are sequential, so an open route was a full download of
+    every screenshot of the dashboard."""
     entries = _load_bug_reports()
     entry = next((e for e in entries if e.get('id') == bug_id), None)
     if not entry or not entry.get('screenshot_filename'):
@@ -31689,6 +32014,34 @@ class _SpyShieldAccessLogFilter(logging.Filter):
             return True
 
 
+_LOG_SIG_RE = re.compile(r'([?&]sig=)[^&\s"]+')
+
+
+class _SignedLinkLogFilter(logging.Filter):
+    """Werkzeug logs every request line, so a signed screenshot link (?sig=,
+    v1.328.0) would sit in journald as a working link. Keep the line, hide the
+    signature."""
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+            if 'sig=' in msg:
+                record.msg = _LOG_SIG_RE.sub(r'\1<redacted>', msg)
+                record.args = ()
+        except Exception:
+            pass
+        return True
+
+
+def _install_request_log_filters():
+    """Hook both filters onto werkzeug's request log (once). Called from
+    __main__; a test calls it too, so dropping the call cannot go unnoticed."""
+    log = logging.getLogger('werkzeug')
+    for flt in (_SpyShieldAccessLogFilter, _SignedLinkLogFilter):
+        if not any(isinstance(x, flt) for x in log.filters):
+            log.addFilter(flt())
+    return log
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     # Sinds v1.315: alleen loopback. Caddy proxyt op dezelfde box naar
@@ -31698,6 +32051,6 @@ if __name__ == '__main__':
     # is alleen betrouwbaar als élke request via Caddy komt. BIND_HOST=0.0.0.0
     # in .env zet het terug (bv. een dev-machine die via LAN bereikt moet zijn).
     host = os.environ.get('BIND_HOST', '127.0.0.1')
-    logging.getLogger('werkzeug').addFilter(_SpyShieldAccessLogFilter())
+    _install_request_log_filters()
     print(f"\nVionna Dashboard running on http://localhost:{port}\n")
     app.run(debug=False, host=host, port=port)
