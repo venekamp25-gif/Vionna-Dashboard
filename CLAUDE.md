@@ -461,6 +461,31 @@ facts, preview per store, apply. Code: server.py section "AFTER QUOTATION"
 
 ---
 
+## 🔐 Shopify OAuth callback (hardened in v1.327.0)
+
+`/auth/<store>` (the "Authorize DK/FR/FI" links in the legacy `index.html`) and
+`/callback` are the only way the fashion stores get a token into `tokens.json`.
+Until v1.327.0 `/callback` trusted the `shop` query value: `/auth/dk` followed by
+`/callback?shop=<any host>` POSTed the DK client_secret to that host and wrote
+the host plus a fake token into `tokens.json` (rated CRITICAL by the audits of
+31 Aug, 15 Sep, 10 and 16 Nov 2026; `shopify_url()` prefers the tokens.json shop).
+
+Rules now, all enforced in `callback()` and covered by `test_oauth_callback.py`:
+- `shop` must be a `*.myshopify.com` domain AND exactly the configured domain of
+  one store (`SHOPIFY_<X>_DOMAIN`); with a session from `/auth/<store>` it must be
+  that store. The value is never echoed back (that was a reflected-XSS spot).
+- The query must carry Shopify's `hmac`, made with that store's client secret
+  (`_shopify_hmac_ok`, known-answer test = the example in Shopify's docs).
+  Duplicate parameters are refused.
+- State: required to match whenever `/auth` set one; used once.
+- The token exchange always goes to the configured domain, and `tokens.json`
+  stores the configured domain, never the query value.
+- Do not put `/auth/<store>` behind `@require_droplet_token`: it is opened by a
+  plain browser link, which cannot send the header. It only redirects to the
+  configured shop, so it leaks nothing; the HMAC is what makes `/callback` safe.
+
+---
+
 ## 🐛 Codeword: "bug"
 
 When the user says **"bug"** (also accept "bugs", "/bug", "fix bugs", "work the
