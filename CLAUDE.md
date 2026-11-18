@@ -477,7 +477,13 @@ Rules now, all enforced in `callback()` and covered by `test_oauth_callback.py`:
 - The query must carry Shopify's `hmac`, made with that store's client secret
   (`_shopify_hmac_ok`, known-answer test = the example in Shopify's docs).
   Duplicate parameters are refused.
-- State: required to match whenever `/auth` set one; used once.
+- State: required to match whenever `/auth` set one (also when the query has no
+  `state`). The session is a signed cookie, so a state cannot be revoked; the
+  one-time guarantee is Shopify's single-use `code`.
+- A failed check logs only parameter NAMES; a failed token exchange logs the HTTP
+  status and Shopify's error text (no secrets). Shopify not answering = 502.
+- Rotating a client secret: put the new value in the droplet `.env` BEFORE
+  re-authorizing, or every callback fails the HMAC check (403).
 - The token exchange always goes to the configured domain, and `tokens.json`
   stores the configured domain, never the query value.
 - Do not put `/auth/<store>` behind `@require_droplet_token`: it is opened by a

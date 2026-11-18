@@ -76,7 +76,9 @@ def signed(secret=DK_SECRET, **params):
 
 # --------------------------------------------------------------------------- the audited attack
 @pytest.mark.parametrize('evil', ['attacker.example', 'evil.myshopify.com', DK + '.attacker.example',
-                                  'attacker.example/x', DK + '/../attacker.example', ''])
+                                  'attacker.example/x', DK + '/../attacker.example', '',
+                                  # look-alikes: an ends-with / prefix match would let these through
+                                  'evil' + DK, DK.replace('.myshopify.com', '-x.myshopify.com')])
 def test_the_audited_attack_never_posts_the_secret(posts, evil):
     """/auth/dk then /callback with another host: no POST anywhere, tokens.json untouched.
     Even a correct-looking HMAC over the forged query does not help."""
@@ -133,6 +135,16 @@ def test_duplicate_parameter_is_refused(posts):
     assert r.status_code in (400, 403) and posts == []
 
 
+def test_store_without_a_secret_never_accepts_a_callback(posts, monkeypatch):
+    """A configured store whose client secret is missing: even an HMAC made with an empty key fails."""
+    fi = 'vionna-test-fi.myshopify.com'
+    monkeypatch.setitem(server.STORES, 'fi', fi)
+    c = server.app.test_client()
+    p = {'code': 'x', 'shop': fi, 'timestamp': '1'}
+    p['hmac'] = sign(p, '')
+    assert callback(c, p).status_code == 403 and posts == []
+
+
 def test_hmac_matches_shopifys_documented_example():
     """Known-answer test: the example from Shopify's OAuth documentation (secret 'hush')."""
     args = ImmutableMultiDict([
@@ -159,14 +171,21 @@ def test_wrong_state_is_refused(posts):
     assert r.status_code == 403 and posts == []
 
 
-def test_a_state_works_only_once(posts):
+def test_missing_state_is_refused_when_auth_set_one(posts):
+    c = server.app.test_client()
+    start_auth(c)
+    r = callback(c, signed(code='x', shop=DK, timestamp='1'))
+    assert r.status_code == 403 and posts == []
+
+
+def test_replayed_callback_only_reaches_the_configured_shop(posts):
+    """The session is a signed cookie, so a replay is possible; the one-time guarantee is
+    Shopify's single-use code. What matters: a replay can only ever talk to our own shop."""
     c = server.app.test_client()
     state = start_auth(c)
     assert callback(c, signed(code='a', shop=DK, state=state, timestamp='1')).status_code == 302
-    # replaying the same callback: the session state is gone, the HMAC is still valid,
-    # so it is accepted as a Shopify-side flow -> exchange goes to the configured shop
     callback(c, signed(code='a', shop=DK, state=state, timestamp='1'))
-    assert all(url == f'https://{DK}/admin/oauth/access_token' for url, _ in posts)
+    assert posts and all(url == f'https://{DK}/admin/oauth/access_token' for url, _ in posts)
 
 
 # --------------------------------------------------------------------------- the real flow still works
@@ -208,6 +227,33 @@ def test_failed_exchange_writes_nothing(posts, monkeypatch):
             return {}
 
     monkeypatch.setattr(server.req, 'post', lambda url, json=None, **kw: Refused())
+    c = server.app.test_client()
+    state = start_auth(c)
+    r = callback(c, signed(code='abc', shop=DK, state=state, timestamp='1'))
+    assert r.status_code == 400 and server.tokens == {}
+
+
+def test_shopify_not_answering_is_a_clean_502(posts, monkeypatch):
+    def timeout(url, json=None, **kw):
+        raise server.req.Timeout('read timed out')
+
+    monkeypatch.setattr(server.req, 'post', timeout)
+    c = server.app.test_client()
+    state = start_auth(c)
+    r = callback(c, signed(code='abc', shop=DK, state=state, timestamp='1'))
+    assert r.status_code == 502 and server.tokens == {}
+
+
+@pytest.mark.parametrize('body', [[1], 'x', None])
+def test_odd_token_answer_is_a_clean_400(posts, monkeypatch, body):
+    class Odd:
+        status_code = 200
+        text = 'odd'
+
+        def json(self):
+            return body
+
+    monkeypatch.setattr(server.req, 'post', lambda url, json=None, **kw: Odd())
     c = server.app.test_client()
     state = start_auth(c)
     r = callback(c, signed(code='abc', shop=DK, state=state, timestamp='1'))

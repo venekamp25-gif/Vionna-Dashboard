@@ -703,6 +703,9 @@ def callback():
     creds = APP_CREDENTIALS.get(store_key, {})
     # Proof that Shopify itself sent this redirect for this shop.
     if not _shopify_hmac_ok(request.args, creds.get('client_secret')):
+        # parameter names only, never values (they hold the code and the hmac)
+        print(f'[oauth] {store_key}: callback refused, bad or missing hmac '
+              f'(params: {sorted(request.args.keys())})')
         return 'Invalid signature', 403
 
     # State (CSRF): enforced whenever /auth set one. A flow started on the Shopify side
@@ -715,22 +718,29 @@ def callback():
         return 'Missing code', 400
 
     shop = STORES[store_key].strip().lower()      # the configured value, never the query's
-    res = req.post(f"https://{shop}/admin/oauth/access_token", json={
-        'client_id':     creds.get('client_id'),
-        'client_secret': creds.get('client_secret'),
-        'code':          code,
-    }, timeout=20)
+    try:
+        res = req.post(f"https://{shop}/admin/oauth/access_token", json={
+            'client_id':     creds.get('client_id'),
+            'client_secret': creds.get('client_secret'),
+            'code':          code,
+        }, timeout=20)
+    except req.RequestException as e:
+        print(f'[oauth] {store_key}: token exchange unreachable ({type(e).__name__})')
+        return 'OAuth error: Shopify did not answer, please try again', 502
     if res.status_code != 200:
-        print(f'[oauth] {store_key}: token exchange failed, HTTP {res.status_code}')
+        print(f'[oauth] {store_key}: token exchange failed, HTTP {res.status_code}: {(res.text or "")[:200]}')
         return f'OAuth error (HTTP {res.status_code})', 400
     try:
-        access_token = (res.json() or {}).get('access_token')
+        data = res.json()
     except ValueError:
-        access_token = None
+        data = None
+    access_token = data.get('access_token') if isinstance(data, dict) else None
     if not access_token:
         return 'OAuth error (no access token in the answer)', 400
 
-    session.pop('oauth_state', None)              # a state is good for one callback only
+    # The session is a signed cookie, so this cannot revoke a captured copy; the real
+    # one-time guarantee is Shopify's single-use code. Clearing it keeps the session tidy.
+    session.pop('oauth_state', None)
     tokens[store_key] = {'shop': shop, 'token': access_token}
     save_tokens()
     return redirect(f'/?auth=success&store={store_key}')
